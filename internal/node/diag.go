@@ -8,8 +8,6 @@ import (
 	"runtime"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 )
@@ -151,14 +149,6 @@ func dirUsage(root string) (bytes int64, files int) {
 		return nil
 	})
 	return bytes, files
-}
-
-func diskSpace(path string) (free, total int64) {
-	var st unix.Statfs_t
-	if err := unix.Statfs(path, &st); err != nil {
-		return 0, 0
-	}
-	return int64(st.Bavail) * int64(st.Bsize), int64(st.Blocks) * int64(st.Bsize)
 }
 
 func humanBytes(n int64) string {

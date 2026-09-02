@@ -268,6 +268,7 @@ func cmdServer(ctx context.Context, args []string) error {
 	insecure := fs.Bool("insecure", false, "allow an empty token")
 	bindings := fs.String("bindings", "", "bindings JSON file")
 	lease := fs.Int64("lease", 30, "claim lease seconds")
+	mode := fs.String("mode", envOr("REMOUNT_SECURITY_MODE", server.ModeStandalone), "security mode: standalone, production-single-tenant, production-multi-tenant")
 	parse(fs, args)
 	if *token == "" && !*insecure {
 		return errors.New("--token is required (or --insecure for local experiments)")
@@ -279,12 +280,12 @@ func cmdServer(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	srv, err := server.New(server.Options{DataDir: *data, Token: *token, Bindings: b, LeaseSec: *lease, Logger: slog.Default()})
+	srv, err := server.New(server.Options{DataDir: *data, Token: *token, Bindings: b, LeaseSec: *lease, Logger: slog.Default(), Mode: *mode})
 	if err != nil {
 		return err
 	}
 	defer srv.Close()
-	slog.Info("remount server listening", "addr", *listen, "data", *data, "bindings", len(b))
+	slog.Info("remount server listening", "addr", *listen, "data", *data, "bindings", len(b), "security_mode", *mode)
 	return srv.Serve(ctx, *listen)
 }
 
@@ -363,22 +364,32 @@ func cmdStandalone(ctx context.Context, args []string) error {
 	if err := os.MkdirAll(*data, 0o700); err != nil {
 		return err
 	}
-	srv, err := server.New(server.Options{DataDir: filepath.Join(*data, "server"), Bindings: b, Logger: slog.Default()})
+	srv, err := server.New(server.Options{DataDir: filepath.Join(*data, "server"), Bindings: b, Logger: slog.Default(), Mode: server.ModeStandalone})
 	if err != nil {
 		return err
 	}
 	defer srv.Close()
-	go func() { _ = srv.Serve(ctx, *listen) }()
-	// Wait for the listener.
-	for i := 0; i < 50 && srv.Addr() == ""; i++ {
-		time.Sleep(20 * time.Millisecond)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ctx, *listen) }()
+	readyCtx, readyCancel := context.WithTimeout(ctx, 10*time.Second)
+	addr, err := srv.WaitReady(readyCtx)
+	readyCancel()
+	if err != nil {
+		select {
+		case serveErrValue := <-serveErr:
+			if serveErrValue != nil {
+				return serveErrValue
+			}
+		default:
+		}
+		return err
 	}
-	c := common{server: "http://" + srv.Addr()}
+	c := common{server: "http://" + addr}
 	n, err := buildNode(filepath.Join(*data, "node"), c, map[string]string{"standalone": "true"}, *backends, "ubuntu:24.04", allow, []string{"127.0.0.1", "localhost"})
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "remount standalone: server http://%s (no token), node %s\n  export REMOUNT_SERVER=http://%s\n", srv.Addr(), n.ID(), srv.Addr())
+	fmt.Fprintf(os.Stderr, "remount standalone [LOCAL/UNISOLATED]: server http://%s (no token), node %s\n  export REMOUNT_SERVER=http://%s\n", addr, n.ID(), addr)
 	return n.Run(ctx)
 }
 

@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -11,7 +12,6 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -50,15 +50,18 @@ type Session struct {
 	Log       *Log
 	Principal string
 
-	mu       sync.Mutex
-	stdin    io.WriteCloser // exec: pipe; pty: the pty master; port: the conn
-	ptmx     *os.File
-	cmd      *exec.Cmd
-	conn     net.Conn
-	lastISeq uint64
-	exit     *proto.ExitInfo
-	exited   chan struct{}
-	timeout  *time.Timer
+	mu          sync.Mutex
+	inputMu     sync.Mutex     // serializes writes without blocking lifecycle reads
+	stdin       io.WriteCloser // exec: pipe; pty: the pty master; port: the conn
+	ptmx        *os.File
+	cmd         *exec.Cmd
+	conn        net.Conn
+	lastISeq    uint64
+	exit        *proto.ExitInfo
+	exited      chan struct{}
+	timeout     *time.Timer
+	outputReady chan struct{} // pumps wait until StreamInfo is committed at seq 0
+	logErr      error
 }
 
 // Exited reports whether the process has finished.
@@ -91,33 +94,71 @@ func (s *Session) Wait(ctx context.Context) (*proto.ExitInfo, error) {
 // Input writes to the process. Inputs carry a client-side sequence; an iseq
 // at or below the last applied one is a retry and is dropped (idempotent).
 func (s *Session) Input(iseq uint64, data []byte, eof bool) error {
+	s.inputMu.Lock()
+	defer s.inputMu.Unlock()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if iseq != 0 {
 		if iseq <= s.lastISeq {
+			s.mu.Unlock()
 			metrics.InputsDropped.Inc()
 			return nil // duplicate delivery
 		}
-		s.lastISeq = iseq
 	}
-	if s.stdin == nil {
+	stdin := s.stdin
+	kind := s.Kind
+	conn := s.conn
+	s.mu.Unlock()
+	if stdin == nil {
 		return proto.Err(proto.CodeUnsupported, "session has no stdin")
 	}
 	if len(data) > 0 {
-		if _, err := s.stdin.Write(data); err != nil {
+		if err := writeFull(stdin, data); err != nil {
 			return proto.Err(proto.CodeClosed, "stdin: %v", err)
 		}
 	}
 	if eof {
-		if s.Kind == proto.SessionExec {
-			_ = s.stdin.Close()
-		} else if s.Kind == proto.SessionPort {
-			if cw, ok := s.conn.(interface{ CloseWrite() error }); ok {
-				_ = cw.CloseWrite()
+		if kind == proto.SessionExec {
+			if err := stdin.Close(); err != nil {
+				return proto.Err(proto.CodeClosed, "stdin close: %v", err)
+			}
+		} else if kind == proto.SessionPort {
+			if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+				if err := cw.CloseWrite(); err != nil {
+					return proto.Err(proto.CodeClosed, "stdin close: %v", err)
+				}
 			}
 		}
 	}
+	if iseq != 0 {
+		s.mu.Lock()
+		s.lastISeq = iseq
+		if eof && kind == proto.SessionExec {
+			s.stdin = nil
+		}
+		s.mu.Unlock()
+	}
 	return nil
+}
+
+func writeFull(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
+// LastInputSeq is the last input sequence durably handed to the process.
+func (s *Session) LastInputSeq() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastISeq
 }
 
 // Resize changes the pty window.
@@ -134,6 +175,9 @@ func (s *Session) Resize(rows, cols uint16) error {
 func (s *Session) Signal(name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.exit != nil {
+		return proto.Err(proto.CodeClosed, "session already exited")
+	}
 	if s.Kind == proto.SessionPort {
 		if s.conn != nil {
 			return s.conn.Close()
@@ -143,20 +187,7 @@ func (s *Session) Signal(name string) error {
 	if s.cmd == nil || s.cmd.Process == nil {
 		return proto.Err(proto.CodeNotFound, "no process")
 	}
-	sig, ok := signals[name]
-	if !ok {
-		return proto.Err(proto.CodeBadRequest, "unknown signal %q", name)
-	}
-	if s.cmd.SysProcAttr != nil && s.cmd.SysProcAttr.Setpgid {
-		// Signal the whole process group so pipelines and children die too.
-		return syscall.Kill(-s.cmd.Process.Pid, sig)
-	}
-	return s.cmd.Process.Signal(sig)
-}
-
-var signals = map[string]syscall.Signal{
-	"TERM": syscall.SIGTERM, "KILL": syscall.SIGKILL, "INT": syscall.SIGINT,
-	"HUP": syscall.SIGHUP, "QUIT": syscall.SIGQUIT, "USR1": syscall.SIGUSR1, "USR2": syscall.SIGUSR2,
+	return signalProcess(s.cmd, name)
 }
 
 // Kill terminates the process immediately.
@@ -171,12 +202,22 @@ func (s *Session) finish(info proto.ExitInfo) {
 		return
 	}
 	s.exit = &info
+	if s.logErr != nil && info.Error == "" {
+		info.Error = s.logErr.Error()
+		s.exit = &info
+	}
 	if s.timeout != nil {
 		s.timeout.Stop()
 	}
 	s.mu.Unlock()
 	metrics.SessionsExited.Inc()
-	_, _ = s.Log.Append(proto.StreamExit, proto.MustMarshal(info))
+	if _, err := s.Log.Append(proto.StreamExit, proto.MustMarshal(info)); err != nil {
+		s.mu.Lock()
+		if s.exit != nil && s.exit.Error == "" {
+			s.exit.Error = "session log: " + err.Error()
+		}
+		s.mu.Unlock()
+	}
 	_ = s.Log.Close()
 	close(s.exited)
 }
@@ -202,8 +243,13 @@ type Manager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*Session
-	byIdem   map[string]string // idempotency key -> session id
+	byIdem   map[string]idemSession // idempotency key -> session id + request fingerprint
 	closed   bool
+}
+
+type idemSession struct {
+	id          string
+	fingerprint [32]byte
 }
 
 // NewManager creates a Manager.
@@ -214,7 +260,7 @@ func NewManager(opts ManagerOptions) *Manager {
 	if opts.SpillDir != "" {
 		_ = os.MkdirAll(opts.SpillDir, 0o700)
 	}
-	return &Manager{opts: opts, sessions: map[string]*Session{}, byIdem: map[string]string{}}
+	return &Manager{opts: opts, sessions: map[string]*Session{}, byIdem: map[string]idemSession{}}
 }
 
 // Get returns a session by id.
@@ -263,7 +309,7 @@ func (m *Manager) Remove(id string, kill bool) bool {
 	}
 	delete(m.sessions, id)
 	for k, v := range m.byIdem {
-		if v == id {
+		if v.id == id {
 			delete(m.byIdem, k)
 		}
 	}
@@ -296,14 +342,19 @@ func (m *Manager) Close() {
 // Open starts a session. If spec.IdempotencyKey names an existing session it
 // is returned instead of starting a second process.
 func (m *Manager) Open(spec Spec) (*Session, error) {
+	fingerprint := sessionFingerprint(spec)
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return nil, proto.Err(proto.CodeClosed, "manager closed")
 	}
 	if spec.IdempotencyKey != "" {
-		if id, ok := m.byIdem[spec.IdempotencyKey]; ok {
-			s := m.sessions[id]
+		if existing, ok := m.byIdem[spec.IdempotencyKey]; ok {
+			if existing.fingerprint != fingerprint {
+				m.mu.Unlock()
+				return nil, proto.Err(proto.CodeConflict, "idempotency key was reused with different session arguments")
+			}
+			s := m.sessions[existing.id]
 			m.mu.Unlock()
 			return s, nil
 		}
@@ -319,15 +370,16 @@ func (m *Manager) Open(spec Spec) (*Session, error) {
 		return nil, err
 	}
 	s := &Session{
-		ID: id, WS: spec.WS, Kind: spec.Kind, Log: log, exited: make(chan struct{}), Principal: spec.Principal,
+		ID: id, WS: spec.WS, Kind: spec.Kind, Log: log, exited: make(chan struct{}), outputReady: make(chan struct{}), Principal: spec.Principal,
 		Info: proto.SessionInfo{ID: id, WS: spec.WS, Kind: spec.Kind, Program: spec.Program, OpenedAt: time.Now().UnixMilli()},
 	}
 	m.sessions[id] = s
 	metrics.SessionsOpened.Inc()
 	if spec.IdempotencyKey != "" {
-		m.byIdem[spec.IdempotencyKey] = id
+		m.byIdem[spec.IdempotencyKey] = idemSession{id: id, fingerprint: fingerprint}
 	}
 	m.mu.Unlock()
+	go m.observe(s)
 
 	var startErr error
 	switch spec.Kind {
@@ -342,10 +394,18 @@ func (m *Manager) Open(spec Spec) (*Session, error) {
 	}
 	// The info chunk is always seq 0 so a replay from 0 reconstructs the
 	// session header; it is written after start so PID is known.
-	_, _ = s.Log.Append(proto.StreamInfo, proto.MustMarshal(s.Info))
+	_, infoErr := s.Log.Append(proto.StreamInfo, proto.MustMarshal(s.Info))
+	if infoErr != nil && startErr == nil {
+		startErr = fmt.Errorf("session info log: %w", infoErr)
+	}
 	if startErr != nil {
+		close(s.outputReady)
+		// A process may already be running when committing the mandatory info
+		// record fails. It must not outlive the terminal session record.
+		if infoErr != nil {
+			_ = s.Signal("KILL")
+		}
 		s.finish(proto.ExitInfo{Code: -1, Error: startErr.Error()})
-		m.scheduleReap(s)
 		return s, nil // the session exists; its log says why it failed
 	}
 	if spec.Timeout > 0 {
@@ -355,14 +415,22 @@ func (m *Manager) Open(spec Spec) (*Session, error) {
 		})
 		s.mu.Unlock()
 	}
-	go func() {
-		<-s.exited
-		if m.opts.OnExit != nil {
-			m.opts.OnExit(s, *s.ExitInfo())
-		}
-		m.scheduleReap(s)
-	}()
+	close(s.outputReady)
 	return s, nil
+}
+
+func sessionFingerprint(spec Spec) [32]byte {
+	copySpec := spec
+	copySpec.IdempotencyKey = ""
+	return sha256.Sum256(proto.MustMarshal(copySpec))
+}
+
+func (m *Manager) observe(s *Session) {
+	<-s.exited
+	if m.opts.OnExit != nil {
+		m.opts.OnExit(s, *s.ExitInfo())
+	}
+	m.scheduleReap(s)
 }
 
 func (m *Manager) scheduleReap(s *Session) {
@@ -378,7 +446,7 @@ func (s *Session) startExec(spec Spec) error {
 	cmd := exec.Command(spec.Program[0], spec.Program[1:]...)
 	cmd.Dir = spec.Cwd
 	cmd.Env = spec.Env
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	configureProcessGroup(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -403,8 +471,16 @@ func (s *Session) startExec(spec Spec) error {
 	s.mu.Unlock()
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); pump(s.Log, proto.StreamStdout, stdout) }()
-	go func() { defer wg.Done(); pump(s.Log, proto.StreamStderr, stderr) }()
+	go func() {
+		defer wg.Done()
+		<-s.outputReady
+		s.recordLogError(pump(s.Log, proto.StreamStdout, stdout))
+	}()
+	go func() {
+		defer wg.Done()
+		<-s.outputReady
+		s.recordLogError(pump(s.Log, proto.StreamStderr, stderr))
+	}()
 	go func() {
 		wg.Wait()
 		err := cmd.Wait()
@@ -438,7 +514,8 @@ func (s *Session) startPTY(spec Spec) error {
 	s.Info.PID = cmd.Process.Pid
 	s.mu.Unlock()
 	go func() {
-		pump(s.Log, proto.StreamStdout, ptmx)
+		<-s.outputReady
+		s.recordLogError(pump(s.Log, proto.StreamStdout, ptmx))
 		err := cmd.Wait()
 		_ = ptmx.Close()
 		s.finish(exitInfo(err, cmd))
@@ -447,6 +524,9 @@ func (s *Session) startPTY(spec Spec) error {
 }
 
 func (s *Session) startPort(spec Spec) error {
+	if spec.Port < 1 || spec.Port > 65535 {
+		return proto.Err(proto.CodeBadRequest, "port must be between 1 and 65535")
+	}
 	host := spec.Host
 	if host == "" {
 		host = "127.0.0.1"
@@ -461,7 +541,8 @@ func (s *Session) startPort(spec Spec) error {
 	s.stdin = conn
 	s.mu.Unlock()
 	go func() {
-		pump(s.Log, proto.StreamStdout, conn)
+		<-s.outputReady
+		s.recordLogError(pump(s.Log, proto.StreamStdout, conn))
 		_ = conn.Close()
 		s.finish(proto.ExitInfo{Code: 0})
 	}()
@@ -469,19 +550,36 @@ func (s *Session) startPort(spec Spec) error {
 }
 
 // pump copies r into the log until EOF.
-func pump(l *Log, stream uint8, r io.Reader) {
+func pump(l *Log, stream uint8, r io.Reader) error {
 	buf := make([]byte, 32<<10)
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {
 			if _, aerr := l.Append(stream, buf[:n]); aerr != nil {
-				return
+				return aerr
 			}
 		}
 		if err != nil {
-			return
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
 		}
 	}
+}
+
+func (s *Session) recordLogError(err error) {
+	if err == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.logErr == nil {
+		s.logErr = fmt.Errorf("session log: %w", err)
+	}
+	s.mu.Unlock()
+	// Stop the producer: continuing after storage failure can block forever
+	// once the kernel pipe fills and would hide the terminal error.
+	_ = s.Signal("KILL")
 }
 
 func exitInfo(err error, cmd *exec.Cmd) proto.ExitInfo {
@@ -491,9 +589,9 @@ func exitInfo(err error, cmd *exec.Cmd) proto.ExitInfo {
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
 		info := proto.ExitInfo{Code: ee.ExitCode()}
-		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-			info.Signal = ws.Signal().String()
-			info.Code = 128 + int(ws.Signal())
+		if signal, code, ok := platformExitSignal(ee); ok {
+			info.Signal = signal
+			info.Code = code
 		}
 		return info
 	}

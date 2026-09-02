@@ -219,3 +219,67 @@ func TestLogEvictsByChunkCount(t *testing.T) {
 		}
 	}
 }
+
+func TestSpillFailurePreservesContiguousMemoryAndReturnsError(t *testing.T) {
+	l, err := NewLog(LogOptions{
+		MemBytes: 20, MaxChunk: 10, SpillBytes: 1 << 20,
+		SpillPath: filepath.Join(t.TempDir(), "spill"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := l.Append(1, bytes.Repeat([]byte{byte(i)}, 10)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.spill.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Append(1, bytes.Repeat([]byte{3}, 10)); err == nil {
+		t.Fatal("spill write failure was hidden")
+	}
+	oldest := l.Oldest()
+	if oldest != 1 {
+		t.Fatalf("oldest=%d, want 1", oldest)
+	}
+	if _, err := l.Read(0, 0); err == nil {
+		t.Fatal("lost spill history was not reported as evicted")
+	}
+	chunks, err := l.Read(oldest, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 3 {
+		t.Fatalf("got %d retained chunks", len(chunks))
+	}
+	for i, chunk := range chunks {
+		if chunk.Seq != oldest+uint64(i) {
+			t.Fatalf("gap at index %d: seq %d", i, chunk.Seq)
+		}
+	}
+}
+
+func TestReadSpillHonorsBatchLimit(t *testing.T) {
+	l, err := NewLog(LogOptions{
+		MemBytes: 10, MaxChunk: 1, SpillBytes: 1 << 20,
+		SpillPath: filepath.Join(t.TempDir(), "spill"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		if _, err := l.Append(1, []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l.mu.Lock()
+	chunks, err := l.readSpillLocked(0, 7)
+	l.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 7 || chunks[0].Seq != 0 || chunks[6].Seq != 6 {
+		t.Fatalf("unexpected batch: %+v", chunks)
+	}
+}

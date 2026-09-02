@@ -16,6 +16,7 @@ func newFS(t *testing.T) (*FS, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = f.Close() })
 	return f, f.Root()
 }
 
@@ -52,7 +53,7 @@ func TestJailBlocksEscapes(t *testing.T) {
 	// Symlink inside is fine.
 	os.MkdirAll(filepath.Join(root, "real"), 0o755)
 	os.WriteFile(filepath.Join(root, "real", "f.txt"), []byte("ok"), 0o644)
-	os.Symlink(filepath.Join(root, "real"), filepath.Join(root, "link"))
+	os.Symlink("real", filepath.Join(root, "link"))
 	r, err := f.Read("link/f.txt", 0, 0)
 	if err != nil || string(r.Data) != "ok" {
 		t.Fatalf("%v %+v", err, r)
@@ -63,6 +64,45 @@ func TestJailBlocksEscapes(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "real", "new.txt")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRemoveUnlinksSymlinkInsteadOfTarget(t *testing.T) {
+	f, root := newFS(t)
+	if err := os.MkdirAll(filepath.Join(root, "real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "real", "keep")
+	if err := os.WriteFile(target, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real", filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Remove("link", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "link")); !os.IsNotExist(err) {
+		t.Fatalf("symlink still exists: %v", err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "keep" {
+		t.Fatalf("symlink target was changed: %q, %v", got, err)
+	}
+}
+
+func TestInvalidAndSpecialPathsFailPromptly(t *testing.T) {
+	f, root := newFS(t)
+	if _, err := f.Read("bad\x00name", 0, 0); codeOf(err) != proto.CodeBadRequest {
+		t.Fatalf("NUL path code = %q: %v", codeOf(err), err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "regular"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("regular", filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Read("link", 0, 0); codeOf(err) != proto.CodeBadRequest {
+		t.Fatalf("symlink read code = %q: %v", codeOf(err), err)
 	}
 }
 

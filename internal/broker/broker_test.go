@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -122,7 +123,7 @@ func TestSubstitutesBearerForBoundHost(t *testing.T) {
 		t.Fatal(up.paths)
 	}
 	a := rec.last()
-	if a.Decision != DecisionSubstituted || a.Binding != "b_gh" || a.Status != 200 || a.WS != "ws_t" {
+	if a.Decision != DecisionSubstituted || a.Binding != "b_gh" || a.Status != 0 || a.WS != "ws_t" {
 		t.Fatalf("%+v", a)
 	}
 	// Placeholder inside a Basic credential (git over HTTP).
@@ -208,7 +209,7 @@ func TestConnectTunnelAllowlisted(t *testing.T) {
 	up := newUpstream(t)
 	rec := &recorder{}
 	b := start(t, up, nil, []string{up.host}, rec)
-	proxyURL, _ := url.Parse(b.BaseURL())
+	proxyURL, _ := url.Parse(b.ProxyURL())
 	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL), TLSClientConfig: &tls.Config{RootCAs: up.pool()}}}
 	resp, err := client.Get(up.srv.URL + "/via-connect")
 	if err != nil {
@@ -228,7 +229,8 @@ func TestConnectTunnelAllowlisted(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "Forbidden") {
 		t.Fatalf("expected 403 on CONNECT, got %v", err)
 	}
-	// Plain-HTTP forward proxy form (absolute URI) is also brokered.
+	// Plain-HTTP forward proxy form is brokered, but a real credential is
+	// never substituted onto its cleartext upstream leg.
 	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "plain:"+r.Header.Get("Authorization"))
 	}))
@@ -242,8 +244,8 @@ func TestConnectTunnelAllowlisted(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ = io.ReadAll(resp.Body)
-	if string(body) != "plain:Token S3" {
-		t.Fatalf("%q", body)
+	if resp.StatusCode != http.StatusForbidden || !strings.Contains(string(body), "never sent over plaintext") {
+		t.Fatalf("%d %q", resp.StatusCode, body)
 	}
 }
 
@@ -304,10 +306,86 @@ func TestHostMatchAndEnvResolution(t *testing.T) {
 	if b.PortOf() == 0 {
 		t.Fatal("port")
 	}
-	if !strings.Contains(strings.Join(b.EnvFor(), " "), "HTTPS_PROXY="+b.BaseURL()) {
+	if !strings.Contains(strings.Join(b.EnvFor(), " "), "HTTPS_PROXY="+b.ProxyURL()) {
 		t.Fatal(b.EnvFor())
 	}
-	if _, err := net.Dial("tcp", strings.TrimPrefix(b.BaseURL(), "http://")); err != nil {
+	if _, err := net.Dial("tcp", b.ln.Addr().String()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPlaceholderMatchingIsExactAndNonCascading(t *testing.T) {
+	up := newUpstream(t)
+	rec := &recorder{}
+	short := proto.BindingLease{ID: "b_a", Secret: "SHORT", Destinations: []string{up.host}}
+	long := proto.BindingLease{ID: "b_ab", Secret: "ref:b_a", Destinations: []string{up.host}}
+	b := start(t, up, []proto.BindingLease{short, long}, nil, rec)
+	_, body := get(t, DestURL(b.BaseURL(), up.host)+"/exact", map[string]string{
+		"X-Api-Key": "ref:b_ab, ref:b_a",
+	})
+	if body != "auth=;key=ref:b_a, SHORT" {
+		t.Fatalf("prefix or cascading substitution: %q", body)
+	}
+	if rec.count(DecisionSubstituted) != 2 {
+		t.Fatalf("expected one attempt audit per binding: %+v", rec.ev)
+	}
+}
+
+func TestCredentialAttemptAuditedWhenUpstreamFails(t *testing.T) {
+	rec := &recorder{}
+	lease := proto.BindingLease{
+		ID: "b_fail", Secret: "REAL", Destinations: []string{"does-not-exist.invalid:443"},
+		ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+	}
+	b := New(Options{WS: "ws", Leases: []proto.BindingLease{lease}, Audit: rec.add})
+	if _, err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	resp, _ := get(t, DestURL(b.BaseURL(), "does-not-exist.invalid:443")+"/x", map[string]string{"Authorization": "Bearer ref:b_fail"})
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatal(resp.StatusCode)
+	}
+	if rec.count(DecisionSubstituted) != 1 || rec.count(DecisionDenied) == 0 {
+		t.Fatalf("missing attempt/failure audit: %+v", rec.ev)
+	}
+}
+
+func TestBrokerRequiresWorkspaceCapability(t *testing.T) {
+	up := newUpstream(t)
+	rec := &recorder{}
+	b := start(t, up, nil, []string{up.host}, rec)
+	raw := "http://" + b.ln.Addr().String() + "/d/" + up.host + "/x"
+	resp, _ := get(t, raw, nil)
+	if resp.StatusCode != http.StatusForbidden || rec.last().Decision != DecisionUnauthenticated {
+		t.Fatalf("status=%d audit=%+v", resp.StatusCode, rec.last())
+	}
+}
+
+func TestExpiredBindingDoesNotAuthorizeConnect(t *testing.T) {
+	up := newUpstream(t)
+	rec := &recorder{}
+	lease := proto.BindingLease{ID: "b_old", Destinations: []string{up.host}, ExpiresAt: time.Now().Add(-time.Second).UnixMilli()}
+	b := start(t, up, []proto.BindingLease{lease}, nil, rec)
+	proxyURL, _ := url.Parse(b.ProxyURL())
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL), TLSClientConfig: &tls.Config{RootCAs: up.pool()}}}
+	_, err := client.Get(up.srv.URL + "/expired")
+	if err == nil || !strings.Contains(err.Error(), "Forbidden") {
+		t.Fatalf("expected expired CONNECT rejection, got %v", err)
+	}
+	if rec.last().Decision != DecisionExpired {
+		t.Fatalf("audit=%+v", rec.last())
+	}
+}
+
+func TestCarrierGradeNATIsNonPublic(t *testing.T) {
+	for _, raw := range []string{"100.64.0.1", "100.100.100.200", "198.18.0.1", "2001:db8::1"} {
+		ip, err := netip.ParseAddr(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !isPrivate(ip) {
+			t.Errorf("%s was treated as public", raw)
+		}
 	}
 }

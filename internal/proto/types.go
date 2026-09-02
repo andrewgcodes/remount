@@ -24,6 +24,12 @@ type Hello struct {
 	Principal string `cbor:"principal,omitempty" json:"principal,omitempty"`
 	// Node-only: what workspaces this node can run.
 	Node *NodeInfo `cbor:"node,omitempty" json:"node,omitempty"`
+	// Nodes sign the canonical hello (with Proof omitted). IssuedAt and Nonce
+	// make the proof fresh and single-use, so a captured enrollment cannot be
+	// replayed as proof of private-key possession.
+	IssuedAt int64  `cbor:"issued_at,omitempty" json:"issued_at,omitempty"`
+	Nonce    []byte `cbor:"nonce,omitempty" json:"nonce,omitempty"`
+	Proof    []byte `cbor:"proof,omitempty" json:"proof,omitempty"`
 }
 
 // HelloOK is the response body.
@@ -34,18 +40,46 @@ type HelloOK struct {
 	Now      int64    `cbor:"now" json:"now"`                                 // server unix millis; clients may use for skew
 	PubKey   []byte   `cbor:"pubkey,omitempty" json:"pubkey,omitempty"`       // control plane's ed25519 key; nodes verify grants with it
 	LeaseSec int64    `cbor:"lease_sec,omitempty" json:"lease_sec,omitempty"` // how often nodes must renew claims
+	Subject  string   `cbor:"subject,omitempty" json:"subject,omitempty"`
+	Tenant   string   `cbor:"tenant,omitempty" json:"tenant,omitempty"`
 }
 
 // NodeInfo describes a node's capabilities for placement.
 type NodeInfo struct {
-	Backends  []string `cbor:"backends" json:"backends"` // e.g. ["process","docker"]
-	OS        string   `cbor:"os" json:"os"`
-	Arch      string   `cbor:"arch" json:"arch"`
-	CPU       int      `cbor:"cpu" json:"cpu"`
-	MemMiB    int      `cbor:"mem_mib" json:"mem_mib"`
-	Caps      []string `cbor:"caps,omitempty" json:"caps,omitempty"`           // display, browser, gpu, egress_enforced …
-	Snapshots string   `cbor:"snapshots,omitempty" json:"snapshots,omitempty"` // "fs" | "fs+mem"
-	Version   string   `cbor:"version,omitempty" json:"version,omitempty"`
+	Backends           []string            `cbor:"backends" json:"backends"` // legacy discovery names
+	BackendDescriptors []BackendDescriptor `cbor:"backend_descriptors,omitempty" json:"backend_descriptors,omitempty"`
+	OS                 string              `cbor:"os" json:"os"`
+	Arch               string              `cbor:"arch" json:"arch"`
+	CPU                int                 `cbor:"cpu" json:"cpu"`
+	MemMiB             int                 `cbor:"mem_mib" json:"mem_mib"`
+	Caps               []string            `cbor:"caps,omitempty" json:"caps,omitempty"` // display, browser, gpu …; never security evidence
+	Snapshots          string              `cbor:"snapshots,omitempty" json:"snapshots,omitempty"`
+	Version            string              `cbor:"version,omitempty" json:"version,omitempty"`
+}
+
+// BackendDescriptor reports evidence-bearing capabilities for one backend.
+// Security properties are kept per backend so a weak backend cannot inherit
+// a stronger backend's node-wide capability union.
+type BackendDescriptor struct {
+	Name     string              `cbor:"name" json:"name"`
+	Security BackendSecurityCaps `cbor:"security" json:"security"`
+	Runtime  RuntimeCaps         `cbor:"runtime" json:"runtime"`
+}
+
+type BackendSecurityCaps struct {
+	Isolation          string `cbor:"isolation" json:"isolation"` // none | process_sandbox | container | microvm
+	MultiTenant        bool   `cbor:"multi_tenant" json:"multi_tenant"`
+	SiblingIsolation   bool   `cbor:"sibling_isolation" json:"sibling_isolation"`
+	EgressMode         string `cbor:"egress_mode" json:"egress_mode"`         // open | cooperative_proxy | enforced_gateway
+	BrokerIdentity     string `cbor:"broker_identity" json:"broker_identity"` // none | token | unix_socket | workload_identity
+	FilesystemBoundary string `cbor:"filesystem_boundary" json:"filesystem_boundary"`
+	NetworkNamespace   bool   `cbor:"network_namespace" json:"network_namespace"`
+	DeviceIsolation    bool   `cbor:"device_isolation" json:"device_isolation"`
+}
+
+type RuntimeCaps struct {
+	Snapshots string `cbor:"snapshots" json:"snapshots"` // fs | fs+mem
+	Display   bool   `cbor:"display,omitempty" json:"display,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -54,12 +88,16 @@ type NodeInfo struct {
 
 // Workspace states.
 const (
-	WSPending   = "pending"  // waiting for a node to claim it
-	WSClaiming  = "claiming" // a node owns it but is not serving yet (materializing, or offline)
-	WSClaimed   = "claimed"  // running on Node and ready to serve requests
-	WSPaused    = "paused"   // snapshotted, no node; wakes on timer/event/attach
-	WSReleased  = "released" // node gave it up; will return to pending
-	WSDestroyed = "destroyed"
+	WSPending       = "pending"       // waiting for a node to claim it
+	WSClaiming      = "claiming"      // a node owns it but is not serving yet (materializing, or offline)
+	WSClaimed       = "claimed"       // running on Node and ready to serve requests
+	WSQuiescing     = "quiescing"     // rejecting new work while sessions stop
+	WSCheckpointing = "checkpointing" // producing and verifying a durable snapshot
+	WSPaused        = "paused"        // snapshotted, no node; wakes on timer/event/attach
+	WSReleased      = "released"      // node gave it up; will return to pending
+	WSDestroying    = "destroying"
+	WSDestroyed     = "destroyed"
+	WSFailed        = "failed" // operator action or retry is required
 )
 
 // Requires constrains placement.
@@ -91,6 +129,55 @@ type WorkspaceSpec struct {
 	Principal   string            `cbor:"principal,omitempty" json:"principal,omitempty"` // who acts through this workspace (a_…)
 	Idle        Idle              `cbor:"idle" json:"idle"`
 	Exclude     []string          `cbor:"exclude,omitempty" json:"exclude,omitempty"` // snapshot path globs to skip (node_modules, .venv …)
+	Security    SecuritySpec      `cbor:"security,omitempty" json:"security,omitempty"`
+	ACL         WorkspaceACL      `cbor:"acl,omitempty" json:"acl,omitempty"`
+}
+
+const (
+	SecurityLocal       = "local"
+	SecurityIsolated    = "isolated"
+	SecurityMultiTenant = "multi_tenant"
+)
+
+// SecuritySpec is an enforceable placement contract, not a documentation
+// hint. Empty Profile is normalized to local only in standalone mode.
+type SecuritySpec struct {
+	Profile                 string        `cbor:"profile,omitempty" json:"profile,omitempty"`
+	MinIsolation            string        `cbor:"min_isolation,omitempty" json:"min_isolation,omitempty"`
+	RequireSiblingIsolation bool          `cbor:"require_sibling_isolation,omitempty" json:"require_sibling_isolation,omitempty"`
+	RequireEnforcedEgress   bool          `cbor:"require_enforced_egress,omitempty" json:"require_enforced_egress,omitempty"`
+	SecretMode              string        `cbor:"secret_mode,omitempty" json:"secret_mode,omitempty"` // none | brokered
+	Network                 NetworkPolicy `cbor:"network,omitempty" json:"network,omitempty"`
+	Audit                   AuditPolicy   `cbor:"audit,omitempty" json:"audit,omitempty"`
+}
+
+type NetworkPolicy struct {
+	Default string       `cbor:"default,omitempty" json:"default,omitempty"` // deny | allow (local only)
+	Rules   []EgressRule `cbor:"rules,omitempty" json:"rules,omitempty"`
+}
+
+type EgressRule struct {
+	ID               string   `cbor:"id" json:"id"`
+	Protocol         string   `cbor:"protocol" json:"protocol"`
+	Hosts            []string `cbor:"hosts,omitempty" json:"hosts,omitempty"`
+	Ports            []uint16 `cbor:"ports,omitempty" json:"ports,omitempty"`
+	Methods          []string `cbor:"methods,omitempty" json:"methods,omitempty"`
+	PathPrefixes     []string `cbor:"path_prefixes,omitempty" json:"path_prefixes,omitempty"`
+	MaxRequests      int64    `cbor:"max_requests,omitempty" json:"max_requests,omitempty"`
+	MaxRequestBytes  int64    `cbor:"max_request_bytes,omitempty" json:"max_request_bytes,omitempty"`
+	MaxResponseBytes int64    `cbor:"max_response_bytes,omitempty" json:"max_response_bytes,omitempty"`
+	SharedState      string   `cbor:"shared_state,omitempty" json:"shared_state,omitempty"`
+}
+
+type AuditPolicy struct {
+	Required bool `cbor:"required,omitempty" json:"required,omitempty"`
+}
+
+// WorkspaceACL names additional subjects that may read or mutate a
+// workspace. The authenticated creator is always its owner.
+type WorkspaceACL struct {
+	Readers []string `cbor:"readers,omitempty" json:"readers,omitempty"`
+	Writers []string `cbor:"writers,omitempty" json:"writers,omitempty"`
 }
 
 // Idle policies (durations in seconds; 0 = disabled).
@@ -101,15 +188,18 @@ type Idle struct {
 
 // Workspace is the control plane's view.
 type Workspace struct {
-	ID           string        `cbor:"id" json:"id"`
-	Spec         WorkspaceSpec `cbor:"spec" json:"spec"`
-	State        string        `cbor:"state" json:"state"`
-	Node         string        `cbor:"node,omitempty" json:"node,omitempty"`
-	LeaseUntil   int64         `cbor:"lease_until,omitempty" json:"lease_until,omitempty"`     // unix millis
-	LastSnapshot string        `cbor:"last_snapshot,omitempty" json:"last_snapshot,omitempty"` // artifact id
-	CreatedAt    int64         `cbor:"created_at" json:"created_at"`
-	UpdatedAt    int64         `cbor:"updated_at" json:"updated_at"`
-	Generation   uint64        `cbor:"gen" json:"gen"` // bumps on every claim; a node with a stale gen must not act
+	ID            string        `cbor:"id" json:"id"`
+	Spec          WorkspaceSpec `cbor:"spec" json:"spec"`
+	State         string        `cbor:"state" json:"state"`
+	Node          string        `cbor:"node,omitempty" json:"node,omitempty"`
+	LeaseUntil    int64         `cbor:"lease_until,omitempty" json:"lease_until,omitempty"`     // unix millis
+	LastSnapshot  string        `cbor:"last_snapshot,omitempty" json:"last_snapshot,omitempty"` // artifact id
+	CreatedAt     int64         `cbor:"created_at" json:"created_at"`
+	UpdatedAt     int64         `cbor:"updated_at" json:"updated_at"`
+	Generation    uint64        `cbor:"gen" json:"gen"` // bumps on every claim; a node with a stale gen must not act
+	Tenant        string        `cbor:"tenant,omitempty" json:"tenant,omitempty"`
+	Owner         string        `cbor:"owner,omitempty" json:"owner,omitempty"`
+	AuthzRevision uint64        `cbor:"authz_revision,omitempty" json:"authz_revision,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -117,24 +207,28 @@ type Workspace struct {
 // ---------------------------------------------------------------------------
 
 const (
-	OpWSCreate     = "ws.create"     // WSCreateReq -> Workspace
-	OpWSGet        = "ws.get"        // WSGetReq -> Workspace
-	OpWSList       = "ws.list"       // -> WSListRes
-	OpWSDestroy    = "ws.destroy"    // WSGetReq -> {}
-	OpWSMove       = "ws.move"       // WSMoveReq -> Workspace (re-queued)
-	OpWSSleep      = "ws.sleep"      // WSSleepReq -> Timer
-	OpWSWake       = "ws.wake"       // WSGetReq -> Workspace
-	OpWSClaim      = "ws.claim"      // node: WSClaimReq -> WSClaimRes
-	OpWSRenew      = "ws.renew"      // node: WSRenewReq -> {}
-	OpWSReleased   = "ws.released"   // node: WSReleasedReq -> {}
-	OpWSReady      = "ws.ready"      // node: WSReadyReq -> {} (materialized, now serving)
-	OpNodeList     = "node.list"     // -> NodeListRes
-	OpEventsTail   = "events.tail"   // EventsTailReq -> streams ev frames, then res
-	OpEventsPost   = "events.post"   // EventPost -> {} (node -> control; also webhook wake)
-	OpBindingLease = "binding.lease" // node: BindingLeaseReq -> BindingLeaseRes
-	OpGrant        = "grant"         // client: GrantReq -> Grant (permission to talk to a node about a ws)
-	OpTimerList    = "timer.list"    // -> TimerListRes
-	OpDiag         = "diag"          // -> ControlDiag (control-plane health and integrity)
+	OpWSCreate         = "ws.create"          // WSCreateReq -> Workspace
+	OpWSGet            = "ws.get"             // WSGetReq -> Workspace
+	OpWSList           = "ws.list"            // -> WSListRes
+	OpWSDestroy        = "ws.destroy"         // WSGetReq -> {}
+	OpWSMove           = "ws.move"            // WSMoveReq -> Workspace (re-queued)
+	OpWSSleep          = "ws.sleep"           // WSSleepReq -> Timer
+	OpWSWake           = "ws.wake"            // WSGetReq -> Workspace
+	OpWSClaim          = "ws.claim"           // node: WSClaimReq -> WSClaimRes
+	OpWSRenew          = "ws.renew"           // node: WSRenewReq -> WSRenewRes
+	OpWSReleased       = "ws.released"        // node: WSReleasedReq -> {}
+	OpWSReady          = "ws.ready"           // node: WSReadyReq -> {} (materialized, now serving)
+	OpWSReleaseCommit  = "ws.release.commit"  // control -> node: source checkpoint is committed; destroy source
+	OpWSReleaseAbort   = "ws.release.abort"   // control -> node: prepare failed/ambiguous; resume retained source
+	OpWSSnapshotCommit = "ws.snapshot.commit" // node -> control: make an uploaded snapshot authoritative
+	OpNodeList         = "node.list"          // -> NodeListRes
+	OpEventsTail       = "events.tail"        // EventsTailReq -> streams ev frames, then res
+	OpEventsStop       = "events.stop"        // EventsStopReq -> {}; stops one event subscription
+	OpEventsPost       = "events.post"        // EventPost -> {} (node -> control; also webhook wake)
+	OpBindingLease     = "binding.lease"      // node: BindingLeaseReq -> BindingLeaseRes
+	OpGrant            = "grant"              // client: GrantReq -> Grant (permission to talk to a node about a ws)
+	OpTimerList        = "timer.list"         // -> TimerListRes
+	OpDiag             = "diag"               // -> ControlDiag (control-plane health and integrity)
 )
 
 type WSCreateReq struct {
@@ -143,7 +237,9 @@ type WSCreateReq struct {
 }
 
 type WSGetReq struct {
-	ID string `cbor:"id" json:"id"`
+	ID             string `cbor:"id" json:"id"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type WSListRes struct {
@@ -184,11 +280,43 @@ type WSRenewReq struct {
 	Gen map[string]uint64 `cbor:"gen,omitempty" json:"gen,omitempty"`
 }
 
+// WSRenewResult is the control plane's affirmative ownership decision for
+// one workspace named in WSRenewReq. Missing and rejected results require the
+// node to fence that workspace.
+type WSRenewResult struct {
+	ID               string `cbor:"id" json:"id"`
+	Generation       uint64 `cbor:"gen" json:"gen"`
+	Accepted         bool   `cbor:"accepted" json:"accepted"`
+	AuthoritativeGen uint64 `cbor:"authoritative_gen,omitempty" json:"authoritative_gen,omitempty"`
+	LeaseUntil       int64  `cbor:"lease_until,omitempty" json:"lease_until,omitempty"`
+	Action           string `cbor:"action" json:"action"` // continue | fence | destroy | reconcile
+}
+
+type WSRenewRes struct {
+	Results []WSRenewResult `cbor:"results" json:"results"`
+}
+
 type WSReleasedReq struct {
 	ID       string `cbor:"id" json:"id"`
 	Gen      uint64 `cbor:"gen" json:"gen"`
 	Snapshot string `cbor:"snapshot,omitempty" json:"snapshot,omitempty"` // artifact id, if one was taken
 	Reason   string `cbor:"reason,omitempty" json:"reason,omitempty"`
+	// Preparing is returned by a duplicate ws.release while the original
+	// checkpoint is still running. It lets control poll without accumulating
+	// blocked request handlers after a response timeout or reconnect.
+	Preparing bool `cbor:"preparing,omitempty" json:"preparing,omitempty"`
+}
+
+type WSReleaseCommitReq struct {
+	ID       string `cbor:"id" json:"id"`
+	Gen      uint64 `cbor:"gen" json:"gen"`
+	Snapshot string `cbor:"snapshot,omitempty" json:"snapshot,omitempty"`
+}
+
+type WSSnapshotCommitReq struct {
+	ID       string `cbor:"id" json:"id"`
+	Gen      uint64 `cbor:"gen" json:"gen"`
+	Snapshot string `cbor:"snapshot" json:"snapshot"`
 }
 
 type NodeListRes struct {
@@ -205,28 +333,44 @@ type NodeStatus struct {
 }
 
 type EventsTailReq struct {
-	From   uint64 `cbor:"from" json:"from"`                 // first seq to deliver (0 = only new)
-	Follow bool   `cbor:"follow" json:"follow"`             // keep streaming
-	WS     string `cbor:"ws,omitempty" json:"ws,omitempty"` // filter by workspace
+	From         uint64 `cbor:"from" json:"from"`                 // first seq to deliver (0 = from beginning)
+	Follow       bool   `cbor:"follow" json:"follow"`             // keep streaming
+	WS           string `cbor:"ws,omitempty" json:"ws,omitempty"` // filter by workspace
+	Subscription string `cbor:"sub,omitempty" json:"sub,omitempty"`
+}
+
+type EventsStopReq struct {
+	Subscription string `cbor:"sub,omitempty" json:"sub,omitempty"`
 }
 
 // Event is one entry in the canonical log. Payload is CBOR.
 type Event struct {
-	Seq       uint64 `cbor:"seq" json:"seq"`
-	At        int64  `cbor:"at" json:"at"`                             // unix millis
-	Stream    string `cbor:"stream,omitempty" json:"stream,omitempty"` // ws id, node id, or "" for global
-	Principal string `cbor:"principal,omitempty" json:"principal,omitempty"`
-	Node      string `cbor:"node,omitempty" json:"node,omitempty"`
-	Type      string `cbor:"type" json:"type"`
-	Payload   []byte `cbor:"payload,omitempty" json:"payload,omitempty"`
-	Cause     uint64 `cbor:"cause,omitempty" json:"cause,omitempty"` // seq of the event that caused this one
+	Seq         uint64 `cbor:"seq" json:"seq"`
+	At          int64  `cbor:"at" json:"at"`                             // unix millis
+	Stream      string `cbor:"stream,omitempty" json:"stream,omitempty"` // ws id, node id, or "" for global
+	Principal   string `cbor:"principal,omitempty" json:"principal,omitempty"`
+	Node        string `cbor:"node,omitempty" json:"node,omitempty"`
+	EventID     string `cbor:"event_id,omitempty" json:"event_id,omitempty"`
+	ReceivedAt  int64  `cbor:"received_at,omitempty" json:"received_at,omitempty"`
+	ObservedAt  int64  `cbor:"observed_at,omitempty" json:"observed_at,omitempty"`
+	Origin      string `cbor:"origin,omitempty" json:"origin,omitempty"`
+	Actor       string `cbor:"actor,omitempty" json:"actor,omitempty"`
+	Tenant      string `cbor:"tenant,omitempty" json:"tenant,omitempty"`
+	Workspace   string `cbor:"workspace,omitempty" json:"workspace,omitempty"`
+	Generation  uint64 `cbor:"generation,omitempty" json:"generation,omitempty"`
+	OperationID string `cbor:"operation_id,omitempty" json:"operation_id,omitempty"`
+	ProducerSeq uint64 `cbor:"producer_seq,omitempty" json:"producer_seq,omitempty"`
+	Type        string `cbor:"type" json:"type"`
+	Payload     []byte `cbor:"payload,omitempty" json:"payload,omitempty"`
+	Cause       uint64 `cbor:"cause,omitempty" json:"cause,omitempty"` // seq of the event that caused this one
 }
 
 // Time returns At as time.Time.
 func (e Event) Time() time.Time { return time.UnixMilli(e.At) }
 
 type EventPost struct {
-	Events []Event `cbor:"events" json:"events"`
+	Events       []Event `cbor:"events" json:"events"`
+	Subscription string  `cbor:"sub,omitempty" json:"sub,omitempty"`
 }
 
 type BindingLeaseReq struct {
@@ -265,12 +409,14 @@ type Grant struct {
 }
 
 type GrantClaims struct {
-	Client    string `cbor:"client" json:"client"`
-	WS        string `cbor:"ws" json:"ws"`
-	Node      string `cbor:"node" json:"node"`
-	Principal string `cbor:"principal,omitempty" json:"principal,omitempty"`
-	ExpiresAt int64  `cbor:"exp" json:"exp"`
-	Gen       uint64 `cbor:"gen" json:"gen"`
+	Client        string `cbor:"client" json:"client"`
+	WS            string `cbor:"ws" json:"ws"`
+	Node          string `cbor:"node" json:"node"`
+	Principal     string `cbor:"principal,omitempty" json:"principal,omitempty"`
+	Tenant        string `cbor:"tenant,omitempty" json:"tenant,omitempty"`
+	AuthzRevision uint64 `cbor:"authz_revision,omitempty" json:"authz_revision,omitempty"`
+	ExpiresAt     int64  `cbor:"exp" json:"exp"`
+	Gen           uint64 `cbor:"gen" json:"gen"`
 }
 
 // Timer is a durable wake.
@@ -383,8 +529,9 @@ type SOpenReq struct {
 }
 
 type SOpenRes struct {
-	S    string `cbor:"s" json:"s"`
-	Next uint64 `cbor:"next" json:"next"` // next seq the node will emit (for attach: where live begins)
+	S            string `cbor:"s" json:"s"`
+	Next         uint64 `cbor:"next" json:"next"` // next seq the node will emit (for attach: where live begins)
+	LastInputSeq uint64 `cbor:"last_iseq,omitempty" json:"last_iseq,omitempty"`
 }
 
 type SAttachReq struct {
@@ -394,35 +541,41 @@ type SAttachReq struct {
 }
 
 type SInputReq struct {
-	S    string `cbor:"s" json:"s"`
-	ISeq uint64 `cbor:"iseq" json:"iseq"` // client-side input sequence; duplicates are dropped
-	Data []byte `cbor:"d,omitempty" json:"d,omitempty"`
-	EOF  bool   `cbor:"eof,omitempty" json:"eof,omitempty"` // close stdin (exec only)
+	S     string `cbor:"s" json:"s"`
+	ISeq  uint64 `cbor:"iseq" json:"iseq"` // client-side input sequence; duplicates are dropped
+	Data  []byte `cbor:"d,omitempty" json:"d,omitempty"`
+	EOF   bool   `cbor:"eof,omitempty" json:"eof,omitempty"` // close stdin (exec only)
+	Grant *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type SResizeReq struct {
-	S    string `cbor:"s" json:"s"`
-	Rows uint16 `cbor:"rows" json:"rows"`
-	Cols uint16 `cbor:"cols" json:"cols"`
+	S     string `cbor:"s" json:"s"`
+	Rows  uint16 `cbor:"rows" json:"rows"`
+	Cols  uint16 `cbor:"cols" json:"cols"`
+	Grant *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type SSignalReq struct {
 	S      string `cbor:"s" json:"s"`
 	Signal string `cbor:"signal" json:"signal"` // TERM, KILL, INT, HUP
+	Grant  *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type SAckReq struct {
-	S   string `cbor:"s" json:"s"`
-	Seq uint64 `cbor:"seq" json:"seq"` // highest contiguous seq received
+	S     string `cbor:"s" json:"s"`
+	Seq   uint64 `cbor:"seq" json:"seq"` // highest contiguous seq received
+	Grant *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type SCloseReq struct {
-	S    string `cbor:"s" json:"s"`
-	Kill bool   `cbor:"kill,omitempty" json:"kill,omitempty"` // also terminate the process
+	S     string `cbor:"s" json:"s"`
+	Kill  bool   `cbor:"kill,omitempty" json:"kill,omitempty"` // also terminate the process
+	Grant *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type SListReq struct {
-	WS string `cbor:"ws,omitempty" json:"ws,omitempty"`
+	WS    string `cbor:"ws,omitempty" json:"ws,omitempty"`
+	Grant *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type SListRes struct {
@@ -440,6 +593,7 @@ type SessionStatus struct {
 type SWaitReq struct {
 	S          string `cbor:"s" json:"s"`
 	TimeoutSec int64  `cbor:"timeout_sec,omitempty" json:"timeout_sec,omitempty"`
+	Grant      *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type SWaitRes struct {
@@ -448,10 +602,11 @@ type SWaitRes struct {
 }
 
 type PortOpenReq struct {
-	WS    string `cbor:"ws" json:"ws"`
-	Port  int    `cbor:"port" json:"port"`
-	Host  string `cbor:"host,omitempty" json:"host,omitempty"` // default 127.0.0.1 inside the workspace
-	Grant *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+	WS             string `cbor:"ws" json:"ws"`
+	Port           int    `cbor:"port" json:"port"`
+	Host           string `cbor:"host,omitempty" json:"host,omitempty"` // default 127.0.0.1 inside the workspace
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 // ---- filesystem ----
@@ -569,9 +724,10 @@ type FSEditRes struct {
 // ---- workspace on node ----
 
 type WSSnapshotReq struct {
-	WS     string `cbor:"ws" json:"ws"`
-	Upload bool   `cbor:"upload" json:"upload"` // push to the control plane's artifact store
-	Grant  *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+	WS             string `cbor:"ws" json:"ws"`
+	Upload         bool   `cbor:"upload" json:"upload"` // push to the control plane's artifact store
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type WSSnapshotRes struct {
@@ -699,6 +855,7 @@ const (
 	EvWSRestored     = "ws.restored"
 	EvWSDestroyed    = "ws.destroyed"
 	EvWSLeaseExpired = "ws.lease_expired"
+	EvWSFenced       = "ws.fenced"
 	EvSOpened        = "s.opened"
 	EvSExited        = "s.exited"
 	EvSInput         = "s.input"
@@ -711,5 +868,6 @@ const (
 	EvTimerSet       = "timer.set"
 	EvTimerFired     = "timer.fired"
 	EvPeerGone       = "peer.gone"
+	EvEventGap       = "event.producer_gap"
 	EvWSOffer        = "ws.offer" // control -> node (not logged; a hint to claim)
 )

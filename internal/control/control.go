@@ -13,11 +13,14 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +35,7 @@ import (
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/relay"
+	"remount.dev/remount/internal/transport"
 )
 
 // Binding is a secret the control plane can lease to nodes.
@@ -44,6 +48,65 @@ type Binding struct {
 	TTLSec       int64    `json:"ttl_sec,omitempty"` // default 600
 }
 
+// Subject is an authenticated user/service identity.
+type Subject struct {
+	ID     string   `json:"id"`
+	Tenant string   `json:"tenant"`
+	Roles  []string `json:"roles,omitempty"`
+}
+
+// Credential is the authentication input supplied by a relay peer.
+type Credential struct {
+	Token string
+	Role  string
+	Peer  string
+}
+
+// Authenticator resolves a credential to server-authoritative identity.
+type Authenticator interface {
+	Authenticate(context.Context, Credential) (Subject, error)
+}
+
+// Authorizer decides an action on a resource after authentication.
+type Authorizer interface {
+	Check(context.Context, Subject, string, Resource) error
+}
+
+type Resource struct {
+	Kind    string
+	ID      string
+	Tenant  string
+	Owner   string
+	Readers []string
+	Writers []string
+}
+
+const (
+	ActionRead    = "read"
+	ActionWrite   = "write"
+	ActionAdmin   = "admin"
+	ActionExecute = "execute"
+)
+
+// StaticAuthenticator is useful for small deployments and integration tests.
+// Map keys are bearer credentials; values, not Hello fields, are authoritative.
+type StaticAuthenticator map[string]Subject
+
+func (a StaticAuthenticator) Authenticate(_ context.Context, c Credential) (Subject, error) {
+	s, ok := a[c.Token]
+	if !ok || s.ID == "" || s.Tenant == "" {
+		return Subject{}, proto.Err(proto.CodeUnauthorized, "invalid credential")
+	}
+	return s, nil
+}
+
+// NodeApproval binds enrollment claims to an operator-approved identity.
+type NodeApproval struct {
+	PubKey []byte
+	Labels map[string]string
+	Info   proto.NodeInfo
+}
+
 // Options configure the control plane.
 type Options struct {
 	DB         *sql.DB            // shared with the event log; required
@@ -51,13 +114,25 @@ type Options struct {
 	Token      string             // shared bearer token; empty = open (standalone)
 	SigningKey ed25519.PrivateKey // grants; generated if nil
 	LeaseSec   int64              // claim lease; default 30
-	Bindings   []Binding
-	Logger     *slog.Logger
+	// RecoveryGraceSec is how long a restarted control plane reserves prior
+	// assignments for their recorded holders to reconnect. Default: 2 leases.
+	RecoveryGraceSec int64
+	Bindings         []Binding
+	Logger           *slog.Logger
 	// Artifacts lets the control plane report on and verify its blob store.
 	// Optional: without it, artifact checks report as unavailable rather
 	// than as passing.
-	Artifacts ArtifactStore
-	Now       func() time.Time // injectable clock for tests
+	Artifacts     ArtifactStore
+	Now           func() time.Time // injectable clock for tests
+	Authenticator Authenticator
+	Authorizer    Authorizer
+	ApprovedNodes map[string]NodeApproval
+	// SharedSubject is used by the legacy single-token/standalone profile.
+	// Client-selected Hello.Principal is always ignored.
+	SharedSubject Subject
+	// SecurityProfileFloor lets a deployment strengthen every requested
+	// workspace policy (isolated or multi_tenant in production modes).
+	SecurityProfileFloor string
 }
 
 // ArtifactStore is the part of the blob store the control plane inspects.
@@ -77,23 +152,39 @@ type Control struct {
 	logger *slog.Logger
 	now    func() time.Time
 
-	mu         sync.Mutex
-	workspaces map[string]*proto.Workspace
-	timers     map[string]*proto.Timer
-	nodes      map[string]*nodeState
-	clients    map[string]*proto.Hello
-	idem       map[string]string
-	bindings   map[string]Binding
-	tails      map[string]context.CancelFunc // events.tail per requester
+	mu            sync.Mutex
+	workspaces    map[string]*proto.Workspace
+	timers        map[string]*proto.Timer
+	nodes         map[string]*nodeState
+	clients       map[string]*proto.Hello
+	subjects      map[string]Subject
+	idem          map[string]string
+	bindings      map[string]Binding
+	tails         map[string]map[string]*tailState // requester -> subscription -> tail
+	lifecycle     map[string]*sync.Mutex           // serializes long-running mutations per workspace
+	proofs        map[string]int64                 // recently accepted node proof -> expiry
+	producerSeq   map[string]uint64                // authenticated node -> last accepted event seq
+	producerLocks map[string]*sync.Mutex           // serialize batches from one node
+	mutationLocks map[string]*sync.Mutex           // serialize duplicate logical mutations
 
-	started time.Time
-	stop    chan struct{}
-	wg      sync.WaitGroup
+	started   time.Time
+	stop      chan struct{}
+	wg        sync.WaitGroup
+	startOnce sync.Once
+	stopOnce  sync.Once
 }
 
 type nodeState struct {
 	Status proto.NodeStatus
 	PubKey []byte
+}
+
+type tailState struct {
+	cancel context.CancelFunc
+}
+
+type mutationWorkspaceResult struct {
+	ID string `cbor:"id"`
 }
 
 // New creates a control plane. Call Attach with the relay before Serve.
@@ -104,6 +195,9 @@ func New(opts Options) (*Control, error) {
 	if opts.LeaseSec == 0 {
 		opts.LeaseSec = 30
 	}
+	if opts.RecoveryGraceSec == 0 {
+		opts.RecoveryGraceSec = 2 * opts.LeaseSec
+	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
@@ -113,11 +207,19 @@ func New(opts Options) (*Control, error) {
 	c := &Control{
 		opts: opts, db: opts.DB, log: opts.Log, logger: opts.Logger, now: opts.Now,
 		workspaces: map[string]*proto.Workspace{}, timers: map[string]*proto.Timer{},
-		nodes: map[string]*nodeState{}, clients: map[string]*proto.Hello{}, idem: map[string]string{},
-		bindings: map[string]Binding{}, tails: map[string]context.CancelFunc{},
+		nodes: map[string]*nodeState{}, clients: map[string]*proto.Hello{}, subjects: map[string]Subject{}, idem: map[string]string{},
+		bindings: map[string]Binding{}, tails: map[string]map[string]*tailState{},
+		lifecycle: map[string]*sync.Mutex{}, proofs: map[string]int64{}, producerSeq: map[string]uint64{},
+		producerLocks: map[string]*sync.Mutex{}, mutationLocks: map[string]*sync.Mutex{},
 		started: opts.Now(), stop: make(chan struct{}),
 	}
 	for _, b := range opts.Bindings {
+		if b.ID == "" || b.Secret == "" || len(b.Destinations) == 0 {
+			return nil, fmt.Errorf("control: binding %q needs a non-empty id, secret and destinations", b.ID)
+		}
+		if _, exists := c.bindings[b.ID]; exists {
+			return nil, fmt.Errorf("control: duplicate binding %q", b.ID)
+		}
 		c.bindings[b.ID] = b
 	}
 	if err := c.migrate(); err != nil {
@@ -146,13 +248,15 @@ func (c *Control) PublicKey() ed25519.PublicKey { return c.key.Public().(ed25519
 
 // Start runs the lease/timer/offer loops.
 func (c *Control) Start() {
-	c.wg.Add(1)
-	go c.loop()
+	c.startOnce.Do(func() {
+		c.wg.Add(1)
+		go c.loop()
+	})
 }
 
 // Stop halts loops.
 func (c *Control) Stop() {
-	close(c.stop)
+	c.stopOnce.Do(func() { close(c.stop) })
 	c.wg.Wait()
 }
 
@@ -166,6 +270,23 @@ CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS timers (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, pubkey BLOB, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS idem (key TEXT PRIMARY KEY, ws TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mutations (
+	scope TEXT NOT NULL,
+	key TEXT NOT NULL,
+	op TEXT NOT NULL,
+	fingerprint BLOB NOT NULL,
+	result BLOB NOT NULL,
+	completed_at INTEGER NOT NULL,
+	PRIMARY KEY(scope, key)
+);
+CREATE TABLE IF NOT EXISTS assignments (
+	workspace TEXT NOT NULL,
+	generation INTEGER NOT NULL,
+	node TEXT NOT NULL,
+	tenant TEXT NOT NULL,
+	created_at INTEGER NOT NULL,
+	PRIMARY KEY(workspace, generation, node)
+);
 CREATE TABLE IF NOT EXISTS keys (name TEXT PRIMARY KEY, priv BLOB NOT NULL);
 `)
 	return err
@@ -192,6 +313,14 @@ func (c *Control) load() error {
 	if err != nil {
 		return err
 	}
+	var repairs []*proto.Workspace
+	type assignment struct {
+		workspace  string
+		generation uint64
+		node       string
+		tenant     string
+	}
+	var assignments []assignment
 	for rows.Next() {
 		var b []byte
 		if err := rows.Scan(&b); err != nil {
@@ -203,18 +332,67 @@ func (c *Control) load() error {
 			rows.Close()
 			return err
 		}
-		// Nothing is online after a restart: claimed workspaces are pending
-		// again with their last snapshot. Nodes that still hold them will
-		// reclaim with a fresh generation and Adopt their local copy.
-		if held(ws.State) {
+		// Preserve the recorded holder across a control restart. Publishing
+		// the workspace as pending here can hand an empty/stale snapshot to a
+		// different node before the only node with current bytes reconnects.
+		changed := false
+		if ws.Tenant == "" {
+			ws.Tenant = "local"
+			ws.Owner = ws.Spec.Principal
+			if ws.Owner == "" {
+				ws.Owner = "local-user"
+			}
+			ws.Spec.Principal = ws.Owner
+			ws.AuthzRevision = 1
+			changed = true
+		}
+		switch ws.State {
+		case proto.WSClaimed, proto.WSClaiming:
+			ws.State = proto.WSClaiming
+			ws.LeaseUntil = c.now().Add(time.Duration(c.opts.RecoveryGraceSec) * time.Second).UnixMilli()
+			changed = true
+		case proto.WSQuiescing, proto.WSCheckpointing, proto.WSDestroying:
+			// Without a persisted operation result we cannot safely infer that
+			// either destruction or resumption completed. Keep it terminal and
+			// operator-visible instead of reviving or deleting data.
+			ws.State = proto.WSFailed
+			ws.LeaseUntil = 0
+			changed = true
+		case proto.WSReleased:
+			// The release checkpoint was committed before WSReleased became
+			// durable. It is safe to re-offer from that snapshot after restart.
 			ws.State = proto.WSPending
 			ws.Node = ""
 			ws.LeaseUntil = 0
 			ws.Spec.RestoreFrom = ws.LastSnapshot
+			changed = true
 		}
 		c.workspaces[ws.ID] = &ws
+		if ws.Node != "" && ws.Generation > 0 {
+			assignments = append(assignments, assignment{ws.ID, ws.Generation, ws.Node, ws.Tenant})
+		}
+		if changed {
+			repairs = append(repairs, &ws)
+		}
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, ws := range repairs {
+		if err := c.persistWS(ws); err != nil {
+			return fmt.Errorf("persist recovered workspace %s: %w", ws.ID, err)
+		}
+	}
+	for _, a := range assignments {
+		if _, err := c.db.Exec(`INSERT OR IGNORE INTO assignments(workspace, generation, node, tenant, created_at) VALUES(?,?,?,?,?)`,
+			a.workspace, a.generation, a.node, a.tenant, c.now().UnixMilli()); err != nil {
+			return fmt.Errorf("persist recovered assignment %s/%d: %w", a.workspace, a.generation, err)
+		}
+	}
 	rows, err = c.db.Query(`SELECT data FROM timers`)
 	if err != nil {
 		return err
@@ -232,7 +410,13 @@ func (c *Control) load() error {
 		}
 		c.timers[t.ID] = &t
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
 	rows, err = c.db.Query(`SELECT id, pubkey, data FROM nodes`)
 	if err != nil {
 		return err
@@ -249,7 +433,13 @@ func (c *Control) load() error {
 		st.Online = false
 		c.nodes[id] = &nodeState{Status: st, PubKey: pub}
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
 	rows, err = c.db.Query(`SELECT key, ws FROM idem`)
 	if err != nil {
 		return err
@@ -260,13 +450,146 @@ func (c *Control) load() error {
 			c.idem[k] = w
 		}
 	}
-	rows.Close()
-	return nil
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	rows, err = c.db.Query(`SELECT node, MAX(producer_seq) FROM events WHERE node != '' AND producer_seq > 0 GROUP BY node`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var node string
+		var seq uint64
+		if err := rows.Scan(&node, &seq); err != nil {
+			rows.Close()
+			return err
+		}
+		c.producerSeq[node] = seq
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	return rows.Close()
+}
+
+func (c *Control) persistWS(ws *proto.Workspace) error {
+	ws.UpdatedAt = c.now().UnixMilli()
+	_, err := c.db.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws))
+	return err
+}
+
+func (c *Control) persistClaim(ws *proto.Workspace) error {
+	ws.UpdatedAt = c.now().UnixMilli()
+	tx, err := c.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO assignments(workspace, generation, node, tenant, created_at) VALUES(?,?,?,?,?)`,
+		ws.ID, ws.Generation, ws.Node, ws.Tenant, c.now().UnixMilli()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (c *Control) assignmentTenant(workspace string, generation uint64, node string) (string, bool, error) {
+	var tenant string
+	err := c.db.QueryRow(`SELECT tenant FROM assignments WHERE workspace=? AND generation=? AND node=?`, workspace, generation, node).Scan(&tenant)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return tenant, true, nil
+}
+
+func (c *Control) persistWorkspaceAndTimer(ws *proto.Workspace, timer *proto.Timer) error {
+	ws.UpdatedAt = c.now().UnixMilli()
+	tx, err := c.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err != nil {
+		return err
+	}
+	if timer != nil {
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO timers(id, data) VALUES(?,?)`, timer.ID, proto.MustMarshal(timer)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (c *Control) persistWSAndMutation(ws *proto.Workspace, scope, key, op string, request, result any) error {
+	ws.UpdatedAt = c.now().UnixMilli()
+	tx, err := c.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err != nil {
+		return err
+	}
+	if err := c.insertMutationTx(tx, scope, key, op, request, result); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (c *Control) persistWorkspaceTimerAndMutation(ws *proto.Workspace, timer *proto.Timer, scope, key, op string, request, result any) error {
+	ws.UpdatedAt = c.now().UnixMilli()
+	tx, err := c.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err != nil {
+		return err
+	}
+	if timer != nil {
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO timers(id, data) VALUES(?,?)`, timer.ID, proto.MustMarshal(timer)); err != nil {
+			return err
+		}
+	}
+	if err := c.insertMutationTx(tx, scope, key, op, request, result); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (c *Control) persistWorkspaceTimersAndMutation(ws *proto.Workspace, timers []*proto.Timer, scope, key, op string, request, result any) error {
+	ws.UpdatedAt = c.now().UnixMilli()
+	tx, err := c.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err != nil {
+		return err
+	}
+	for _, timer := range timers {
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO timers(id, data) VALUES(?,?)`, timer.ID, proto.MustMarshal(timer)); err != nil {
+			return err
+		}
+	}
+	if err := c.insertMutationTx(tx, scope, key, op, request, result); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (c *Control) saveWS(ws *proto.Workspace) {
-	ws.UpdatedAt = c.now().UnixMilli()
-	if _, err := c.db.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err != nil {
+	if err := c.persistWS(ws); err != nil {
 		c.logger.Error("save workspace", "err", err)
 	}
 }
@@ -284,7 +607,22 @@ func (c *Control) saveNode(id string, n *nodeState) {
 }
 
 func (c *Control) emit(ctx context.Context, typ, stream, principal, node string, payload any) uint64 {
-	e, err := c.log.Emit(ctx, typ, stream, principal, node, payload, 0)
+	now := c.now().UnixMilli()
+	e := &proto.Event{
+		EventID: ids.New("ev"), ReceivedAt: now, Origin: "control", Actor: principal,
+		Type: typ, Stream: stream, Principal: principal, Node: node,
+	}
+	if payload != nil {
+		e.Payload = proto.MustMarshal(payload)
+	}
+	if strings.HasPrefix(stream, "ws_") {
+		c.mu.Lock()
+		if ws := c.workspaces[stream]; ws != nil {
+			e.Tenant, e.Workspace, e.Generation = ws.Tenant, ws.ID, ws.Generation
+		}
+		c.mu.Unlock()
+	}
+	err := c.log.Append(ctx, e)
 	if err != nil {
 		c.logger.Error("emit", "type", typ, "err", err)
 		return 0
@@ -298,32 +636,94 @@ func (c *Control) emit(ctx context.Context, typ, stream, principal, node string,
 
 // Authenticate checks the token and assigns/validates the peer id.
 func (c *Control) Authenticate(ctx context.Context, h *proto.Hello) (string, *proto.HelloOK, error) {
-	if c.opts.Token != "" && subtle.ConstantTimeCompare([]byte(h.Token), []byte(c.opts.Token)) != 1 {
-		return "", nil, proto.Err(proto.CodeUnauthorized, "bad token")
-	}
 	ok := &proto.HelloOK{Caps: []string{"v1"}, Server: "remount", Now: c.now().UnixMilli(), PubKey: c.PublicKey(), LeaseSec: c.opts.LeaseSec}
 	switch h.Role {
 	case proto.RoleNode:
+		if c.opts.Token != "" && subtle.ConstantTimeCompare([]byte(h.Token), []byte(c.opts.Token)) != 1 {
+			return "", nil, proto.Err(proto.CodeUnauthorized, "bad node token")
+		}
 		if h.Peer == "" || !strings.HasPrefix(h.Peer, "n_") || len(h.PubKey) != ed25519.PublicKeySize {
 			return "", nil, proto.Err(proto.CodeBadRequest, "node hello needs an n_ id and an ed25519 public key")
 		}
+		if err := c.verifyNodeProofLocked(h); err != nil {
+			return "", nil, err
+		}
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		if approval, required := c.opts.ApprovedNodes[h.Peer]; required || c.opts.ApprovedNodes != nil {
+			if !required || subtle.ConstantTimeCompare(approval.PubKey, h.PubKey) != 1 {
+				return "", nil, proto.Err(proto.CodeUnauthorized, "node is not operator-approved")
+			}
+			h.Labels = cloneMap(approval.Labels)
+			info := approval.Info
+			h.Node = &info
+		}
 		if n, exists := c.nodes[h.Peer]; exists && len(n.PubKey) > 0 && subtle.ConstantTimeCompare(n.PubKey, h.PubKey) != 1 {
 			return "", nil, proto.Err(proto.CodeUnauthorized, "node id %s is registered to a different key", h.Peer)
 		}
 		ok.Peer = h.Peer
 		return h.Peer, ok, nil
 	case proto.RoleClient:
+		var subject Subject
+		var err error
+		if c.opts.Authenticator != nil {
+			subject, err = c.opts.Authenticator.Authenticate(ctx, Credential{Token: h.Token, Role: h.Role, Peer: h.Peer})
+		} else {
+			if c.opts.Token != "" && subtle.ConstantTimeCompare([]byte(h.Token), []byte(c.opts.Token)) != 1 {
+				return "", nil, proto.Err(proto.CodeUnauthorized, "bad token")
+			}
+			subject = c.opts.SharedSubject
+			if subject.ID == "" {
+				subject = Subject{ID: "local-user", Tenant: "local", Roles: []string{"admin"}}
+			}
+		}
+		if err != nil || subject.ID == "" || subject.Tenant == "" {
+			return "", nil, proto.Err(proto.CodeUnauthorized, "authentication failed")
+		}
 		id := h.Peer
 		if id == "" || !strings.HasPrefix(id, "c_") {
 			id = ids.New("c")
 		}
 		ok.Peer = id
+		ok.Subject, ok.Tenant = subject.ID, subject.Tenant
+		c.mu.Lock()
+		c.subjects[id] = subject
+		c.mu.Unlock()
 		return id, ok, nil
 	default:
 		return "", nil, proto.Err(proto.CodeBadRequest, "unknown role %q", h.Role)
 	}
+}
+
+func (c *Control) verifyNodeProofLocked(h *proto.Hello) error {
+	now := c.now().UnixMilli()
+	if len(h.Nonce) < 16 || len(h.Proof) != ed25519.SignatureSize || h.IssuedAt < now-60_000 || h.IssuedAt > now+60_000 {
+		return proto.Err(proto.CodeUnauthorized, "missing or stale node proof")
+	}
+	if !ed25519.Verify(ed25519.PublicKey(h.PubKey), proto.HelloProofBytes(*h), h.Proof) {
+		return proto.Err(proto.CodeUnauthorized, "invalid node proof")
+	}
+	proofID := h.Peer + "|" + hex.EncodeToString(h.Nonce)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id, expires := range c.proofs {
+		if expires < now {
+			delete(c.proofs, id)
+		}
+	}
+	if _, replayed := c.proofs[proofID]; replayed {
+		return proto.Err(proto.CodeUnauthorized, "replayed node proof")
+	}
+	c.proofs[proofID] = now + 120_000
+	return nil
+}
+
+func cloneMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // PeerConnected records a node/client coming online and offers pending work.
@@ -374,8 +774,13 @@ func (c *Control) PeerGone(ctx context.Context, id string) {
 		var demoted []string
 		for _, ws := range c.workspaces {
 			if ws.Node == id && ws.State == proto.WSClaimed {
-				ws.State = proto.WSClaiming
-				c.saveWS(ws)
+				next := *ws
+				next.State = proto.WSClaiming
+				if err := c.persistWS(&next); err != nil {
+					c.logger.Error("persist node-offline demotion", "ws", ws.ID, "err", err)
+					continue
+				}
+				*ws = next
 				demoted = append(demoted, ws.ID)
 			}
 		}
@@ -384,8 +789,11 @@ func (c *Control) PeerGone(ctx context.Context, id string) {
 		return
 	}
 	delete(c.clients, id)
-	if cancel, ok := c.tails[id]; ok {
-		cancel()
+	delete(c.subjects, id)
+	if tails := c.tails[id]; tails != nil {
+		for _, tail := range tails {
+			tail.cancel()
+		}
 		delete(c.tails, id)
 	}
 	c.mu.Unlock()
@@ -413,10 +821,80 @@ func (c *Control) HandleFrame(ctx context.Context, f *proto.Frame) {
 func (c *Control) principalOf(from string) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if h, ok := c.clients[from]; ok && h.Principal != "" {
-		return h.Principal
+	if subject, ok := c.subjects[from]; ok {
+		return subject.ID
 	}
 	return from
+}
+
+func (c *Control) subjectOf(from string) (Subject, error) {
+	c.mu.Lock()
+	subject, ok := c.subjects[from]
+	c.mu.Unlock()
+	if !ok {
+		return Subject{}, proto.Err(proto.CodeUnauthorized, "peer %s has no authenticated subject", from)
+	}
+	return subject, nil
+}
+
+func hasRole(subject Subject, role string) bool {
+	for _, candidate := range subject.Roles {
+		if candidate == role {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Control) check(ctx context.Context, subject Subject, action string, resource Resource) error {
+	if c.opts.Authorizer != nil {
+		if err := c.opts.Authorizer.Check(ctx, subject, action, resource); err != nil {
+			return proto.Err(proto.CodeDenied, "authorization denied: %v", err)
+		}
+		return nil
+	}
+	if hasRole(subject, "admin") || (hasRole(subject, "tenant_admin") && subject.Tenant == resource.Tenant) {
+		return nil
+	}
+	if action == ActionAdmin {
+		return proto.Err(proto.CodeDenied, "administrator role required")
+	}
+	if subject.Tenant == "" || subject.Tenant != resource.Tenant {
+		return proto.Err(proto.CodeDenied, "resource belongs to another tenant")
+	}
+	if subject.ID == resource.Owner {
+		return nil
+	}
+	if action == ActionRead {
+		if contains(resource.Readers, subject.ID) || contains(resource.Writers, subject.ID) {
+			return nil
+		}
+	} else if contains(resource.Writers, subject.ID) {
+		return nil
+	}
+	return proto.Err(proto.CodeDenied, "subject %s may not %s %s %s", subject.ID, action, resource.Kind, resource.ID)
+}
+
+func workspaceResource(ws *proto.Workspace) Resource {
+	return Resource{
+		Kind: "workspace", ID: ws.ID, Tenant: ws.Tenant, Owner: ws.Owner,
+		Readers: append([]string(nil), ws.Spec.ACL.Readers...), Writers: append([]string(nil), ws.Spec.ACL.Writers...),
+	}
+}
+
+func (c *Control) authorizeWorkspace(ctx context.Context, from, id, action string) (*proto.Workspace, error) {
+	subject, err := c.subjectOf(from)
+	if err != nil {
+		return nil, err
+	}
+	ws, err := c.wsGet(id)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.check(ctx, subject, action, workspaceResource(ws)); err != nil {
+		return nil, err
+	}
+	return ws, nil
 }
 
 func (c *Control) isNode(from string) bool {
@@ -441,24 +919,34 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return c.wsCreate(ctx, c.principalOf(f.From), req)
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.wsCreate(ctx, subject, req)
 	case proto.OpWSGet, proto.OpWSInfo:
 		req, err := decode[proto.WSGetReq](f)
 		if err != nil {
 			return nil, err
 		}
-		return c.wsGet(req.ID)
+		return c.authorizeWorkspace(ctx, f.From, req.ID, ActionRead)
 	case proto.OpWSList:
-		return c.wsList(), nil
+		return c.wsListAuthorized(ctx, f.From)
 	case proto.OpWSDestroy:
 		req, err := decode[proto.WSGetReq](f)
 		if err != nil {
 			return nil, err
 		}
-		return struct{}{}, c.wsDestroy(ctx, c.principalOf(f.From), req.ID)
+		if _, err := c.authorizeWorkspace(ctx, f.From, req.ID, ActionWrite); err != nil {
+			return nil, err
+		}
+		return struct{}{}, c.wsDestroy(ctx, c.principalOf(f.From), req.ID, req.IdempotencyKey)
 	case proto.OpWSMove:
 		req, err := decode[proto.WSMoveReq](f)
 		if err != nil {
+			return nil, err
+		}
+		if _, err := c.authorizeWorkspace(ctx, f.From, req.ID, ActionWrite); err != nil {
 			return nil, err
 		}
 		return c.wsMove(ctx, c.principalOf(f.From), req)
@@ -467,13 +955,19 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		if _, err := c.authorizeWorkspace(ctx, f.From, req.ID, ActionWrite); err != nil {
+			return nil, err
+		}
 		return c.wsSleep(ctx, c.principalOf(f.From), req)
 	case proto.OpWSWake:
 		req, err := decode[proto.WSGetReq](f)
 		if err != nil {
 			return nil, err
 		}
-		return c.wsWake(ctx, c.principalOf(f.From), req.ID, "")
+		if _, err := c.authorizeWorkspace(ctx, f.From, req.ID, ActionWrite); err != nil {
+			return nil, err
+		}
+		return c.wsWake(ctx, c.principalOf(f.From), req.ID, "", req.IdempotencyKey)
 	case proto.OpWSClaim:
 		if !c.isNode(f.From) {
 			return nil, proto.Err(proto.CodeUnauthorized, "only nodes claim")
@@ -491,7 +985,7 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return struct{}{}, c.wsRenew(ctx, f.From, req)
+		return c.wsRenew(ctx, f.From, req)
 	case proto.OpWSReady:
 		if !c.isNode(f.From) {
 			return nil, proto.Err(proto.CodeUnauthorized, "only nodes report ready")
@@ -510,21 +1004,45 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return struct{}{}, c.wsReleased(ctx, f.From, req)
+	case proto.OpWSSnapshotCommit:
+		if !c.isNode(f.From) {
+			return nil, proto.Err(proto.CodeUnauthorized, "only nodes commit snapshots")
+		}
+		req, err := decode[proto.WSSnapshotCommitReq](f)
+		if err != nil {
+			return nil, err
+		}
+		return struct{}{}, c.wsSnapshotCommit(ctx, f.From, req)
 	case proto.OpNodeList:
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.check(ctx, subject, ActionAdmin, Resource{Kind: "fleet", Tenant: subject.Tenant}); err != nil {
+			return nil, err
+		}
 		return c.nodeList(), nil
 	case proto.OpEventsTail:
 		req, err := decode[proto.EventsTailReq](f)
 		if err != nil {
 			return nil, err
 		}
-		return c.eventsTail(ctx, f.From, req)
-	case "events.stop":
-		c.mu.Lock()
-		if cancel, ok := c.tails[f.From]; ok {
-			cancel()
-			delete(c.tails, f.From)
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
 		}
-		c.mu.Unlock()
+		if req.WS != "" {
+			if _, err := c.authorizeWorkspace(ctx, f.From, req.WS, ActionRead); err != nil {
+				return nil, err
+			}
+		}
+		return c.eventsTail(ctx, f.From, subject, req)
+	case proto.OpEventsStop:
+		req, err := decode[proto.EventsStopReq](f)
+		if err != nil {
+			return nil, err
+		}
+		c.stopEventTail(f.From, req.Subscription)
 		return struct{}{}, nil
 	case proto.OpEventsPost:
 		req, err := decode[proto.EventPost](f)
@@ -546,12 +1064,23 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return c.grant(f.From, c.principalOf(f.From), req.WS)
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.grant(ctx, f.From, subject, req.WS)
 	case proto.OpTimerList:
-		return c.timerList(), nil
+		return c.timerListAuthorized(ctx, f.From)
 	case proto.OpDiag:
 		req, err := decode[proto.DiagReq](f)
 		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.check(ctx, subject, ActionAdmin, Resource{Kind: "control", Tenant: subject.Tenant}); err != nil {
 			return nil, err
 		}
 		d := c.Diag(ctx)
@@ -568,40 +1097,69 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 // workspaces
 // ---------------------------------------------------------------------------
 
-func (c *Control) wsCreate(ctx context.Context, principal string, req *proto.WSCreateReq) (*proto.Workspace, error) {
-	c.mu.Lock()
-	if req.IdempotencyKey != "" {
-		if id, ok := c.idem[req.IdempotencyKey]; ok {
-			// Copy: everything returned from here is serialized by the
-			// caller without the lock, so it must not alias live state.
-			cp := *c.workspaces[id]
-			c.mu.Unlock()
-			return &cp, nil
+func (c *Control) wsCreate(ctx context.Context, subject Subject, req *proto.WSCreateReq) (*proto.Workspace, error) {
+	security, err := proto.NormalizeSecurity(req.Spec.Security)
+	if err != nil {
+		return nil, err
+	}
+	if c.opts.SecurityProfileFloor != "" {
+		security, err = proto.StrengthenSecurity(security, c.opts.SecurityProfileFloor)
+		if err != nil {
+			return nil, err
 		}
 	}
+	if len(req.Spec.Bindings) > 0 && security.SecretMode == "" {
+		security.SecretMode = "brokered"
+	}
+	req.Spec.Security = security
+	// Authority comes only from the authenticated subject. A client may not
+	// select a different identity to gain bindings or ACL access.
+	req.Spec.Principal = subject.ID
+	scope := subject.Tenant + "|" + subject.ID + "|workspace.create"
+	unlockMutation := c.lockMutation(scope, req.IdempotencyKey)
+	defer unlockMutation()
+	var prior mutationWorkspaceResult
+	if hit, err := c.mutationLookup(scope, req.IdempotencyKey, proto.OpWSCreate, req, &prior); err != nil {
+		return nil, err
+	} else if hit {
+		return c.wsGet(prior.ID)
+	}
+	c.mu.Lock()
 	for _, b := range req.Spec.Bindings {
 		if _, ok := c.bindings[b]; !ok {
 			c.mu.Unlock()
 			return nil, proto.Err(proto.CodeNotFound, "binding %q is not defined", b)
 		}
 	}
-	if req.Spec.Principal == "" {
-		req.Spec.Principal = principal
-	}
 	now := c.now().UnixMilli()
-	ws := &proto.Workspace{ID: ids.New("ws"), Spec: req.Spec, State: proto.WSPending, CreatedAt: now, UpdatedAt: now}
-	c.workspaces[ws.ID] = ws
-	if req.IdempotencyKey != "" {
-		c.idem[req.IdempotencyKey] = ws.ID
-		_, _ = c.db.Exec(`INSERT OR REPLACE INTO idem(key, ws) VALUES(?,?)`, req.IdempotencyKey, ws.ID)
+	ws := &proto.Workspace{
+		ID: ids.New("ws"), Spec: req.Spec, State: proto.WSPending, CreatedAt: now, UpdatedAt: now,
+		Tenant: subject.Tenant, Owner: subject.ID, AuthzRevision: 1,
 	}
-	c.saveWS(ws)
+	tx, err := c.db.Begin()
+	if err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	if _, err = tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err == nil {
+		err = c.insertMutationTx(tx, scope, req.IdempotencyKey, proto.OpWSCreate, req, mutationWorkspaceResult{ID: ws.ID})
+	}
+	if err == nil {
+		err = tx.Commit()
+	} else {
+		_ = tx.Rollback()
+	}
+	if err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	c.workspaces[ws.ID] = ws
 	// The workspace is in the shared map now, so a node can claim and mutate
 	// it the moment the lock is released. Copy what the event needs first.
 	id, spec := ws.ID, ws.Spec
 	c.mu.Unlock()
 	metrics.WSCreated.Inc()
-	c.emit(ctx, proto.EvWSCreated, id, principal, "", spec)
+	c.emit(ctx, proto.EvWSCreated, id, subject.ID, "", spec)
 	c.offerPending(ctx)
 	return c.snapshotWS(id), nil
 }
@@ -638,28 +1196,344 @@ func (c *Control) wsList() *proto.WSListRes {
 	return out
 }
 
-func (c *Control) wsDestroy(ctx context.Context, principal, id string) error {
+func (c *Control) wsListAuthorized(ctx context.Context, from string) (*proto.WSListRes, error) {
+	subject, err := c.subjectOf(from)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	var candidates []proto.Workspace
+	for _, ws := range c.workspaces {
+		if ws.State != proto.WSDestroyed {
+			candidates = append(candidates, *ws)
+		}
+	}
+	c.mu.Unlock()
+	out := &proto.WSListRes{}
+	for i := range candidates {
+		if c.check(ctx, subject, ActionRead, workspaceResource(&candidates[i])) == nil {
+			out.Workspaces = append(out.Workspaces, candidates[i])
+		}
+	}
+	sort.Slice(out.Workspaces, func(i, j int) bool { return out.Workspaces[i].ID < out.Workspaces[j].ID })
+	return out, nil
+}
+
+func (c *Control) lockLifecycle(id string) func() {
+	c.mu.Lock()
+	lock := c.lifecycle[id]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		c.lifecycle[id] = lock
+	}
+	c.mu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
+
+func (c *Control) lockProducer(id string) func() {
+	c.mu.Lock()
+	lock := c.producerLocks[id]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		c.producerLocks[id] = lock
+	}
+	c.mu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
+
+func (c *Control) lockMutation(scope, key string) func() {
+	if key == "" {
+		return func() {}
+	}
+	name := scope + "\x00" + key
+	c.mu.Lock()
+	lock := c.mutationLocks[name]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		c.mutationLocks[name] = lock
+	}
+	c.mu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
+
+func mutationFingerprint(request any) []byte {
+	sum := sha256.Sum256(proto.MustMarshal(request))
+	return sum[:]
+}
+
+func (c *Control) mutationLookup(scope, key, op string, request, out any) (bool, error) {
+	if key == "" {
+		return false, nil
+	}
+	var storedOp string
+	var fingerprint, result []byte
+	err := c.db.QueryRow(`SELECT op, fingerprint, result FROM mutations WHERE scope=? AND key=?`, scope, key).
+		Scan(&storedOp, &fingerprint, &result)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if storedOp != op || !bytes.Equal(fingerprint, mutationFingerprint(request)) {
+		return false, proto.Err(proto.CodeConflict, "idempotency key was reused for a different operation or arguments")
+	}
+	if out != nil {
+		if err := proto.Unmarshal(result, out); err != nil {
+			return false, fmt.Errorf("decode idempotent %s result: %w", op, err)
+		}
+	}
+	return true, nil
+}
+
+func (c *Control) insertMutationTx(tx *sql.Tx, scope, key, op string, request, result any) error {
+	if key == "" {
+		return nil
+	}
+	_, err := tx.Exec(`INSERT INTO mutations(scope, key, op, fingerprint, result, completed_at) VALUES(?,?,?,?,?,?)`,
+		scope, key, op, mutationFingerprint(request), proto.MustMarshal(result), c.now().UnixMilli())
+	return err
+}
+
+const (
+	releaseAttemptTimeout = 15 * time.Second
+	releaseAbortTimeout   = 30 * time.Second
+	releaseMaxAttempts    = 8
+)
+
+// prepareRelease retries the exact same generation-scoped request after an
+// ambiguous transport failure. A duplicate request against a node that is
+// still checkpointing returns Preparing, so polling cannot accumulate a set
+// of request handlers all waiting for the same long snapshot.
+func (c *Control) prepareRelease(ctx context.Context, node string, req proto.WSReleaseReq) (proto.WSReleasedReq, error) {
+	var (
+		res               proto.WSReleasedReq
+		lastErr           error
+		backoff           = 50 * time.Millisecond
+		transientFailures int
+	)
+	for {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return proto.WSReleasedReq{}, errors.Join(lastErr, err)
+			}
+			return proto.WSReleasedReq{}, err
+		}
+		res = proto.WSReleasedReq{}
+		attemptCtx, cancel := context.WithTimeout(ctx, releaseAttemptTimeout)
+		err := c.send.Request(attemptCtx, node, proto.OpWSRelease, req, &res)
+		cancel()
+		if err == nil && !res.Preparing {
+			return res, nil
+		}
+		if err == nil {
+			lastErr = proto.Err(proto.CodeTimeout, "release preparation is still running")
+		} else {
+			lastErr = err
+			if !retryableReleaseError(err) {
+				return proto.WSReleasedReq{}, err
+			}
+			transientFailures++
+			if transientFailures >= releaseMaxAttempts {
+				return proto.WSReleasedReq{}, lastErr
+			}
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return proto.WSReleasedReq{}, errors.Join(lastErr, ctx.Err())
+		}
+		if backoff < 2*time.Second {
+			backoff *= 2
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
+			}
+		}
+	}
+}
+
+func retryableReleaseError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, transport.ErrClosed) || errors.Is(err, io.EOF) {
+		return true
+	}
+	var pe *proto.Error
+	if !errors.As(err, &pe) {
+		return false
+	}
+	switch pe.Code {
+	case proto.CodeUnreachable, proto.CodeTimeout, proto.CodeClosed:
+		return true
+	default:
+		return false
+	}
+}
+
+// abortPreparedRelease reconciles every prepare-side failure. Only an
+// acknowledged abort permits the control plane to publish the old assignment
+// as claimed again; otherwise the workspace becomes failed and cannot be
+// reassigned from an older snapshot while a prepared source may still exist.
+func (c *Control) abortPreparedRelease(ctx context.Context, id, node string, gen uint64, expectedState string, cause error) error {
+	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseAbortTimeout)
+	defer cancel()
+	abortReq := proto.WSReleaseCommitReq{ID: id, Gen: gen}
+	var abortErr error
+	backoff := 50 * time.Millisecond
+	for {
+		abortErr = c.send.Request(abortCtx, node, proto.OpWSReleaseAbort, abortReq, nil)
+		if abortErr == nil || !retryableReleaseError(abortErr) {
+			break
+		}
+		if abortCtx.Err() != nil {
+			abortErr = errors.Join(abortErr, abortCtx.Err())
+			break
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-timer.C:
+		case <-abortCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			abortErr = errors.Join(abortErr, abortCtx.Err())
+		}
+		if backoff < 2*time.Second {
+			backoff *= 2
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
+			}
+		}
+		if abortCtx.Err() != nil {
+			break
+		}
+	}
+
+	c.mu.Lock()
+	ws := c.workspaces[id]
+	if ws == nil || ws.Node != node || ws.Generation != gen || ws.State != expectedState {
+		state := "missing"
+		if ws != nil {
+			state = ws.State
+		}
+		c.mu.Unlock()
+		return errors.Join(cause, abortErr, proto.Err(proto.CodeConflict, "workspace changed during release abort: %s", state))
+	}
+	next := *ws
+	if abortErr == nil {
+		next.State = proto.WSClaimed
+		next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
+	} else {
+		next.State = proto.WSFailed
+		next.LeaseUntil = 0
+	}
+	if err := c.persistWS(&next); err != nil {
+		c.mu.Unlock()
+		return errors.Join(cause, abortErr, fmt.Errorf("persist release reconciliation: %w", err))
+	}
+	*ws = next
+	c.mu.Unlock()
+	if abortErr != nil {
+		return errors.Join(cause, fmt.Errorf("release abort was not acknowledged; source fenced for reconciliation: %w", abortErr))
+	}
+	return cause
+}
+
+func (c *Control) wsDestroy(ctx context.Context, principal, id, idem string) error {
+	unlock := c.lockLifecycle(id)
+	defer unlock()
+	scope := principal + "|" + id + "|workspace.destroy"
+	unlockMutation := c.lockMutation(scope, idem)
+	defer unlockMutation()
+	request := proto.WSGetReq{ID: id, IdempotencyKey: idem}
+	var prior struct{}
+	if hit, err := c.mutationLookup(scope, idem, proto.OpWSDestroy, request, &prior); err != nil {
+		return err
+	} else if hit {
+		return nil
+	}
 	c.mu.Lock()
 	ws := c.workspaces[id]
 	if ws == nil {
 		c.mu.Unlock()
 		return proto.Err(proto.CodeNotFound, "workspace %s", id)
 	}
+	if ws.State == proto.WSDestroyed {
+		c.mu.Unlock()
+		return nil
+	}
+	if ws.State == proto.WSFailed {
+		c.mu.Unlock()
+		return proto.Err(proto.CodeConflict, "workspace requires reconciliation before destroy")
+	}
 	node, gen := ws.Node, ws.Generation
-	ws.State = proto.WSDestroyed
-	ws.Node = ""
-	c.saveWS(ws)
-	for _, t := range c.timers {
-		if t.WS == id && !t.Fired {
-			t.Fired = true
-			c.saveTimer(t)
+	wasHeld := held(ws.State)
+	if wasHeld {
+		next := *ws
+		next.State = proto.WSDestroying
+		if err := c.persistWS(&next); err != nil {
+			c.mu.Unlock()
+			return err
 		}
+		*ws = next
 	}
 	c.mu.Unlock()
+	var prepared proto.WSReleasedReq
 	if node != "" && c.send != nil && c.send.Online(node) {
 		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		_ = c.send.Request(rctx, node, proto.OpWSRelease, proto.WSReleaseReq{WS: id, Gen: gen, Snapshot: false, Reason: "destroy"}, nil)
+		var err error
+		prepared, err = c.prepareRelease(rctx, node, proto.WSReleaseReq{WS: id, Gen: gen, Snapshot: false, Reason: "destroy"})
 		cancel()
+		if err != nil {
+			return c.abortPreparedRelease(ctx, id, node, gen, proto.WSDestroying, err)
+		}
+		if prepared.ID != id || prepared.Gen != gen {
+			err := proto.Err(proto.CodeConflict, "node returned a destroy result for a different workspace or generation")
+			return c.abortPreparedRelease(ctx, id, node, gen, proto.WSDestroying, err)
+		}
+	}
+	c.mu.Lock()
+	if ws.Generation != gen || (wasHeld && ws.State != proto.WSDestroying) {
+		state := ws.State
+		c.mu.Unlock()
+		return proto.Err(proto.CodeConflict, "workspace changed during destroy: %s", state)
+	}
+	destroyed := *ws
+	destroyed.State = proto.WSDestroyed
+	destroyed.Node = ""
+	destroyed.LeaseUntil = 0
+	var timerUpdates []*proto.Timer
+	for _, timer := range c.timers {
+		if timer.WS == id && !timer.Fired {
+			copyTimer := *timer
+			copyTimer.Fired = true
+			timerUpdates = append(timerUpdates, &copyTimer)
+		}
+	}
+	if err := c.persistWorkspaceTimersAndMutation(&destroyed, timerUpdates, scope, idem, proto.OpWSDestroy, request, struct{}{}); err != nil {
+		c.mu.Unlock()
+		if prepared.ID != "" {
+			return c.abortPreparedRelease(ctx, id, node, gen, proto.WSDestroying, err)
+		}
+		return err
+	}
+	*ws = destroyed
+	for _, timer := range timerUpdates {
+		*c.timers[timer.ID] = *timer
+	}
+	c.mu.Unlock()
+	if prepared.ID != "" {
+		commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		err := c.send.Request(commitCtx, node, proto.OpWSReleaseCommit, proto.WSReleaseCommitReq{ID: id, Gen: gen}, nil)
+		cancel()
+		if err != nil {
+			c.logger.Warn("destroy commit not acknowledged; fenced source retained", "ws", id, "node", node, "err", err)
+		}
 	}
 	metrics.WSDestroyed.Inc()
 	c.emit(ctx, proto.EvWSDestroyed, id, principal, node, nil)
@@ -670,46 +1544,112 @@ func (c *Control) wsDestroy(ctx context.Context, principal, id string) error {
 // snapshot) and moves it to the given state. It is used by move, sleep and
 // destroy. Returns the snapshot artifact id if one was taken.
 func (c *Control) release(ctx context.Context, id string, snapshot bool, reason string) (string, error) {
+	if c.send == nil {
+		return "", proto.Err(proto.CodeUnreachable, "relay is not attached")
+	}
 	c.mu.Lock()
 	ws := c.workspaces[id]
 	if ws == nil {
 		c.mu.Unlock()
 		return "", proto.Err(proto.CodeNotFound, "workspace %s", id)
 	}
-	if !held(ws.State) {
-		last := ws.LastSnapshot
-		c.mu.Unlock()
-		return last, nil
+	if ws.State != proto.WSClaimed {
+		switch ws.State {
+		case proto.WSPending, proto.WSReleased, proto.WSPaused:
+			last := ws.LastSnapshot
+			c.mu.Unlock()
+			return last, nil
+		case proto.WSDestroyed:
+			c.mu.Unlock()
+			return "", proto.Err(proto.CodeConflict, "workspace destroyed")
+		default:
+			state := ws.State
+			c.mu.Unlock()
+			return "", proto.Err(proto.CodeConflict, "workspace %s requires reconciliation from state %s", id, state)
+		}
 	}
 	node, gen := ws.Node, ws.Generation
-	ws.State = proto.WSReleased
-	c.saveWS(ws)
+	next := *ws
+	next.State = proto.WSQuiescing
+	if err := c.persistWS(&next); err != nil {
+		c.mu.Unlock()
+		return "", err
+	}
+	*ws = next
 	c.mu.Unlock()
 	var res proto.WSReleasedReq
 	rctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	if err := c.send.Request(rctx, node, proto.OpWSRelease, proto.WSReleaseReq{WS: id, Gen: gen, Snapshot: snapshot, Reason: reason}, &res); err != nil {
-		// Node unreachable: treat like a lease expiry; the last snapshot is what we have.
-		c.mu.Lock()
-		last := ws.LastSnapshot
-		c.mu.Unlock()
+	var err error
+	res, err = c.prepareRelease(rctx, node, proto.WSReleaseReq{WS: id, Gen: gen, Snapshot: snapshot, Reason: reason})
+	if err != nil {
+		err = c.abortPreparedRelease(ctx, id, node, gen, proto.WSQuiescing, err)
 		c.logger.Warn("release request failed", "ws", id, "node", node, "err", err)
-		return last, nil
+		return "", err
+	}
+	if res.ID != id || res.Gen != gen {
+		err := proto.Err(proto.CodeConflict, "node returned a release result for a different workspace or generation")
+		return "", c.abortPreparedRelease(ctx, id, node, gen, proto.WSQuiescing, err)
+	}
+	if snapshot && res.Snapshot == "" {
+		err := proto.Err(proto.CodeConflict, "node prepared release without required snapshot")
+		return "", c.abortPreparedRelease(ctx, id, node, gen, proto.WSQuiescing, err)
+	}
+	if res.Snapshot != "" && c.opts.Artifacts != nil {
+		if err := c.opts.Artifacts.Verify(res.Snapshot); err != nil {
+			cause := proto.Err(proto.CodeConflict, "release snapshot verification failed: %v", err)
+			return "", c.abortPreparedRelease(ctx, id, node, gen, proto.WSQuiescing, cause)
+		}
 	}
 	c.mu.Lock()
-	if res.Snapshot != "" {
-		ws.LastSnapshot = res.Snapshot
+	if ws.Node != node || ws.Generation != gen || ws.State != proto.WSQuiescing {
+		state := ws.State
+		c.mu.Unlock()
+		return "", proto.Err(proto.CodeConflict, "workspace changed during release: %s", state)
 	}
-	last := ws.LastSnapshot
-	c.saveWS(ws)
+	committed := *ws
+	if res.Snapshot != "" {
+		committed.LastSnapshot = res.Snapshot
+		committed.Spec.RestoreFrom = res.Snapshot
+	}
+	committed.State = proto.WSReleased
+	last := committed.LastSnapshot
+	if err := c.persistWS(&committed); err != nil {
+		c.mu.Unlock()
+		return "", c.abortPreparedRelease(ctx, id, node, gen, proto.WSQuiescing, err)
+	}
+	*ws = committed
 	c.mu.Unlock()
+	commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	commitErr := c.send.Request(commitCtx, node, proto.OpWSReleaseCommit, proto.WSReleaseCommitReq{ID: id, Gen: gen, Snapshot: res.Snapshot}, nil)
+	commitCancel()
+	if commitErr != nil {
+		// The checkpoint is already durable and authoritative. Retaining an
+		// extra fenced source is safe; the node can reconcile it later.
+		c.logger.Warn("release commit not acknowledged; source retained", "ws", id, "node", node, "err", commitErr)
+	}
 	c.emit(ctx, proto.EvWSReleased, id, "", node, map[string]any{"reason": reason, "snapshot": res.Snapshot})
 	return last, nil
 }
 
 func (c *Control) wsMove(ctx context.Context, principal string, req *proto.WSMoveReq) (*proto.Workspace, error) {
-	if _, err := c.wsGet(req.ID); err != nil {
+	unlock := c.lockLifecycle(req.ID)
+	defer unlock()
+	scope := principal + "|" + req.ID + "|workspace.move"
+	unlockMutation := c.lockMutation(scope, req.IdempotencyKey)
+	defer unlockMutation()
+	var prior proto.Workspace
+	if hit, err := c.mutationLookup(scope, req.IdempotencyKey, proto.OpWSMove, req, &prior); err != nil {
 		return nil, err
+	} else if hit {
+		return &prior, nil
+	}
+	current, err := c.wsGet(req.ID)
+	if err != nil {
+		return nil, err
+	}
+	if current.State == proto.WSDestroyed {
+		return nil, proto.Err(proto.CodeConflict, "workspace destroyed")
 	}
 	snap, err := c.release(ctx, req.ID, true, "move")
 	if err != nil {
@@ -717,17 +1657,40 @@ func (c *Control) wsMove(ctx context.Context, principal string, req *proto.WSMov
 	}
 	c.mu.Lock()
 	ws := c.workspaces[req.ID]
+	if ws == nil || ws.State == proto.WSDestroyed {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace destroyed during move")
+	}
+	if ws.Generation != current.Generation {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace generation changed during move")
+	}
+	if held(current.State) && ws.State != proto.WSReleased {
+		state := ws.State
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace changed during move: %s", state)
+	}
+	if !held(current.State) && ws.State != current.State {
+		state := ws.State
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace changed during move: %s", state)
+	}
+	next := *ws
 	if req.Requires != nil {
-		ws.Spec.Requires = *req.Requires
+		next.Spec.Requires = *req.Requires
 	}
 	if req.Placement != nil {
-		ws.Spec.Placement = *req.Placement
+		next.Spec.Placement = *req.Placement
 	}
-	ws.Spec.RestoreFrom = snap
-	ws.State = proto.WSPending
-	ws.Node = ""
-	ws.LeaseUntil = 0
-	c.saveWS(ws)
+	next.Spec.RestoreFrom = snap
+	next.State = proto.WSPending
+	next.Node = ""
+	next.LeaseUntil = 0
+	if err := c.persistWSAndMutation(&next, scope, req.IdempotencyKey, proto.OpWSMove, req, &next); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	*ws = next
 	c.mu.Unlock()
 	metrics.WSMoved.Inc()
 	c.emit(ctx, proto.EvWSMoved, req.ID, principal, "", map[string]any{"restore_from": snap})
@@ -736,11 +1699,30 @@ func (c *Control) wsMove(ctx context.Context, principal string, req *proto.WSMov
 }
 
 func (c *Control) wsSleep(ctx context.Context, principal string, req *proto.WSSleepReq) (*proto.Timer, error) {
-	if _, err := c.wsGet(req.ID); err != nil {
+	unlock := c.lockLifecycle(req.ID)
+	defer unlock()
+	scope := principal + "|" + req.ID + "|workspace.sleep"
+	unlockMutation := c.lockMutation(scope, req.IdempotencyKey)
+	defer unlockMutation()
+	var prior proto.Timer
+	if hit, err := c.mutationLookup(scope, req.IdempotencyKey, proto.OpWSSleep, req, &prior); err != nil {
 		return nil, err
+	} else if hit {
+		return &prior, nil
+	}
+	current, err := c.wsGet(req.ID)
+	if err != nil {
+		return nil, err
+	}
+	if current.State == proto.WSDestroyed {
+		return nil, proto.Err(proto.CodeConflict, "workspace destroyed")
 	}
 	if req.AfterSec == 0 && req.AtMillis == 0 && req.OnEvent == "" {
 		return nil, proto.Err(proto.CodeBadRequest, "sleep needs after_sec, at or on")
+	}
+	snap, err := c.release(ctx, req.ID, true, "sleep")
+	if err != nil {
+		return nil, err
 	}
 	t := &proto.Timer{ID: ids.New("t"), WS: req.ID, Action: "resume", CreatedAt: c.now().UnixMilli(), OnEvent: req.OnEvent}
 	if req.AfterSec > 0 {
@@ -749,28 +1731,56 @@ func (c *Control) wsSleep(ctx context.Context, principal string, req *proto.WSSl
 		t.At = req.AtMillis
 	}
 	c.mu.Lock()
+	ws := c.workspaces[req.ID]
+	if ws == nil || ws.State == proto.WSDestroyed {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace destroyed during sleep")
+	}
+	if ws.Generation != current.Generation {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace generation changed during sleep")
+	}
+	if held(current.State) && ws.State != proto.WSReleased {
+		state := ws.State
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace changed during sleep: %s", state)
+	}
+	if !held(current.State) && ws.State != current.State {
+		state := ws.State
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace changed during sleep: %s", state)
+	}
+	next := *ws
+	next.Spec.RestoreFrom = snap
+	next.State = proto.WSPaused
+	next.Node = ""
+	next.LeaseUntil = 0
+	if err := c.persistWorkspaceTimerAndMutation(&next, t, scope, req.IdempotencyKey, proto.OpWSSleep, req, t); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	*ws = next
 	c.timers[t.ID] = t
-	c.saveTimer(t)
 	tcp := *t
 	c.mu.Unlock()
 	c.emit(ctx, proto.EvTimerSet, req.ID, principal, "", tcp)
-	snap, err := c.release(ctx, req.ID, true, "sleep")
-	if err != nil {
-		return nil, err
-	}
-	c.mu.Lock()
-	ws := c.workspaces[req.ID]
-	ws.Spec.RestoreFrom = snap
-	ws.State = proto.WSPaused
-	ws.Node = ""
-	ws.LeaseUntil = 0
-	c.saveWS(ws)
-	c.mu.Unlock()
 	c.emit(ctx, proto.EvWSPaused, req.ID, principal, "", map[string]any{"timer": tcp.ID, "snapshot": snap})
 	return &tcp, nil
 }
 
-func (c *Control) wsWake(ctx context.Context, principal, id, timerID string) (*proto.Workspace, error) {
+func (c *Control) wsWake(ctx context.Context, principal, id, timerID, idem string) (*proto.Workspace, error) {
+	unlock := c.lockLifecycle(id)
+	defer unlock()
+	scope := principal + "|" + id + "|workspace.wake"
+	unlockMutation := c.lockMutation(scope, idem)
+	defer unlockMutation()
+	request := proto.WSGetReq{ID: id, IdempotencyKey: idem}
+	var prior proto.Workspace
+	if hit, err := c.mutationLookup(scope, idem, proto.OpWSWake, request, &prior); err != nil {
+		return nil, err
+	} else if hit {
+		return &prior, nil
+	}
 	c.mu.Lock()
 	ws := c.workspaces[id]
 	if ws == nil {
@@ -781,17 +1791,46 @@ func (c *Control) wsWake(ctx context.Context, principal, id, timerID string) (*p
 		c.mu.Unlock()
 		return nil, proto.Err(proto.CodeConflict, "workspace destroyed")
 	}
-	if ws.State != proto.WSPaused {
-		cp := *ws
+	var nextTimer *proto.Timer
+	if timerID != "" {
+		timer := c.timers[timerID]
+		if timer == nil || timer.WS != id {
+			c.mu.Unlock()
+			return nil, proto.Err(proto.CodeNotFound, "timer %s", timerID)
+		}
+		copyTimer := *timer
+		copyTimer.Fired = true
+		nextTimer = &copyTimer
+	}
+	next := *ws
+	resumed := next.State == proto.WSPaused
+	if resumed {
+		next.State = proto.WSPending
+	}
+	if !resumed && (nextTimer == nil || c.timers[timerID].Fired) {
+		cp := next
 		c.mu.Unlock()
 		return &cp, nil
 	}
-	ws.State = proto.WSPending
-	c.saveWS(ws)
+	if err := c.persistWorkspaceTimerAndMutation(&next, nextTimer, scope, idem, proto.OpWSWake, request, &next); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	*ws = next
+	if nextTimer != nil {
+		*c.timers[timerID] = *nextTimer
+	}
+	cp := next
 	c.mu.Unlock()
-	c.emit(ctx, proto.EvWSResumed, id, principal, "", map[string]any{"timer": timerID})
-	c.offerPending(ctx)
-	return c.snapshotWS(id), nil
+	if nextTimer != nil {
+		metrics.TimersFired.Inc()
+		c.emit(ctx, proto.EvTimerFired, id, principal, "", *nextTimer)
+	}
+	if resumed {
+		c.emit(ctx, proto.EvWSResumed, id, principal, "", map[string]any{"timer": timerID})
+		c.offerPending(ctx)
+	}
+	return &cp, nil
 }
 
 func (c *Control) wsClaim(ctx context.Context, node, id string) (*proto.WSClaimRes, error) {
@@ -801,16 +1840,20 @@ func (c *Control) wsClaim(ctx context.Context, node, id string) (*proto.WSClaimR
 		c.mu.Unlock()
 		return nil, proto.Err(proto.CodeNotFound, "workspace %s", id)
 	}
-	if held(ws.State) && ws.Node == node {
+	if (ws.State == proto.WSClaimed || ws.State == proto.WSClaiming) && ws.Node == node {
 		// Re-adoption: the same node reconnecting still holds this workspace.
 		// Keep the generation so the client's outstanding grants stay valid,
 		// but go back through claiming so waiters do not race the restore.
-		ws.State = proto.WSClaiming
-		ws.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
-		c.saveWS(ws)
-		cp := *ws
+		next := *ws
+		next.State = proto.WSClaiming
+		next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
+		if err := c.persistClaim(&next); err != nil {
+			c.mu.Unlock()
+			return nil, err
+		}
+		*ws = next
 		c.mu.Unlock()
-		return &proto.WSClaimRes{Workspace: cp, LeaseSec: c.opts.LeaseSec}, nil
+		return &proto.WSClaimRes{Workspace: next, LeaseSec: c.opts.LeaseSec}, nil
 	}
 	if ws.State != proto.WSPending {
 		// Read the state before releasing the lock: formatting the message
@@ -820,7 +1863,8 @@ func (c *Control) wsClaim(ctx context.Context, node, id string) (*proto.WSClaimR
 		return nil, proto.Err(proto.CodeConflict, "workspace %s is %s", id, state)
 	}
 	n := c.nodes[node]
-	if n == nil || !c.eligibleLocked(ws, n) {
+	backend, eligible := c.eligibleBackendLocked(ws, n)
+	if n == nil || !eligible {
 		c.mu.Unlock()
 		metrics.WSClaimDenied.Inc()
 		return nil, proto.Err(proto.CodeDenied, "node %s is not eligible for %s", node, id)
@@ -828,16 +1872,23 @@ func (c *Control) wsClaim(ctx context.Context, node, id string) (*proto.WSClaimR
 	// The compare-and-swap: state was pending under the lock; now it's ours.
 	// It becomes WSClaimed only once the node reports ws.ready, so a client
 	// never talks to a node that is still restoring the filesystem.
-	ws.State = proto.WSClaiming
-	ws.Node = node
-	ws.Generation++
-	ws.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
-	c.saveWS(ws)
-	cp := *ws
+	next := *ws
+	if next.Spec.Requires.Backend == "" {
+		next.Spec.Requires.Backend = backend
+	}
+	next.State = proto.WSClaiming
+	next.Node = node
+	next.Generation++
+	next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
+	if err := c.persistClaim(&next); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	*ws = next
 	c.mu.Unlock()
 	metrics.WSClaims.Inc()
-	c.emit(ctx, proto.EvWSClaiming, id, "", node, map[string]any{"gen": cp.Generation, "restore_from": cp.Spec.RestoreFrom})
-	return &proto.WSClaimRes{Workspace: cp, LeaseSec: c.opts.LeaseSec}, nil
+	c.emit(ctx, proto.EvWSClaiming, id, "", node, map[string]any{"gen": next.Generation, "restore_from": next.Spec.RestoreFrom})
+	return &proto.WSClaimRes{Workspace: next, LeaseSec: c.opts.LeaseSec}, nil
 }
 
 // wsReady is the node reporting that a claimed workspace is materialized.
@@ -853,40 +1904,110 @@ func (c *Control) wsReady(ctx context.Context, node string, req *proto.WSReadyRe
 		return proto.Err(proto.CodeConflict, "stale ready for %s", req.ID)
 	}
 	if ws.State == proto.WSClaimed {
+		next := *ws
+		next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
+		if err := c.persistWS(&next); err != nil {
+			c.mu.Unlock()
+			return err
+		}
+		*ws = next
 		c.mu.Unlock()
 		return nil
 	}
-	ws.State = proto.WSClaimed
-	c.saveWS(ws)
-	gen := ws.Generation
-	restore := ws.Spec.RestoreFrom
+	if ws.State != proto.WSClaiming {
+		state := ws.State
+		c.mu.Unlock()
+		return proto.Err(proto.CodeConflict, "workspace %s cannot become ready from %s", req.ID, state)
+	}
+	next := *ws
+	next.State = proto.WSClaimed
+	next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
+	if err := c.persistWS(&next); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	*ws = next
+	gen := next.Generation
+	restore := next.Spec.RestoreFrom
 	c.mu.Unlock()
 	c.emit(ctx, proto.EvWSClaimed, req.ID, "", node, map[string]any{"gen": gen, "restore_from": restore})
 	return nil
 }
 
-func (c *Control) wsRenew(ctx context.Context, node string, req *proto.WSRenewReq) error {
+func (c *Control) wsRenew(ctx context.Context, node string, req *proto.WSRenewReq) (*proto.WSRenewRes, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	until := c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
+	res := &proto.WSRenewRes{Results: make([]proto.WSRenewResult, 0, len(req.IDs))}
 	for _, id := range req.IDs {
+		requested := req.Gen[id]
+		result := proto.WSRenewResult{ID: id, Generation: requested, Action: "fence"}
 		ws := c.workspaces[id]
-		if ws == nil || ws.Node != node || !held(ws.State) {
+		if ws == nil {
+			result.Action = "destroy"
+			res.Results = append(res.Results, result)
 			continue
 		}
-		if g, ok := req.Gen[id]; ok && g != ws.Generation {
-			continue // stale generation must not extend a lease
+		result.AuthoritativeGen = ws.Generation
+		renewable := ws.State == proto.WSClaimed || ws.State == proto.WSClaiming
+		if ws.Node != node || !renewable || requested == 0 || requested != ws.Generation {
+			res.Results = append(res.Results, result)
+			continue
 		}
-		ws.LeaseUntil = until
-		c.saveWS(ws)
+		next := *ws
+		next.LeaseUntil = until
+		if err := c.persistWS(&next); err != nil {
+			return nil, err
+		}
+		*ws = next
+		result.Accepted = true
+		result.LeaseUntil = until
+		result.Action = "continue"
+		res.Results = append(res.Results, result)
 	}
 	if n := c.nodes[node]; n != nil {
 		n.Status.LastSeen = c.now().UnixMilli()
 	}
+	return res, nil
+}
+
+func (c *Control) wsSnapshotCommit(ctx context.Context, node string, req *proto.WSSnapshotCommitReq) error {
+	if req.Snapshot == "" {
+		return proto.Err(proto.CodeBadRequest, "snapshot id is required")
+	}
+	if c.opts.Artifacts != nil {
+		if err := c.opts.Artifacts.Verify(req.Snapshot); err != nil {
+			return proto.Err(proto.CodeConflict, "snapshot verification failed: %v", err)
+		}
+	}
+	c.mu.Lock()
+	ws := c.workspaces[req.ID]
+	if ws == nil {
+		c.mu.Unlock()
+		return proto.Err(proto.CodeNotFound, "workspace %s", req.ID)
+	}
+	if ws.Node != node || ws.Generation != req.Gen || !held(ws.State) {
+		c.mu.Unlock()
+		return proto.Err(proto.CodeConflict, "stale snapshot commit for %s", req.ID)
+	}
+	next := *ws
+	next.LastSnapshot = req.Snapshot
+	if err := c.persistWS(&next); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	*ws = next
+	c.mu.Unlock()
+	c.emit(ctx, proto.EvWSSnapshot, req.ID, "", node, map[string]any{"artifact": req.Snapshot, "committed": true})
 	return nil
 }
 
 func (c *Control) wsReleased(ctx context.Context, node string, req *proto.WSReleasedReq) error {
+	if req.Snapshot != "" && c.opts.Artifacts != nil {
+		if err := c.opts.Artifacts.Verify(req.Snapshot); err != nil {
+			return proto.Err(proto.CodeConflict, "released snapshot verification failed: %v", err)
+		}
+	}
 	c.mu.Lock()
 	ws := c.workspaces[req.ID]
 	if ws == nil {
@@ -897,17 +2018,26 @@ func (c *Control) wsReleased(ctx context.Context, node string, req *proto.WSRele
 		c.mu.Unlock()
 		return proto.Err(proto.CodeConflict, "stale release for %s", req.ID)
 	}
+	if ws.State == proto.WSDestroyed {
+		c.mu.Unlock()
+		return proto.Err(proto.CodeConflict, "workspace %s is destroyed", req.ID)
+	}
+	next := *ws
 	if req.Snapshot != "" {
-		ws.LastSnapshot = req.Snapshot
-		ws.Spec.RestoreFrom = req.Snapshot
+		next.LastSnapshot = req.Snapshot
+		next.Spec.RestoreFrom = req.Snapshot
 	}
-	if held(ws.State) {
-		ws.State = proto.WSPending
+	if held(next.State) {
+		next.State = proto.WSPending
 	}
-	ws.Node = ""
-	ws.LeaseUntil = 0
-	c.saveWS(ws)
-	state := ws.State
+	next.Node = ""
+	next.LeaseUntil = 0
+	if err := c.persistWS(&next); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	*ws = next
+	state := next.State
 	c.mu.Unlock()
 	c.emit(ctx, proto.EvWSReleased, req.ID, "", node, map[string]any{"reason": req.Reason, "snapshot": req.Snapshot})
 	if state == proto.WSPending {
@@ -918,45 +2048,77 @@ func (c *Control) wsReleased(ctx context.Context, node string, req *proto.WSRele
 
 // eligibleLocked applies Requires and Placement against a node.
 func (c *Control) eligibleLocked(ws *proto.Workspace, n *nodeState) bool {
-	if !n.Status.Online {
-		return false
+	_, ok := c.eligibleBackendLocked(ws, n)
+	return ok
+}
+
+// eligibleBackendLocked returns the exact backend that satisfies both
+// runtime requirements and the security policy. Keeping this decision
+// backend-specific prevents a process backend from inheriting properties of
+// a stronger backend registered on the same node.
+func (c *Control) eligibleBackendLocked(ws *proto.Workspace, n *nodeState) (string, bool) {
+	if n == nil || !n.Status.Online {
+		return "", false
 	}
 	r := ws.Spec.Requires
-	if r.Backend != "" && !contains(n.Status.Info.Backends, r.Backend) {
-		return false
-	}
 	if r.OS != "" && n.Status.Info.OS != r.OS {
-		return false
+		return "", false
 	}
 	if r.Arch != "" && n.Status.Info.Arch != r.Arch {
-		return false
+		return "", false
 	}
 	if r.CPU > 0 && n.Status.Info.CPU < r.CPU {
-		return false
+		return "", false
 	}
-	if r.MemMiB > 0 && n.Status.Info.MemMiB > 0 && n.Status.Info.MemMiB < r.MemMiB {
-		return false
+	if r.MemMiB > 0 && n.Status.Info.MemMiB < r.MemMiB {
+		return "", false
 	}
 	for _, cap := range r.Caps {
 		if !contains(n.Status.Info.Caps, cap) {
-			return false
+			return "", false
 		}
 	}
 	p := ws.Spec.Placement
 	if p.Node != "" && p.Node != n.Status.ID {
-		return false
+		return "", false
 	}
 	for k, v := range p.Allow {
 		if n.Status.Labels[k] != v {
-			return false
+			return "", false
 		}
 	}
-	return true
+	descriptors := n.Status.Info.BackendDescriptors
+	if len(descriptors) == 0 {
+		// Compatibility for v1 peers: absence is evidence only for a local,
+		// non-isolating backend. Never infer stronger security properties.
+		for _, name := range n.Status.Info.Backends {
+			descriptors = append(descriptors, proto.BackendDescriptor{
+				Name: name, Security: proto.BackendSecurityCaps{Isolation: "none", EgressMode: "open", BrokerIdentity: "none"},
+				Runtime: proto.RuntimeCaps{Snapshots: n.Status.Info.Snapshots},
+			})
+		}
+	}
+	for _, descriptor := range descriptors {
+		if r.Backend != "" && descriptor.Name != r.Backend {
+			continue
+		}
+		if err := proto.ValidateBackendSecurity(ws.Spec.Security, descriptor); err == nil {
+			return descriptor.Name, true
+		}
+	}
+	return "", false
 }
 
 // held reports whether a node currently owns the workspace (materializing
 // or serving). Both states carry a lease.
-func held(state string) bool { return state == proto.WSClaimed || state == proto.WSClaiming }
+func held(state string) bool {
+	switch state {
+	case proto.WSClaimed, proto.WSClaiming, proto.WSQuiescing, proto.WSCheckpointing, proto.WSDestroying:
+		return true
+	default:
+		return false
+	}
+}
 
 func contains(list []string, s string) bool {
 	for _, x := range list {
@@ -1017,23 +2179,43 @@ func (c *Control) nodeList() *proto.NodeListRes {
 
 // eventsTail streams events to the requester as ev frames (Op "log") until
 // events.stop or disconnect. Historical events are delivered first.
-func (c *Control) eventsTail(ctx context.Context, from string, req *proto.EventsTailReq) (any, error) {
+func (c *Control) eventsTail(ctx context.Context, from string, subject Subject, req *proto.EventsTailReq) (any, error) {
 	if !req.Follow {
-		evs, err := c.log.Read(ctx, req.From, req.WS, 1000)
+		evs, err := c.readAuthorizedEvents(ctx, subject, req.From, req.WS, 1000)
 		if err != nil {
 			return nil, err
 		}
 		return proto.EventPost{Events: evs}, nil
 	}
+	subID := req.Subscription
+	if subID == "" {
+		subID = "default"
+	}
 	c.mu.Lock()
-	if cancel, ok := c.tails[from]; ok {
-		cancel()
+	byID := c.tails[from]
+	if byID == nil {
+		byID = map[string]*tailState{}
+		c.tails[from] = byID
+	}
+	if previous := byID[subID]; previous != nil {
+		previous.cancel()
 	}
 	tctx, cancel := context.WithCancel(context.Background())
-	c.tails[from] = cancel
+	tail := &tailState{cancel: cancel}
+	byID[subID] = tail
 	c.mu.Unlock()
 	go func() {
-		defer cancel()
+		defer func() {
+			cancel()
+			c.mu.Lock()
+			if current := c.tails[from][subID]; current == tail {
+				delete(c.tails[from], subID)
+				if len(c.tails[from]) == 0 {
+					delete(c.tails, from)
+				}
+			}
+			c.mu.Unlock()
+		}()
 		sub := c.log.Subscribe(req.From, req.WS)
 		defer sub.Close()
 		for {
@@ -1041,7 +2223,16 @@ func (c *Control) eventsTail(ctx context.Context, from string, req *proto.Events
 			if err != nil {
 				return
 			}
-			if err := c.send.Send(tctx, proto.NewEvent(from, "log", proto.EventPost{Events: evs})); err != nil {
+			filtered := evs[:0]
+			for _, event := range evs {
+				if c.eventVisible(subject, event) {
+					filtered = append(filtered, event)
+				}
+			}
+			if len(filtered) == 0 {
+				continue
+			}
+			if err := c.send.Send(tctx, proto.NewEvent(from, "log", proto.EventPost{Events: filtered, Subscription: req.Subscription})); err != nil {
 				return
 			}
 		}
@@ -1049,24 +2240,219 @@ func (c *Control) eventsTail(ctx context.Context, from string, req *proto.Events
 	return struct{}{}, nil
 }
 
+func (c *Control) eventVisible(subject Subject, event proto.Event) bool {
+	if hasRole(subject, "admin") {
+		return true
+	}
+	return event.Tenant != "" && event.Tenant == subject.Tenant
+}
+
+func (c *Control) readAuthorizedEvents(ctx context.Context, subject Subject, from uint64, ws string, limit int) ([]proto.Event, error) {
+	cursor := from
+	var out []proto.Event
+	for len(out) < limit {
+		events, err := c.log.Read(ctx, cursor, ws, 1000)
+		if err != nil {
+			return nil, err
+		}
+		if len(events) == 0 {
+			break
+		}
+		for _, event := range events {
+			if c.eventVisible(subject, event) {
+				out = append(out, event)
+				if len(out) == limit {
+					break
+				}
+			}
+		}
+		next := events[len(events)-1].Seq + 1
+		if next <= cursor || len(events) < 1000 {
+			break
+		}
+		cursor = next
+	}
+	return out, nil
+}
+
+func (c *Control) stopEventTail(from, subID string) {
+	if subID == "" {
+		subID = "default"
+	}
+	c.mu.Lock()
+	if tail := c.tails[from][subID]; tail != nil {
+		tail.cancel()
+		delete(c.tails[from], subID)
+	}
+	if len(c.tails[from]) == 0 {
+		delete(c.tails, from)
+	}
+	c.mu.Unlock()
+}
+
 // eventsPost appends node-originated events (node id enforced) and fires
 // any timer waiting on the event type.
 func (c *Control) eventsPost(ctx context.Context, from string, req *proto.EventPost) error {
 	isNode := c.isNode(from)
+	if len(req.Events) > 512 {
+		return proto.Err(proto.CodeResourceExhausted, "event batch exceeds 512 entries")
+	}
+	if isNode {
+		unlock := c.lockProducer(from)
+		defer unlock()
+	}
+	var subject Subject
+	if !isNode {
+		var err error
+		subject, err = c.subjectOf(from)
+		if err != nil {
+			return err
+		}
+	}
 	for i := range req.Events {
 		e := req.Events[i]
+		observedAt, producerSeq := e.ObservedAt, e.ProducerSeq
+		if observedAt == 0 {
+			observedAt = e.At
+		}
+		if producerSeq == 0 {
+			producerSeq = e.Seq
+		}
+		hintedWorkspace, hintedGeneration := e.Workspace, e.Generation
+		if hintedWorkspace == "" && strings.HasPrefix(e.Stream, "ws_") {
+			hintedWorkspace = e.Stream
+		}
+		if hintedWorkspace != "" {
+			if strings.HasPrefix(e.Stream, "ws_") && e.Stream != hintedWorkspace {
+				return proto.Err(proto.CodeBadRequest, "event stream and workspace disagree")
+			}
+			if e.Stream == "" {
+				e.Stream = hintedWorkspace
+			}
+		}
 		e.Seq = 0
+		e.At = 0
+		e.EventID = ids.New("ev")
+		e.ReceivedAt = c.now().UnixMilli()
+		e.ObservedAt = observedAt
+		e.ProducerSeq = producerSeq
+		e.OperationID = ""
 		if isNode {
+			if producerSeq == 0 {
+				return proto.Err(proto.CodeBadRequest, "node events require a producer sequence")
+			}
+			tenant, workspace, generation, err := c.authorizeNodeEvent(from, hintedWorkspace, hintedGeneration)
+			if err != nil {
+				return err
+			}
+			c.mu.Lock()
+			last := c.producerSeq[from]
+			c.mu.Unlock()
+			if producerSeq <= last {
+				duplicate, err := c.sameNodeEvent(ctx, from, producerSeq, e.Type, e.Stream, e.Payload, observedAt, workspace, generation)
+				if err != nil {
+					return err
+				}
+				if duplicate {
+					continue
+				}
+				return proto.Err(proto.CodeConflict, "node event sequence %d is out of order or changed", producerSeq)
+			}
+			if producerSeq > last+1 {
+				gap := proto.Event{
+					EventID:    fmt.Sprintf("gap:%s:%d:%d", from, last+1, producerSeq-1),
+					ReceivedAt: c.now().UnixMilli(), ObservedAt: observedAt,
+					Origin: "control", Actor: "control", Node: from,
+					Tenant: tenant, Workspace: workspace, Generation: generation,
+					Stream: from, Type: proto.EvEventGap, ProducerSeq: producerSeq - 1,
+					Payload: proto.MustMarshal(map[string]any{"producer": from, "missing_from": last + 1, "missing_through": producerSeq - 1}),
+				}
+				if err := c.log.Append(ctx, &gap); err != nil {
+					return err
+				}
+				c.mu.Lock()
+				c.producerSeq[from] = producerSeq - 1
+				c.mu.Unlock()
+			}
+			e.EventID = fmt.Sprintf("%s:%d", from, producerSeq)
+			e.Origin = "node"
+			e.Actor = from
 			e.Node = from
-		} else if e.Principal == "" {
-			e.Principal = c.principalOf(from)
+			e.Principal = ""
+			e.Tenant, e.Workspace, e.Generation = tenant, workspace, generation
+		} else {
+			e.Origin = "client"
+			e.Actor = subject.ID
+			e.Principal = subject.ID
+			e.Node = ""
+			e.Tenant = subject.Tenant
+			e.Generation = 0
+			if e.Stream != "" {
+				ws, err := c.authorizeWorkspace(ctx, from, e.Stream, ActionWrite)
+				if err != nil {
+					return err
+				}
+				e.Workspace, e.Tenant = ws.ID, ws.Tenant
+			}
 		}
 		if err := c.log.Append(ctx, &e); err != nil {
 			return err
 		}
-		c.fireEventTimers(ctx, e.Type)
+		if isNode {
+			c.mu.Lock()
+			if producerSeq > c.producerSeq[from] {
+				c.producerSeq[from] = producerSeq
+			}
+			c.mu.Unlock()
+		}
+		c.fireEventTimers(ctx, e.Type, e.Tenant, e.Stream)
 	}
 	return nil
+}
+
+func (c *Control) authorizeNodeEvent(node, workspace string, generation uint64) (string, string, uint64, error) {
+	if workspace == "" {
+		return "", "", 0, nil
+	}
+	if generation == 0 {
+		// Compatibility with a node that predates assignment hints is safe only
+		// for the assignment that is currently held by that node.
+		c.mu.Lock()
+		ws := c.workspaces[workspace]
+		if ws == nil || ws.Node != node || !held(ws.State) {
+			c.mu.Unlock()
+			return "", "", 0, proto.Err(proto.CodeDenied, "node does not own event workspace %s", workspace)
+		}
+		tenant, gen := ws.Tenant, ws.Generation
+		c.mu.Unlock()
+		return tenant, workspace, gen, nil
+	}
+	tenant, ok, err := c.assignmentTenant(workspace, generation, node)
+	if err != nil {
+		return "", "", 0, err
+	}
+	if !ok {
+		return "", "", 0, proto.Err(proto.CodeDenied, "node has no assignment for workspace %s generation %d", workspace, generation)
+	}
+	return tenant, workspace, generation, nil
+}
+
+func (c *Control) sameNodeEvent(ctx context.Context, node string, producerSeq uint64, typ, stream string, payload []byte, observedAt int64, workspace string, generation uint64) (bool, error) {
+	var storedType, storedStream, storedWorkspace string
+	var storedPayload []byte
+	var storedObserved int64
+	var storedGeneration uint64
+	err := c.db.QueryRowContext(ctx, `SELECT type, stream, payload, observed_at, workspace, generation
+		FROM events WHERE origin='node' AND event_id=?`, fmt.Sprintf("%s:%d", node, producerSeq)).
+		Scan(&storedType, &storedStream, &storedPayload, &storedObserved, &storedWorkspace, &storedGeneration)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return storedType == typ && storedStream == stream && bytes.Equal(storedPayload, payload) &&
+		storedObserved == observedAt && storedWorkspace == workspace && storedGeneration == generation, nil
 }
 
 // PostEvents appends externally originated events (webhooks, integrations)
@@ -1077,23 +2463,37 @@ func (c *Control) PostEvents(ctx context.Context, principal string, events []pro
 	for i := range events {
 		e := events[i]
 		e.Seq = 0
-		if e.Principal == "" {
-			e.Principal = principal
+		e.At = 0
+		e.EventID = ids.New("ev")
+		e.ReceivedAt = c.now().UnixMilli()
+		e.Origin, e.Actor, e.Principal, e.Node = "webhook", principal, principal, ""
+		if e.Tenant == "" {
+			e.Tenant = "local"
+		}
+		if e.Stream != "" {
+			c.mu.Lock()
+			if ws := c.workspaces[e.Stream]; ws != nil {
+				e.Workspace, e.Tenant = ws.ID, ws.Tenant
+			}
+			c.mu.Unlock()
 		}
 		if err := c.log.Append(ctx, &e); err != nil {
 			return err
 		}
-		c.fireEventTimers(ctx, e.Type)
+		c.fireEventTimers(ctx, e.Type, e.Tenant, e.Stream)
 	}
 	return nil
 }
 
-func (c *Control) fireEventTimers(ctx context.Context, typ string) {
+func (c *Control) fireEventTimers(ctx context.Context, typ, tenant, stream string) {
 	c.mu.Lock()
 	var fire []*proto.Timer
 	for _, t := range c.timers {
 		if !t.Fired && t.OnEvent != "" && t.OnEvent == typ {
-			fire = append(fire, t)
+			ws := c.workspaces[t.WS]
+			if ws != nil && ws.Tenant == tenant && (stream == "" || stream == ws.ID) {
+				fire = append(fire, t)
+			}
 		}
 	}
 	c.mu.Unlock()
@@ -1108,20 +2508,19 @@ func (c *Control) fireTimer(ctx context.Context, t *proto.Timer) {
 		c.mu.Unlock()
 		return
 	}
-	t.Fired = true
-	c.saveTimer(t)
-	cp := *t
+	id, ws := t.ID, t.WS
 	c.mu.Unlock()
-	metrics.TimersFired.Inc()
-	c.emit(ctx, proto.EvTimerFired, cp.WS, "", "", cp)
-	_, _ = c.wsWake(ctx, "", cp.WS, cp.ID)
+	if _, err := c.wsWake(ctx, "", ws, id, ""); err != nil {
+		c.logger.Error("fire timer", "timer", id, "ws", ws, "err", err)
+	}
 }
 
 func (c *Control) bindingLease(ctx context.Context, node, wsID string) (*proto.BindingLeaseRes, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ws := c.workspaces[wsID]
-	if ws == nil || ws.Node != node || !held(ws.State) {
+	leaseable := ws != nil && (ws.State == proto.WSClaimed || ws.State == proto.WSClaiming)
+	if !leaseable || ws.Node != node {
 		return nil, proto.Err(proto.CodeDenied, "workspace %s is not claimed by %s", wsID, node)
 	}
 	out := &proto.BindingLeaseRes{}
@@ -1145,7 +2544,7 @@ func (c *Control) bindingLease(ctx context.Context, node, wsID string) (*proto.B
 	return out, nil
 }
 
-func (c *Control) grant(client, principal, wsID string) (*proto.Grant, error) {
+func (c *Control) grant(ctx context.Context, client string, subject Subject, wsID string) (*proto.Grant, error) {
 	c.mu.Lock()
 	ws := c.workspaces[wsID]
 	if ws == nil {
@@ -1157,7 +2556,26 @@ func (c *Control) grant(client, principal, wsID string) (*proto.Grant, error) {
 		c.mu.Unlock()
 		return nil, proto.Err(proto.CodeConflict, "workspace %s is %s, not claimed", wsID, st)
 	}
-	claims := proto.GrantClaims{Client: client, WS: wsID, Node: ws.Node, Principal: principal, ExpiresAt: c.now().Add(time.Hour).UnixMilli(), Gen: ws.Generation}
+	resource := workspaceResource(ws)
+	generation, assignedNode := ws.Generation, ws.Node
+	c.mu.Unlock()
+	if err := c.check(ctx, subject, ActionExecute, resource); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	ws = c.workspaces[wsID]
+	if ws == nil || ws.Generation != generation || ws.Node != assignedNode || ws.State != proto.WSClaimed {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace changed while granting access")
+	}
+	expires := c.now().Add(time.Hour).UnixMilli()
+	if ws.LeaseUntil > 0 && ws.LeaseUntil < expires {
+		expires = ws.LeaseUntil
+	}
+	claims := proto.GrantClaims{
+		Client: client, WS: wsID, Node: ws.Node, Principal: subject.ID, Tenant: subject.Tenant,
+		AuthzRevision: ws.AuthzRevision, ExpiresAt: expires, Gen: ws.Generation,
+	}
 	node := ws.Node
 	c.mu.Unlock()
 	sig := ed25519.Sign(c.key, proto.MustMarshal(claims))
@@ -1190,6 +2608,31 @@ func (c *Control) timerList() *proto.TimerListRes {
 	return out
 }
 
+func (c *Control) timerListAuthorized(ctx context.Context, from string) (*proto.TimerListRes, error) {
+	subject, err := c.subjectOf(from)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	var timers []proto.Timer
+	resources := make(map[string]Resource)
+	for _, timer := range c.timers {
+		if ws := c.workspaces[timer.WS]; ws != nil {
+			timers = append(timers, *timer)
+			resources[timer.WS] = workspaceResource(ws)
+		}
+	}
+	c.mu.Unlock()
+	out := &proto.TimerListRes{}
+	for _, timer := range timers {
+		if c.check(ctx, subject, ActionRead, resources[timer.WS]) == nil {
+			out.Timers = append(out.Timers, timer)
+		}
+	}
+	sort.Slice(out.Timers, func(i, j int) bool { return out.Timers[i].ID < out.Timers[j].ID })
+	return out, nil
+}
+
 // ---------------------------------------------------------------------------
 // background loop: leases, timers, re-offers
 // ---------------------------------------------------------------------------
@@ -1216,14 +2659,26 @@ func (c *Control) Tick(ctx context.Context) {
 	var fire []*proto.Timer
 	c.mu.Lock()
 	for _, ws := range c.workspaces {
-		if held(ws.State) && ws.LeaseUntil > 0 && ws.LeaseUntil < now {
-			ws.State = proto.WSPending
-			ws.Spec.RestoreFrom = ws.LastSnapshot
+		// Transitional states are owned by an in-flight control operation. The
+		// operation either commits them or, after a crash, load() marks them
+		// failed for reconciliation; lease expiry must not reassign mid-snapshot.
+		leaseManaged := ws.State == proto.WSClaimed || ws.State == proto.WSClaiming
+		if leaseManaged && ws.LeaseUntil > 0 && ws.LeaseUntil < now {
+			// Advancing the authoritative generation revokes every grant made
+			// under the expired assignment before another node may claim.
+			next := *ws
+			next.Generation++
+			next.State = proto.WSPending
+			next.Spec.RestoreFrom = next.LastSnapshot
 			lost := ws.Node
-			ws.Node = ""
-			ws.LeaseUntil = 0
-			c.saveWS(ws)
-			cp := *ws
+			next.Node = ""
+			next.LeaseUntil = 0
+			if err := c.persistWS(&next); err != nil {
+				c.logger.Error("persist lease expiry", "ws", ws.ID, "err", err)
+				continue
+			}
+			*ws = next
+			cp := next
 			cp.Node = lost
 			expired = append(expired, &cp)
 		}

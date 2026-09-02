@@ -6,6 +6,16 @@ statements that the described controls already exist.
 
 ## Documents
 
+### [Adversarial review — 2026-09-02](./adversarial-review-2026-09-02.md)
+
+Six independent reviewers audited one dimension each, and every candidate
+defect was then handed to a separate agent instructed to refute it. Thirty
+seven findings survived that pass, three of them critical, several with
+reproduced proofs of concept.
+
+Read it before trusting the security claims in the README or design document.
+All findings are open.
+
 ### [Code audit — 2026-09-02](./code-audit-2026-09-02.md)
 
 A point-in-time audit of the current implementation, including reproduced test

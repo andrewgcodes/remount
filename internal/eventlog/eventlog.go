@@ -101,13 +101,15 @@ type Subscription struct {
 	mu     sync.Mutex
 	lagged bool
 	closed bool
+	done   chan struct{}
+	once   sync.Once
 }
 
 // Subscribe returns a subscription delivering events with seq >= from
 // (0 = from the beginning; use Last()+1 for "only new"). Historical events
 // are read from the store, then live ones follow.
 func (l *Log) Subscribe(from uint64, stream string) *Subscription {
-	s := &Subscription{log: l, stream: stream, ch: make(chan proto.Event, 256), next: from}
+	s := &Subscription{log: l, stream: stream, ch: make(chan proto.Event, 256), next: from, done: make(chan struct{})}
 	l.mu.Lock()
 	l.subs[s] = struct{}{}
 	l.mu.Unlock()
@@ -170,6 +172,8 @@ func (s *Subscription) Next(ctx context.Context) ([]proto.Event, error) {
 			return batch, nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-s.done:
+			return nil, errors.New("eventlog: subscription closed")
 		}
 	}
 }
@@ -192,12 +196,15 @@ func (s *Subscription) drain() {
 
 // Close unsubscribes.
 func (s *Subscription) Close() {
-	s.log.mu.Lock()
-	delete(s.log.subs, s)
-	s.log.mu.Unlock()
-	s.mu.Lock()
-	s.closed = true
-	s.mu.Unlock()
+	s.once.Do(func() {
+		s.log.mu.Lock()
+		delete(s.log.subs, s)
+		s.log.mu.Unlock()
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		close(s.done)
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -290,8 +297,62 @@ func OpenSQLite(path string) (*SQLite, error) {
 		node TEXT NOT NULL DEFAULT '',
 		type TEXT NOT NULL,
 		payload BLOB,
-		cause INTEGER NOT NULL DEFAULT 0
+		cause INTEGER NOT NULL DEFAULT 0,
+		event_id TEXT NOT NULL DEFAULT '',
+		received_at INTEGER NOT NULL DEFAULT 0,
+		observed_at INTEGER NOT NULL DEFAULT 0,
+		origin TEXT NOT NULL DEFAULT '',
+		actor TEXT NOT NULL DEFAULT '',
+		tenant TEXT NOT NULL DEFAULT '',
+		workspace TEXT NOT NULL DEFAULT '',
+		generation INTEGER NOT NULL DEFAULT 0,
+		operation_id TEXT NOT NULL DEFAULT '',
+		producer_seq INTEGER NOT NULL DEFAULT 0
 	); CREATE INDEX IF NOT EXISTS events_stream ON events(stream, seq);`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// Additive migration for databases created before authoritative event
+	// metadata. SQLite has no IF NOT EXISTS for ADD COLUMN, so inspect first.
+	columns := []struct{ name, declaration string }{
+		{"event_id", "TEXT NOT NULL DEFAULT ''"}, {"received_at", "INTEGER NOT NULL DEFAULT 0"},
+		{"observed_at", "INTEGER NOT NULL DEFAULT 0"}, {"origin", "TEXT NOT NULL DEFAULT ''"},
+		{"actor", "TEXT NOT NULL DEFAULT ''"}, {"tenant", "TEXT NOT NULL DEFAULT ''"},
+		{"workspace", "TEXT NOT NULL DEFAULT ''"}, {"generation", "INTEGER NOT NULL DEFAULT 0"},
+		{"operation_id", "TEXT NOT NULL DEFAULT ''"}, {"producer_seq", "INTEGER NOT NULL DEFAULT 0"},
+	}
+	rows, err := db.Query(`PRAGMA table_info(events)`)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	present := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			db.Close()
+			return nil, err
+		}
+		present[name] = true
+	}
+	if err := rows.Close(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	for _, column := range columns {
+		if !present[column.name] {
+			if _, err := db.Exec(`ALTER TABLE events ADD COLUMN ` + column.name + ` ` + column.declaration); err != nil {
+				db.Close()
+				return nil, err
+			}
+		}
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS events_tenant ON events(tenant, seq);
+		CREATE UNIQUE INDEX IF NOT EXISTS events_origin_id ON events(origin, event_id) WHERE event_id != '';`); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -304,8 +365,12 @@ func (s *SQLite) DB() *sql.DB { return s.db }
 func (s *SQLite) Append(ctx context.Context, e *proto.Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.ExecContext(ctx, `INSERT INTO events(at, stream, principal, node, type, payload, cause) VALUES(?,?,?,?,?,?,?)`,
-		e.At, e.Stream, e.Principal, e.Node, e.Type, e.Payload, e.Cause)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO events(
+		at, stream, principal, node, type, payload, cause, event_id, received_at,
+		observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq
+	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		e.At, e.Stream, e.Principal, e.Node, e.Type, e.Payload, e.Cause, e.EventID, e.ReceivedAt,
+		e.ObservedAt, e.Origin, e.Actor, e.Tenant, e.Workspace, e.Generation, e.OperationID, e.ProducerSeq)
 	if err != nil {
 		return err
 	}
@@ -324,9 +389,13 @@ func (s *SQLite) Read(ctx context.Context, from uint64, stream string, limit int
 	var rows *sql.Rows
 	var err error
 	if stream == "" {
-		rows, err = s.db.QueryContext(ctx, `SELECT seq, at, stream, principal, node, type, payload, cause FROM events WHERE seq >= ? ORDER BY seq LIMIT ?`, from, limit)
+		rows, err = s.db.QueryContext(ctx, `SELECT seq, at, stream, principal, node, type, payload, cause,
+			event_id, received_at, observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq
+			FROM events WHERE seq >= ? ORDER BY seq LIMIT ?`, from, limit)
 	} else {
-		rows, err = s.db.QueryContext(ctx, `SELECT seq, at, stream, principal, node, type, payload, cause FROM events WHERE seq >= ? AND stream = ? ORDER BY seq LIMIT ?`, from, stream, limit)
+		rows, err = s.db.QueryContext(ctx, `SELECT seq, at, stream, principal, node, type, payload, cause,
+			event_id, received_at, observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq
+			FROM events WHERE seq >= ? AND stream = ? ORDER BY seq LIMIT ?`, from, stream, limit)
 	}
 	if err != nil {
 		return nil, err
@@ -335,7 +404,11 @@ func (s *SQLite) Read(ctx context.Context, from uint64, stream string, limit int
 	var out []proto.Event
 	for rows.Next() {
 		var e proto.Event
-		if err := rows.Scan(&e.Seq, &e.At, &e.Stream, &e.Principal, &e.Node, &e.Type, &e.Payload, &e.Cause); err != nil {
+		if err := rows.Scan(
+			&e.Seq, &e.At, &e.Stream, &e.Principal, &e.Node, &e.Type, &e.Payload, &e.Cause,
+			&e.EventID, &e.ReceivedAt, &e.ObservedAt, &e.Origin, &e.Actor, &e.Tenant,
+			&e.Workspace, &e.Generation, &e.OperationID, &e.ProducerSeq,
+		); err != nil {
 			return nil, err
 		}
 		out = append(out, e)

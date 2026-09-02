@@ -31,7 +31,7 @@ type Peer struct {
 	nextID  atomic.Uint64
 
 	mu      sync.Mutex
-	pending map[uint64]chan *proto.Frame
+	pending map[uint64]pendingRequest
 	closed  bool
 	done    chan struct{}
 	err     error
@@ -44,12 +44,20 @@ type Peer struct {
 	writeTimeout time.Duration
 }
 
+type pendingRequest struct {
+	from string
+	op   string
+	ch   chan *proto.Frame
+}
+
+const maxPendingRequests = 4096
+
 // NewPeer wraps conn and starts its read loop with the given handler.
 func NewPeer(conn Conn, handler Handler) *Peer {
 	p := &Peer{
 		conn:         conn,
 		handler:      handler,
-		pending:      map[uint64]chan *proto.Frame{},
+		pending:      map[uint64]pendingRequest{},
 		done:         make(chan struct{}),
 		writeTimeout: 30 * time.Second,
 	}
@@ -79,13 +87,19 @@ func (p *Peer) readLoop() {
 		switch f.T {
 		case proto.KindRes, proto.KindPong:
 			p.mu.Lock()
-			ch, ok := p.pending[f.ID]
+			pending, ok := p.pending[f.ID]
+			if ok && pending.from != "" && f.From != "" && f.From != pending.from {
+				ok = false
+			}
+			if ok && pending.op != "" && f.Op != pending.op {
+				ok = false
+			}
 			if ok {
 				delete(p.pending, f.ID)
 			}
 			p.mu.Unlock()
 			if ok {
-				ch <- f
+				pending.ch <- f
 				continue
 			}
 			// Not one of ours: a relay sees transit responses addressed to
@@ -114,11 +128,11 @@ func (p *Peer) fail(err error) {
 	p.closed = true
 	p.err = err
 	pend := p.pending
-	p.pending = map[uint64]chan *proto.Frame{}
+	p.pending = map[uint64]pendingRequest{}
 	p.mu.Unlock()
 	_ = p.conn.Close()
-	for _, ch := range pend {
-		ch <- nil // nil = connection failed
+	for _, pending := range pend {
+		pending.ch <- nil // nil = connection failed
 	}
 	close(p.done)
 }
@@ -157,7 +171,7 @@ func (p *Peer) Send(ctx context.Context, f *proto.Frame) error {
 func (p *Peer) Request(ctx context.Context, to, op string, body any) (*proto.Frame, error) {
 	id := p.nextID.Add(1)
 	f := proto.NewReq(id, to, op, body)
-	return p.roundTrip(ctx, id, f)
+	return p.roundTrip(ctx, id, to, op, f)
 }
 
 // RequestFrame sends an arbitrary frame that expects a res with the same ID
@@ -166,7 +180,7 @@ func (p *Peer) RequestFrame(ctx context.Context, f *proto.Frame) (*proto.Frame, 
 	if f.ID == 0 {
 		f.ID = p.nextID.Add(1)
 	}
-	return p.roundTrip(ctx, f.ID, f)
+	return p.roundTrip(ctx, f.ID, f.To, f.Op, f)
 }
 
 // Hello performs the hello exchange: it must be the first frame on a
@@ -188,18 +202,22 @@ func Hello(ctx context.Context, p *Peer, h proto.Hello) (*proto.HelloOK, error) 
 func (p *Peer) Ping(ctx context.Context) (time.Duration, error) {
 	id := p.nextID.Add(1)
 	start := time.Now()
-	_, err := p.roundTrip(ctx, id, &proto.Frame{V: proto.Version, T: proto.KindPing, ID: id})
+	_, err := p.roundTrip(ctx, id, "", "", &proto.Frame{V: proto.Version, T: proto.KindPing, ID: id})
 	return time.Since(start), err
 }
 
-func (p *Peer) roundTrip(ctx context.Context, id uint64, f *proto.Frame) (*proto.Frame, error) {
+func (p *Peer) roundTrip(ctx context.Context, id uint64, from, op string, f *proto.Frame) (*proto.Frame, error) {
 	ch := make(chan *proto.Frame, 1)
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
 		return nil, ErrClosed
 	}
-	p.pending[id] = ch
+	if len(p.pending) >= maxPendingRequests {
+		p.mu.Unlock()
+		return nil, proto.Err(proto.CodeDenied, "too many pending requests")
+	}
+	p.pending[id] = pendingRequest{from: from, op: op, ch: ch}
 	p.mu.Unlock()
 	if err := p.Send(ctx, f); err != nil {
 		p.mu.Lock()

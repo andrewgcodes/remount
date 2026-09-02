@@ -164,3 +164,25 @@ func TestSQLitePersistsAcrossOpen(t *testing.T) {
 		t.Fatal(e.Seq)
 	}
 }
+
+func TestSubscriptionCloseWakesBlockedNext(t *testing.T) {
+	l := New(NewMemory(0))
+	defer l.Close()
+	sub := l.Subscribe(1, "")
+	done := make(chan error, 1)
+	go func() {
+		_, err := sub.Next(context.Background())
+		done <- err
+	}()
+	sub.Close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("closed subscription returned no error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not wake Next")
+	}
+	// Idempotent close must not panic.
+	sub.Close()
+}

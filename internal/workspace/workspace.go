@@ -31,10 +31,17 @@ import (
 // Caps describes what a backend can do; advertised honestly to the control
 // plane so policy can refuse to place workloads that need more.
 type Caps struct {
-	Isolation      string // none | container | microvm
-	Snapshots      string // fs | fs+mem
-	EgressEnforced bool   // can the backend force all egress through the broker?
-	Display        bool
+	Isolation          string // none | process_sandbox | container | microvm
+	Snapshots          string // fs | fs+mem
+	EgressEnforced     bool   // can the backend force all egress through the broker?
+	Display            bool
+	MultiTenant        bool
+	SiblingIsolation   bool
+	EgressMode         string // open | cooperative_proxy | enforced_gateway
+	BrokerIdentity     string // none | token | unix_socket | workload_identity
+	FilesystemBoundary string
+	NetworkNamespace   bool
+	DeviceIsolation    bool
 }
 
 // Backend creates workspaces.
@@ -131,7 +138,10 @@ func NewProcess(dir string) (*Process, error) {
 func (p *Process) Name() string { return "process" }
 
 func (p *Process) Caps() Caps {
-	return Caps{Isolation: "none", Snapshots: "fs", EgressEnforced: false}
+	return Caps{
+		Isolation: "none", Snapshots: "fs", EgressEnforced: false,
+		EgressMode: "cooperative_proxy", BrokerIdentity: "token", FilesystemBoundary: "root_handle",
+	}
 }
 
 func (p *Process) root(id string) string { return filepath.Join(p.Dir, id) }
@@ -197,6 +207,7 @@ func (h *processHandle) Snapshot(ctx context.Context, excludes []string, w io.Wr
 }
 
 func (h *processHandle) Destroy(ctx context.Context) error {
+	_ = h.fs.Close()
 	return os.RemoveAll(h.root)
 }
 
@@ -230,7 +241,11 @@ func NewDocker(dir, defaultImage string) (*Docker, error) {
 func (d *Docker) Name() string { return "docker" }
 
 func (d *Docker) Caps() Caps {
-	return Caps{Isolation: "container", Snapshots: "fs", EgressEnforced: false}
+	return Caps{
+		Isolation: "container", Snapshots: "fs", EgressEnforced: false,
+		EgressMode: "cooperative_proxy", BrokerIdentity: "token", FilesystemBoundary: "bind_mount",
+		NetworkNamespace: true, DeviceIsolation: true,
+	}
 }
 
 // Available reports whether the docker daemon answers.
@@ -278,6 +293,7 @@ func (d *Docker) Create(ctx context.Context, id string, spec proto.WorkspaceSpec
 	name := d.container(id)
 	args := []string{"run", "-d", "--name", name, "--init",
 		"-v", root + ":/work", "-w", "/work",
+		"--add-host", "host.docker.internal:host-gateway",
 		"--label", "remount.workspace=" + id,
 	}
 	if spec.Requires.CPU > 0 {
@@ -370,6 +386,7 @@ func (h *dockerHandle) Snapshot(ctx context.Context, excludes []string, w io.Wri
 }
 
 func (h *dockerHandle) Destroy(ctx context.Context) error {
+	_ = h.fs.Close()
 	out, err := exec.CommandContext(ctx, h.bin, "rm", "-f", h.name).CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "No such container") {
 		return proto.Err(proto.CodeInternal, "docker rm: %s", strings.TrimSpace(string(out)))
@@ -415,6 +432,42 @@ func (r *Registry) Get(name string) (Backend, error) {
 // Names lists registered backends in order.
 func (r *Registry) Names() []string { return append([]string(nil), r.order...) }
 
+// Descriptors returns immutable, per-backend capability evidence.
+func (r *Registry) Descriptors() []proto.BackendDescriptor {
+	out := make([]proto.BackendDescriptor, 0, len(r.order))
+	for _, name := range r.order {
+		caps := r.backends[name].Caps()
+		egress := caps.EgressMode
+		if egress == "" {
+			egress = "open"
+		}
+		if caps.EgressEnforced {
+			egress = "enforced_gateway"
+		}
+		out = append(out, proto.BackendDescriptor{
+			Name: name,
+			Security: proto.BackendSecurityCaps{
+				Isolation: caps.Isolation, MultiTenant: caps.MultiTenant,
+				SiblingIsolation: caps.SiblingIsolation, EgressMode: egress,
+				BrokerIdentity: caps.BrokerIdentity, FilesystemBoundary: caps.FilesystemBoundary,
+				NetworkNamespace: caps.NetworkNamespace, DeviceIsolation: caps.DeviceIsolation,
+			},
+			Runtime: proto.RuntimeCaps{Snapshots: caps.Snapshots, Display: caps.Display},
+		})
+	}
+	return out
+}
+
+// Descriptor reports one registered backend's capabilities.
+func (r *Registry) Descriptor(name string) (proto.BackendDescriptor, error) {
+	for _, d := range r.Descriptors() {
+		if d.Name == name {
+			return d, nil
+		}
+	}
+	return proto.BackendDescriptor{}, proto.Err(proto.CodeUnsupported, "backend %q not available on this node", name)
+}
+
 // HostInfo fills the static parts of NodeInfo.
 func HostInfo(backends []string) proto.NodeInfo {
 	return proto.NodeInfo{
@@ -425,4 +478,11 @@ func HostInfo(backends []string) proto.NodeInfo {
 		MemMiB:    totalMemMiB(),
 		Snapshots: "fs",
 	}
+}
+
+// HostInfoForRegistry fills NodeInfo with backend-specific descriptors.
+func HostInfoForRegistry(r *Registry) proto.NodeInfo {
+	info := HostInfo(r.Names())
+	info.BackendDescriptors = r.Descriptors()
+	return info
 }

@@ -196,7 +196,7 @@ func (c *Control) WorkspacePlacement(id string) []proto.Finding {
 		}
 		out = append(out, proto.Finding{
 			Severity: "info", Check: "placement.ineligible", Subject: nid,
-			Detail: ineligibleReason(ws, n),
+			Detail: c.ineligibleReason(ws, n),
 		})
 	}
 	return out
@@ -204,7 +204,7 @@ func (c *Control) WorkspacePlacement(id string) []proto.Finding {
 
 // ineligibleReason explains, in one sentence, why a node cannot take a
 // workspace. Caller holds c.mu.
-func ineligibleReason(ws *proto.Workspace, n *nodeState) string {
+func (c *Control) ineligibleReason(ws *proto.Workspace, n *nodeState) string {
 	if !n.Status.Online {
 		return "offline"
 	}
@@ -221,7 +221,7 @@ func ineligibleReason(ws *proto.Workspace, n *nodeState) string {
 	if r.CPU > 0 && n.Status.Info.CPU < r.CPU {
 		return fmt.Sprintf("has %d cpus, workspace requires %d", n.Status.Info.CPU, r.CPU)
 	}
-	if r.MemMiB > 0 && n.Status.Info.MemMiB > 0 && n.Status.Info.MemMiB < r.MemMiB {
+	if r.MemMiB > 0 && n.Status.Info.MemMiB < r.MemMiB {
 		return fmt.Sprintf("has %d MiB, workspace requires %d MiB", n.Status.Info.MemMiB, r.MemMiB)
 	}
 	for _, cap := range r.Caps {
@@ -237,6 +237,9 @@ func ineligibleReason(ws *proto.Workspace, n *nodeState) string {
 		if n.Status.Labels[k] != v {
 			return fmt.Sprintf("label %s=%q does not match required %q", k, n.Status.Labels[k], v)
 		}
+	}
+	if _, ok := c.eligibleBackendLocked(ws, n); !ok {
+		return fmt.Sprintf("no backend satisfies security profile %q", ws.Spec.Security.Profile)
 	}
 	return "unknown"
 }

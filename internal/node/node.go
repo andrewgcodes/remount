@@ -12,6 +12,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,12 +50,18 @@ type Options struct {
 	// Empty disables uploads (snapshots stay local).
 	ArtifactURL string
 	HTTPClient  *http.Client
-	Logger      *slog.Logger
+	// MaxArtifactBytes bounds compressed snapshots and remote downloads.
+	// Zero selects 8 GiB.
+	MaxArtifactBytes int64
+	Logger           *slog.Logger
 	// Allow lists hosts every workspace on this node may reach without a credential.
 	Allow []string
 	// AllowPrivate lists hosts that may resolve to private addresses (local models).
 	AllowPrivate []string
-	Version      string
+	// BrokerRootCAs augments trust for broker-reoriginated TLS (primarily
+	// private providers and deterministic integration tests).
+	BrokerRootCAs *x509.CertPool
+	Version       string
 	// Caps advertises extra capabilities (display, gpu …).
 	Caps []string
 }
@@ -77,9 +85,18 @@ type Node struct {
 	// materializing holds workspaces this node has claimed but not finished
 	// restoring: their leases must be renewed too, or a slow restore loses
 	// the claim it is working on.
-	materializing map[string]uint64       // ws -> generation
+	materializing map[string]*materialization
+	deadlines     map[string]time.Time    // monotonic local self-fence deadline
+	quarantined   map[string]struct{}     // local bytes retained but never served
 	grants        map[string]*proto.Grant // client|ws -> grant
 	subs          map[string]*subscriber  // client|session -> active stream
+	prepared      map[string]*preparedRelease
+	committed     map[string]uint64 // idempotent release commits by workspace
+	eventClaims   map[string]eventClaim
+
+	mutationMu   sync.Mutex
+	mutations    map[string]*mutationEntry
+	mutationPath string
 
 	started time.Time
 	stop    chan struct{}
@@ -98,7 +115,47 @@ type ws struct {
 
 // subscriber streams one session's log to one client.
 type subscriber struct {
-	cancel context.CancelFunc
+	client  string
+	ws      string
+	session string
+	cancel  context.CancelFunc
+}
+
+type preparedRelease struct {
+	workspace *ws
+	request   proto.WSReleaseReq
+	response  proto.WSReleasedReq
+	done      chan struct{}
+	err       error
+}
+
+// eventClaim retains the authenticated assignment metadata needed to forward
+// late node events after a workspace has been fenced or released locally.
+// The control plane still verifies this tuple against durable assignment
+// history; these values are hints, never authority by themselves.
+type eventClaim struct {
+	tenant     string
+	generation uint64
+}
+
+type materialization struct {
+	generation uint64
+	deadline   time.Time
+	cancel     context.CancelFunc
+}
+
+type mutationEntry struct {
+	Fingerprint [32]byte
+	Result      []byte
+	CompletedAt int64
+	done        chan struct{}
+	err         error
+}
+
+type persistedMutation struct {
+	Fingerprint []byte `cbor:"fingerprint"`
+	Result      []byte `cbor:"result"`
+	CompletedAt int64  `cbor:"completed_at"`
 }
 
 // New loads or creates the node identity and prepares runtime state.
@@ -111,6 +168,9 @@ func New(opts Options) (*Node, error) {
 	}
 	if opts.HTTPClient == nil {
 		opts.HTTPClient = &http.Client{Timeout: 10 * time.Minute}
+	}
+	if opts.MaxArtifactBytes <= 0 {
+		opts.MaxArtifactBytes = 8 << 30
 	}
 	for _, d := range []string{"", "ws", "spill", "artifacts"} {
 		if err := os.MkdirAll(filepath.Join(opts.DataDir, d), 0o700); err != nil {
@@ -132,11 +192,20 @@ func New(opts Options) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	mutationPath := filepath.Join(opts.DataDir, "mutations.cbor")
+	mutations, err := loadMutations(mutationPath)
+	if err != nil {
+		return nil, err
+	}
 	n := &Node{
 		opts: opts, id: id, priv: priv, logger: opts.Logger.With("node", id),
 		store: store, events: eventlog.New(eventlog.NewMemory(10000)),
-		workspaces: map[string]*ws{}, materializing: map[string]uint64{},
+		workspaces: map[string]*ws{}, materializing: map[string]*materialization{},
+		deadlines: map[string]time.Time{}, quarantined: map[string]struct{}{},
 		grants: map[string]*proto.Grant{}, subs: map[string]*subscriber{},
+		prepared: map[string]*preparedRelease{}, committed: map[string]uint64{},
+		eventClaims: map[string]eventClaim{},
+		mutations:   mutations, mutationPath: mutationPath,
 		started: time.Now(), stop: make(chan struct{}), online: make(chan struct{}),
 	}
 	n.sessions = session.NewManager(session.ManagerOptions{
@@ -146,6 +215,127 @@ func New(opts Options) (*Node, error) {
 		},
 	})
 	return n, nil
+}
+
+func loadMutations(path string) (map[string]*mutationEntry, error) {
+	out := map[string]*mutationEntry{}
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return out, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var stored map[string]persistedMutation
+	if err := proto.Unmarshal(b, &stored); err != nil {
+		return nil, fmt.Errorf("node: corrupt mutation journal: %w", err)
+	}
+	for key, record := range stored {
+		if len(record.Fingerprint) != sha256.Size {
+			return nil, fmt.Errorf("node: corrupt mutation journal fingerprint for %q", key)
+		}
+		entry := &mutationEntry{Result: append([]byte(nil), record.Result...), CompletedAt: record.CompletedAt, done: make(chan struct{})}
+		copy(entry.Fingerprint[:], record.Fingerprint)
+		close(entry.done)
+		out[key] = entry
+	}
+	return out, nil
+}
+
+func (n *Node) persistMutationsLocked() error {
+	const maxMutationRecords = 10_000
+	if len(n.mutations) > maxMutationRecords {
+		var oldestKey string
+		var oldest int64
+		for key, entry := range n.mutations {
+			select {
+			case <-entry.done:
+				if entry.err == nil && (oldestKey == "" || entry.CompletedAt < oldest) {
+					oldestKey, oldest = key, entry.CompletedAt
+				}
+			default:
+			}
+		}
+		if oldestKey != "" {
+			delete(n.mutations, oldestKey)
+		}
+	}
+	stored := make(map[string]persistedMutation, len(n.mutations))
+	for key, entry := range n.mutations {
+		select {
+		case <-entry.done:
+			if entry.err == nil {
+				stored[key] = persistedMutation{
+					Fingerprint: append([]byte(nil), entry.Fingerprint[:]...),
+					Result:      append([]byte(nil), entry.Result...), CompletedAt: entry.CompletedAt,
+				}
+			}
+		default:
+		}
+	}
+	b, err := proto.Marshal(stored)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(n.mutationPath), ".mutations-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err == nil {
+		_, err = tmp.Write(b)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(tmpName, n.mutationPath)
+	}
+	return err
+}
+
+func (n *Node) runMutation(ctx context.Context, key string, request any, apply func() ([]byte, error)) ([]byte, error) {
+	if key == "" {
+		return apply()
+	}
+	fingerprint := sha256.Sum256(proto.MustMarshal(request))
+	n.mutationMu.Lock()
+	if existing := n.mutations[key]; existing != nil {
+		if existing.Fingerprint != fingerprint {
+			n.mutationMu.Unlock()
+			return nil, proto.Err(proto.CodeConflict, "idempotency key was reused with different arguments")
+		}
+		done := existing.done
+		n.mutationMu.Unlock()
+		select {
+		case <-done:
+			return append([]byte(nil), existing.Result...), existing.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	entry := &mutationEntry{Fingerprint: fingerprint, done: make(chan struct{})}
+	n.mutations[key] = entry
+	n.mutationMu.Unlock()
+
+	result, err := apply()
+	n.mutationMu.Lock()
+	entry.Result, entry.err, entry.CompletedAt = append([]byte(nil), result...), err, time.Now().UnixMilli()
+	if err != nil {
+		delete(n.mutations, key) // failed operations remain retryable
+	}
+	close(entry.done)
+	if err == nil {
+		if persistErr := n.persistMutationsLocked(); persistErr != nil {
+			n.logger.Error("persist mutation journal", "err", persistErr)
+		}
+	}
+	n.mutationMu.Unlock()
+	return result, err
 }
 
 // ID returns the node id.
@@ -169,6 +359,10 @@ func loadIdentity(path string) (string, ed25519.PrivateKey, error) {
 		if err := json.Unmarshal(b, &f); err == nil && len(f.Priv) == ed25519.PrivateKeySize && strings.HasPrefix(f.ID, "n_") {
 			return f.ID, ed25519.PrivateKey(f.Priv), nil
 		}
+		return "", nil, fmt.Errorf("node: identity file %s is corrupt; refusing to replace enrolled identity", path)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", nil, err
 	}
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -176,7 +370,25 @@ func loadIdentity(path string) (string, ed25519.PrivateKey, error) {
 	}
 	f := identityFile{ID: ids.New("n"), Priv: priv}
 	b, _ = json.Marshal(f)
-	if err := os.WriteFile(path, b, 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".identity-*")
+	if err != nil {
+		return "", nil, err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err == nil {
+		_, err = tmp.Write(b)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(tmpName, path)
+	}
+	if err != nil {
 		return "", nil, err
 	}
 	return f.ID, priv, nil
@@ -184,20 +396,18 @@ func loadIdentity(path string) (string, ed25519.PrivateKey, error) {
 
 // emit records an event locally and forwards it to the control plane.
 func (n *Node) emit(typ, stream, principal string, payload any) {
-	ctx := context.Background()
-	e, err := n.events.Emit(ctx, typ, stream, principal, n.id, payload, 0)
-	if err != nil {
-		return
+	e := &proto.Event{Type: typ, Stream: stream, Principal: principal, Node: n.id, Origin: "node", Actor: n.id}
+	if payload != nil {
+		e.Payload = proto.MustMarshal(payload)
 	}
-	n.mu.Lock()
-	p := n.peer
-	n.mu.Unlock()
-	if p != nil {
-		go func() {
-			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			defer cancel()
-			_ = p.Call(cctx, proto.PeerControl, proto.OpEventsPost, proto.EventPost{Events: []proto.Event{*e}}, nil)
-		}()
+	if strings.HasPrefix(stream, "ws_") {
+		n.mu.Lock()
+		claim := n.eventClaims[stream]
+		n.mu.Unlock()
+		e.Workspace, e.Tenant, e.Generation = stream, claim.tenant, claim.generation
+	}
+	if err := n.events.Append(context.Background(), e); err != nil {
+		n.logger.Error("append node event", "type", typ, "workspace", stream, "err", err)
 	}
 }
 
@@ -207,25 +417,85 @@ func (n *Node) emit(typ, stream, principal string, payload any) {
 
 // Run connects (and reconnects) to the relay until ctx ends.
 func (n *Node) Run(ctx context.Context) error {
-	n.wg.Add(1)
+	n.wg.Add(3)
 	go n.renewLoop(ctx)
+	go n.fenceLoop(ctx)
+	go n.eventLoop(ctx)
 	defer n.wg.Wait()
 	defer n.shutdown()
-	backoff := time.Second
+	backoff := 100 * time.Millisecond
 	for {
+		connectedAt := time.Now()
 		err := n.connectOnce(ctx)
 		if ctx.Err() != nil {
 			return nil
 		}
-		n.logger.Warn("uplink lost; reconnecting", "err", err, "backoff", backoff)
+		// A connection that remained healthy for a while starts a fresh retry
+		// epoch. Without this reset, unrelated flaps days apart eventually wait
+		// the full cap and unnecessarily cross local lease safety deadlines.
+		if time.Since(connectedAt) >= 30*time.Second {
+			backoff = 100 * time.Millisecond
+		}
+		delay := backoff
+		n.mu.Lock()
+		holding := len(n.workspaces) > 0 || len(n.materializing) > 0
+		if holding {
+			maxDelay := n.localLeaseWindowLocked() / 4
+			if maxDelay < 25*time.Millisecond {
+				maxDelay = 25 * time.Millisecond
+			}
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+		}
+		n.mu.Unlock()
+		n.logger.Warn("uplink lost; reconnecting", "err", err, "backoff", delay)
 		select {
-		case <-time.After(backoff):
+		case <-time.After(delay):
 		case <-ctx.Done():
 			return nil
 		}
 		backoff *= 2
 		if backoff > 30*time.Second {
 			backoff = 30 * time.Second
+		}
+	}
+}
+
+// eventLoop is the node event outbox. One ordered producer retains an
+// unacknowledged batch across reconnects; control deduplicates retries using
+// the node log's sequence number.
+func (n *Node) eventLoop(ctx context.Context) {
+	defer n.wg.Done()
+	sub := n.events.Subscribe(1, "")
+	defer sub.Close()
+	var pending []proto.Event
+	for {
+		if len(pending) == 0 {
+			events, err := sub.Next(ctx)
+			if err != nil {
+				return
+			}
+			pending = events
+		}
+		n.mu.Lock()
+		p := n.peer
+		n.mu.Unlock()
+		if p != nil {
+			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := p.Call(cctx, proto.PeerControl, proto.OpEventsPost, proto.EventPost{Events: pending}, nil)
+			cancel()
+			if err == nil {
+				pending = nil
+				continue
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-n.stop:
+			return
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
@@ -238,6 +508,10 @@ func (n *Node) shutdown() {
 		if w.broker != nil {
 			w.broker.Close()
 		}
+		_ = w.handle.FS().Close()
+	}
+	for _, prepared := range n.prepared {
+		_ = prepared.workspace.handle.FS().Close()
 	}
 	n.mu.Unlock()
 }
@@ -252,10 +526,16 @@ func (n *Node) connectOnce(ctx context.Context) error {
 		Peer: n.id, Role: proto.RoleNode, Token: n.opts.Token, Caps: []string{"v1"},
 		PubKey: n.priv.Public().(ed25519.PublicKey), Labels: n.opts.Labels,
 	}
-	info := workspace.HostInfo(n.opts.Backends.Names())
+	info := workspace.HostInfoForRegistry(n.opts.Backends)
 	info.Version = n.opts.Version
 	info.Caps = n.opts.Caps
 	hello.Node = &info
+	hello.IssuedAt = time.Now().UnixMilli()
+	hello.Nonce = make([]byte, 32)
+	if _, err := rand.Read(hello.Nonce); err != nil {
+		return err
+	}
+	hello.Proof = ed25519.Sign(n.priv, proto.HelloProofBytes(hello))
 	return n.helloAndServe(ctx, peer, hello)
 }
 
@@ -330,6 +610,24 @@ func (n *Node) renewLoop(ctx context.Context) {
 	}
 }
 
+// fenceLoop is deliberately independent of renewal I/O. A wedged control RPC
+// must not postpone the local safety deadline it is supposed to enforce.
+func (n *Node) fenceLoop(ctx context.Context) {
+	defer n.wg.Done()
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-n.stop:
+			return
+		case now := <-t.C:
+			n.fenceExpired(ctx, now)
+		}
+	}
+}
+
 func (n *Node) renew(ctx context.Context) {
 	n.mu.Lock()
 	p := n.peer
@@ -338,10 +636,10 @@ func (n *Node) renew(ctx context.Context) {
 		req.IDs = append(req.IDs, id)
 		req.Gen[id] = w.Generation
 	}
-	for id, gen := range n.materializing {
-		if _, done := n.workspaces[id]; !done {
+	for id, materializing := range n.materializing {
+		if _, done := n.workspaces[id]; !done && materializing.generation != 0 {
 			req.IDs = append(req.IDs, id)
-			req.Gen[id] = gen
+			req.Gen[id] = materializing.generation
 		}
 	}
 	// Refresh broker leases that are within a minute of expiry.
@@ -359,14 +657,80 @@ func (n *Node) renew(ctx context.Context) {
 		return
 	}
 	if len(req.IDs) > 0 {
+		var res proto.WSRenewRes
 		rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		if err := p.Call(rctx, proto.PeerControl, proto.OpWSRenew, req, nil); err != nil {
+		if err := p.Call(rctx, proto.PeerControl, proto.OpWSRenew, req, &res); err != nil {
 			n.logger.Warn("renew failed", "err", err)
+		} else {
+			n.applyRenewResults(req, &res)
 		}
 		cancel()
 	}
 	for _, w := range refresh {
 		n.refreshLeases(ctx, w)
+	}
+}
+
+func (n *Node) applyRenewResults(req proto.WSRenewReq, res *proto.WSRenewRes) {
+	results := make(map[string]proto.WSRenewResult, len(res.Results))
+	for _, result := range res.Results {
+		results[result.ID] = result
+	}
+	for _, id := range req.IDs {
+		result, ok := results[id]
+		if !ok || !result.Accepted || result.Generation != req.Gen[id] {
+			reason := "renewal result missing"
+			if ok {
+				reason = fmt.Sprintf("renewal rejected: action=%s authoritative_gen=%d", result.Action, result.AuthoritativeGen)
+			}
+			n.fenceWorkspace(context.Background(), id, reason)
+			continue
+		}
+		deadline := time.Now().Add(n.localLeaseWindow())
+		n.mu.Lock()
+		if w := n.workspaces[id]; w != nil && w.Generation == result.Generation {
+			n.deadlines[id] = deadline
+			w.LeaseUntil = result.LeaseUntil
+		}
+		if materializing := n.materializing[id]; materializing != nil && materializing.generation == result.Generation {
+			materializing.deadline = deadline
+		}
+		n.mu.Unlock()
+	}
+}
+
+func (n *Node) localLeaseWindow() time.Duration {
+	n.mu.Lock()
+	d := n.localLeaseWindowLocked()
+	n.mu.Unlock()
+	return d
+}
+
+func (n *Node) localLeaseWindowLocked() time.Duration {
+	seconds := n.leaseSec
+	if seconds <= 0 {
+		seconds = 30
+	}
+	// Fence with one third of the authoritative lease still remaining.
+	return time.Duration(seconds) * time.Second * 2 / 3
+}
+
+func (n *Node) fenceExpired(ctx context.Context, now time.Time) {
+	n.mu.Lock()
+	var expired []string
+	for id, deadline := range n.deadlines {
+		if !deadline.IsZero() && !now.Before(deadline) {
+			expired = append(expired, id)
+		}
+	}
+	for id, materializing := range n.materializing {
+		if !materializing.deadline.IsZero() && !now.Before(materializing.deadline) {
+			expired = append(expired, id)
+		}
+	}
+	n.mu.Unlock()
+	for _, id := range expired {
+		n.fenceWorkspace(ctx, id, "local lease safety deadline elapsed")
 	}
 }
 
@@ -395,7 +759,7 @@ func (n *Node) refreshLeases(ctx context.Context, w *ws) {
 // resync re-declares the workspaces this node is already serving. A control
 // plane that saw us disconnect has demoted them; ws.ready promotes them back.
 // A conflict means the workspace moved on without us, so the local copy is
-// dropped.
+// fenced and retained for reconciliation.
 func (n *Node) resync(ctx context.Context) {
 	n.mu.Lock()
 	p := n.peer
@@ -412,12 +776,18 @@ func (n *Node) resync(ctx context.Context) {
 		err := p.Call(rctx, proto.PeerControl, proto.OpWSReady, proto.WSReadyReq{ID: w.ID, Gen: w.Generation}, nil)
 		cancel()
 		if err == nil {
+			n.mu.Lock()
+			if current := n.workspaces[w.ID]; current == w && current.Generation == w.Generation {
+				n.deadlines[w.ID] = time.Now().Add(n.localLeaseWindowLocked())
+			}
+			n.mu.Unlock()
 			continue
 		}
 		var pe *proto.Error
 		if errors.As(err, &pe) && (pe.Code == proto.CodeConflict || pe.Code == proto.CodeNotFound) {
-			n.logger.Info("dropping workspace we no longer own", "ws", w.ID, "reason", pe.Code)
-			n.dropWorkspace(ctx, w.ID)
+			n.logger.Warn("fencing workspace pending reconciliation", "ws", w.ID, "reason", pe.Code)
+			n.fenceWorkspace(ctx, w.ID, "ready rejected during reconnect: "+pe.Code)
+			go n.tryClaim(context.WithoutCancel(ctx), w.ID, true)
 			continue
 		}
 		n.logger.Warn("resync failed", "ws", w.ID, "err", err)
@@ -456,29 +826,54 @@ func writeWorkspaceEnv(handle workspace.Handle, w *ws) error {
 	return handle.FS().Write(EnvFilePath, []byte(b.String()), 0o644, false, true)
 }
 
-// dropWorkspace tears down a workspace locally without telling the control
-// plane (it already knows, or no longer cares).
-func (n *Node) dropWorkspace(ctx context.Context, id string) {
+// fenceWorkspace stops all execution and egress but preserves the filesystem.
+// Authority disagreement is not permission to delete the only current copy.
+func (n *Node) fenceWorkspace(ctx context.Context, id, reason string) {
 	n.mu.Lock()
 	w := n.workspaces[id]
+	materializing := n.materializing[id]
+	if w == nil && materializing == nil {
+		n.mu.Unlock()
+		return
+	}
 	delete(n.workspaces, id)
+	delete(n.deadlines, id)
+	n.quarantined[id] = struct{}{}
+	if materializing != nil {
+		materializing.cancel()
+	}
 	for k, s := range n.subs {
-		if strings.HasSuffix(k, "|"+id) {
+		if s.ws == id {
 			s.cancel()
 			delete(n.subs, k)
 		}
 	}
 	n.mu.Unlock()
-	if w == nil {
-		return
-	}
 	n.sessions.KillWorkspace(id)
-	if w.broker != nil {
-		w.broker.Close()
+	if w != nil {
+		if w.broker != nil {
+			w.broker.Close()
+		}
+		_ = w.handle.FS().Close()
 	}
-	if err := w.handle.Destroy(ctx); err != nil {
-		n.logger.Warn("destroy failed", "ws", id, "err", err)
+	n.logger.Warn("workspace fenced; local filesystem retained", "ws", id, "reason", reason)
+	n.emit(proto.EvWSFenced, id, "", map[string]any{"reason": reason})
+}
+
+// quarantineMaterialization makes a partially prepared filesystem inert while
+// retaining its bytes for reconciliation. Setup failure is not proof that the
+// local tree is disposable: it may be the only copy left after a restart.
+func (n *Node) quarantineMaterialization(id string, handle workspace.Handle, b *broker.Broker, reason string) {
+	if b != nil {
+		b.Close()
 	}
+	if handle != nil {
+		_ = handle.FS().Close()
+	}
+	n.mu.Lock()
+	n.quarantined[id] = struct{}{}
+	n.mu.Unlock()
+	n.logger.Warn("workspace materialization quarantined; local filesystem retained", "ws", id, "reason", reason)
 }
 
 // reclaimLocal re-claims workspaces whose directories are still on disk.
@@ -532,7 +927,7 @@ func (n *Node) dropClient(client string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for k, s := range n.subs {
-		if strings.HasPrefix(k, client+"|") {
+		if s.client == client {
 			s.cancel()
 			delete(n.subs, k)
 		}
@@ -586,6 +981,9 @@ func (n *Node) authorize(client, wsID string, g *proto.Grant) (*ws, error) {
 	if g.Claims.Gen != w.Generation {
 		return nil, proto.Err(proto.CodeConflict, "grant generation %d != workspace generation %d (workspace moved?)", g.Claims.Gen, w.Generation)
 	}
+	if g.Claims.Tenant != w.Tenant || g.Claims.AuthzRevision != w.AuthzRevision {
+		return nil, proto.Err(proto.CodeUnauthorized, "grant authorization revision or tenant is stale")
+	}
 	n.grants[key] = g
 	return w, nil
 }
@@ -599,6 +997,18 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 				return nil, err
 			}
 			return n.release(ctx, req)
+		case proto.OpWSReleaseCommit:
+			req, err := decode[proto.WSReleaseCommitReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return struct{}{}, n.releaseCommit(ctx, req)
+		case proto.OpWSReleaseAbort:
+			req, err := decode[proto.WSReleaseCommitReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return struct{}{}, n.releaseAbort(req)
 		}
 		return nil, proto.Err(proto.CodeUnsupported, "unknown control op %q", f.Op)
 	}
@@ -660,13 +1070,13 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		n.subscribe(p, f.From, s, req.From)
-		return proto.SOpenRes{S: s.ID, Next: s.Log.Next()}, nil
+		return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq()}, nil
 	case proto.OpSInput:
 		req, err := decode[proto.SInputReq](f)
 		if err != nil {
 			return nil, err
 		}
-		s, err := n.sessionFor(f.From, req.S, nil)
+		s, err := n.sessionFor(f.From, req.S, req.Grant)
 		if err != nil {
 			return nil, err
 		}
@@ -676,7 +1086,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		s, err := n.sessionFor(f.From, req.S, nil)
+		s, err := n.sessionFor(f.From, req.S, req.Grant)
 		if err != nil {
 			return nil, err
 		}
@@ -686,19 +1096,26 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		s, err := n.sessionFor(f.From, req.S, nil)
+		s, err := n.sessionFor(f.From, req.S, req.Grant)
 		if err != nil {
 			return nil, err
 		}
 		return struct{}{}, s.Signal(req.Signal)
 	case proto.OpSAck:
+		req, err := decode[proto.SAckReq](f)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := n.sessionFor(f.From, req.S, req.Grant); err != nil {
+			return nil, err
+		}
 		return struct{}{}, nil // liveness only in v0; cursors are per-subscriber
 	case proto.OpSClose:
 		req, err := decode[proto.SCloseReq](f)
 		if err != nil {
 			return nil, err
 		}
-		s, err := n.sessionFor(f.From, req.S, nil)
+		s, err := n.sessionFor(f.From, req.S, req.Grant)
 		if err != nil {
 			return nil, err
 		}
@@ -712,7 +1129,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		s, err := n.sessionFor(f.From, req.S, nil)
+		s, err := n.sessionFor(f.From, req.S, req.Grant)
 		if err != nil {
 			return nil, err
 		}
@@ -733,7 +1150,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		if req.WS != "" {
-			if _, err := n.authorize(f.From, req.WS, nil); err != nil {
+			if _, err := n.authorize(f.From, req.WS, req.Grant); err != nil {
 				return nil, err
 			}
 		}
@@ -766,11 +1183,20 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		if err := w.handle.FS().Write(req.Path, req.Data, req.Mode, req.Append, req.MkdirP); err != nil {
-			return nil, err
+		clean := *req
+		clean.Grant = nil
+		key := ""
+		if req.IdempotencyKey != "" {
+			key = f.From + "|" + w.ID + "|fs.write|" + req.IdempotencyKey
 		}
-		n.emit(proto.EvFSWrite, w.ID, w.Spec.Principal, map[string]any{"path": req.Path, "bytes": len(req.Data), "client": f.From})
-		return struct{}{}, nil
+		_, err = n.runMutation(ctx, key, clean, func() ([]byte, error) {
+			if err := w.handle.FS().Write(req.Path, req.Data, req.Mode, req.Append, req.MkdirP); err != nil {
+				return nil, err
+			}
+			n.emit(proto.EvFSWrite, w.ID, w.Spec.Principal, map[string]any{"path": req.Path, "bytes": len(req.Data), "client": f.From})
+			return proto.Marshal(struct{}{})
+		})
+		return struct{}{}, err
 	case proto.OpFSList:
 		req, err := decode[proto.FSListReq](f)
 		if err != nil {
@@ -852,12 +1278,28 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		nrep, err := w.handle.FS().Edit(req.Path, req.Edits)
+		clean := *req
+		clean.Grant = nil
+		key := ""
+		if req.IdempotencyKey != "" {
+			key = f.From + "|" + w.ID + "|fs.edit|" + req.IdempotencyKey
+		}
+		raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
+			nrep, err := w.handle.FS().Edit(req.Path, req.Edits)
+			if err != nil {
+				return nil, err
+			}
+			n.emit(proto.EvFSEdit, w.ID, w.Spec.Principal, map[string]any{"path": req.Path, "replacements": nrep, "client": f.From})
+			return proto.Marshal(proto.FSEditRes{Replacements: nrep})
+		})
 		if err != nil {
 			return nil, err
 		}
-		n.emit(proto.EvFSEdit, w.ID, w.Spec.Principal, map[string]any{"path": req.Path, "replacements": nrep, "client": f.From})
-		return proto.FSEditRes{Replacements: nrep}, nil
+		var result proto.FSEditRes
+		if err := proto.Unmarshal(raw, &result); err != nil {
+			return nil, err
+		}
+		return result, nil
 	case proto.OpWSSnapshot:
 		req, err := decode[proto.WSSnapshotReq](f)
 		if err != nil {
@@ -867,17 +1309,41 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		id, size, err := n.snapshot(ctx, w, req.Upload)
+		clean := *req
+		clean.Grant = nil
+		key := ""
+		if req.IdempotencyKey != "" {
+			key = f.From + "|" + w.ID + "|ws.snapshot|" + req.IdempotencyKey
+		}
+		raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
+			id, size, err := n.snapshot(ctx, w, req.Upload)
+			if err != nil {
+				return nil, err
+			}
+			if req.Upload {
+				cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				err = p.Call(cctx, proto.PeerControl, proto.OpWSSnapshotCommit, proto.WSSnapshotCommitReq{ID: w.ID, Gen: w.Generation, Snapshot: id}, nil)
+				cancel()
+				if err != nil {
+					return nil, fmt.Errorf("commit snapshot: %w", err)
+				}
+			}
+			return proto.Marshal(proto.WSSnapshotRes{Artifact: id, Bytes: size})
+		})
 		if err != nil {
 			return nil, err
 		}
-		return proto.WSSnapshotRes{Artifact: id, Bytes: size}, nil
+		var result proto.WSSnapshotRes
+		if err := proto.Unmarshal(raw, &result); err != nil {
+			return nil, err
+		}
+		return result, nil
 	case proto.OpWSInfo:
 		req, err := decode[proto.WSGetReq](f)
 		if err != nil {
 			return nil, err
 		}
-		w, err := n.authorize(f.From, req.ID, nil)
+		w, err := n.authorize(f.From, req.ID, req.Grant)
 		if err != nil {
 			return nil, err
 		}
@@ -906,8 +1372,9 @@ func (n *Node) sessionFor(client, sid string, g *proto.Grant) (*session.Session,
 }
 
 func (n *Node) status() proto.NodeStatus {
-	info := workspace.HostInfo(n.opts.Backends.Names())
+	info := workspace.HostInfoForRegistry(n.opts.Backends)
 	info.Version = n.opts.Version
+	info.Caps = append([]string(nil), n.opts.Caps...)
 	st := proto.NodeStatus{ID: n.id, Labels: n.opts.Labels, Info: info, Online: true, LastSeen: time.Now().UnixMilli()}
 	n.mu.Lock()
 	for id := range n.workspaces {
@@ -947,7 +1414,7 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, w *w
 		Principal: w.Spec.Principal,
 	}
 	if req.IdempotencyKey != "" {
-		spec.IdempotencyKey = w.ID + "|" + req.IdempotencyKey
+		spec.IdempotencyKey = client + "|" + w.ID + "|" + req.IdempotencyKey
 	}
 	if req.TimeoutSec > 0 {
 		spec.Timeout = time.Duration(req.TimeoutSec) * time.Second
@@ -963,11 +1430,20 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, w *w
 	if !req.NoSubscribe {
 		n.subscribe(p, client, s, 0)
 	}
-	return proto.SOpenRes{S: s.ID, Next: s.Log.Next()}, nil
+	return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq()}, nil
 }
 
 func (n *Node) portOpen(ctx context.Context, p *transport.Peer, client string, w *ws, req *proto.PortOpenReq) (any, error) {
+	if req.Host != "" {
+		return nil, proto.Err(proto.CodeDenied, "port.open host is backend-controlled")
+	}
+	if req.Port < 1 || req.Port > 65535 {
+		return nil, proto.Err(proto.CodeBadRequest, "port must be between 1 and 65535")
+	}
 	spec := session.Spec{WS: w.ID, Kind: proto.SessionPort, Host: req.Host, Port: req.Port, Principal: w.Spec.Principal}
+	if req.IdempotencyKey != "" {
+		spec.IdempotencyKey = client + "|" + w.ID + "|port|" + req.IdempotencyKey
+	}
 	if err := w.handle.Prepare(&spec); err != nil {
 		return nil, err
 	}
@@ -988,7 +1464,7 @@ func (n *Node) portOpen(ctx context.Context, p *transport.Peer, client string, w
 		return nil, proto.Err(proto.CodeUnreachable, "port %d: %s", req.Port, msg)
 	}
 	n.subscribe(p, client, s, 0)
-	return proto.SOpenRes{S: s.ID, Next: s.Log.Next()}, nil
+	return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq()}, nil
 }
 
 // subscribe streams s's log to client from seq `from` until the client
@@ -997,22 +1473,18 @@ func (n *Node) portOpen(ctx context.Context, p *transport.Peer, client string, w
 func (n *Node) subscribe(p *transport.Peer, client string, s *session.Session, from uint64) {
 	key := client + "|" + s.ID
 	ctx, cancel := context.WithCancel(context.Background())
+	sub := &subscriber{client: client, ws: s.WS, session: s.ID, cancel: cancel}
 	n.mu.Lock()
 	if old, ok := n.subs[key]; ok {
 		old.cancel()
 	}
-	n.subs[key] = &subscriber{cancel: cancel}
+	n.subs[key] = sub
 	n.mu.Unlock()
 	go func() {
 		defer func() {
 			n.mu.Lock()
-			if cur, ok := n.subs[key]; ok && cur.cancel != nil {
-				// only remove if it's still ours (compare by ctx doneness)
-				select {
-				case <-ctx.Done():
-					delete(n.subs, key)
-				default:
-				}
+			if n.subs[key] == sub {
+				delete(n.subs, key)
 			}
 			n.mu.Unlock()
 		}()
@@ -1067,40 +1539,49 @@ func (n *Node) tryClaim(ctx context.Context, wsID string, adopt bool) {
 	p := n.peer
 	_, have := n.workspaces[wsID]
 	_, busy := n.materializing[wsID]
-	if have || busy || p == nil {
+	_, prepared := n.prepared[wsID]
+	_, retained := n.quarantined[wsID]
+	if have || busy || prepared || p == nil {
 		n.mu.Unlock()
 		return
 	}
-	n.materializing[wsID] = 0
+	adopt = adopt || retained
+	mctx, materializeCancel := context.WithCancel(ctx)
+	materializing := &materialization{cancel: materializeCancel}
+	n.materializing[wsID] = materializing
 	n.mu.Unlock()
 	defer func() {
+		materializeCancel()
 		n.mu.Lock()
-		delete(n.materializing, wsID)
+		if n.materializing[wsID] == materializing {
+			delete(n.materializing, wsID)
+		}
 		n.mu.Unlock()
 	}()
 	var res proto.WSClaimRes
-	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	cctx, cancel := context.WithTimeout(mctx, 15*time.Second)
 	err := p.Call(cctx, proto.PeerControl, proto.OpWSClaim, proto.WSClaimReq{ID: wsID}, &res)
 	cancel()
 	if err != nil {
 		if adopt {
-			// Nobody wants what we have; it was destroyed or lives elsewhere now.
+			// Authority disagreement fences the local copy; it does not prove
+			// those bytes are obsolete or authorize their destruction.
 			var pe *proto.Error
 			if errors.As(err, &pe) && (pe.Code == proto.CodeNotFound || pe.Code == proto.CodeConflict) {
-				n.logger.Info("dropping local workspace copy", "ws", wsID, "reason", pe.Code)
-				if be, err := n.opts.Backends.Get(""); err == nil {
-					if h, err := be.Adopt(ctx, wsID); err == nil {
-						_ = h.Destroy(ctx)
-					}
-				}
+				n.mu.Lock()
+				n.quarantined[wsID] = struct{}{}
+				n.mu.Unlock()
+				n.logger.Warn("local workspace retained in quarantine", "ws", wsID, "reason", pe.Code)
 			}
 		}
 		return
 	}
 	n.mu.Lock()
-	n.materializing[wsID] = res.Workspace.Generation
+	materializing.generation = res.Workspace.Generation
+	materializing.deadline = time.Now().Add(n.localLeaseWindowLocked())
+	n.eventClaims[wsID] = eventClaim{tenant: res.Workspace.Tenant, generation: res.Workspace.Generation}
 	n.mu.Unlock()
-	if err := n.materialize(ctx, res.Workspace, adopt); err != nil {
+	if err := n.materialize(mctx, res.Workspace, adopt); err != nil {
 		n.logger.Error("materialize failed; releasing", "ws", wsID, "err", err)
 		_ = p.Call(ctx, proto.PeerControl, proto.OpWSReleased, proto.WSReleasedReq{ID: wsID, Gen: res.Workspace.Generation, Reason: "materialize failed: " + err.Error()}, nil)
 	}
@@ -1110,6 +1591,13 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 	be, err := n.opts.Backends.Get(w.Spec.Requires.Backend)
 	if err != nil {
 		return err
+	}
+	descriptor, err := n.opts.Backends.Descriptor(be.Name())
+	if err != nil {
+		return err
+	}
+	if err := proto.ValidateBackendSecurity(w.Spec.Security, descriptor); err != nil {
+		return proto.Err(proto.CodeDenied, "backend %s no longer satisfies workspace security policy: %v", be.Name(), err)
 	}
 	var handle workspace.Handle
 	if adopt {
@@ -1138,23 +1626,23 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 		handle, err = create()
 		var pe *proto.Error
 		if err != nil && errors.As(err, &pe) && pe.Code == proto.CodeConflict {
-			// A directory left over from a previous life. The snapshot the
-			// control plane named is authoritative, so replace it; with no
-			// snapshot the leftover is the only copy, so adopt it.
-			if w.Spec.RestoreFrom != "" {
-				if stale, aerr := be.Adopt(ctx, w.ID); aerr == nil {
-					_ = stale.Destroy(ctx)
-				}
-				handle, err = create()
-			} else {
-				handle, err = be.Adopt(ctx, w.ID)
-			}
+			// A local tree may contain bytes newer than the last control-plane
+			// snapshot. Adopt it; never destroy it merely because a restore was
+			// also named.
+			handle, err = be.Adopt(ctx, w.ID)
 		}
 		if err != nil {
 			return err
 		}
 	}
 	entry := &ws{Workspace: w, handle: handle}
+	retainOnError := func(err error) error {
+		n.quarantineMaterialization(w.ID, handle, entry.broker, err.Error())
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return retainOnError(err)
+	}
 	// Broker: one per workspace, always on, so every session has an egress path.
 	var leases []proto.BindingLease
 	if len(w.Spec.Bindings) > 0 {
@@ -1162,44 +1650,62 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 		n.mu.Lock()
 		p := n.peer
 		n.mu.Unlock()
-		if p != nil {
-			lctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			if err := p.Call(lctx, proto.PeerControl, proto.OpBindingLease, proto.BindingLeaseReq{WS: w.ID}, &res); err != nil {
-				cancel()
-				_ = handle.Destroy(ctx)
-				return fmt.Errorf("binding lease: %w", err)
-			}
-			cancel()
-			leases = res.Leases
+		if p == nil {
+			return retainOnError(proto.Err(proto.CodeUnreachable, "control connection lost before binding lease"))
 		}
+		lctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := p.Call(lctx, proto.PeerControl, proto.OpBindingLease, proto.BindingLeaseReq{WS: w.ID}, &res)
+		cancel()
+		if err != nil {
+			return retainOnError(fmt.Errorf("binding lease: %w", err))
+		}
+		leases = res.Leases
 	}
 	entry.leases = leases
-	entry.broker = broker.New(broker.Options{
+	brokerOpts := broker.Options{
 		WS: w.ID, Principal: w.Spec.Principal, Leases: leases, Allow: n.opts.Allow, AllowPrivate: n.opts.AllowPrivate,
+		RootCAs: n.opts.BrokerRootCAs,
 		Audit: func(a broker.Audit) {
 			typ := proto.EvEgressAllowed
 			switch a.Decision {
 			case broker.DecisionSubstituted:
 				typ = proto.EvCredUsed
-			case broker.DecisionDenied, broker.DecisionLeakBlocked, broker.DecisionExpired:
+			case broker.DecisionDenied, broker.DecisionLeakBlocked, broker.DecisionExpired, broker.DecisionUnauthenticated:
 				typ = proto.EvEgressDenied
 			}
 			n.emit(typ, a.WS, a.Principal, map[string]any{"decision": a.Decision, "binding": a.Binding, "host": a.Host, "method": a.Method, "path": a.Path, "reason": a.Reason, "status": a.Status})
 		},
-	})
+	}
+	if handle.Backend() == "docker" {
+		// Containers cannot reach a host loopback listener. The random
+		// per-workspace capability authenticates this host-gateway listener.
+		brokerOpts.Listen = "0.0.0.0:0"
+		brokerOpts.AdvertiseHost = "host.docker.internal"
+	}
+	entry.broker = broker.New(brokerOpts)
 	if _, err := entry.broker.Start(); err != nil {
-		_ = handle.Destroy(ctx)
-		return err
+		return retainOnError(err)
 	}
 	// Drop a sourceable env file into the workspace. The broker's address
 	// changes every time a workspace is materialized, so anything that bakes
 	// it into a config file goes stale after a move. Reading this file at
 	// start-up is the portable way to find it.
 	if err := writeWorkspaceEnv(handle, entry); err != nil {
-		n.logger.Warn("could not write .remount/env", "ws", w.ID, "err", err)
+		return retainOnError(fmt.Errorf("write workspace environment: %w", err))
 	}
 	n.mu.Lock()
+	materializing := n.materializing[w.ID]
+	if materializing == nil || materializing.generation != w.Generation || ctx.Err() != nil {
+		n.mu.Unlock()
+		return retainOnError(proto.Err(proto.CodeConflict, "claim expired while workspace was materializing"))
+	}
+	deadline := materializing.deadline
+	if deadline.IsZero() {
+		deadline = time.Now().Add(n.localLeaseWindowLocked())
+	}
 	n.workspaces[w.ID] = entry
+	n.deadlines[w.ID] = deadline
+	delete(n.quarantined, w.ID)
 	n.mu.Unlock()
 	if w.Spec.RestoreFrom != "" && !adopt {
 		metrics.RestoresDone.Inc()
@@ -1211,12 +1717,16 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 	n.mu.Lock()
 	p := n.peer
 	n.mu.Unlock()
-	if p != nil {
-		rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-		if err := p.Call(rctx, proto.PeerControl, proto.OpWSReady, proto.WSReadyReq{ID: w.ID, Gen: w.Generation}, nil); err != nil {
-			n.logger.Warn("ws.ready failed", "ws", w.ID, "err", err)
-		}
+	if p == nil {
+		n.fenceWorkspace(ctx, w.ID, "control connection lost before ws.ready")
+		return proto.Err(proto.CodeUnreachable, "control connection lost before ws.ready")
+	}
+	rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	err = p.Call(rctx, proto.PeerControl, proto.OpWSReady, proto.WSReadyReq{ID: w.ID, Gen: w.Generation}, nil)
+	cancel()
+	if err != nil {
+		n.fenceWorkspace(ctx, w.ID, "ws.ready rejected: "+err.Error())
+		return fmt.Errorf("ws.ready: %w", err)
 	}
 	return nil
 }
@@ -1242,15 +1752,15 @@ func (n *Node) fetchArtifact(ctx context.Context, id string) (io.ReadCloser, err
 		resp.Body.Close()
 		return nil, fmt.Errorf("artifact %s: HTTP %d", id, resp.StatusCode)
 	}
+	if resp.ContentLength > n.opts.MaxArtifactBytes {
+		resp.Body.Close()
+		return nil, fmt.Errorf("artifact %s: %w", id, artifact.ErrTooLarge)
+	}
 	// Cache locally while streaming through, verifying the digest.
-	got, _, err := n.store.Put(resp.Body)
+	_, err = n.store.PutExpected(id, resp.Body, n.opts.MaxArtifactBytes)
 	resp.Body.Close()
 	if err != nil {
 		return nil, err
-	}
-	if got != id {
-		_ = n.store.Delete(got)
-		return nil, fmt.Errorf("artifact %s: digest mismatch (%s)", id, got)
 	}
 	r, _, err := n.store.Open(id)
 	return r, err
@@ -1261,14 +1771,14 @@ func (n *Node) snapshot(ctx context.Context, w *ws, upload bool) (string, int64,
 	excludes := append([]string{EnvFileDir}, w.Spec.Exclude...)
 	pr, pw := io.Pipe()
 	go func() { pw.CloseWithError(w.handle.Snapshot(ctx, excludes, pw)) }()
-	id, size, err := n.store.Put(pr)
+	id, size, err := n.store.PutLimit(pr, n.opts.MaxArtifactBytes)
 	if err != nil {
 		pr.CloseWithError(err)
 		return "", 0, err
 	}
 	if upload && n.opts.ArtifactURL != "" {
 		if err := n.upload(ctx, id); err != nil {
-			return "", 0, fmt.Errorf("upload: %w", err)
+			return id, size, fmt.Errorf("upload artifact %s: %w", id, err)
 		}
 	}
 	metrics.SnapshotsTaken.Inc()
@@ -1304,6 +1814,22 @@ func (n *Node) upload(ctx context.Context, id string) error {
 // release gives a workspace back to the control plane.
 func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error) {
 	n.mu.Lock()
+	if existing := n.prepared[req.WS]; existing != nil {
+		if existing.request.Gen != req.Gen || existing.request.Snapshot != req.Snapshot || existing.request.Reason != req.Reason {
+			n.mu.Unlock()
+			return nil, proto.Err(proto.CodeConflict, "release retry does not match prepared operation")
+		}
+		n.mu.Unlock()
+		select {
+		case <-existing.done:
+			if existing.err != nil {
+				return nil, existing.err
+			}
+			return existing.response, nil
+		default:
+			return proto.WSReleasedReq{ID: req.WS, Gen: req.Gen, Reason: req.Reason, Preparing: true}, nil
+		}
+	}
 	w := n.workspaces[req.WS]
 	if w == nil {
 		n.mu.Unlock()
@@ -1313,10 +1839,14 @@ func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error
 		n.mu.Unlock()
 		return nil, proto.Err(proto.CodeConflict, "generation mismatch")
 	}
+	prepared := &preparedRelease{workspace: w, request: *req, done: make(chan struct{})}
+	n.prepared[req.WS] = prepared
 	delete(n.workspaces, req.WS)
+	delete(n.deadlines, req.WS)
 	for k, s := range n.subs {
-		if strings.HasSuffix(k, "|"+req.WS) {
+		if s.ws == req.WS {
 			s.cancel()
+			delete(n.subs, k)
 		}
 	}
 	n.mu.Unlock()
@@ -1326,16 +1856,89 @@ func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error
 	if req.Snapshot {
 		id, _, err := n.snapshot(ctx, w, true)
 		if err != nil {
-			n.logger.Error("snapshot on release failed", "ws", req.WS, "err", err)
-		} else {
-			out.Snapshot = id
+			prepared.err = fmt.Errorf("checkpoint %s: %w", id, err)
+			n.mu.Lock()
+			n.workspaces[req.WS] = w
+			delete(n.prepared, req.WS)
+			close(prepared.done)
+			n.mu.Unlock()
+			return nil, prepared.err
 		}
+		out.Snapshot = id
 	}
 	if w.broker != nil {
-		w.broker.Close()
+		w.broker.Suspend()
 	}
-	if err := w.handle.Destroy(ctx); err != nil {
-		n.logger.Warn("destroy failed", "ws", req.WS, "err", err)
-	}
+	prepared.response = out
+	n.mu.Lock()
+	close(prepared.done)
+	n.mu.Unlock()
 	return out, nil
+}
+
+func (n *Node) releaseCommit(ctx context.Context, req *proto.WSReleaseCommitReq) error {
+	n.mu.Lock()
+	if n.committed[req.ID] == req.Gen {
+		n.mu.Unlock()
+		return nil
+	}
+	prepared := n.prepared[req.ID]
+	if prepared == nil {
+		n.mu.Unlock()
+		return proto.Err(proto.CodeConflict, "workspace %s has no prepared release", req.ID)
+	}
+	if prepared.response.Gen != req.Gen || prepared.response.Snapshot != req.Snapshot {
+		n.mu.Unlock()
+		return proto.Err(proto.CodeConflict, "release commit does not match prepared checkpoint")
+	}
+	done := prepared.done
+	n.mu.Unlock()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if prepared.err != nil {
+		return prepared.err
+	}
+	if prepared.workspace.broker != nil {
+		_ = prepared.workspace.broker.Close()
+	}
+	if err := prepared.workspace.handle.Destroy(ctx); err != nil {
+		return err
+	}
+	n.mu.Lock()
+	if n.prepared[req.ID] == prepared {
+		delete(n.prepared, req.ID)
+		n.committed[req.ID] = req.Gen
+	}
+	n.mu.Unlock()
+	return nil
+}
+
+func (n *Node) releaseAbort(req *proto.WSReleaseCommitReq) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	prepared := n.prepared[req.ID]
+	if prepared == nil {
+		if current := n.workspaces[req.ID]; current != nil && current.Generation == req.Gen {
+			return nil // duplicate abort after successful restoration
+		}
+		return proto.Err(proto.CodeConflict, "workspace %s has no prepared release", req.ID)
+	}
+	if prepared.response.Gen != req.Gen {
+		return proto.Err(proto.CodeConflict, "release abort generation mismatch")
+	}
+	select {
+	case <-prepared.done:
+	default:
+		return proto.Err(proto.CodeTimeout, "release prepare is still running")
+	}
+	if prepared.workspace.broker != nil {
+		prepared.workspace.broker.Resume()
+	}
+	n.workspaces[req.ID] = prepared.workspace
+	n.deadlines[req.ID] = time.Now().Add(n.localLeaseWindowLocked())
+	delete(n.prepared, req.ID)
+	return nil
 }

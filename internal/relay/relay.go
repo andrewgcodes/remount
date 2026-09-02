@@ -56,13 +56,21 @@ type Relay struct {
 	recent map[string]map[string]struct{}
 
 	pendMu  sync.Mutex
-	pending map[uint64]chan *proto.Frame
+	pending map[uint64]relayPending
 	nextID  atomic.Uint64
 }
 
+type relayPending struct {
+	from string
+	op   string
+	ch   chan *proto.Frame
+}
+
+const maxPendingRequests = 4096
+
 // New creates a relay for the controller.
 func New(ctrl Controller) *Relay {
-	return &Relay{ctrl: ctrl, peers: map[string]*transport.Peer{}, hellos: map[string]*proto.Hello{}, recent: map[string]map[string]struct{}{}, pending: map[uint64]chan *proto.Frame{}}
+	return &Relay{ctrl: ctrl, peers: map[string]*transport.Peer{}, hellos: map[string]*proto.Hello{}, recent: map[string]map[string]struct{}{}, pending: map[uint64]relayPending{}}
 }
 
 // Serve handles one accepted connection until it closes. It blocks.
@@ -129,6 +137,9 @@ func (r *Relay) remove(ctx context.Context, id string, peer *transport.Peer) {
 	delete(r.hellos, id)
 	correspondents := r.recent[id]
 	delete(r.recent, id)
+	for other := range correspondents {
+		delete(r.recent[other], id)
+	}
 	r.mu.Unlock()
 	metrics.PeersConnected.Set(int64(len(r.Peers())))
 	r.ctrl.PeerGone(ctx, id)
@@ -142,20 +153,23 @@ func (r *Relay) route(ctx context.Context, f *proto.Frame) {
 	if f.To == "" || f.To == proto.PeerControl {
 		if f.T == proto.KindRes {
 			r.pendMu.Lock()
-			ch, ok := r.pending[f.ID]
+			pending, ok := r.pending[f.ID]
+			if ok && (f.From != pending.from || f.Op != pending.op) {
+				ok = false
+			}
 			if ok {
 				delete(r.pending, f.ID)
 			}
 			r.pendMu.Unlock()
 			if ok {
-				ch <- f
+				pending.ch <- f
 				return
 			}
 		}
 		r.ctrl.HandleFrame(ctx, f)
 		return
 	}
-	r.mu.RLock()
+	r.mu.Lock()
 	dst := r.peers[f.To]
 	if dst != nil {
 		if r.recent[f.From] == nil {
@@ -164,8 +178,10 @@ func (r *Relay) route(ctx context.Context, f *proto.Frame) {
 		if r.recent[f.To] == nil {
 			r.recent[f.To] = map[string]struct{}{}
 		}
+		r.recent[f.From][f.To] = struct{}{}
+		r.recent[f.To][f.From] = struct{}{}
 	}
-	r.mu.RUnlock()
+	r.mu.Unlock()
 	if dst == nil {
 		metrics.FramesDropped.Inc()
 		if f.T == proto.KindReq {
@@ -173,10 +189,6 @@ func (r *Relay) route(ctx context.Context, f *proto.Frame) {
 		}
 		return
 	}
-	r.mu.Lock()
-	r.recent[f.From][f.To] = struct{}{}
-	r.recent[f.To][f.From] = struct{}{}
-	r.mu.Unlock()
 	metrics.FramesRouted.Inc()
 	metrics.BytesRouted.Add(uint64(len(f.Body)))
 	if err := dst.Send(ctx, f); err != nil && f.T == proto.KindReq {
@@ -204,7 +216,11 @@ func (r *Relay) Request(ctx context.Context, to, op string, body, out any) error
 	id := r.nextID.Add(1)
 	ch := make(chan *proto.Frame, 1)
 	r.pendMu.Lock()
-	r.pending[id] = ch
+	if len(r.pending) >= maxPendingRequests {
+		r.pendMu.Unlock()
+		return proto.Err(proto.CodeDenied, "too many pending relay requests")
+	}
+	r.pending[id] = relayPending{from: to, op: op, ch: ch}
 	r.pendMu.Unlock()
 	f := proto.NewReq(id, to, op, body)
 	if err := r.Send(ctx, f); err != nil {
@@ -215,6 +231,9 @@ func (r *Relay) Request(ctx context.Context, to, op string, body, out any) error
 	}
 	select {
 	case res := <-ch:
+		if res == nil {
+			return transport.ErrClosed
+		}
 		if res.Err != nil {
 			return res.Err
 		}
@@ -264,5 +283,12 @@ func (r *Relay) Close() {
 	r.mu.Unlock()
 	for _, p := range peers {
 		p.Close()
+	}
+	r.pendMu.Lock()
+	pending := r.pending
+	r.pending = map[uint64]relayPending{}
+	r.pendMu.Unlock()
+	for _, request := range pending {
+		request.ch <- nil
 	}
 }

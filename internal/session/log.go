@@ -138,9 +138,9 @@ func (l *Log) Append(stream uint8, data []byte) (uint64, error) {
 			break
 		}
 	}
-	l.evictLocked()
+	err := l.evictLocked()
 	l.broadcastLocked()
-	return firstSeq, nil
+	return firstSeq, err
 }
 
 // Close marks the log complete: no more appends; cursors at the end return io.EOF.
@@ -205,57 +205,109 @@ func (l *Log) broadcastLocked() {
 }
 
 // evictLocked moves chunks from memory to the spill file until the ring fits.
-func (l *Log) evictLocked() {
+func (l *Log) evictLocked() error {
 	for (l.bytes > l.opts.MemBytes || len(l.chunks) > l.opts.MaxChunks) && len(l.chunks) > 1 {
 		c := l.chunks[0]
+		if l.spill != nil {
+			// Spill before removing the only in-memory copy. On failure the
+			// ring may temporarily exceed its configured bound, but it remains
+			// contiguous and the caller sees the storage failure.
+			if err := l.spillLocked(c); err != nil {
+				return err
+			}
+		}
 		l.chunks = l.chunks[1:]
 		l.bytes -= len(c.Data)
 		l.first = c.Seq + 1
 		metrics.ChunksEvicted.Inc()
-		if l.spill != nil {
-			l.spillLocked(c)
-		}
 	}
 	// Let the backing array be reclaimed when the ring drains.
 	if len(l.chunks) == 0 {
 		l.chunks = nil
 		l.first = l.next
 	}
+	return nil
 }
 
-func (l *Log) spillLocked(c Chunk) {
+func (l *Log) spillLocked(c Chunk) error {
 	rec := int64(8 + 1 + 4 + len(c.Data))
 	if l.spillBytes+rec > l.opts.SpillBytes {
 		// Rotate: drop history. Brute force (P10); a segmented file can come later.
-		_ = l.spill.Truncate(0)
-		_, _ = l.spill.Seek(0, io.SeekStart)
+		if err := l.spill.Truncate(0); err != nil {
+			return fmt.Errorf("session: rotate spill: %w", err)
+		}
+		// Truncate has already committed the loss of the old segment.
 		l.spillBytes = 0
-		l.spillFirst = c.Seq
-		l.spillNext = c.Seq
+		l.spillFirst = 0
+		l.spillNext = 0
 		l.spillIndex = l.spillIndex[:0]
+		if _, err := l.spill.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("session: seek spill: %w", err)
+		}
+		// Truncate committed the loss of the old segment. Publish that fact
+		// before attempting the new record so a subsequent write failure
+		// produces ErrEvicted rather than an unmarked hole.
 	}
-	if l.spillNext == l.spillFirst && l.spillBytes == 0 {
-		l.spillFirst = c.Seq
+	first := l.spillFirst
+	if l.spillBytes == 0 {
+		first = c.Seq
 	}
-	if (c.Seq-l.spillFirst)%indexStride == 0 {
-		l.spillIndex = append(l.spillIndex, spillEntry{seq: c.Seq, off: l.spillBytes})
-	}
+	off := l.spillBytes
 	var hdr [13]byte
 	binary.BigEndian.PutUint64(hdr[0:8], c.Seq)
 	hdr[8] = c.Stream
 	binary.BigEndian.PutUint32(hdr[9:13], uint32(len(c.Data)))
-	if _, err := l.spill.WriteAt(hdr[:], l.spillBytes); err != nil {
-		return
+	if err := writeAtFull(l.spill, hdr[:], off); err != nil {
+		l.invalidateSpillLocked()
+		return fmt.Errorf("session: write spill header: %w", err)
 	}
-	if _, err := l.spill.WriteAt(c.Data, l.spillBytes+13); err != nil {
-		return
+	if err := writeAtFull(l.spill, c.Data, off+13); err != nil {
+		l.invalidateSpillLocked()
+		return fmt.Errorf("session: write spill data: %w", err)
+	}
+	if err := l.spill.Sync(); err != nil {
+		l.invalidateSpillLocked()
+		return fmt.Errorf("session: sync spill: %w", err)
+	}
+	if off == 0 {
+		l.spillFirst = first
+	}
+	if (c.Seq-first)%indexStride == 0 {
+		l.spillIndex = append(l.spillIndex, spillEntry{seq: c.Seq, off: off})
 	}
 	l.spillBytes += rec
 	l.spillNext = c.Seq + 1
+	return nil
+}
+
+func writeAtFull(w io.WriterAt, p []byte, off int64) error {
+	for len(p) > 0 {
+		n, err := w.WriteAt(p, off)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		p = p[n:]
+		off += int64(n)
+	}
+	return nil
+}
+
+func (l *Log) invalidateSpillLocked() {
+	// The existing segment may now be partially overwritten. Stop claiming
+	// any of it is replayable; the still-resident memory chunk determines the
+	// exact new oldest sequence.
+	_ = l.spill.Truncate(0)
+	l.spillBytes = 0
+	l.spillFirst = 0
+	l.spillNext = 0
+	l.spillIndex = l.spillIndex[:0]
 }
 
 // readSpillLocked returns chunks with seq in [from, spillNext).
-func (l *Log) readSpillLocked(from uint64) ([]Chunk, error) {
+func (l *Log) readSpillLocked(from uint64, max int) ([]Chunk, error) {
 	if l.spill == nil || from < l.spillFirst || from >= l.spillNext {
 		return nil, nil
 	}
@@ -275,12 +327,18 @@ func (l *Log) readSpillLocked(from uint64) ([]Chunk, error) {
 		}
 		seq := binary.BigEndian.Uint64(hdr[0:8])
 		n := int(binary.BigEndian.Uint32(hdr[9:13]))
+		if n < 0 || n > l.opts.MaxChunk || off+13+int64(n) > l.spillBytes {
+			return out, errors.New("session: corrupt spill record")
+		}
 		if seq >= from {
 			data := make([]byte, n)
 			if _, err := l.spill.ReadAt(data, off+13); err != nil {
 				return out, err
 			}
 			out = append(out, Chunk{Seq: seq, Stream: hdr[8], Data: data})
+			if max > 0 && len(out) >= max {
+				break
+			}
 		}
 		off += int64(13 + n)
 	}
@@ -305,11 +363,17 @@ func (l *Log) readLocked(from uint64, max int) ([]Chunk, error) {
 	}
 	var out []Chunk
 	if from < l.first {
-		sp, err := l.readSpillLocked(from)
+		sp, err := l.readSpillLocked(from, max)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, sp...)
+		if max > 0 && len(out) >= max {
+			return out, nil
+		}
+		if len(sp) == 0 || sp[len(sp)-1].Seq+1 != l.first {
+			return nil, &ErrEvicted{Requested: from, Oldest: l.first}
+		}
 		from = l.first
 	}
 	if from < l.next && len(l.chunks) > 0 {
@@ -317,12 +381,9 @@ func (l *Log) readLocked(from uint64, max int) ([]Chunk, error) {
 		if i < 0 {
 			i = 0
 		}
-		for ; i < len(l.chunks); i++ {
+		for ; i < len(l.chunks) && (max <= 0 || len(out) < max); i++ {
 			out = append(out, l.chunks[i])
 		}
-	}
-	if max > 0 && len(out) > max {
-		out = out[:max]
 	}
 	return out, nil
 }

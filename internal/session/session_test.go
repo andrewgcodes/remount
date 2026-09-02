@@ -13,6 +13,23 @@ import (
 	"remount.dev/remount/internal/proto"
 )
 
+type failAfterWriter struct {
+	n int
+}
+
+func (w *failAfterWriter) Write(p []byte) (int, error) {
+	if w.n <= 0 {
+		return 0, io.ErrClosedPipe
+	}
+	if len(p) > w.n {
+		p = p[:w.n]
+	}
+	w.n -= len(p)
+	return len(p), nil
+}
+
+func (w *failAfterWriter) Close() error { return nil }
+
 func newMgr(t *testing.T) *Manager {
 	t.Helper()
 	m := NewManager(ManagerOptions{SpillDir: t.TempDir(), MemBytes: 1 << 20, SpillBytes: 1 << 20, Retention: time.Hour})
@@ -110,6 +127,72 @@ func TestExecStartFailureIsRecordedInLog(t *testing.T) {
 	}
 }
 
+func TestStartFailureAlwaysCallsOnExit(t *testing.T) {
+	exited := make(chan proto.ExitInfo, 1)
+	m := NewManager(ManagerOptions{
+		SpillDir: t.TempDir(), MemBytes: 1 << 20, SpillBytes: 1 << 20, Retention: time.Hour,
+		OnExit: func(_ *Session, info proto.ExitInfo) { exited <- info },
+	})
+	t.Cleanup(m.Close)
+	if _, err := m.Open(Spec{WS: "ws_1", Kind: proto.SessionExec, Program: []string{"/definitely/not/a/binary"}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case info := <-exited:
+		if info.Code != -1 || info.Error == "" {
+			t.Fatalf("unexpected exit: %+v", info)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnExit was not called for a synchronous start failure")
+	}
+}
+
+func TestImmediateOutputStillFollowsInfo(t *testing.T) {
+	m := newMgr(t)
+	for i := 0; i < 100; i++ {
+		s, err := m.Open(Spec{WS: "ws_1", Kind: proto.SessionExec, Program: []string{"sh", "-c", "printf x"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		chunks, err := s.Log.CursorAt(0).Next(ctx, 1)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(chunks) != 1 || chunks[0].Seq != 0 || chunks[0].Stream != proto.StreamInfo {
+			t.Fatalf("iteration %d: first chunk = %+v", i, chunks)
+		}
+		if _, _, exit := collect(t, s); exit.Code != 0 {
+			t.Fatalf("iteration %d: exit = %+v", i, exit)
+		}
+	}
+}
+
+func TestInputSequenceAdvancesOnlyAfterCompleteWrite(t *testing.T) {
+	s := &Session{Kind: proto.SessionExec, stdin: &failAfterWriter{n: 2}}
+	if err := s.Input(7, []byte("hello"), false); err == nil {
+		t.Fatal("expected the partial write to fail")
+	}
+	if got := s.LastInputSeq(); got != 0 {
+		t.Fatalf("failed input advanced sequence to %d", got)
+	}
+	var dst bytes.Buffer
+	s.mu.Lock()
+	s.stdin = nopWriteCloser{Writer: &dst}
+	s.mu.Unlock()
+	if err := s.Input(7, []byte("hello"), false); err != nil {
+		t.Fatal(err)
+	}
+	if dst.String() != "hello" || s.LastInputSeq() != 7 {
+		t.Fatalf("retry wrote %q at sequence %d", dst.String(), s.LastInputSeq())
+	}
+}
+
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
+
 func TestExecTimeoutKillsProcessGroup(t *testing.T) {
 	m := newMgr(t)
 	s, _ := m.Open(Spec{WS: "ws_1", Kind: proto.SessionExec, Program: []string{"sh", "-c", "sleep 30; echo done"}, Timeout: 100 * time.Millisecond})
@@ -202,9 +285,15 @@ func TestPortSessionForwardsBytes(t *testing.T) {
 func TestIdempotentOpenAndRemove(t *testing.T) {
 	m := newMgr(t)
 	a, _ := m.Open(Spec{WS: "ws_1", Kind: proto.SessionExec, Program: []string{"echo", "once"}, IdempotencyKey: "k1"})
-	b, _ := m.Open(Spec{WS: "ws_1", Kind: proto.SessionExec, Program: []string{"echo", "twice"}, IdempotencyKey: "k1"})
+	b, err := m.Open(Spec{WS: "ws_1", Kind: proto.SessionExec, Program: []string{"echo", "once"}, IdempotencyKey: "k1"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if a.ID != b.ID {
 		t.Fatal("idempotency key did not dedupe")
+	}
+	if _, err := m.Open(Spec{WS: "ws_1", Kind: proto.SessionExec, Program: []string{"echo", "twice"}, IdempotencyKey: "k1"}); err == nil {
+		t.Fatal("idempotency key reuse with different arguments was accepted")
 	}
 	if len(m.List("ws_1")) != 1 || len(m.List("ws_other")) != 0 {
 		t.Fatal("list")
