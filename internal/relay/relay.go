@@ -47,9 +47,12 @@ type Sender interface {
 type Relay struct {
 	ctrl Controller
 
-	mu     sync.RWMutex
-	peers  map[string]*transport.Peer
-	hellos map[string]*proto.Hello
+	mu      sync.RWMutex
+	peers   map[string]*transport.Peer
+	hellos  map[string]*proto.Hello
+	active  map[*serveCall]struct{}
+	serveWG sync.WaitGroup
+	closed  bool
 	// recent records, per peer, which peers it has exchanged frames with so
 	// peer.gone can be delivered to the right places without content
 	// inspection.
@@ -58,6 +61,13 @@ type Relay struct {
 	pendMu  sync.Mutex
 	pending map[uint64]relayPending
 	nextID  atomic.Uint64
+}
+
+// serveCall keeps even pre-authentication connections visible to Close. A
+// peer is not entered in peers until its hello succeeds, but shutdown must
+// still wake and join a connection blocked waiting for that first frame.
+type serveCall struct {
+	conn transport.Conn
 }
 
 type relayPending struct {
@@ -70,11 +80,32 @@ const maxPendingRequests = 4096
 
 // New creates a relay for the controller.
 func New(ctrl Controller) *Relay {
-	return &Relay{ctrl: ctrl, peers: map[string]*transport.Peer{}, hellos: map[string]*proto.Hello{}, recent: map[string]map[string]struct{}{}, pending: map[uint64]relayPending{}}
+	return &Relay{
+		ctrl: ctrl, peers: map[string]*transport.Peer{}, hellos: map[string]*proto.Hello{},
+		active: map[*serveCall]struct{}{}, recent: map[string]map[string]struct{}{},
+		pending: map[uint64]relayPending{},
+	}
 }
 
 // Serve handles one accepted connection until it closes. It blocks.
 func (r *Relay) Serve(ctx context.Context, conn transport.Conn) error {
+	call := &serveCall{conn: conn}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		_ = conn.Close()
+		return transport.ErrClosed
+	}
+	r.active[call] = struct{}{}
+	r.serveWG.Add(1)
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.active, call)
+		r.mu.Unlock()
+		r.serveWG.Done()
+	}()
+
 	hctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	first, err := conn.Recv(hctx)
 	cancel()
@@ -109,6 +140,11 @@ func (r *Relay) Serve(ctx context.Context, conn transport.Conn) error {
 	}))
 	peer.Name = id
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		_ = peer.Close()
+		return transport.ErrClosed
+	}
 	if old, exists := r.peers[id]; exists {
 		// A reconnecting peer replaces its previous connection.
 		old.Close()
@@ -203,8 +239,12 @@ func (r *Relay) Send(ctx context.Context, f *proto.Frame) error {
 		f.V = proto.Version
 	}
 	r.mu.RLock()
+	closed := r.closed
 	dst := r.peers[f.To]
 	r.mu.RUnlock()
+	if closed {
+		return transport.ErrClosed
+	}
 	if dst == nil {
 		return proto.Err(proto.CodeUnreachable, "peer %s not connected", f.To)
 	}
@@ -272,17 +312,54 @@ func (r *Relay) Peers() []string {
 func (r *Relay) Hello(id string) *proto.Hello {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.hellos[id]
+	return cloneHello(r.hellos[id])
 }
 
-// Close disconnects everyone.
+func cloneHello(in *proto.Hello) *proto.Hello {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Caps = append([]string(nil), in.Caps...)
+	out.PubKey = append([]byte(nil), in.PubKey...)
+	out.Nonce = append([]byte(nil), in.Nonce...)
+	out.Proof = append([]byte(nil), in.Proof...)
+	if in.Labels != nil {
+		out.Labels = make(map[string]string, len(in.Labels))
+		for key, value := range in.Labels {
+			out.Labels[key] = value
+		}
+	}
+	if in.Node != nil {
+		node := *in.Node
+		node.Backends = append([]string(nil), in.Node.Backends...)
+		node.BackendDescriptors = append([]proto.BackendDescriptor(nil), in.Node.BackendDescriptors...)
+		node.Caps = append([]string(nil), in.Node.Caps...)
+		out.Node = &node
+	}
+	return &out
+}
+
+// Close disconnects everyone and waits until every Serve call, including a
+// connection still waiting for its hello, has returned. Once Close starts no
+// new connection or control-plane send is admitted.
 func (r *Relay) Close() {
 	r.mu.Lock()
+	r.closed = true
 	peers := r.peers
 	r.peers = map[string]*transport.Peer{}
+	r.hellos = map[string]*proto.Hello{}
+	r.recent = map[string]map[string]struct{}{}
+	active := make([]transport.Conn, 0, len(r.active))
+	for call := range r.active {
+		active = append(active, call.conn)
+	}
 	r.mu.Unlock()
+	for _, conn := range active {
+		_ = conn.Close()
+	}
 	for _, p := range peers {
-		p.Close()
+		_ = p.Close()
 	}
 	r.pendMu.Lock()
 	pending := r.pending
@@ -291,4 +368,5 @@ func (r *Relay) Close() {
 	for _, request := range pending {
 		request.ch <- nil
 	}
+	r.serveWG.Wait()
 }

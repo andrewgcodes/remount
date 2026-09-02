@@ -133,6 +133,9 @@ type Options struct {
 	// SecurityProfileFloor lets a deployment strengthen every requested
 	// workspace policy (isolated or multi_tenant in production modes).
 	SecurityProfileFloor string
+	// MaxConcurrentRequests bounds request handlers independently of relay
+	// connection count. Zero selects 128.
+	MaxConcurrentRequests int
 }
 
 // ArtifactStore is the part of the blob store the control plane inspects.
@@ -166,6 +169,14 @@ type Control struct {
 	producerSeq   map[string]uint64                // authenticated node -> last accepted event seq
 	producerLocks map[string]*sync.Mutex           // serialize batches from one node
 	mutationLocks map[string]*sync.Mutex           // serialize duplicate logical mutations
+
+	requestMu      sync.Mutex
+	requestSlots   chan struct{}
+	overloadSlots  chan struct{}
+	requestWG      sync.WaitGroup
+	requestCtx     context.Context
+	requestCancel  context.CancelFunc
+	acceptRequests bool
 
 	started   time.Time
 	stop      chan struct{}
@@ -204,6 +215,17 @@ func New(opts Options) (*Control, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	if opts.MaxConcurrentRequests <= 0 {
+		opts.MaxConcurrentRequests = 128
+	}
+	requestCtx, requestCancel := context.WithCancel(context.Background())
+	overloadLimit := opts.MaxConcurrentRequests / 8
+	if overloadLimit < 8 {
+		overloadLimit = 8
+	}
+	if overloadLimit > 64 {
+		overloadLimit = 64
+	}
 	c := &Control{
 		opts: opts, db: opts.DB, log: opts.Log, logger: opts.Logger, now: opts.Now,
 		workspaces: map[string]*proto.Workspace{}, timers: map[string]*proto.Timer{},
@@ -211,6 +233,8 @@ func New(opts Options) (*Control, error) {
 		bindings: map[string]Binding{}, tails: map[string]map[string]*tailState{},
 		lifecycle: map[string]*sync.Mutex{}, proofs: map[string]int64{}, producerSeq: map[string]uint64{},
 		producerLocks: map[string]*sync.Mutex{}, mutationLocks: map[string]*sync.Mutex{},
+		requestSlots: make(chan struct{}, opts.MaxConcurrentRequests), overloadSlots: make(chan struct{}, overloadLimit),
+		requestCtx: requestCtx, requestCancel: requestCancel, acceptRequests: true,
 		started: opts.Now(), stop: make(chan struct{}),
 	}
 	for _, b := range opts.Bindings {
@@ -256,7 +280,14 @@ func (c *Control) Start() {
 
 // Stop halts loops.
 func (c *Control) Stop() {
-	c.stopOnce.Do(func() { close(c.stop) })
+	c.stopOnce.Do(func() {
+		c.requestMu.Lock()
+		c.acceptRequests = false
+		c.requestMu.Unlock()
+		c.requestCancel()
+		close(c.stop)
+	})
+	c.requestWG.Wait()
 	c.wg.Wait()
 }
 
@@ -804,18 +835,58 @@ func (c *Control) HandleFrame(ctx context.Context, f *proto.Frame) {
 	if f.T != proto.KindReq {
 		return // control ignores stray events/chunks
 	}
-	go func() {
-		body, err := c.dispatch(ctx, f)
-		if err != nil {
-			var pe *proto.Error
-			if !errors.As(err, &pe) {
-				pe = proto.Err(proto.CodeInternal, "%v", err)
+	c.requestMu.Lock()
+	if !c.acceptRequests {
+		c.requestMu.Unlock()
+		return
+	}
+	select {
+	case c.requestSlots <- struct{}{}:
+		c.requestWG.Add(1)
+		c.requestMu.Unlock()
+		metrics.ControlRequestsActive.Add(1)
+		go func() {
+			defer func() {
+				metrics.ControlRequestsActive.Add(-1)
+				<-c.requestSlots
+				c.requestWG.Done()
+			}()
+			body, err := c.dispatch(c.requestCtx, f)
+			if err != nil {
+				var pe *proto.Error
+				if !errors.As(err, &pe) {
+					pe = proto.Err(proto.CodeInternal, "%v", err)
+				}
+				_ = c.send.Send(c.requestCtx, proto.NewErrRes(f, pe))
+				return
 			}
-			_ = c.send.Send(ctx, proto.NewErrRes(f, pe))
-			return
-		}
-		_ = c.send.Send(ctx, proto.NewRes(f, body))
-	}()
+			_ = c.send.Send(c.requestCtx, proto.NewRes(f, body))
+		}()
+		return
+	default:
+		metrics.ControlRequestsRejected.Inc()
+	}
+	select {
+	case c.overloadSlots <- struct{}{}:
+		c.requestWG.Add(1)
+		c.requestMu.Unlock()
+		go func() {
+			defer func() {
+				<-c.overloadSlots
+				c.requestWG.Done()
+			}()
+			rctx, cancel := context.WithTimeout(c.requestCtx, time.Second)
+			defer cancel()
+			_ = c.send.Send(rctx, proto.NewErrRes(f,
+				proto.Err(proto.CodeResourceExhausted, "control request capacity exhausted")))
+		}()
+	default:
+		// The bounded overload responders are saturated too. Dropping this
+		// frame is preferable to allowing an attacker to create unbounded
+		// goroutines; the caller's request deadline remains authoritative.
+		c.requestMu.Unlock()
+	}
+	_ = ctx // inbound transport contexts do not carry a remote deadline
 }
 
 func (c *Control) principalOf(from string) string {

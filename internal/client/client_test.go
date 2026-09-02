@@ -17,6 +17,17 @@ func chunkFrame(seq uint64, stream uint8, data []byte) *proto.Frame {
 	}
 }
 
+func TestCallerSuppliedIdempotencyKey(t *testing.T) {
+	key, configured := operationKey([]OperationOption{WithIdempotencyKey("logical-operation")})
+	if key != "logical-operation" || !configured {
+		t.Fatalf("operation key = %q, configured=%v", key, configured)
+	}
+	generated, configured := operationKey(nil)
+	if generated == "" || configured {
+		t.Fatalf("generated key = %q, configured=%v", generated, configured)
+	}
+}
+
 func TestSessionDeliveryReordersWithoutTransportBlocking(t *testing.T) {
 	c := New(Options{})
 	s := c.newSession("s_test", "ws_test", proto.SessionExec)

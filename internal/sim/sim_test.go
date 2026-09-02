@@ -816,6 +816,44 @@ func TestIdempotentExec(t *testing.T) {
 	}
 }
 
+func TestFilesystemMutationsAreDurablyIdempotent(t *testing.T) {
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("c1")
+	ws := mustWS(t, c, proto.WorkspaceSpec{})
+	ctx := ctxT(t, 30*time.Second)
+
+	if err := c.Mkdir(ctx, ws.ID, "dir", client.WithIdempotencyKey("mkdir-one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.WriteFile(ctx, ws.ID, "dir/file", []byte("value"), 0,
+		client.WithIdempotencyKey("write-one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Rename(ctx, ws.ID, "dir/file", "dir/renamed",
+		client.WithIdempotencyKey("rename-one")); err != nil {
+		t.Fatal(err)
+	}
+	// The source no longer exists, so a second success proves replay rather
+	// than accidental filesystem idempotency.
+	if err := c.Rename(ctx, ws.ID, "dir/file", "dir/renamed",
+		client.WithIdempotencyKey("rename-one")); err != nil {
+		t.Fatalf("rename replay: %v", err)
+	}
+	if err := c.Remove(ctx, ws.ID, "dir/renamed", false,
+		client.WithIdempotencyKey("remove-one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Remove(ctx, ws.ID, "dir/renamed", false,
+		client.WithIdempotencyKey("remove-one")); err != nil {
+		t.Fatalf("remove replay: %v", err)
+	}
+	if err := c.Remove(ctx, ws.ID, "different", false,
+		client.WithIdempotencyKey("remove-one")); err == nil {
+		t.Fatal("idempotency key reuse with changed arguments succeeded")
+	}
+}
+
 // Node restart: workspaces on disk are adopted back under a new generation.
 func TestNodeRestartAdoptsLocalWorkspaces(t *testing.T) {
 	w := newWorld(t)

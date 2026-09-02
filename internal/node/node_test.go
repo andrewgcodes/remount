@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/fsops"
@@ -192,5 +193,142 @@ func TestWorkspaceRegistryDescriptorsAreDerived(t *testing.T) {
 	d := r.Descriptors()
 	if len(d) != 1 || d[0].Name != "process" || d[0].Security.Isolation != "none" || d[0].Security.EgressMode == "enforced_gateway" {
 		t.Fatalf("process descriptor overclaims security: %#v", d)
+	}
+}
+
+func TestHandleRejectsWhenRequestCapacityIsExhausted(t *testing.T) {
+	n := newTestNode(t, func(opts *Options) { opts.MaxConcurrentRequests = 1 })
+	n.requestSlots <- struct{}{}
+	nodeConn, clientConn := transport.Pipe(4)
+	p := transport.NewPeer(nodeConn, nil)
+	defer p.Close()
+	defer clientConn.Close()
+
+	f := &proto.Frame{V: proto.Version, T: proto.KindReq, ID: 77, From: "c_test", Op: proto.OpNodeStatus}
+	n.handle(context.Background(), p, f)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := clientConn.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != f.ID || got.Err == nil || got.Err.Code != proto.CodeResourceExhausted {
+		t.Fatalf("overload response = %#v", got)
+	}
+	<-n.requestSlots
+}
+
+func TestMutationJournalWritesIntentBeforeEffectAndReplaysDurableResult(t *testing.T) {
+	n := newTestNode(t, nil)
+	request := struct{ Value string }{Value: "one"}
+	key := "subject|workspace|operation|key"
+	applied := 0
+	result, err := n.runMutation(context.Background(), key, request, func() ([]byte, error) {
+		applied++
+		loaded, err := loadMutations(n.mutationPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry := loaded[key]
+		if entry == nil || entry.State != mutationPending {
+			t.Fatalf("durable intent before effect = %#v", entry)
+		}
+		return []byte("result"), nil
+	})
+	if err != nil || string(result) != "result" || applied != 1 {
+		t.Fatalf("first mutation = %q, %v, applied=%d", result, err, applied)
+	}
+
+	replayed, err := n.runMutation(context.Background(), key, request, func() ([]byte, error) {
+		applied++
+		return []byte("duplicate"), nil
+	})
+	if err != nil || string(replayed) != "result" || applied != 1 {
+		t.Fatalf("replay = %q, %v, applied=%d", replayed, err, applied)
+	}
+	loaded, err := loadMutations(n.mutationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry := loaded[key]; entry == nil || entry.State != mutationCompleted || string(entry.Result) != "result" {
+		t.Fatalf("durable result = %#v", entry)
+	}
+	if _, err := n.runMutation(context.Background(), key, struct{ Value string }{Value: "two"}, func() ([]byte, error) {
+		return nil, nil
+	}); err == nil {
+		t.Fatal("same key with a different fingerprint was accepted")
+	}
+}
+
+func TestMutationDoesNotRunWithoutDurableIntent(t *testing.T) {
+	n := newTestNode(t, nil)
+	n.mutationPath = filepath.Join(t.TempDir(), "missing", "mutations.cbor")
+	applied := false
+	_, err := n.runMutation(context.Background(), "key", "request", func() ([]byte, error) {
+		applied = true
+		return nil, nil
+	})
+	if err == nil || applied {
+		t.Fatalf("mutation err=%v applied=%v", err, applied)
+	}
+}
+
+func TestMutationDoesNotAcknowledgeUntilResultIsDurable(t *testing.T) {
+	n := newTestNode(t, nil)
+	originalPath := n.mutationPath
+	request := struct{ Value string }{Value: "request"}
+	applied := 0
+	result, err := n.runMutation(context.Background(), "key", request, func() ([]byte, error) {
+		applied++
+		// The intent is already durable at originalPath. Make only the
+		// completion write fail to model disk loss after the side effect.
+		n.mutationPath = filepath.Join(t.TempDir(), "missing", "mutations.cbor")
+		return []byte("committed-result"), nil
+	})
+	if err == nil || result != nil || applied != 1 {
+		t.Fatalf("first result=%q err=%v applied=%d", result, err, applied)
+	}
+
+	// Once storage recovers, an exact retry durably records and returns the
+	// original result without executing the effect again.
+	n.mutationPath = originalPath
+	result, err = n.runMutation(context.Background(), "key", request, func() ([]byte, error) {
+		applied++
+		return []byte("duplicate"), nil
+	})
+	if err != nil || string(result) != "committed-result" || applied != 1 {
+		t.Fatalf("recovery result=%q err=%v applied=%d", result, err, applied)
+	}
+}
+
+func TestPendingMutationFromRestartIsNeverReapplied(t *testing.T) {
+	n := newTestNode(t, nil)
+	request := struct{ Value string }{Value: "request"}
+	key := "pending-key"
+	fingerprint := sha256.Sum256(proto.MustMarshal(request))
+	n.mutationMu.Lock()
+	n.mutations[key] = &mutationEntry{
+		Fingerprint: fingerprint, State: mutationPending, CompletedAt: time.Now().UnixMilli(),
+		done: make(chan struct{}), needsPersist: true,
+	}
+	if err := n.persistMutationsLocked(); err != nil {
+		n.mutationMu.Unlock()
+		t.Fatal(err)
+	}
+	n.mutationMu.Unlock()
+
+	loaded, err := loadMutations(n.mutationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := &Node{mutations: loaded, mutationPath: n.mutationPath}
+	applied := false
+	_, err = restarted.runMutation(context.Background(), key, request, func() ([]byte, error) {
+		applied = true
+		return nil, nil
+	})
+	var protocolErr *proto.Error
+	if !errors.As(err, &protocolErr) || protocolErr.Code != proto.CodeConflict || applied {
+		t.Fatalf("restart replay err=%v applied=%v", err, applied)
 	}
 }

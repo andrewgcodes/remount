@@ -661,23 +661,26 @@ type FSStatRes struct {
 }
 
 type FSMkdirReq struct {
-	WS    string `cbor:"ws" json:"ws"`
-	Path  string `cbor:"path" json:"path"`
-	Grant *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+	WS             string `cbor:"ws" json:"ws"`
+	Path           string `cbor:"path" json:"path"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type FSRemoveReq struct {
-	WS        string `cbor:"ws" json:"ws"`
-	Path      string `cbor:"path" json:"path"`
-	Recursive bool   `cbor:"recursive,omitempty" json:"recursive,omitempty"`
-	Grant     *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+	WS             string `cbor:"ws" json:"ws"`
+	Path           string `cbor:"path" json:"path"`
+	Recursive      bool   `cbor:"recursive,omitempty" json:"recursive,omitempty"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type FSRenameReq struct {
-	WS    string `cbor:"ws" json:"ws"`
-	From  string `cbor:"from" json:"from"`
-	To    string `cbor:"to" json:"to"`
-	Grant *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+	WS             string `cbor:"ws" json:"ws"`
+	From           string `cbor:"from" json:"from"`
+	To             string `cbor:"to" json:"to"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type FSSearchReq struct {
@@ -860,8 +863,10 @@ const (
 	EvSExited        = "s.exited"
 	EvSInput         = "s.input"
 	EvFSWrite        = "fs.write"
+	EvFSMkdir        = "fs.mkdir"
 	EvFSEdit         = "fs.edit"
 	EvFSRemove       = "fs.remove"
+	EvFSRename       = "fs.rename"
 	EvCredUsed       = "cred.used"
 	EvEgressAllowed  = "egress.allowed"
 	EvEgressDenied   = "egress.denied"

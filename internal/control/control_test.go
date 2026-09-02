@@ -516,3 +516,35 @@ func TestNodeEventsDetectGapsDeduplicateAndUseAssignmentHistory(t *testing.T) {
 		t.Fatal("event for an unassigned generation was accepted")
 	}
 }
+
+func TestHandleFrameRejectsWhenRequestCapacityIsExhausted(t *testing.T) {
+	f := newControlFixture(t, "", func(opts *Options) { opts.MaxConcurrentRequests = 1 })
+	sender := &fakeSender{online: map[string]bool{}}
+	f.c.Attach(sender)
+	// Occupy the only execution slot without creating a goroutine. The frame
+	// must be answered by the separately bounded overload path.
+	f.c.requestSlots <- struct{}{}
+	f.c.HandleFrame(context.Background(), &proto.Frame{
+		V: proto.Version, T: proto.KindReq, ID: 41, From: "c_test", Op: proto.OpTimerList,
+	})
+	deadline := time.Now().Add(time.Second)
+	for {
+		sender.mu.Lock()
+		var got *proto.Frame
+		if len(sender.sent) > 0 {
+			got = sender.sent[0]
+		}
+		sender.mu.Unlock()
+		if got != nil {
+			if got.ID != 41 || got.Err == nil || got.Err.Code != proto.CodeResourceExhausted {
+				t.Fatalf("overload response = %#v", got)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no overload response")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	<-f.c.requestSlots
+}
