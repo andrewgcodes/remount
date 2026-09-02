@@ -144,3 +144,69 @@ func TestCloseFailsControlRequests(t *testing.T) {
 		t.Fatal("request remained blocked after close")
 	}
 }
+
+func TestCloseJoinsPreAuthenticationServeAndRejectsNewConnections(t *testing.T) {
+	r := New(testController{})
+	conn := newTestConn()
+	done := make(chan error, 1)
+	go func() { done <- r.Serve(context.Background(), conn) }()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		r.mu.RLock()
+		active := len(r.active)
+		r.mu.RUnlock()
+		if active == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Serve was not registered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	r.Close()
+	select {
+	case err := <-done:
+		if !errors.Is(err, transport.ErrClosed) {
+			t.Fatalf("Serve returned %v, want ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close returned without joining Serve")
+	}
+
+	rejected := newTestConn()
+	if err := r.Serve(context.Background(), rejected); !errors.Is(err, transport.ErrClosed) {
+		t.Fatalf("Serve after Close returned %v, want ErrClosed", err)
+	}
+	select {
+	case <-rejected.closed:
+	default:
+		t.Fatal("rejected connection was not closed")
+	}
+}
+
+func TestHelloReturnsDeepCopy(t *testing.T) {
+	r := New(testController{})
+	r.hellos["node"] = &proto.Hello{
+		Peer: "node", Caps: []string{"v1"}, PubKey: []byte{1}, Nonce: []byte{2}, Proof: []byte{3},
+		Labels: map[string]string{"zone": "a"},
+		Node: &proto.NodeInfo{Backends: []string{"process"}, Caps: []string{"gpu"},
+			BackendDescriptors: []proto.BackendDescriptor{{Name: "process"}}},
+	}
+
+	got := r.Hello("node")
+	got.Caps[0] = "changed"
+	got.PubKey[0], got.Nonce[0], got.Proof[0] = 9, 9, 9
+	got.Labels["zone"] = "changed"
+	got.Node.Backends[0] = "changed"
+	got.Node.Caps[0] = "changed"
+	got.Node.BackendDescriptors[0].Name = "changed"
+
+	want := r.Hello("node")
+	if want.Caps[0] != "v1" || want.PubKey[0] != 1 || want.Nonce[0] != 2 || want.Proof[0] != 3 ||
+		want.Labels["zone"] != "a" || want.Node.Backends[0] != "process" || want.Node.Caps[0] != "gpu" ||
+		want.Node.BackendDescriptors[0].Name != "process" {
+		t.Fatalf("stored hello was mutated through returned value: %+v", want)
+	}
+}

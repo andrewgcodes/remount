@@ -164,10 +164,14 @@ func (r *Registry) Snapshot() map[string]float64 {
 // ---------------------------------------------------------------------------
 
 var (
-	FramesRouted   = Count("remount_frames_routed_total", "frames forwarded between peers by the relay")
-	FramesDropped  = Count("remount_frames_dropped_total", "frames discarded because the destination was gone")
-	BytesRouted    = Count("remount_relay_bytes_total", "approximate frame bytes forwarded by the relay")
-	PeersConnected = Measure("remount_peers_connected", "peers currently connected to the relay")
+	FramesRouted            = Count("remount_frames_routed_total", "frames forwarded between peers by the relay")
+	FramesDropped           = Count("remount_frames_dropped_total", "frames discarded because the destination was gone")
+	BytesRouted             = Count("remount_relay_bytes_total", "approximate frame bytes forwarded by the relay")
+	PeersConnected          = Measure("remount_peers_connected", "peers currently connected to the relay")
+	ControlRequestsActive   = Measure("remount_control_requests_active", "control-plane requests currently executing")
+	ControlRequestsRejected = Count("remount_control_requests_rejected_total", "control-plane requests rejected by admission control")
+	NodeRequestsActive      = Measure("remount_node_requests_active", "node requests currently executing")
+	NodeRequestsRejected    = Count("remount_node_requests_rejected_total", "node requests rejected by admission control")
 
 	WSCreated      = Count("remount_workspaces_created_total", "workspaces created")
 	WSClaims       = Count("remount_workspace_claims_total", "successful claims, including re-adoptions")

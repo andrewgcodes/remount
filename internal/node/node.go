@@ -64,6 +64,9 @@ type Options struct {
 	Version       string
 	// Caps advertises extra capabilities (display, gpu …).
 	Caps []string
+	// MaxConcurrentRequests bounds request handlers independently of relay
+	// connection count. Zero selects 128.
+	MaxConcurrentRequests int
 }
 
 // Node is the supervisor.
@@ -98,11 +101,20 @@ type Node struct {
 	mutations    map[string]*mutationEntry
 	mutationPath string
 
-	started time.Time
-	stop    chan struct{}
-	wg      sync.WaitGroup
-	online  chan struct{} // closed when first connected
-	onceOn  sync.Once
+	requestMu      sync.Mutex
+	requestSlots   chan struct{}
+	overloadSlots  chan struct{}
+	requestWG      sync.WaitGroup
+	requestCtx     context.Context
+	requestCancel  context.CancelFunc
+	acceptRequests bool
+
+	started  time.Time
+	stop     chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
+	online   chan struct{} // closed when first connected
+	onceOn   sync.Once
 }
 
 // ws is a claimed workspace on this node.
@@ -145,18 +157,27 @@ type materialization struct {
 }
 
 type mutationEntry struct {
-	Fingerprint [32]byte
-	Result      []byte
-	CompletedAt int64
-	done        chan struct{}
-	err         error
+	Fingerprint  [32]byte
+	State        string
+	Result       []byte
+	CompletedAt  int64
+	done         chan struct{}
+	err          error
+	needsPersist bool
 }
 
 type persistedMutation struct {
 	Fingerprint []byte `cbor:"fingerprint"`
+	State       string `cbor:"state,omitempty"`
 	Result      []byte `cbor:"result"`
 	CompletedAt int64  `cbor:"completed_at"`
 }
+
+const (
+	mutationPending    = "pending"
+	mutationCompleted  = "completed"
+	maxMutationRecords = 10_000
+)
 
 // New loads or creates the node identity and prepares runtime state.
 func New(opts Options) (*Node, error) {
@@ -171,6 +192,9 @@ func New(opts Options) (*Node, error) {
 	}
 	if opts.MaxArtifactBytes <= 0 {
 		opts.MaxArtifactBytes = 8 << 30
+	}
+	if opts.MaxConcurrentRequests <= 0 {
+		opts.MaxConcurrentRequests = 128
 	}
 	for _, d := range []string{"", "ws", "spill", "artifacts"} {
 		if err := os.MkdirAll(filepath.Join(opts.DataDir, d), 0o700); err != nil {
@@ -197,6 +221,14 @@ func New(opts Options) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	requestCtx, requestCancel := context.WithCancel(context.Background())
+	overloadLimit := opts.MaxConcurrentRequests / 8
+	if overloadLimit < 8 {
+		overloadLimit = 8
+	}
+	if overloadLimit > 64 {
+		overloadLimit = 64
+	}
 	n := &Node{
 		opts: opts, id: id, priv: priv, logger: opts.Logger.With("node", id),
 		store: store, events: eventlog.New(eventlog.NewMemory(10000)),
@@ -206,6 +238,8 @@ func New(opts Options) (*Node, error) {
 		prepared: map[string]*preparedRelease{}, committed: map[string]uint64{},
 		eventClaims: map[string]eventClaim{},
 		mutations:   mutations, mutationPath: mutationPath,
+		requestSlots: make(chan struct{}, opts.MaxConcurrentRequests), overloadSlots: make(chan struct{}, overloadLimit),
+		requestCtx: requestCtx, requestCancel: requestCancel, acceptRequests: true,
 		started: time.Now(), stop: make(chan struct{}), online: make(chan struct{}),
 	}
 	n.sessions = session.NewManager(session.ManagerOptions{
@@ -234,8 +268,24 @@ func loadMutations(path string) (map[string]*mutationEntry, error) {
 		if len(record.Fingerprint) != sha256.Size {
 			return nil, fmt.Errorf("node: corrupt mutation journal fingerprint for %q", key)
 		}
-		entry := &mutationEntry{Result: append([]byte(nil), record.Result...), CompletedAt: record.CompletedAt, done: make(chan struct{})}
+		state := record.State
+		if state == "" {
+			// Journals written before states were introduced contain only
+			// completed records.
+			state = mutationCompleted
+		}
+		if state != mutationPending && state != mutationCompleted {
+			return nil, fmt.Errorf("node: corrupt mutation journal state %q for %q", state, key)
+		}
+		entry := &mutationEntry{
+			State: state, Result: append([]byte(nil), record.Result...),
+			CompletedAt: record.CompletedAt, done: make(chan struct{}),
+		}
 		copy(entry.Fingerprint[:], record.Fingerprint)
+		if state == mutationPending {
+			entry.err = proto.Err(proto.CodeConflict,
+				"mutation outcome is unknown after node restart; automatic replay is refused")
+		}
 		close(entry.done)
 		out[key] = entry
 	}
@@ -243,34 +293,14 @@ func loadMutations(path string) (map[string]*mutationEntry, error) {
 }
 
 func (n *Node) persistMutationsLocked() error {
-	const maxMutationRecords = 10_000
-	if len(n.mutations) > maxMutationRecords {
-		var oldestKey string
-		var oldest int64
-		for key, entry := range n.mutations {
-			select {
-			case <-entry.done:
-				if entry.err == nil && (oldestKey == "" || entry.CompletedAt < oldest) {
-					oldestKey, oldest = key, entry.CompletedAt
-				}
-			default:
-			}
-		}
-		if oldestKey != "" {
-			delete(n.mutations, oldestKey)
-		}
-	}
 	stored := make(map[string]persistedMutation, len(n.mutations))
 	for key, entry := range n.mutations {
-		select {
-		case <-entry.done:
-			if entry.err == nil {
-				stored[key] = persistedMutation{
-					Fingerprint: append([]byte(nil), entry.Fingerprint[:]...),
-					Result:      append([]byte(nil), entry.Result...), CompletedAt: entry.CompletedAt,
-				}
-			}
-		default:
+		if entry.State != mutationPending && entry.State != mutationCompleted {
+			return fmt.Errorf("invalid mutation state %q", entry.State)
+		}
+		stored[key] = persistedMutation{
+			Fingerprint: append([]byte(nil), entry.Fingerprint[:]...), State: entry.State,
+			Result: append([]byte(nil), entry.Result...), CompletedAt: entry.CompletedAt,
 		}
 	}
 	b, err := proto.Marshal(stored)
@@ -295,6 +325,19 @@ func (n *Node) persistMutationsLocked() error {
 	if err == nil {
 		err = os.Rename(tmpName, n.mutationPath)
 	}
+	if err == nil {
+		err = syncParentDir(filepath.Dir(n.mutationPath))
+	}
+	if err == nil {
+		for _, entry := range n.mutations {
+			if entry.needsPersist {
+				entry.needsPersist = false
+				if entry.State == mutationCompleted {
+					entry.err = nil
+				}
+			}
+		}
+	}
 	return err
 }
 
@@ -313,28 +356,74 @@ func (n *Node) runMutation(ctx context.Context, key string, request any, apply f
 		n.mutationMu.Unlock()
 		select {
 		case <-done:
-			return append([]byte(nil), existing.Result...), existing.err
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
+		n.mutationMu.Lock()
+		if existing.State == mutationCompleted && existing.needsPersist {
+			if err := n.persistMutationsLocked(); err != nil {
+				existing.err = proto.Err(proto.CodeInternal,
+					"mutation completed but its result is not durable: %v", err)
+			}
+		}
+		result, err := append([]byte(nil), existing.Result...), existing.err
+		n.mutationMu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return result, err
 	}
-	entry := &mutationEntry{Fingerprint: fingerprint, done: make(chan struct{})}
+	if len(n.mutations) >= maxMutationRecords {
+		n.mutationMu.Unlock()
+		return nil, proto.Err(proto.CodeResourceExhausted,
+			"node mutation journal contains %d records", maxMutationRecords)
+	}
+	entry := &mutationEntry{
+		Fingerprint: fingerprint, State: mutationPending, CompletedAt: time.Now().UnixMilli(),
+		done: make(chan struct{}), needsPersist: true,
+	}
 	n.mutations[key] = entry
+	if err := n.persistMutationsLocked(); err != nil {
+		delete(n.mutations, key)
+		entry.err = proto.Err(proto.CodeInternal, "persist mutation intent before execution: %v", err)
+		close(entry.done)
+		n.mutationMu.Unlock()
+		return nil, entry.err
+	}
 	n.mutationMu.Unlock()
 
 	result, err := apply()
 	n.mutationMu.Lock()
-	entry.Result, entry.err, entry.CompletedAt = append([]byte(nil), result...), err, time.Now().UnixMilli()
 	if err != nil {
-		delete(n.mutations, key) // failed operations remain retryable
+		// Failed operations are retryable only after removing the durable
+		// intent. If that removal cannot be committed, retain an ambiguous
+		// pending record so a restart cannot repeat a possibly partial effect.
+		delete(n.mutations, key)
+		if persistErr := n.persistMutationsLocked(); persistErr != nil {
+			n.mutations[key] = entry
+			entry.err = proto.Err(proto.CodeInternal,
+				"mutation failed and its durable intent could not be cleared; outcome is ambiguous: %v", persistErr)
+		} else {
+			entry.err = err
+		}
+		close(entry.done)
+		n.mutationMu.Unlock()
+		return nil, entry.err
+	}
+	entry.State = mutationCompleted
+	entry.Result = append([]byte(nil), result...)
+	entry.CompletedAt = time.Now().UnixMilli()
+	entry.needsPersist = true
+	if persistErr := n.persistMutationsLocked(); persistErr != nil {
+		entry.err = proto.Err(proto.CodeInternal,
+			"mutation completed but its result could not be durably recorded: %v", persistErr)
 	}
 	close(entry.done)
-	if err == nil {
-		if persistErr := n.persistMutationsLocked(); persistErr != nil {
-			n.logger.Error("persist mutation journal", "err", persistErr)
-		}
-	}
+	result, err = append([]byte(nil), entry.Result...), entry.err
 	n.mutationMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	return result, err
 }
 
@@ -501,7 +590,12 @@ func (n *Node) eventLoop(ctx context.Context) {
 }
 
 func (n *Node) shutdown() {
-	close(n.stop)
+	n.requestMu.Lock()
+	n.acceptRequests = false
+	n.requestMu.Unlock()
+	n.requestCancel()
+	n.stopOnce.Do(func() { close(n.stop) })
+	n.requestWG.Wait()
 	n.sessions.Close()
 	n.mu.Lock()
 	for _, w := range n.workspaces {
@@ -905,8 +999,57 @@ func (n *Node) handle(ctx context.Context, p *transport.Peer, f *proto.Frame) {
 	case proto.KindEvent:
 		n.handleEvent(ctx, f)
 	case proto.KindReq:
-		go n.handleReq(ctx, p, f)
+		n.scheduleRequest(ctx, p, f)
 	}
+}
+
+func (n *Node) scheduleRequest(ctx context.Context, p *transport.Peer, f *proto.Frame) {
+	n.requestMu.Lock()
+	if !n.acceptRequests {
+		n.requestMu.Unlock()
+		return
+	}
+	select {
+	case n.requestSlots <- struct{}{}:
+		n.requestWG.Add(1)
+		n.requestMu.Unlock()
+		metrics.NodeRequestsActive.Add(1)
+		go func() {
+			defer func() {
+				metrics.NodeRequestsActive.Add(-1)
+				<-n.requestSlots
+				n.requestWG.Done()
+			}()
+			n.handleReq(n.requestCtx, p, f)
+		}()
+		return
+	default:
+		metrics.NodeRequestsRejected.Inc()
+	}
+	select {
+	case n.overloadSlots <- struct{}{}:
+		n.requestWG.Add(1)
+		n.requestMu.Unlock()
+		go func() {
+			defer func() {
+				<-n.overloadSlots
+				n.requestWG.Done()
+			}()
+			rctx, cancel := context.WithTimeout(n.requestCtx, time.Second)
+			defer cancel()
+			if err := p.RespondErr(rctx, f,
+				proto.Err(proto.CodeResourceExhausted, "node request capacity exhausted")); err != nil {
+				_ = p.Close()
+			}
+		}()
+	default:
+		n.requestMu.Unlock()
+		// The peer is producing requests faster than even bounded rejection
+		// responses can be written. Disconnect it to release all associated
+		// transport state without allocating another goroutine.
+		_ = p.Close()
+	}
+	_ = ctx // inbound transport contexts do not carry a remote deadline
 }
 
 func (n *Node) handleEvent(ctx context.Context, f *proto.Frame) {
@@ -986,6 +1129,27 @@ func (n *Node) authorize(client, wsID string, g *proto.Grant) (*ws, error) {
 	}
 	n.grants[key] = g
 	return w, nil
+}
+
+// mutationKey scopes caller-selected keys to the authenticated subject,
+// tenant, workspace and operation. The relay peer id is deliberately not in
+// the durable key: it changes across client processes, while the subject does
+// not. authorize has already verified and cached this grant.
+func (n *Node) mutationKey(client, wsID, op, key string) string {
+	if key == "" {
+		return ""
+	}
+	n.mu.Lock()
+	g := n.grants[client+"|"+wsID]
+	n.mu.Unlock()
+	principal, tenant := client, ""
+	if g != nil {
+		principal, tenant = g.Claims.Principal, g.Claims.Tenant
+	}
+	sum := sha256.Sum256(proto.MustMarshal(struct {
+		Tenant, Principal, Workspace, Operation, Key string
+	}{tenant, principal, wsID, op, key}))
+	return fmt.Sprintf("mutation:%x", sum[:])
 }
 
 func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) (any, error) {
@@ -1185,10 +1349,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		}
 		clean := *req
 		clean.Grant = nil
-		key := ""
-		if req.IdempotencyKey != "" {
-			key = f.From + "|" + w.ID + "|fs.write|" + req.IdempotencyKey
-		}
+		key := n.mutationKey(f.From, w.ID, proto.OpFSWrite, req.IdempotencyKey)
 		_, err = n.runMutation(ctx, key, clean, func() ([]byte, error) {
 			if err := w.handle.FS().Write(req.Path, req.Data, req.Mode, req.Append, req.MkdirP); err != nil {
 				return nil, err
@@ -1234,7 +1395,17 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		return struct{}{}, w.handle.FS().Mkdir(req.Path)
+		clean := *req
+		clean.Grant = nil
+		key := n.mutationKey(f.From, w.ID, proto.OpFSMkdir, req.IdempotencyKey)
+		_, err = n.runMutation(ctx, key, clean, func() ([]byte, error) {
+			if err := w.handle.FS().Mkdir(req.Path); err != nil {
+				return nil, err
+			}
+			n.emit(proto.EvFSMkdir, w.ID, w.Spec.Principal, map[string]any{"path": req.Path, "client": f.From})
+			return proto.Marshal(struct{}{})
+		})
+		return struct{}{}, err
 	case proto.OpFSRemove:
 		req, err := decode[proto.FSRemoveReq](f)
 		if err != nil {
@@ -1244,11 +1415,17 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		if err := w.handle.FS().Remove(req.Path, req.Recursive); err != nil {
-			return nil, err
-		}
-		n.emit(proto.EvFSRemove, w.ID, w.Spec.Principal, map[string]any{"path": req.Path, "client": f.From})
-		return struct{}{}, nil
+		clean := *req
+		clean.Grant = nil
+		key := n.mutationKey(f.From, w.ID, proto.OpFSRemove, req.IdempotencyKey)
+		_, err = n.runMutation(ctx, key, clean, func() ([]byte, error) {
+			if err := w.handle.FS().Remove(req.Path, req.Recursive); err != nil {
+				return nil, err
+			}
+			n.emit(proto.EvFSRemove, w.ID, w.Spec.Principal, map[string]any{"path": req.Path, "client": f.From})
+			return proto.Marshal(struct{}{})
+		})
+		return struct{}{}, err
 	case proto.OpFSRename:
 		req, err := decode[proto.FSRenameReq](f)
 		if err != nil {
@@ -1258,7 +1435,18 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		return struct{}{}, w.handle.FS().Rename(req.From, req.To)
+		clean := *req
+		clean.Grant = nil
+		key := n.mutationKey(f.From, w.ID, proto.OpFSRename, req.IdempotencyKey)
+		_, err = n.runMutation(ctx, key, clean, func() ([]byte, error) {
+			if err := w.handle.FS().Rename(req.From, req.To); err != nil {
+				return nil, err
+			}
+			n.emit(proto.EvFSRename, w.ID, w.Spec.Principal,
+				map[string]any{"from": req.From, "to": req.To, "client": f.From})
+			return proto.Marshal(struct{}{})
+		})
+		return struct{}{}, err
 	case proto.OpFSSearch:
 		req, err := decode[proto.FSSearchReq](f)
 		if err != nil {
@@ -1280,10 +1468,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		}
 		clean := *req
 		clean.Grant = nil
-		key := ""
-		if req.IdempotencyKey != "" {
-			key = f.From + "|" + w.ID + "|fs.edit|" + req.IdempotencyKey
-		}
+		key := n.mutationKey(f.From, w.ID, proto.OpFSEdit, req.IdempotencyKey)
 		raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
 			nrep, err := w.handle.FS().Edit(req.Path, req.Edits)
 			if err != nil {
@@ -1311,10 +1496,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		}
 		clean := *req
 		clean.Grant = nil
-		key := ""
-		if req.IdempotencyKey != "" {
-			key = f.From + "|" + w.ID + "|ws.snapshot|" + req.IdempotencyKey
-		}
+		key := n.mutationKey(f.From, w.ID, proto.OpWSSnapshot, req.IdempotencyKey)
 		raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
 			id, size, err := n.snapshot(ctx, w, req.Upload)
 			if err != nil {

@@ -32,6 +32,37 @@ type Options struct {
 	MaxReadBytes int64
 }
 
+// OperationOption configures one logical mutating operation. Reuse the same
+// idempotency key when retrying after an ambiguous timeout or client restart.
+type OperationOption func(*operationOptions)
+
+type operationOptions struct {
+	idempotencyKey string
+	keySet         bool
+}
+
+// WithIdempotencyKey supplies a stable caller-owned key for a logical
+// mutation. An empty key falls back to a generated key.
+func WithIdempotencyKey(key string) OperationOption {
+	return func(opts *operationOptions) {
+		opts.idempotencyKey = key
+		opts.keySet = true
+	}
+}
+
+func operationKey(options []OperationOption) (string, bool) {
+	var configured operationOptions
+	for _, option := range options {
+		if option != nil {
+			option(&configured)
+		}
+	}
+	if configured.idempotencyKey == "" {
+		return ids.New("idem"), configured.keySet
+	}
+	return configured.idempotencyKey, configured.keySet
+}
+
 // Client is a connection to a Remount relay.
 type Client struct {
 	opts Options
@@ -288,9 +319,10 @@ func (c *Client) call(ctx context.Context, to, op string, body, out any) error {
 // ---------------------------------------------------------------------------
 
 // CreateWorkspace submits a workspace spec.
-func (c *Client) CreateWorkspace(ctx context.Context, spec proto.WorkspaceSpec) (*proto.Workspace, error) {
+func (c *Client) CreateWorkspace(ctx context.Context, spec proto.WorkspaceSpec, options ...OperationOption) (*proto.Workspace, error) {
 	var ws proto.Workspace
-	err := c.call(ctx, proto.PeerControl, proto.OpWSCreate, proto.WSCreateReq{Spec: spec, IdempotencyKey: ids.New("idem")}, &ws)
+	idem, _ := operationKey(options)
+	err := c.call(ctx, proto.PeerControl, proto.OpWSCreate, proto.WSCreateReq{Spec: spec, IdempotencyKey: idem}, &ws)
 	return &ws, err
 }
 
@@ -330,23 +362,29 @@ func (c *Client) ListWorkspaces(ctx context.Context) ([]proto.Workspace, error) 
 }
 
 // DestroyWorkspace destroys a workspace.
-func (c *Client) DestroyWorkspace(ctx context.Context, id string) error {
-	return c.call(ctx, proto.PeerControl, proto.OpWSDestroy, proto.WSGetReq{ID: id, IdempotencyKey: ids.New("idem")}, nil)
+func (c *Client) DestroyWorkspace(ctx context.Context, id string, options ...OperationOption) error {
+	idem, _ := operationKey(options)
+	return c.call(ctx, proto.PeerControl, proto.OpWSDestroy, proto.WSGetReq{ID: id, IdempotencyKey: idem}, nil)
 }
 
 // MoveWorkspace snapshots and re-queues a workspace with new requirements.
-func (c *Client) MoveWorkspace(ctx context.Context, id string, req *proto.Requires, placement *proto.Placement) (*proto.Workspace, error) {
+func (c *Client) MoveWorkspace(ctx context.Context, id string, req *proto.Requires, placement *proto.Placement, options ...OperationOption) (*proto.Workspace, error) {
 	var ws proto.Workspace
-	err := c.call(ctx, proto.PeerControl, proto.OpWSMove, proto.WSMoveReq{ID: id, Requires: req, Placement: placement, IdempotencyKey: ids.New("idem")}, &ws)
+	idem, _ := operationKey(options)
+	err := c.call(ctx, proto.PeerControl, proto.OpWSMove, proto.WSMoveReq{ID: id, Requires: req, Placement: placement, IdempotencyKey: idem}, &ws)
 	c.forgetGrant(id)
 	return &ws, err
 }
 
 // SleepWorkspace pauses a workspace until a timer or event.
-func (c *Client) SleepWorkspace(ctx context.Context, req proto.WSSleepReq) (*proto.Timer, error) {
+func (c *Client) SleepWorkspace(ctx context.Context, req proto.WSSleepReq, options ...OperationOption) (*proto.Timer, error) {
 	var t proto.Timer
-	if req.IdempotencyKey == "" {
-		req.IdempotencyKey = ids.New("idem")
+	idem, configured := operationKey(options)
+	if configured && req.IdempotencyKey != "" && req.IdempotencyKey != idem {
+		return nil, proto.Err(proto.CodeBadRequest, "conflicting idempotency keys")
+	}
+	if req.IdempotencyKey == "" || configured {
+		req.IdempotencyKey = idem
 	}
 	err := c.call(ctx, proto.PeerControl, proto.OpWSSleep, req, &t)
 	c.forgetGrant(req.ID)
@@ -354,9 +392,10 @@ func (c *Client) SleepWorkspace(ctx context.Context, req proto.WSSleepReq) (*pro
 }
 
 // WakeWorkspace resumes a paused workspace.
-func (c *Client) WakeWorkspace(ctx context.Context, id string) (*proto.Workspace, error) {
+func (c *Client) WakeWorkspace(ctx context.Context, id string, options ...OperationOption) (*proto.Workspace, error) {
 	var ws proto.Workspace
-	err := c.call(ctx, proto.PeerControl, proto.OpWSWake, proto.WSGetReq{ID: id, IdempotencyKey: ids.New("idem")}, &ws)
+	idem, _ := operationKey(options)
+	err := c.call(ctx, proto.PeerControl, proto.OpWSWake, proto.WSGetReq{ID: id, IdempotencyKey: idem}, &ws)
 	return &ws, err
 }
 
@@ -609,11 +648,11 @@ func (c *Client) ReadFile(ctx context.Context, wsID, path string) ([]byte, error
 }
 
 // WriteFile writes a file, creating parents.
-func (c *Client) WriteFile(ctx context.Context, wsID, path string, data []byte, mode uint32) error {
+func (c *Client) WriteFile(ctx context.Context, wsID, path string, data []byte, mode uint32, options ...OperationOption) error {
 	if len(data) > maxInlineMutationBytes {
 		return proto.Err(proto.CodeResourceExhausted, "inline write exceeds %d bytes", maxInlineMutationBytes)
 	}
-	idem := ids.New("idem")
+	idem, _ := operationKey(options)
 	return c.nodeCall(ctx, wsID, proto.OpFSWrite, func(g *proto.Grant) any {
 		return proto.FSWriteReq{WS: wsID, Path: path, Data: data, Mode: mode, MkdirP: true, IdempotencyKey: idem, Grant: g}
 	}, nil)
@@ -634,20 +673,27 @@ func (c *Client) Stat(ctx context.Context, wsID, path string) (*proto.FSEntry, e
 }
 
 // Mkdir creates a directory.
-func (c *Client) Mkdir(ctx context.Context, wsID, path string) error {
-	return c.nodeCall(ctx, wsID, proto.OpFSMkdir, func(g *proto.Grant) any { return proto.FSMkdirReq{WS: wsID, Path: path, Grant: g} }, nil)
+func (c *Client) Mkdir(ctx context.Context, wsID, path string, options ...OperationOption) error {
+	idem, _ := operationKey(options)
+	return c.nodeCall(ctx, wsID, proto.OpFSMkdir, func(g *proto.Grant) any {
+		return proto.FSMkdirReq{WS: wsID, Path: path, IdempotencyKey: idem, Grant: g}
+	}, nil)
 }
 
 // Remove deletes a path.
-func (c *Client) Remove(ctx context.Context, wsID, path string, recursive bool) error {
+func (c *Client) Remove(ctx context.Context, wsID, path string, recursive bool, options ...OperationOption) error {
+	idem, _ := operationKey(options)
 	return c.nodeCall(ctx, wsID, proto.OpFSRemove, func(g *proto.Grant) any {
-		return proto.FSRemoveReq{WS: wsID, Path: path, Recursive: recursive, Grant: g}
+		return proto.FSRemoveReq{WS: wsID, Path: path, Recursive: recursive, IdempotencyKey: idem, Grant: g}
 	}, nil)
 }
 
 // Rename moves a path.
-func (c *Client) Rename(ctx context.Context, wsID, from, to string) error {
-	return c.nodeCall(ctx, wsID, proto.OpFSRename, func(g *proto.Grant) any { return proto.FSRenameReq{WS: wsID, From: from, To: to, Grant: g} }, nil)
+func (c *Client) Rename(ctx context.Context, wsID, from, to string, options ...OperationOption) error {
+	idem, _ := operationKey(options)
+	return c.nodeCall(ctx, wsID, proto.OpFSRename, func(g *proto.Grant) any {
+		return proto.FSRenameReq{WS: wsID, From: from, To: to, IdempotencyKey: idem, Grant: g}
+	}, nil)
 }
 
 // Search greps.
@@ -660,7 +706,7 @@ func (c *Client) Search(ctx context.Context, wsID, path, pattern, glob string, m
 }
 
 // Edit applies atomic find/replace edits.
-func (c *Client) Edit(ctx context.Context, wsID, path string, edits []proto.FSEdit) (int, error) {
+func (c *Client) Edit(ctx context.Context, wsID, path string, edits []proto.FSEdit, options ...OperationOption) (int, error) {
 	requestBytes := 0
 	for _, edit := range edits {
 		requestBytes += len(edit.Old) + len(edit.New)
@@ -669,7 +715,7 @@ func (c *Client) Edit(ctx context.Context, wsID, path string, edits []proto.FSEd
 		return 0, proto.Err(proto.CodeResourceExhausted, "inline edit exceeds %d bytes", maxInlineMutationBytes)
 	}
 	var res proto.FSEditRes
-	idem := ids.New("idem")
+	idem, _ := operationKey(options)
 	err := c.nodeCall(ctx, wsID, proto.OpFSEdit, func(g *proto.Grant) any {
 		return proto.FSEditReq{WS: wsID, Path: path, Edits: edits, IdempotencyKey: idem, Grant: g}
 	}, &res)
@@ -677,9 +723,9 @@ func (c *Client) Edit(ctx context.Context, wsID, path string, edits []proto.FSEd
 }
 
 // Snapshot takes a snapshot; upload pushes it to the control plane store.
-func (c *Client) Snapshot(ctx context.Context, wsID string, upload bool) (*proto.WSSnapshotRes, error) {
+func (c *Client) Snapshot(ctx context.Context, wsID string, upload bool, options ...OperationOption) (*proto.WSSnapshotRes, error) {
 	var res proto.WSSnapshotRes
-	idem := ids.New("idem")
+	idem, _ := operationKey(options)
 	err := c.nodeCall(ctx, wsID, proto.OpWSSnapshot, func(g *proto.Grant) any {
 		return proto.WSSnapshotReq{WS: wsID, Upload: upload, IdempotencyKey: idem, Grant: g}
 	}, &res)
@@ -769,14 +815,14 @@ func (c *Client) Exec(ctx context.Context, req proto.SOpenReq) (*Session, error)
 }
 
 // OpenPort opens a TCP forward to a port inside the workspace.
-func (c *Client) OpenPort(ctx context.Context, wsID string, port int) (*Session, error) {
+func (c *Client) OpenPort(ctx context.Context, wsID string, port int, options ...OperationOption) (*Session, error) {
 	var res proto.SOpenRes
 	s := c.newSession("", wsID, proto.SessionPort)
 	pendingID := "pending:" + ids.New("idem")
 	c.mu.Lock()
 	c.sessions[pendingID] = s
 	c.mu.Unlock()
-	idem := ids.New("idem")
+	idem, _ := operationKey(options)
 	err := c.nodeCall(ctx, wsID, proto.OpPortOpen, func(g *proto.Grant) any {
 		return proto.PortOpenReq{WS: wsID, Port: port, IdempotencyKey: idem, Grant: g}
 	}, &res)
