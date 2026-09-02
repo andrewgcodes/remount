@@ -32,7 +32,7 @@ The data directory contains two things:
 
 | Path | Contents |
 |---|---|
-| `control.db` | SQLite: the event log, workspaces, timers, nodes, idempotency keys, and the grant signing key |
+| `control.db` | SQLite: the event log, workspaces, fleet operations, timers, nodes, idempotency keys, assignment history, and the grant signing key |
 | `artifacts/` | content-addressed snapshot blobs, named by SHA-256 |
 
 The grant signing key is generated on first start and stored in `control.db`.
@@ -79,7 +79,9 @@ The node data directory holds `identity.json`, which is the node's id and
 ed25519 private key. Keep it; a node that loses it enrolls as a new node and the
 control plane refuses the old id with a different key. It also holds `ws/` for
 workspace roots, `spill/` for session output that overflowed memory, and
-`artifacts/` as a local cache of snapshots.
+`artifacts/` as a local cache of snapshots. `mutations.cbor` is the node's
+write-ahead idempotency journal. Back it up with the node data: deleting it can
+remove the proof required to finish a prepared fleet destroy safely.
 
 Nodes advertise OS, architecture, CPU count, memory and backends. Workspaces
 specify requirements and placement; a node is eligible only when every
@@ -186,12 +188,75 @@ entries, modes, mtimes and symlinks, minus the workspace's `exclude` globs.
 It contains no process state and no secrets. Identical trees produce identical
 ids, so repeated snapshots of an unchanged workspace cost nothing.
 
-To restore a server, put both back and start it. Every workspace that was held
-by a node is re-queued as pending with its last snapshot. Nodes that still have
-their local copy re-adopt it; nodes that do not restore from the artifact.
+To restore a server, put both back and start it. A recorded holder is preserved
+through a recovery grace period rather than immediately re-queued: the same
+node may re-adopt it at the same generation and prove readiness. A held
+workspace whose lease later expires returns to `pending` from its last durable
+snapshot. An interrupted transitional state is made `failed` and remains
+operator-visible; Remount does not guess that an ambiguous source is disposable.
+Durable fleet operations are loaded from the same database and continue their
+pending target reconciliation.
 
 To move a deployment, copy both, start the new server, and point nodes at it.
 Node identity is on the node, not the server, so nodes keep their ids.
+
+## Fleet containment
+
+Use `fleet quarantine` when a principal, run, model, node, backend, tenant, or
+label set may be compromised. The command freezes its target list at creation,
+persists the operation, and reports each target independently.
+
+```sh
+# Stop one suspicious run and wait up to five minutes for acknowledgements.
+remount fleet quarantine --run run_20260902 --action stop --idem incident-4821
+
+# Revoke and fence everything currently assigned to one node.
+remount fleet quarantine --node n_abc --action revoke_egress --idem node-abc-4821
+
+# Preserve a checkpoint, then authorize deletion of every matching source.
+remount fleet quarantine --tenant acme --label campaign=bad \
+  --action destroy --deadline 10m --idem incident-4821-destroy --json
+
+remount fleet get fleet_abc --json
+remount fleet ls --json
+```
+
+At least one selector is required; `--all` is deliberately explicit. Available
+selectors are `--tenant`, `--principal`, `--run`, `--node`, `--model`,
+`--backend`, repeated `--label k=v`, `--created-after`, and `--created-before`.
+Times are RFC 3339. The acknowledgement deadline defaults to five minutes and
+may not exceed 24 hours. `--idem` should be a stable incident-specific value;
+re-running the same command returns the original operation rather than creating
+a second target set.
+
+All actions perform strong containment: revoke broker/network capability,
+advance the authoritative generation fence, stop execution, and retain the
+local filesystem. `checkpoint` also records a verified snapshot. `destroy`
+uses a second phase and deletes source bytes only after the checkpoint and
+fence are durably committed in `control.db` and the node matches the exact
+phase-one proof in `mutations.cbor`.
+
+Operation state meanings:
+
+| State | Meaning | Operator action |
+|---|---|---|
+| `pending` / `running` | containment is in progress | wait or inspect per-target state |
+| `completed` | every target acknowledged | preserve the operation id with the incident record |
+| `partial` | the deadline passed or at least one target failed | inspect `results[].error`; isolate unreachable hosts out of band |
+
+A `partial` operation remains durable and control continues retrying targets
+that are merely unreachable. If a checkpoint itself failed, the target is
+`failed` and its source stays quarantined; correct the storage/network problem
+and submit a new operation with a new idempotency key. A later action can
+escalate a completed or partial quarantine, for example from `freeze` to
+`destroy`, without losing the original physical generation.
+
+Containment is safe under acknowledgement loss. The node removes a workspace
+from service before slow snapshot I/O. Control advances the generation even if
+the node cannot be reached, so new grants are invalid; the old node's local
+lease deadline independently stops its execution and egress. An unreachable
+target remains explicitly `pending` rather than being reported as fenced by
+the node.
 
 ## Monitoring
 
@@ -210,6 +275,9 @@ remount events --follow --json | jq -c 'select(.type|test("lease_expired|egress.
 | `egress.denied` with `expired` | a lease TTL passed and renewal failed | check the node's link to the server |
 | `cred.used` | a secret was substituted for a bound host | the audit trail; count these per principal |
 | `ws.restored` | a workspace was materialized from a snapshot | expected after a move, sleep or failover |
+| `fleet.quarantine.requested` | a durable selector and action were accepted | record the operation id in the incident |
+| `fleet.quarantine.target` | one target changed containment state | inspect `operation_id`, acknowledgement, and error |
+| `fleet.quarantine.completed` | the bounded operation result changed to completed or partial | inspect every result; partial is not a clean bill of health |
 
 `remount nodes` shows liveness, labels and how many workspaces each node holds.
 `remount ws ls` shows state, node and generation for every workspace. A
@@ -223,6 +291,8 @@ workspace in `pending` for more than a few seconds has no eligible node.
 | session output on disk | 128 MiB per session | under the node's `spill/`; rotated when full |
 | finished session retention | 24 hours | the exit record and log stay attachable |
 | control-plane events | unbounded in SQLite | plan for the log's growth; it is the audit trail |
+| node mutation records | 10,000 per node | new mutations fail closed with `resource_exhausted` at the cap |
+| fleet acknowledgement deadline | 5 minutes default, 24 hours maximum | pending unreachable targets remain visible and are retried |
 | grants | 1 hour | clients refresh them transparently |
 
 Session output that ages out of both tiers is reported to clients as an
@@ -230,11 +300,12 @@ explicit gap, never silently dropped.
 
 ## Restarts and upgrades
 
-The control plane can be restarted at any time. On start it re-queues every
-held workspace with its last snapshot and waits for nodes. Nodes reconnect with
-backoff up to 30 seconds, announce the workspaces they still serve, and re-adopt
-what is on their disk. Client sessions on a restarted node are gone, because
-the processes are gone, but the filesystem is intact.
+The control plane can be restarted at any time. On start it preserves recorded
+holders for a recovery grace period, reloads fleet operations, and waits for
+nodes. Nodes reconnect with backoff up to 30 seconds, prove the same assignment
+and generation, and re-adopt what is on their disk. If authority disagrees, the
+node fences execution and egress and retains the local filesystem for
+reconciliation instead of deleting possibly fresher bytes.
 
 A node can be restarted at any time. It re-adopts its local workspaces under
 the same generation if the lease has not expired, and under a new generation

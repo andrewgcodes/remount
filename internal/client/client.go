@@ -406,6 +406,51 @@ func (c *Client) ListNodes(ctx context.Context) ([]proto.NodeStatus, error) {
 	return res.Nodes, err
 }
 
+// QuarantineFleet creates a durable incident-containment operation. The
+// returned object may still be running; use WaitFleetOperation or GetFleetOperation
+// to observe per-target acknowledgement.
+func (c *Client) QuarantineFleet(ctx context.Context, req proto.FleetQuarantineReq) (*proto.FleetOperation, error) {
+	if req.IdempotencyKey == "" {
+		req.IdempotencyKey = ids.New("idem")
+	}
+	var operation proto.FleetOperation
+	err := c.call(ctx, proto.PeerControl, proto.OpFleetQuarantine, req, &operation)
+	return &operation, err
+}
+
+// GetFleetOperation returns one durable containment operation.
+func (c *Client) GetFleetOperation(ctx context.Context, id string) (*proto.FleetOperation, error) {
+	var operation proto.FleetOperation
+	err := c.call(ctx, proto.PeerControl, proto.OpFleetGet, proto.FleetGetReq{ID: id}, &operation)
+	return &operation, err
+}
+
+// ListFleetOperations returns containment operations visible to the caller.
+func (c *Client) ListFleetOperations(ctx context.Context) ([]proto.FleetOperation, error) {
+	var response proto.FleetListRes
+	err := c.call(ctx, proto.PeerControl, proto.OpFleetList, nil, &response)
+	return response.Operations, err
+}
+
+// WaitFleetOperation waits for completed or partial state. Partial means at
+// least one target failed or remained unreachable at the operation deadline.
+func (c *Client) WaitFleetOperation(ctx context.Context, id string) (*proto.FleetOperation, error) {
+	for {
+		operation, err := c.GetFleetOperation(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if operation.State == proto.FleetStateCompleted || operation.State == proto.FleetStatePartial {
+			return operation, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 // ListTimers lists timers.
 func (c *Client) ListTimers(ctx context.Context) ([]proto.Timer, error) {
 	var res proto.TimerListRes

@@ -120,6 +120,9 @@ type Placement struct {
 // WorkspaceSpec is the movable unit's declaration.
 type WorkspaceSpec struct {
 	Name        string            `cbor:"name,omitempty" json:"name,omitempty"`
+	Run         string            `cbor:"run,omitempty" json:"run,omitempty"`
+	Model       string            `cbor:"model,omitempty" json:"model,omitempty"`
+	Labels      map[string]string `cbor:"labels,omitempty" json:"labels,omitempty"`
 	Image       string            `cbor:"image,omitempty" json:"image,omitempty"`               // backend-specific (docker image); ignored by process
 	RestoreFrom string            `cbor:"restore_from,omitempty" json:"restore_from,omitempty"` // artifact id to restore the filesystem from
 	Requires    Requires          `cbor:"requires" json:"requires"`
@@ -200,6 +203,11 @@ type Workspace struct {
 	Tenant        string        `cbor:"tenant,omitempty" json:"tenant,omitempty"`
 	Owner         string        `cbor:"owner,omitempty" json:"owner,omitempty"`
 	AuthzRevision uint64        `cbor:"authz_revision,omitempty" json:"authz_revision,omitempty"`
+	// QuarantineOperation identifies the durable fleet operation that fenced
+	// this workspace. It prevents restart reconciliation from treating an
+	// incident response as an ordinary transient failure.
+	QuarantineOperation string `cbor:"quarantine_operation,omitempty" json:"quarantine_operation,omitempty"`
+	QuarantinedAt       int64  `cbor:"quarantined_at,omitempty" json:"quarantined_at,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +237,9 @@ const (
 	OpGrant            = "grant"              // client: GrantReq -> Grant (permission to talk to a node about a ws)
 	OpTimerList        = "timer.list"         // -> TimerListRes
 	OpDiag             = "diag"               // -> ControlDiag (control-plane health and integrity)
+	OpFleetQuarantine  = "fleet.quarantine"   // FleetQuarantineReq -> FleetOperation
+	OpFleetGet         = "fleet.get"          // FleetGetReq -> FleetOperation
+	OpFleetList        = "fleet.list"         // -> FleetListRes
 )
 
 type WSCreateReq struct {
@@ -321,6 +332,85 @@ type WSSnapshotCommitReq struct {
 
 type NodeListRes struct {
 	Nodes []NodeStatus `cbor:"nodes" json:"nodes"`
+}
+
+// WorkspaceSelector identifies incident-containment targets. Empty selectors
+// are rejected unless All is explicit.
+type WorkspaceSelector struct {
+	All           bool              `cbor:"all,omitempty" json:"all,omitempty"`
+	Tenant        string            `cbor:"tenant,omitempty" json:"tenant,omitempty"`
+	Principal     string            `cbor:"principal,omitempty" json:"principal,omitempty"`
+	Run           string            `cbor:"run,omitempty" json:"run,omitempty"`
+	Node          string            `cbor:"node,omitempty" json:"node,omitempty"`
+	Model         string            `cbor:"model,omitempty" json:"model,omitempty"`
+	Backend       string            `cbor:"backend,omitempty" json:"backend,omitempty"`
+	Labels        map[string]string `cbor:"labels,omitempty" json:"labels,omitempty"`
+	CreatedAfter  int64             `cbor:"created_after,omitempty" json:"created_after,omitempty"`
+	CreatedBefore int64             `cbor:"created_before,omitempty" json:"created_before,omitempty"`
+}
+
+const (
+	FleetActionFreeze       = "freeze"
+	FleetActionRevokeEgress = "revoke_egress"
+	FleetActionCheckpoint   = "checkpoint"
+	FleetActionStop         = "stop"
+	FleetActionDestroy      = "destroy"
+
+	FleetStatePending   = "pending"
+	FleetStateRunning   = "running"
+	FleetStateCompleted = "completed"
+	FleetStatePartial   = "partial"
+
+	FleetTargetPending      = "pending"
+	FleetTargetAcknowledged = "acknowledged"
+	FleetTargetFailed       = "failed"
+)
+
+// FleetOperation is one durable, selector-frozen containment request.
+type FleetOperation struct {
+	ID          string                 `cbor:"id" json:"id"`
+	Selector    WorkspaceSelector      `cbor:"selector" json:"selector"`
+	Action      string                 `cbor:"action" json:"action"`
+	RequestedBy string                 `cbor:"requested_by" json:"requested_by"`
+	Tenant      string                 `cbor:"tenant" json:"tenant"`
+	State       string                 `cbor:"state" json:"state"`
+	CreatedAt   int64                  `cbor:"created_at" json:"created_at"`
+	Deadline    int64                  `cbor:"deadline" json:"deadline"`
+	UpdatedAt   int64                  `cbor:"updated_at" json:"updated_at"`
+	Results     []FleetOperationResult `cbor:"results" json:"results"`
+}
+
+// FleetOperationResult records containment progress for one frozen target.
+type FleetOperationResult struct {
+	Workspace    string `cbor:"workspace" json:"workspace"`
+	Node         string `cbor:"node,omitempty" json:"node,omitempty"`
+	Backend      string `cbor:"backend,omitempty" json:"backend,omitempty"`
+	Generation   uint64 `cbor:"generation,omitempty" json:"generation,omitempty"`
+	State        string `cbor:"state" json:"state"`
+	Fenced       bool   `cbor:"fenced,omitempty" json:"fenced,omitempty"`
+	Acknowledged bool   `cbor:"acknowledged" json:"acknowledged"`
+	Snapshot     string `cbor:"snapshot,omitempty" json:"snapshot,omitempty"`
+	Error        string `cbor:"error,omitempty" json:"error,omitempty"`
+	UpdatedAt    int64  `cbor:"updated_at" json:"updated_at"`
+}
+
+// FleetQuarantineReq creates an idempotent fleet containment operation.
+type FleetQuarantineReq struct {
+	Selector       WorkspaceSelector `cbor:"selector" json:"selector"`
+	Action         string            `cbor:"action" json:"action"`
+	DeadlineMillis int64             `cbor:"deadline,omitempty" json:"deadline,omitempty"`
+	TimeoutMillis  int64             `cbor:"timeout_ms,omitempty" json:"timeout_ms,omitempty"`
+	IdempotencyKey string            `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// FleetGetReq identifies a durable fleet operation.
+type FleetGetReq struct {
+	ID string `cbor:"id" json:"id"`
+}
+
+// FleetListRes contains fleet operations visible to the caller.
+type FleetListRes struct {
+	Operations []FleetOperation `cbor:"operations" json:"operations"`
 }
 
 type NodeStatus struct {
@@ -459,11 +549,13 @@ const (
 	OpFSSearch = "fs.search"
 	OpFSEdit   = "fs.edit"
 
-	OpWSSnapshot = "ws.snapshot" // WSSnapshotReq -> WSSnapshotRes
-	OpWSRelease  = "ws.release"  // control -> node: WSReleaseReq -> WSReleasedReq
-	OpWSInfo     = "ws.info"     // WSGetReq -> WSInfoRes
-	OpNodeStatus = "node.status" // -> NodeStatus
-	OpNodeDiag   = "node.diag"   // -> NodeDiag (deep: sessions, logs, disk, metrics)
+	OpWSSnapshot         = "ws.snapshot"          // WSSnapshotReq -> WSSnapshotRes
+	OpWSRelease          = "ws.release"           // control -> node: WSReleaseReq -> WSReleasedReq
+	OpWSInfo             = "ws.info"              // WSGetReq -> WSInfoRes
+	OpNodeStatus         = "node.status"          // -> NodeStatus
+	OpNodeDiag           = "node.diag"            // -> NodeDiag (deep: sessions, logs, disk, metrics)
+	OpWSQuarantine       = "ws.quarantine"        // control -> node: WSQuarantineReq -> WSQuarantineRes
+	OpWSQuarantineCommit = "ws.quarantine.commit" // control -> node: destroy a durably fenced source
 
 	OpPortOpen = "port.open" // PortOpenReq -> SOpenRes (a session of kind port)
 )
@@ -745,6 +837,37 @@ type WSReleaseReq struct {
 	Reason   string `cbor:"reason,omitempty" json:"reason,omitempty"`
 }
 
+// WSQuarantineReq asks the recorded holder to fence and optionally checkpoint
+// a workspace as phase one of a fleet operation.
+type WSQuarantineReq struct {
+	OperationID string   `cbor:"operation" json:"operation"`
+	WS          string   `cbor:"ws" json:"ws"`
+	Gen         uint64   `cbor:"gen" json:"gen"`
+	Action      string   `cbor:"action" json:"action"`
+	Backend     string   `cbor:"backend,omitempty" json:"backend,omitempty"`
+	Exclude     []string `cbor:"exclude,omitempty" json:"exclude,omitempty"`
+}
+
+// WSQuarantineRes is the node's durable phase-one containment proof.
+type WSQuarantineRes struct {
+	Fenced     bool   `cbor:"fenced" json:"fenced"`
+	Generation uint64 `cbor:"gen" json:"gen"`
+	Action     string `cbor:"action" json:"action"`
+	Backend    string `cbor:"backend,omitempty" json:"backend,omitempty"`
+	Snapshot   string `cbor:"snapshot,omitempty" json:"snapshot,omitempty"`
+	Warning    string `cbor:"warning,omitempty" json:"warning,omitempty"`
+}
+
+// WSQuarantineCommitReq authorizes physical deletion after control has
+// durably committed a matching phase-one proof and generation fence.
+type WSQuarantineCommitReq struct {
+	OperationID string `cbor:"operation" json:"operation"`
+	WS          string `cbor:"ws" json:"ws"`
+	Gen         uint64 `cbor:"gen" json:"gen"`
+	Backend     string `cbor:"backend" json:"backend"`
+	Snapshot    string `cbor:"snapshot" json:"snapshot"`
+}
+
 type WSInfoRes struct {
 	WS       string   `cbor:"ws" json:"ws"`
 	Backend  string   `cbor:"backend" json:"backend"`
@@ -874,5 +997,8 @@ const (
 	EvTimerFired     = "timer.fired"
 	EvPeerGone       = "peer.gone"
 	EvEventGap       = "event.producer_gap"
+	EvFleetRequested = "fleet.quarantine.requested"
+	EvFleetTarget    = "fleet.quarantine.target"
+	EvFleetCompleted = "fleet.quarantine.completed"
 	EvWSOffer        = "ws.offer" // control -> node (not logged; a hint to claim)
 )

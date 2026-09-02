@@ -954,6 +954,226 @@ func (n *Node) fenceWorkspace(ctx context.Context, id, reason string) {
 	n.emit(proto.EvWSFenced, id, "", map[string]any{"reason": reason})
 }
 
+// quarantine is the node half of a durable fleet containment operation. It
+// removes the workspace from the serving map before any slow checkpoint I/O,
+// revokes its broker, stops its sessions and retains the filesystem. Control
+// advances the authoritative generation after this acknowledgement.
+func (n *Node) quarantine(ctx context.Context, req *proto.WSQuarantineReq) (*proto.WSQuarantineRes, error) {
+	if req.OperationID == "" || req.WS == "" || req.Gen == 0 {
+		return nil, proto.Err(proto.CodeBadRequest, "quarantine requires operation, workspace and generation")
+	}
+	switch req.Action {
+	case proto.FleetActionFreeze, proto.FleetActionRevokeEgress, proto.FleetActionCheckpoint,
+		proto.FleetActionStop, proto.FleetActionDestroy:
+	default:
+		return nil, proto.Err(proto.CodeBadRequest, "unknown quarantine action %q", req.Action)
+	}
+	key := "fleet:" + req.OperationID + ":" + req.WS
+	raw, err := n.runMutation(ctx, key, *req, func() ([]byte, error) {
+		n.mu.Lock()
+		w := n.workspaces[req.WS]
+		materializing := n.materializing[req.WS]
+		if w == nil {
+			_, retained := n.quarantined[req.WS]
+			if materializing == nil && !retained {
+				n.mu.Unlock()
+				return nil, proto.Err(proto.CodeNotFound, "workspace %s not here", req.WS)
+			}
+			if materializing != nil && materializing.generation != 0 && materializing.generation != req.Gen {
+				n.mu.Unlock()
+				return nil, proto.Err(proto.CodeConflict, "generation mismatch")
+			}
+			if materializing != nil {
+				materializing.cancel()
+			}
+			n.quarantined[req.WS] = struct{}{}
+			delete(n.deadlines, req.WS)
+			n.mu.Unlock()
+			res := proto.WSQuarantineRes{
+				Fenced: true, Generation: req.Gen, Action: req.Action, Backend: req.Backend,
+			}
+			if req.Action == proto.FleetActionCheckpoint || req.Action == proto.FleetActionDestroy {
+				switch {
+				case materializing != nil:
+					res.Warning = "materialization cancelled before a stable checkpoint could be taken"
+				case req.Backend == "":
+					res.Warning = "retained workspace has no backend identity for checkpoint"
+				default:
+					backend, backendErr := n.opts.Backends.Get(req.Backend)
+					if backendErr != nil {
+						res.Warning = backendErr.Error()
+						break
+					}
+					handle, adoptErr := backend.Adopt(ctx, req.WS)
+					if adoptErr != nil {
+						res.Warning = adoptErr.Error()
+						break
+					}
+					retainedWorkspace := &ws{
+						Workspace: proto.Workspace{
+							ID: req.WS, Generation: req.Gen,
+							Spec: proto.WorkspaceSpec{Exclude: append([]string(nil), req.Exclude...)},
+						},
+						handle: handle,
+					}
+					id, _, snapshotErr := n.snapshot(ctx, retainedWorkspace, true)
+					_ = handle.FS().Close()
+					if snapshotErr != nil {
+						res.Warning = snapshotErr.Error()
+					} else {
+						res.Snapshot = id
+					}
+				}
+			}
+			n.emit(proto.EvWSFenced, req.WS, "", map[string]any{
+				"operation": req.OperationID, "action": req.Action, "materializing": materializing != nil,
+				"snapshot": res.Snapshot, "warning": res.Warning,
+			})
+			return proto.Marshal(res)
+		}
+		if w.Generation != req.Gen {
+			n.mu.Unlock()
+			return nil, proto.Err(proto.CodeConflict, "generation mismatch")
+		}
+		delete(n.workspaces, req.WS)
+		delete(n.deadlines, req.WS)
+		n.quarantined[req.WS] = struct{}{}
+		for key, grant := range n.grants {
+			if grant != nil && grant.Claims.WS == req.WS {
+				delete(n.grants, key)
+			}
+		}
+		for key, sub := range n.subs {
+			if sub.ws == req.WS {
+				sub.cancel()
+				delete(n.subs, key)
+			}
+		}
+		n.mu.Unlock()
+
+		if w.broker != nil {
+			w.broker.Suspend()
+			_ = w.broker.Close()
+		}
+		n.sessions.KillWorkspace(req.WS)
+		res := proto.WSQuarantineRes{
+			Fenced: true, Generation: req.Gen, Action: req.Action, Backend: w.handle.Backend(),
+		}
+		if req.Action == proto.FleetActionCheckpoint || req.Action == proto.FleetActionDestroy {
+			id, _, snapshotErr := n.snapshot(ctx, w, true)
+			if snapshotErr != nil {
+				res.Warning = snapshotErr.Error()
+			} else {
+				res.Snapshot = id
+			}
+		}
+		_ = w.handle.FS().Close()
+		n.emit(proto.EvWSFenced, req.WS, w.Spec.Principal, map[string]any{
+			"operation": req.OperationID, "action": req.Action, "snapshot": res.Snapshot,
+			"warning": res.Warning,
+		})
+		return proto.Marshal(res)
+	})
+	if err != nil {
+		return nil, err
+	}
+	var res proto.WSQuarantineRes
+	if err := proto.Unmarshal(raw, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// quarantineCommit performs the destructive second phase only after control
+// has durably committed the fenced state and snapshot reference. It is itself
+// journaled, so a lost acknowledgement can be retried without deleting an
+// unrelated replacement.
+func (n *Node) quarantineCommit(ctx context.Context, req *proto.WSQuarantineCommitReq) error {
+	if req.OperationID == "" || req.WS == "" || req.Gen == 0 || req.Backend == "" || req.Snapshot == "" {
+		return proto.Err(proto.CodeBadRequest,
+			"quarantine commit requires operation, workspace, generation, backend and snapshot")
+	}
+	if err := n.verifyQuarantineProof(ctx, req); err != nil {
+		return err
+	}
+	key := "fleet:" + req.OperationID + ":destroy:" + req.WS
+	_, err := n.runMutation(ctx, key, *req, func() ([]byte, error) {
+		n.mu.Lock()
+		if current := n.workspaces[req.WS]; current != nil {
+			n.mu.Unlock()
+			return nil, proto.Err(proto.CodeConflict, "workspace %s is still serviceable", req.WS)
+		}
+		n.mu.Unlock()
+		backend, err := n.opts.Backends.Get(req.Backend)
+		if err != nil {
+			return nil, err
+		}
+		handle, err := backend.Adopt(ctx, req.WS)
+		var protocolErr *proto.Error
+		if errors.As(err, &protocolErr) && protocolErr.Code == proto.CodeNotFound {
+			n.mu.Lock()
+			delete(n.quarantined, req.WS)
+			n.mu.Unlock()
+			return proto.Marshal(struct{}{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		if err := handle.Destroy(ctx); err != nil {
+			return nil, err
+		}
+		n.mu.Lock()
+		delete(n.quarantined, req.WS)
+		n.mu.Unlock()
+		return proto.Marshal(struct{}{})
+	})
+	return err
+}
+
+// verifyQuarantineProof prevents a destructive phase-two request from becoming
+// authority by itself. The exact snapshot and backend must have been returned
+// by a successfully completed, durable phase-one quarantine on this node.
+func (n *Node) verifyQuarantineProof(ctx context.Context, req *proto.WSQuarantineCommitReq) error {
+	key := "fleet:" + req.OperationID + ":" + req.WS
+	n.mutationMu.Lock()
+	entry := n.mutations[key]
+	if entry == nil {
+		n.mutationMu.Unlock()
+		return proto.Err(proto.CodeConflict, "destroy commit has no quarantine proof")
+	}
+	done := entry.done
+	n.mutationMu.Unlock()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	n.mutationMu.Lock()
+	if entry.State == mutationCompleted && entry.needsPersist {
+		if err := n.persistMutationsLocked(); err != nil {
+			entry.err = proto.Err(proto.CodeInternal,
+				"quarantine proof completed but is not durable: %v", err)
+		}
+	}
+	state := entry.State
+	result := append([]byte(nil), entry.Result...)
+	entryErr := entry.err
+	n.mutationMu.Unlock()
+	if state != mutationCompleted || entryErr != nil {
+		return proto.Err(proto.CodeConflict, "destroy commit quarantine proof is not durably complete")
+	}
+	var proof proto.WSQuarantineRes
+	if err := proto.Unmarshal(result, &proof); err != nil {
+		return proto.Err(proto.CodeConflict, "destroy commit quarantine proof is invalid: %v", err)
+	}
+	if !proof.Fenced || proof.Generation != req.Gen || proof.Action != proto.FleetActionDestroy ||
+		proof.Backend != req.Backend || proof.Snapshot != req.Snapshot {
+		return proto.Err(proto.CodeConflict, "destroy commit does not match quarantine proof")
+	}
+	return nil
+}
+
 // quarantineMaterialization makes a partially prepared filesystem inert while
 // retaining its bytes for reconciliation. Setup failure is not proof that the
 // local tree is disposable: it may be the only copy left after a restart.
@@ -1155,6 +1375,18 @@ func (n *Node) mutationKey(client, wsID, op, key string) string {
 func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) (any, error) {
 	if f.From == proto.PeerControl {
 		switch f.Op {
+		case proto.OpWSQuarantine:
+			req, err := decode[proto.WSQuarantineReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return n.quarantine(ctx, req)
+		case proto.OpWSQuarantineCommit:
+			req, err := decode[proto.WSQuarantineCommitReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return struct{}{}, n.quarantineCommit(ctx, req)
 		case proto.OpWSRelease:
 			req, err := decode[proto.WSReleaseReq](f)
 			if err != nil {

@@ -854,6 +854,46 @@ func TestFilesystemMutationsAreDurablyIdempotent(t *testing.T) {
 	}
 }
 
+func TestFleetDestroyCheckpointsBeforeDeletingSource(t *testing.T) {
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("incident-commander")
+	ctx := ctxT(t, 60*time.Second)
+	ws := mustWS(t, c, proto.WorkspaceSpec{Run: "compromised-run", Labels: map[string]string{"incident": "one"}})
+	if err := c.WriteFile(ctx, ws.ID, "evidence.txt", []byte("preserve me"), 0); err != nil {
+		t.Fatal(err)
+	}
+	info, err := c.WorkspaceInfo(ctx, ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err := c.QuarantineFleet(ctx, proto.FleetQuarantineReq{
+		Selector: proto.WorkspaceSelector{Run: "compromised-run", Labels: map[string]string{"incident": "one"}},
+		Action:   proto.FleetActionDestroy, IdempotencyKey: "destroy-compromised-run",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err = c.WaitFleetOperation(ctx, operation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.State != proto.FleetStateCompleted || len(operation.Results) != 1 ||
+		!operation.Results[0].Acknowledged || operation.Results[0].Snapshot == "" {
+		t.Fatalf("fleet destroy=%#v", operation)
+	}
+	got, err := c.GetWorkspace(ctx, ws.ID)
+	if err != nil || got.State != proto.WSDestroyed || got.LastSnapshot != operation.Results[0].Snapshot {
+		t.Fatalf("destroyed workspace=%#v err=%v", got, err)
+	}
+	if !w.srv.Store.Has(operation.Results[0].Snapshot) {
+		t.Fatal("committed evidence snapshot is missing")
+	}
+	if _, err := os.Stat(info.Root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("source still exists after acknowledged destructive commit: %v", err)
+	}
+}
+
 // Node restart: workspaces on disk are adopted back under a new generation.
 func TestNodeRestartAdoptsLocalWorkspaces(t *testing.T) {
 	w := newWorld(t)

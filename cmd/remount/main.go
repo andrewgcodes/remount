@@ -8,6 +8,7 @@
 //	remount attach   WS SESSION [--from SEQ]
 //	remount fs       read|write|ls|stat|rm|mv|search WS ...
 //	remount port     WS PORT [--local ADDR]
+//	remount fleet    quarantine|ls|get
 //	remount nodes / remount events [--follow] / remount timers
 //	remount standalone [--data DIR]   (server + node in one process, no token)
 package main
@@ -71,6 +72,8 @@ func main() {
 		err = cmdFS(ctx, os.Args[2:])
 	case "port":
 		err = cmdPort(ctx, os.Args[2:])
+	case "fleet":
+		err = cmdFleet(ctx, os.Args[2:])
 	case "status":
 		err = cmdStatus(ctx, os.Args[2:])
 	case "inspect":
@@ -121,6 +124,7 @@ func usage() {
   remount attach WS SESSION [--from N]
   remount fs read|write|ls|stat|rm|mv|search|edit WS ...
   remount port WS PORT [--local 127.0.0.1:PORT]
+  remount fleet quarantine --action freeze (--all | SELECTORS...) | ls | get OPERATION
   remount nodes | events [--follow] [--ws WS] | timers
 
 Inspection, at three depths. All take --json.
@@ -414,8 +418,11 @@ func cmdWS(ctx context.Context, args []string) error {
 		mem := fs.Int("mem", 0, "required memory MiB")
 		nodeID := fs.String("node", "", "pin to node id")
 		principal := fs.String("principal", "", "principal (default: caller)")
-		labels, env := kvFlag{}, kvFlag{}
+		run := fs.String("run", "", "run identifier used by fleet selectors")
+		model := fs.String("model", "", "model identifier used by fleet selectors")
+		labels, workspaceLabels, env := kvFlag{}, kvFlag{}, kvFlag{}
 		fs.Var(labels, "label", "placement label k=v (repeatable)")
+		fs.Var(workspaceLabels, "workspace-label", "workspace label k=v (repeatable)")
 		fs.Var(env, "env", "env K=V; values may be ref:<binding> or ${REMOUNT_BROKER} (repeatable)")
 		var bindings, exclude listFlag
 		fs.Var(&bindings, "binding", "binding id (repeatable)")
@@ -425,7 +432,7 @@ func cmdWS(ctx context.Context, args []string) error {
 		cl := c.client()
 		defer cl.Close()
 		spec := proto.WorkspaceSpec{
-			Name: *name, Image: *image, Principal: *principal,
+			Name: *name, Run: *run, Model: *model, Labels: workspaceLabels, Image: *image, Principal: *principal,
 			Requires:  proto.Requires{Backend: *backend, CPU: *cpu, MemMiB: *mem},
 			Placement: proto.Placement{Allow: labels, Node: *nodeID},
 			Bindings:  bindings, Env: env, Exclude: exclude,
@@ -591,6 +598,133 @@ func cmdWS(ctx context.Context, args []string) error {
 		return fmt.Errorf("unknown ws subcommand %q", sub)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// fleet incident response
+// ---------------------------------------------------------------------------
+
+func parseRFC3339Millis(value string) (int64, error) {
+	if value == "" {
+		return 0, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return 0, fmt.Errorf("parse %q as RFC3339: %w", value, err)
+	}
+	return parsed.UnixMilli(), nil
+}
+
+func cmdFleet(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return errors.New("fleet: quarantine|ls|get")
+	}
+	sub, rest := args[0], args[1:]
+	fs := flag.NewFlagSet("fleet "+sub, flag.ExitOnError)
+	var commonFlags common
+	commonFlags.flags(fs)
+	switch sub {
+	case "quarantine":
+		action := fs.String("action", proto.FleetActionFreeze, "freeze|revoke_egress|checkpoint|stop|destroy")
+		all := fs.Bool("all", false, "explicitly select every visible workspace")
+		tenant := fs.String("tenant", "", "tenant selector")
+		principal := fs.String("principal", "", "principal selector")
+		run := fs.String("run", "", "run selector")
+		nodeID := fs.String("node", "", "node selector")
+		model := fs.String("model", "", "model selector")
+		backend := fs.String("backend", "", "backend selector")
+		createdAfter := fs.String("created-after", "", "RFC3339 lower creation-time bound")
+		createdBefore := fs.String("created-before", "", "RFC3339 upper creation-time bound")
+		deadline := fs.Duration("deadline", 5*time.Minute, "containment acknowledgement deadline")
+		idem := fs.String("idem", "", "stable idempotency key for retry after an ambiguous result")
+		wait := fs.Bool("wait", true, "wait for completed/partial state")
+		labels := kvFlag{}
+		fs.Var(labels, "label", "workspace label selector k=v (repeatable)")
+		parse(fs, rest)
+		afterMillis, err := parseRFC3339Millis(*createdAfter)
+		if err != nil {
+			return err
+		}
+		beforeMillis, err := parseRFC3339Millis(*createdBefore)
+		if err != nil {
+			return err
+		}
+		request := proto.FleetQuarantineReq{
+			Action: *action, IdempotencyKey: *idem, TimeoutMillis: (*deadline).Milliseconds(),
+			Selector: proto.WorkspaceSelector{
+				All: *all, Tenant: *tenant, Principal: *principal, Run: *run, Node: *nodeID,
+				Model: *model, Backend: *backend, Labels: labels,
+				CreatedAfter: afterMillis, CreatedBefore: beforeMillis,
+			},
+		}
+		if *deadline < time.Millisecond {
+			return errors.New("--deadline must be at least 1ms")
+		}
+		cl := commonFlags.client()
+		defer cl.Close()
+		operation, err := cl.QuarantineFleet(ctx, request)
+		if err != nil {
+			return err
+		}
+		if *wait && operation.State != proto.FleetStateCompleted {
+			operationID := operation.ID
+			operation, err = cl.WaitFleetOperation(ctx, operation.ID)
+			if err != nil {
+				return fmt.Errorf("fleet operation %s is still durable and may continue: %w", operationID, err)
+			}
+		}
+		printFleetOperation(operation, commonFlags.json)
+	case "get":
+		parse(fs, rest)
+		if fs.NArg() != 1 {
+			return errors.New("fleet get OPERATION")
+		}
+		cl := commonFlags.client()
+		defer cl.Close()
+		operation, err := cl.GetFleetOperation(ctx, fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		printFleetOperation(operation, commonFlags.json)
+	case "ls":
+		parse(fs, rest)
+		cl := commonFlags.client()
+		defer cl.Close()
+		operations, err := cl.ListFleetOperations(ctx)
+		if err != nil {
+			return err
+		}
+		if commonFlags.json {
+			printJSON(operations)
+			return nil
+		}
+		tw := tabWriter()
+		fmt.Fprintln(tw, "ID\tACTION\tSTATE\tTARGETS\tREQUESTED_BY\tCREATED")
+		for _, operation := range operations {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\n", operation.ID, operation.Action,
+				operation.State, len(operation.Results), operation.RequestedBy,
+				time.UnixMilli(operation.CreatedAt).Format(time.RFC3339))
+		}
+		tw.Flush()
+	default:
+		return fmt.Errorf("unknown fleet subcommand %q", sub)
+	}
+	return nil
+}
+
+func printFleetOperation(operation *proto.FleetOperation, jsonOutput bool) {
+	if jsonOutput {
+		printJSON(operation)
+		return
+	}
+	fmt.Printf("%s\t%s\t%s\n", operation.ID, operation.Action, operation.State)
+	tw := tabWriter()
+	fmt.Fprintln(tw, "WORKSPACE\tNODE\tSTATE\tACK\tSNAPSHOT\tERROR")
+	for _, result := range operation.Results {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%t\t%s\t%s\n", result.Workspace, result.Node,
+			result.State, result.Acknowledged, short(result.Snapshot), result.Error)
+	}
+	tw.Flush()
 }
 
 func short(s string) string {

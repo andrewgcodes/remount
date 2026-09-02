@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -547,4 +549,266 @@ func TestHandleFrameRejectsWhenRequestCapacityIsExhausted(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	<-f.c.requestSlots
+}
+
+func TestFleetQuarantineSelectsFencesAndIsIdempotent(t *testing.T) {
+	f := newControlFixture(t, "", nil)
+	sender := &fakeSender{online: map[string]bool{"n_one": true}}
+	sender.request = func(_ context.Context, to, op string, body, out any) error {
+		if to != "n_one" || op != proto.OpWSQuarantine {
+			return fmt.Errorf("unexpected request %s %s", to, op)
+		}
+		req := body.(proto.WSQuarantineReq)
+		*out.(*proto.WSQuarantineRes) = proto.WSQuarantineRes{
+			Fenced: true, Generation: req.Gen, Action: req.Action, Backend: "process",
+		}
+		if req.OperationID == "" || req.WS == "" || req.Gen == 0 {
+			return errors.New("incomplete quarantine request")
+		}
+		return nil
+	}
+	f.c.Attach(sender)
+	connectNode(t, f.c, "n_one", processNodeInfo(4096))
+	target := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{
+		Run: "incident-run", Model: "target-model", Labels: map[string]string{"risk": "high"},
+	})
+	other := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{Run: "other-run"})
+	claim, err := f.c.wsClaim(context.Background(), "n_one", target.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.c.wsReady(context.Background(), "n_one", &proto.WSReadyReq{ID: target.ID, Gen: claim.Workspace.Generation}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := &proto.FleetQuarantineReq{
+		Selector: proto.WorkspaceSelector{Run: "incident-run", Model: "target-model", Labels: map[string]string{"risk": "high"}},
+		Action:   proto.FleetActionFreeze, IdempotencyKey: "contain-once",
+	}
+	op, err := f.c.fleetQuarantine(context.Background(), localSubject(), req)
+	if err != nil || len(op.Results) != 1 || op.Results[0].Workspace != target.ID {
+		t.Fatalf("operation=%#v err=%v", op, err)
+	}
+	f.c.runFleetOperation(context.Background(), op.ID)
+	done, err := f.c.fleetGet(context.Background(), localSubject(), op.ID)
+	if err != nil || done.State != proto.FleetStateCompleted || !done.Results[0].Acknowledged {
+		t.Fatalf("completed operation=%#v err=%v", done, err)
+	}
+	fenced := f.c.snapshotWS(target.ID)
+	if fenced.State != proto.WSFailed || fenced.Generation != claim.Workspace.Generation+1 ||
+		fenced.QuarantineOperation != op.ID || fenced.AuthzRevision <= target.AuthzRevision {
+		t.Fatalf("fenced workspace=%#v", fenced)
+	}
+	if got := f.c.snapshotWS(other.ID); got.State != proto.WSPending {
+		t.Fatalf("selector fenced unrelated workspace: %#v", got)
+	}
+	replay, err := f.c.fleetQuarantine(context.Background(), localSubject(), req)
+	if err != nil || replay.ID != op.ID {
+		t.Fatalf("idempotent replay=%#v err=%v", replay, err)
+	}
+	changed := *req
+	changed.Action = proto.FleetActionStop
+	if _, err := f.c.fleetQuarantine(context.Background(), localSubject(), &changed); err == nil {
+		t.Fatal("changed request reused an idempotency key")
+	}
+}
+
+func TestFleetQuarantinePersistsPendingTargetsAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fleet-restart.db")
+	f1 := newControlFixture(t, path, nil)
+	offline := &fakeSender{online: map[string]bool{"n_one": false}}
+	f1.c.Attach(offline)
+	connectNode(t, f1.c, "n_one", processNodeInfo(4096))
+	ws := createWorkspace(t, f1.c, localSubject(), proto.WorkspaceSpec{})
+	claim, err := f1.c.wsClaim(context.Background(), "n_one", ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f1.c.wsReady(context.Background(), "n_one", &proto.WSReadyReq{ID: ws.ID, Gen: claim.Workspace.Generation}); err != nil {
+		t.Fatal(err)
+	}
+	op, err := f1.c.fleetQuarantine(context.Background(), localSubject(), &proto.FleetQuarantineReq{
+		Selector: proto.WorkspaceSelector{Node: "n_one"}, Action: proto.FleetActionStop,
+		IdempotencyKey: "restartable-containment",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f1.c.runFleetOperation(context.Background(), op.ID)
+	pending, err := f1.c.fleetGet(context.Background(), localSubject(), op.ID)
+	if err != nil || pending.State != proto.FleetStateRunning || pending.Results[0].State != proto.FleetTargetPending {
+		t.Fatalf("pending operation=%#v err=%v", pending, err)
+	}
+	if got := f1.c.snapshotWS(ws.ID); got.State != proto.WSFailed || got.Generation != claim.Workspace.Generation+1 {
+		t.Fatalf("offline target was not authoritatively fenced: %#v", got)
+	}
+	f1.c.Stop()
+	if err := f1.log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	f2 := newControlFixture(t, path, nil)
+	online := &fakeSender{online: map[string]bool{"n_one": true}}
+	online.request = func(_ context.Context, _ string, op string, body any, out any) error {
+		if op != proto.OpWSQuarantine {
+			return fmt.Errorf("unexpected op %s", op)
+		}
+		req := body.(proto.WSQuarantineReq)
+		*out.(*proto.WSQuarantineRes) = proto.WSQuarantineRes{
+			Fenced: true, Generation: req.Gen, Action: req.Action, Backend: "process",
+		}
+		return nil
+	}
+	f2.c.Attach(online)
+	f2.c.runFleetOperation(context.Background(), op.ID)
+	recovered, err := f2.c.fleetGet(context.Background(), localSubject(), op.ID)
+	if err != nil || recovered.State != proto.FleetStateCompleted || !recovered.Results[0].Acknowledged {
+		t.Fatalf("recovered operation=%#v err=%v", recovered, err)
+	}
+}
+
+func TestFleetQuarantineCanEscalateCompletedFenceToDestroy(t *testing.T) {
+	f := newControlFixture(t, "", nil)
+	sender := &fakeSender{online: map[string]bool{"n_one": true}}
+	var requests []proto.WSQuarantineReq
+	var commits int
+	sender.request = func(_ context.Context, _ string, op string, body, out any) error {
+		switch op {
+		case proto.OpWSQuarantine:
+			req := body.(proto.WSQuarantineReq)
+			requests = append(requests, req)
+			res := proto.WSQuarantineRes{
+				Fenced: true, Generation: req.Gen, Action: req.Action, Backend: "process",
+			}
+			if req.Action == proto.FleetActionDestroy {
+				res.Snapshot = "art_sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+			}
+			*out.(*proto.WSQuarantineRes) = res
+		case proto.OpWSQuarantineCommit:
+			commits++
+		default:
+			return fmt.Errorf("unexpected op %s", op)
+		}
+		return nil
+	}
+	f.c.Attach(sender)
+	connectNode(t, f.c, "n_one", processNodeInfo(4096))
+	ws := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{Run: "escalate"})
+	claim, err := f.c.wsClaim(context.Background(), "n_one", ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.c.wsReady(context.Background(), "n_one", &proto.WSReadyReq{ID: ws.ID, Gen: claim.Workspace.Generation}); err != nil {
+		t.Fatal(err)
+	}
+
+	freeze, err := f.c.fleetQuarantine(context.Background(), localSubject(), &proto.FleetQuarantineReq{
+		Selector: proto.WorkspaceSelector{Run: "escalate"}, Action: proto.FleetActionFreeze,
+		IdempotencyKey: "freeze-first",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.c.runFleetOperation(context.Background(), freeze.ID)
+	destroy, err := f.c.fleetQuarantine(context.Background(), localSubject(), &proto.FleetQuarantineReq{
+		Selector: proto.WorkspaceSelector{Run: "escalate"}, Action: proto.FleetActionDestroy,
+		IdempotencyKey: "destroy-second",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.c.runFleetOperation(context.Background(), destroy.ID)
+	done, err := f.c.fleetGet(context.Background(), localSubject(), destroy.ID)
+	if err != nil || done.State != proto.FleetStateCompleted || len(done.Results) != 1 || !done.Results[0].Acknowledged {
+		t.Fatalf("destroy escalation=%#v err=%v", done, err)
+	}
+	if len(requests) != 2 || requests[1].Gen != claim.Workspace.Generation ||
+		requests[1].Action != proto.FleetActionDestroy || commits != 1 {
+		t.Fatalf("requests=%#v commits=%d", requests, commits)
+	}
+	if got := f.c.snapshotWS(ws.ID); got.State != proto.WSDestroyed || got.QuarantineOperation != destroy.ID || got.LastSnapshot == "" {
+		t.Fatalf("destroyed workspace=%#v", got)
+	}
+}
+
+func TestFleetPartialOperationContinuesReconcilingAfterDeadline(t *testing.T) {
+	now := time.Now()
+	f := newControlFixture(t, "", func(opts *Options) { opts.Now = func() time.Time { return now } })
+	sender := &fakeSender{online: map[string]bool{"n_one": false}}
+	sender.request = func(_ context.Context, _ string, op string, body, out any) error {
+		if op != proto.OpWSQuarantine {
+			return fmt.Errorf("unexpected op %s", op)
+		}
+		req := body.(proto.WSQuarantineReq)
+		*out.(*proto.WSQuarantineRes) = proto.WSQuarantineRes{
+			Fenced: true, Generation: req.Gen, Action: req.Action, Backend: "process",
+		}
+		return nil
+	}
+	f.c.Attach(sender)
+	connectNode(t, f.c, "n_one", processNodeInfo(4096))
+	ws := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{Run: "late-node"})
+	claim, err := f.c.wsClaim(context.Background(), "n_one", ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.c.wsReady(context.Background(), "n_one", &proto.WSReadyReq{ID: ws.ID, Gen: claim.Workspace.Generation}); err != nil {
+		t.Fatal(err)
+	}
+	op, err := f.c.fleetQuarantine(context.Background(), localSubject(), &proto.FleetQuarantineReq{
+		Selector: proto.WorkspaceSelector{Run: "late-node"}, Action: proto.FleetActionStop,
+		DeadlineMillis: now.Add(time.Second).UnixMilli(), IdempotencyKey: "deadline-reconcile",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Second)
+	f.c.runFleetOperation(context.Background(), op.ID)
+	partial, err := f.c.fleetGet(context.Background(), localSubject(), op.ID)
+	if err != nil || partial.State != proto.FleetStatePartial || partial.Results[0].State != proto.FleetTargetPending {
+		t.Fatalf("deadline result=%#v err=%v", partial, err)
+	}
+	sender.mu.Lock()
+	sender.online["n_one"] = true
+	sender.mu.Unlock()
+	f.c.runFleetOperation(context.Background(), op.ID)
+	done, err := f.c.fleetGet(context.Background(), localSubject(), op.ID)
+	if err != nil || done.State != proto.FleetStateCompleted || !done.Results[0].Acknowledged {
+		t.Fatalf("post-deadline reconciliation=%#v err=%v", done, err)
+	}
+}
+
+func TestFleetEmptySelectionIsDurablyAndObservablyComplete(t *testing.T) {
+	f := newControlFixture(t, "", nil)
+	req := &proto.FleetQuarantineReq{
+		Selector: proto.WorkspaceSelector{Run: "does-not-exist"}, Action: proto.FleetActionFreeze,
+		TimeoutMillis: time.Minute.Milliseconds(), IdempotencyKey: "empty-selection",
+	}
+	op, err := f.c.fleetQuarantine(context.Background(), localSubject(), req)
+	if err != nil || op.State != proto.FleetStateCompleted || len(op.Results) != 0 {
+		t.Fatalf("empty operation=%#v err=%v", op, err)
+	}
+	replayed, err := f.c.fleetQuarantine(context.Background(), localSubject(), req)
+	if err != nil || replayed.ID != op.ID || replayed.Deadline != op.Deadline {
+		t.Fatalf("timeout-based replay=%#v err=%v", replayed, err)
+	}
+	events, err := f.log.Read(context.Background(), 1, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requested, completed := 0, 0
+	for _, event := range events {
+		if event.OperationID != op.ID {
+			continue
+		}
+		switch event.Type {
+		case proto.EvFleetRequested:
+			requested++
+		case proto.EvFleetCompleted:
+			completed++
+		}
+	}
+	if requested != 1 || completed != 1 {
+		t.Fatalf("fleet events requested=%d completed=%d", requested, completed)
+	}
 }
