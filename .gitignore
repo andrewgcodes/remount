@@ -1,0 +1,19 @@
+# Secrets — never commit
+.env
+.env.*
+bindings.json
+bindings.*.json
+
+# Local state
+remount-data/
+remount-node/
+/remount
+dist/
+
+# Go
+*.test
+*.out
+coverage.txt
+
+# stray example binaries
+/agentloop

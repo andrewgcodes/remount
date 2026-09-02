@@ -1,0 +1,200 @@
+// Package metrics is the low-level counter surface: cheap atomic counters and
+// gauges, rendered as Prometheus text.
+//
+// Deliberately dependency-free. A metrics library would be a bigger import than
+// the thing it measures, and the whole surface here is "add one" and "set".
+package metrics
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+)
+
+// Registry holds counters and gauges by name.
+type Registry struct {
+	mu       sync.RWMutex
+	counters map[string]*Counter
+	gauges   map[string]*Gauge
+	funcs    map[string]func() float64
+	help     map[string]string
+}
+
+// Counter only ever increases.
+type Counter struct{ v atomic.Uint64 }
+
+// Add increments by n.
+func (c *Counter) Add(n uint64) { c.v.Add(n) }
+
+// Inc increments by one.
+func (c *Counter) Inc() { c.v.Add(1) }
+
+// Value reads it.
+func (c *Counter) Value() uint64 { return c.v.Load() }
+
+// Gauge goes up and down.
+type Gauge struct{ v atomic.Int64 }
+
+// Set replaces the value.
+func (g *Gauge) Set(n int64) { g.v.Store(n) }
+
+// Add adds a delta, which may be negative.
+func (g *Gauge) Add(n int64) { g.v.Add(n) }
+
+// Value reads it.
+func (g *Gauge) Value() int64 { return g.v.Load() }
+
+// New creates an empty registry.
+func New() *Registry {
+	return &Registry{
+		counters: map[string]*Counter{},
+		gauges:   map[string]*Gauge{},
+		funcs:    map[string]func() float64{},
+		help:     map[string]string{},
+	}
+}
+
+// Default is the process-wide registry.
+var Default = New()
+
+// Counter returns (creating if needed) a named counter.
+func (r *Registry) Counter(name, help string) *Counter {
+	r.mu.RLock()
+	c := r.counters[name]
+	r.mu.RUnlock()
+	if c != nil {
+		return c
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if c = r.counters[name]; c == nil {
+		c = &Counter{}
+		r.counters[name] = c
+		r.help[name] = help
+	}
+	return c
+}
+
+// Gauge returns (creating if needed) a named gauge.
+func (r *Registry) Gauge(name, help string) *Gauge {
+	r.mu.RLock()
+	g := r.gauges[name]
+	r.mu.RUnlock()
+	if g != nil {
+		return g
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if g = r.gauges[name]; g == nil {
+		g = &Gauge{}
+		r.gauges[name] = g
+		r.help[name] = help
+	}
+	return g
+}
+
+// GaugeFunc registers a gauge computed on scrape, for things that already have
+// a source of truth elsewhere (open sessions, connected peers).
+func (r *Registry) GaugeFunc(name, help string, f func() float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.funcs[name] = f
+	r.help[name] = help
+}
+
+// Counter and Gauge on the default registry.
+func Count(name, help string) *Counter { return Default.Counter(name, help) }
+func Measure(name, help string) *Gauge { return Default.Gauge(name, help) }
+
+// Write renders the registry as Prometheus text format.
+func (r *Registry) Write(sb *strings.Builder) {
+	r.mu.RLock()
+	type sample struct {
+		name string
+		typ  string
+		val  float64
+	}
+	var out []sample
+	for n, c := range r.counters {
+		out = append(out, sample{n, "counter", float64(c.Value())})
+	}
+	for n, g := range r.gauges {
+		out = append(out, sample{n, "gauge", float64(g.Value())})
+	}
+	for n, f := range r.funcs {
+		out = append(out, sample{n, "gauge", f()})
+	}
+	help := make(map[string]string, len(r.help))
+	for k, v := range r.help {
+		help[k] = v
+	}
+	r.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	for _, s := range out {
+		if h := help[s.name]; h != "" {
+			fmt.Fprintf(sb, "# HELP %s %s\n", s.name, h)
+		}
+		fmt.Fprintf(sb, "# TYPE %s %s\n", s.name, s.typ)
+		fmt.Fprintf(sb, "%s %g\n", s.name, s.val)
+	}
+}
+
+// Snapshot returns every metric as a map, for the CLI and for tests.
+func (r *Registry) Snapshot() map[string]float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := map[string]float64{}
+	for n, c := range r.counters {
+		out[n] = float64(c.Value())
+	}
+	for n, g := range r.gauges {
+		out[n] = float64(g.Value())
+	}
+	for n, f := range r.funcs {
+		out[n] = f()
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// The metrics Remount actually keeps. Named here so they are one list rather
+// than string literals scattered through the code.
+// ---------------------------------------------------------------------------
+
+var (
+	FramesRouted   = Count("remount_frames_routed_total", "frames forwarded between peers by the relay")
+	FramesDropped  = Count("remount_frames_dropped_total", "frames discarded because the destination was gone")
+	BytesRouted    = Count("remount_relay_bytes_total", "approximate frame bytes forwarded by the relay")
+	PeersConnected = Measure("remount_peers_connected", "peers currently connected to the relay")
+
+	WSCreated      = Count("remount_workspaces_created_total", "workspaces created")
+	WSClaims       = Count("remount_workspace_claims_total", "successful claims, including re-adoptions")
+	WSClaimDenied  = Count("remount_workspace_claims_denied_total", "claims refused as ineligible or already held")
+	WSLeaseExpired = Count("remount_workspace_lease_expired_total", "leases that expired, returning a workspace to pending")
+	WSMoved        = Count("remount_workspaces_moved_total", "explicit moves")
+	WSDestroyed    = Count("remount_workspaces_destroyed_total", "workspaces destroyed")
+
+	SessionsOpened = Count("remount_sessions_opened_total", "sessions opened on this node")
+	SessionsExited = Count("remount_sessions_exited_total", "sessions that finished")
+	ChunksEmitted  = Count("remount_session_chunks_total", "output chunks appended to session logs")
+	BytesEmitted   = Count("remount_session_bytes_total", "output bytes appended to session logs")
+	ChunksEvicted  = Count("remount_session_chunks_evicted_total", "chunks dropped from memory into spill or discarded")
+	GapsReported   = Count("remount_session_gaps_total", "replay gaps reported to clients; each is data a client could not get")
+	InputsDropped  = Count("remount_session_inputs_deduped_total", "duplicate inputs dropped by sequence")
+
+	SnapshotsTaken = Count("remount_snapshots_total", "snapshots created")
+	SnapshotBytes  = Count("remount_snapshot_bytes_total", "bytes written into snapshots")
+	RestoresDone   = Count("remount_restores_total", "workspaces restored from a snapshot")
+	ArtifactMiss   = Count("remount_artifact_digest_mismatch_total", "artifacts rejected because the digest did not match; each one is corruption")
+
+	CredUsed     = Count("remount_credentials_substituted_total", "credential substitutions at the egress broker")
+	EgressAllow  = Count("remount_egress_allowed_total", "requests allowed without a credential")
+	EgressDeny   = Count("remount_egress_denied_total", "requests denied by policy")
+	LeakBlocked  = Count("remount_egress_leak_blocked_total", "placeholders sent to an unbound host; each is an exfiltration attempt")
+	LeaseExpired = Count("remount_binding_lease_expired_total", "requests refused because a binding lease had expired")
+
+	EventsAppended = Count("remount_events_total", "events appended to the canonical log")
+	TimersFired    = Count("remount_timers_fired_total", "durable timers that fired")
+)
