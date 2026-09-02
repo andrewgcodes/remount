@@ -1,0 +1,559 @@
+# Mistakes
+
+Everything that broke while building Remount, in the order it was found, with
+the actual cause and the actual fix. This is the most useful document in the
+repository. The design documents say what the system is; this one says how it
+got that way.
+
+Each entry: symptom, cause, fix, lesson, and how it was found where that
+matters.
+
+---
+
+## 1. Every client-to-node request timed out
+
+**Symptom.** Workspace creation worked. Reading a file from that workspace hung
+for the full ten seconds and failed. Client-to-control traffic was fine;
+client-to-node traffic never got a response, not even an error.
+
+**Cause.** The relay wraps every connection in a `transport.Peer`. The peer's
+read loop matched every `res` frame against its own pending-request map and
+silently dropped any that did not match, on the theory that an unknown id was a
+late reply to a timed-out request. A response from a node to a client passes
+through the relay as a `res` with the client's id, which the relay-side peer
+never issued. It was dropped before routing ever saw it.
+
+**Fix.** `internal/transport/peer.go`. A `res` or `pong` that matches a pending
+request is delivered to it; one that does not is handed to the handler. The
+relay's handler routes it by destination. An endpoint's handler ignores it.
+
+**Lesson.** A component that sits in the middle must not apply endpoint
+semantics to what it forwards. The bug was invisible because the frame was
+consumed by code that was correct for the other role.
+
+**How found.** Instrumenting `relay.route` showed the request going out and no
+response ever coming back in.
+
+## 2. Sessions hung forever
+
+**Symptom.** After the previous fix, `Exec` returned a session, and ranging over
+its chunks never finished. The process had exited on the node.
+
+**Cause.** The node subscribes the client to the session's log before it sends
+the `s.open` response, so seq 0 can arrive at the client before the client knows
+the session id. The client looked the id up, found nothing, and dropped it.
+Every later chunk was held waiting for seq 0, which would never come.
+
+**Fix.** `internal/client/client.go`. Chunks for an unknown session id go into a
+bounded orphan buffer. When the open response arrives, `register` drains the
+buffer into the session in seq order.
+
+**Lesson.** When a stream and its metadata arrive on the same connection from
+different senders, assume the stream can win the race.
+
+**How found.** The test timed out with a goroutine parked on channel receive
+inside `range s.Chunks()`.
+
+## 3. The client never reconnected when idle
+
+**Symptom.** Cut the client's connection mid-stream and the stream stopped for
+good. Nothing errored.
+
+**Cause.** Reconnection lived inside `call`, so it only happened when the caller
+made a request. A caller that was only ranging over chunks made no requests, so
+it sat forever on a channel that would never be written again.
+
+**Fix.** `internal/client/client.go`. Every successful `Connect` starts a
+`supervise` goroutine that waits for the connection to die and, if the client
+is open and has live sessions, reconnects. Reconnect re-attaches every session
+from its last delivered seq. Dials are serialized by a separate mutex so two
+callers cannot race to open two connections.
+
+**Lesson.** Reconnect is a property of the connection, not of the next request.
+
+## 4. Node restart destroyed the local workspace
+
+**Symptom.** Restart a node process. The workspace it held was still marked
+claimed by that node id. The restarted node tried to claim, got a conflict, and
+the adopt path deleted the directory. Files written before the restart were
+gone.
+
+**Cause.** The claim path treated "already claimed" as "someone else has it" and
+disposed of the local copy. It did not consider "I already have it".
+
+**Fix.** `internal/control/control.go`. If a node claims a workspace that is
+already held by that same node, the control plane returns it at the same
+generation. Outstanding client grants stay valid. The node adopts its local
+directory rather than restoring.
+
+**Lesson.** Identity persists across process restarts. A claim from the holder
+is not a conflict.
+
+## 5. "Workspace is not on this node" right after it became claimed
+
+**Symptom.** `WaitClaimed` returned, the next `ReadFile` failed with
+`not_found: workspace ws_… is not on this node`.
+
+**Cause.** The control plane marked a workspace `claimed` the instant a node won
+the race. The node then spent time restoring a snapshot into a directory that
+did not exist yet. A client that waited for `claimed` saw it, sent a request,
+and hit a node that had not finished.
+
+**Fix.** A new state. `claiming` means a node owns the workspace but is not
+serving it. The node sends `ws.ready` after materializing and only then does the
+control plane set `claimed`. Grants are issued only for `claimed`. This is
+`docs/adr/0011-ready-handshake.md`.
+
+**Lesson.** Winning a race is not the same as being ready. Say "ready" only when
+it is true.
+
+**How found.** The sleep test under the race detector, where restores were slow
+enough to widen the window.
+
+## 6. An offline node still advertised its workspaces as ready
+
+**Symptom.** Restart a node. `WaitClaimed` returned immediately because the
+state was still `claimed` from before the restart. The next request hit a node
+that had not re-adopted yet.
+
+**Cause.** `PeerGone` marked the node offline and left its workspaces
+untouched, on the reasoning that the lease was still valid.
+
+**Fix.** `internal/control/control.go`. When a node disconnects, every
+`claimed` workspace it holds is demoted to `claiming`. The lease still runs.
+When the node returns, `resync` sends `ws.ready` for everything it is still
+serving, and `reclaimLocal` re-claims anything only on disk.
+
+**Lesson.** "Held" and "serving" are different facts. A lease says held.
+
+## 7. The webhook wake never fired
+
+**Symptom.** `POST /v1/events` returned 202. The timer waiting on that event
+type never fired. A timer-based wake worked fine.
+
+**Cause.** The HTTP handler passed `r.Context()` into the control plane and
+returned. The request context was cancelled the moment the handler returned,
+which was before the goroutine got to `log.Append`, which failed with
+`context canceled` and never reached the timer check.
+
+**Fix.** `internal/server/server.go` and `internal/control/control.go`. The
+handler uses `context.WithoutCancel(r.Context())` and calls a dedicated
+`PostEvents` method that appends, fires timers, and re-offers pending work.
+
+**Lesson.** Work that outlives a request must not borrow the request's context.
+
+**How found.** Instrumenting `fireTimer` showed one timer fire for the
+duration-based sleep and none for the event-based one.
+
+## 8. One workspace materialized twice on the same node
+
+**Symptom.** After a timer wake, the node logged `materialize failed;
+releasing … already exists on this node`, then a second claim at a higher
+generation, then `ws.ready failed … stale ready`. The workspace bounced forever.
+
+**Cause.** The timer wake and the periodic tick each sent an offer. Two
+`tryClaim` goroutines ran on the same node. The first claim won the race. The
+second arrived while the workspace was `claiming` by the same node, which the
+re-adoption rule from mistake 4 accepted as a valid claim. Both goroutines
+materialized. One created the directory; the other hit the conflict, and its
+error path released the claim the first one was about to finish.
+
+**Fix.** `internal/node/node.go`. `tryClaim` reserves the workspace id in
+`n.materializing` under the node's mutex before talking to the control plane.
+A second offer for a reserved id returns immediately.
+
+**Lesson.** An idempotency rule that is correct across restarts can be wrong
+across concurrent goroutines. Serialize at the smallest scope that owns the
+resource.
+
+**How found.** Node logs under the race detector, where restores were slow
+enough for both offers to arrive before the first finished.
+
+## 9. Leases expired during a slow restore
+
+**Symptom.** Under the race detector, a workspace being restored from a
+snapshot returned to pending before the node finished. It was then claimed
+again, restored again, and expired again.
+
+**Cause.** The renew loop iterated `n.workspaces`. A workspace being restored
+was not in that map until `materialize` returned. Nothing renewed its lease
+while the restore ran.
+
+**Fix.** `internal/node/node.go`. `renew` includes every entry in
+`n.materializing` along with the generation from the claim.
+
+**Lesson.** A claim you are working on is a claim you hold. Renew from the
+moment of the claim, not the moment of completion.
+
+## 10. The node renewed every five seconds under a two-second lease
+
+**Symptom.** With the sim world's two-second lease, workspaces churned between
+claimed and pending under `-race`.
+
+**Cause.** The renew interval was a constant. The control plane handed the node
+the lease length in `HelloOK` and the node ignored it.
+
+**Fix.** `internal/node/node.go`. The renew loop ticks every 250 ms and renews
+when a third of the lease has passed since the last renew. The spec now states
+that a node must renew at no more than one third of the lease.
+
+**Lesson.** A constant that must be smaller than another value is not a
+constant.
+
+## 11. Data race on control-plane workspace state
+
+**Symptom.** `WARNING: DATA RACE` between `wsReady` writing `ws.State` and
+`wsClaim` reading it. Both functions held `c.mu` at those lines.
+
+**Cause.** The idempotent path of `wsCreate` returned the live `*Workspace`
+from the map after unlocking. `wsSleep` returned the live `*Timer`. The caller
+serialized those pointers into a response without the lock while another
+goroutine mutated the same object under it.
+
+**Fix.** `internal/control/control.go`. Every value that leaves a locked region
+is a copy: `cp := *ws` before `c.mu.Unlock()`.
+
+**Lesson.** A mutex protects a critical section, not the data that escapes it.
+
+**How found.** The race detector, on the third run. It was intermittent.
+
+## 12. A dead port session was returned as a live one
+
+**Symptom.** `OpenPort` succeeded immediately even though nothing was
+listening. The retry loop waiting for a server to come up never retried. Input
+then failed with `session has no stdin`.
+
+**Cause.** `Manager.Open` returns the session even when the runner fails to
+start, because for exec and pty the failure is recorded in the log and that is
+the right behavior. For a port session the "runner" is a TCP dial, and a failed
+dial means there is nothing to attach to.
+
+**Fix.** `internal/node/node.go`. `portOpen` checks whether the session exited
+immediately with an error and returns `unreachable` instead of a session id.
+
+**Lesson.** The same success signal can mean different things for different
+session kinds.
+
+## 13. `--node` after the workspace id was silently ignored
+
+**Symptom.** `remount ws move WS --node B` moved the workspace back to node A.
+The move worked perfectly. The flag was not read.
+
+**Cause.** Go's `flag` package stops parsing at the first argument that does not
+start with a dash. `WS` came first, so `--node B` became a positional argument
+nobody looked at.
+
+**Fix.** `cmd/remount/main.go`. A `parse` function permutes flags ahead of
+positionals before calling `fs.Parse`, honoring `--` as a terminator and
+knowing which flags take a value.
+
+**Lesson.** A CLI that silently accepts a flag and ignores it is worse than one
+that rejects it.
+
+**How found.** Live, watching a move land on the wrong node while every event
+in the log said the move succeeded.
+
+## 14. A move that no node could satisfy sat pending forever
+
+**Symptom.** After fixing mistake 13, `ws move --node laptop` timed out after
+two minutes with `context deadline exceeded`. The log showed snapshot,
+release, and move, then nothing.
+
+**Cause.** The workspace was created with `--label vendor=modal`. The move
+added `Node: laptop` and kept `Allow: {vendor: modal}`. Eligibility requires
+both. No node was both the laptop and labeled modal.
+
+**Fix.** `cmd/remount/main.go`. Naming a node clears a conflicting label
+constraint unless labels are also given. On timeout the CLI now prints the
+requirements and placement it was waiting on.
+
+**Lesson.** Constraints compose by intersection. A user who names a node means
+that node.
+
+**How found.** Live, against the Modal deployment.
+
+## 15. A hosted control plane that scaled out
+
+**Symptom.** A node enrolled and logged `uplink established`. `remount nodes`
+did not list it. `remount ws ls` was empty a minute after creating a workspace.
+
+**Cause.** The control plane ran as a Modal web endpoint with default scaling.
+Different requests reached different containers, each running its own
+`remount server` with its own SQLite database. There were several control
+planes behind one URL.
+
+**Fix.** `deploy/modal_app.py`. `max_containers=1`, `modal.concurrent` so that
+one container serves many connections, and a `modal.Volume` at `/data` so a
+restart keeps the claim queue and artifact store.
+
+**Lesson.** A stateful singleton on a platform that scales by request volume
+must be pinned explicitly. The platform will not guess.
+
+**How found.** Live. The node's log and the CLI disagreed about the same fact.
+
+## 16. The harness install produced nothing
+
+**Symptom.** `npm install @openai/codex` inside a workspace on the Modal node
+printed nothing and left no `node_modules`.
+
+**Cause.** The Modal image was `debian_slim`, which has no Node runtime. The
+shell command failed at `npm`, and the tail of its output was empty.
+
+**Fix.** `deploy/modal_app.py`. The image installs Node 22 from NodeSource.
+
+**Lesson.** A demo that depends on a runtime should assert the runtime exists
+before doing anything that would look like success without it.
+
+## 17. A config file that baked in the broker's address
+
+**Symptom.** A harness configured on one node would have stopped working after
+a move, because its config named a broker port that only existed on the old
+node.
+
+**Cause.** The broker listens on a loopback port chosen at materialize time. It
+is different on every node and after every move. Anything that copied
+`REMOUNT_BROKER` into a file that travels in the snapshot carried a stale
+address.
+
+**Fix.** `internal/node/node.go`. On every materialize the node writes
+`.remount/env` into the workspace with the current broker address, workspace
+id, and each binding's placeholder. The `.remount` directory is excluded from
+every snapshot. A launcher script sources that file and regenerates config at
+start-up.
+
+```sh
+#!/bin/sh
+. ./.remount/env          # discovers REMOUNT_BROKER for whichever machine holds the workspace now
+```
+
+**Proof.** The same launcher ran the Codex CLI on a Modal Linux container, then
+ran it again on an Apple Silicon Mac after a move, with no client-side
+reconfiguration. The agent appended to the same file on both machines.
+
+**Lesson.** Node-local truth must be rewritten by the node and must not travel.
+The test for this is a move followed by a read of the file.
+
+**How found.** Thinking through what "move a running agent" would require
+before running it.
+
+## 18. A deploy hung and blamed the platform's capacity
+
+**Symptom.** After redeploying the hosted control plane, `/healthz` never
+answered. `modal app logs` repeated: `Function 'control' is waiting to be
+scheduled on a CPU worker. We are actively working on acquiring more capacity
+for your workload.` It read as the platform being out of CPUs.
+
+**Cause.** The function was pinned with `min_containers=1, max_containers=1`,
+which mistake 15 required. A rolling redeploy cannot place the new revision
+because the running container holds the only permitted slot. The platform
+reports that wait as a capacity message.
+
+**Fix.** Stop the app before deploying a new revision of a pinned singleton.
+Deploying onto a stopped app became healthy in about five seconds.
+
+**Lesson.** A pinned singleton and a rolling deploy are contradictory. Also, a
+queue message describes a symptom, not a diagnosis; the platform cannot know
+that its own scheduling ceiling is the thing blocking it.
+
+**How found.** Testing the hypothesis directly: stop the app, deploy, watch
+`/healthz`.
+
+## 19. `modal run` silently used the wrong environment
+
+**Symptom.** `Secret 'remount-openai' not found in environment 'main'`. The
+secret had been created in `dev` minutes earlier and was definitely there.
+
+**Cause.** `--env dev` was passed to `modal deploy` but not to `modal run`,
+which defaults to `main`. The account had no access to `main` at all, so every
+symptom pointed at permissions rather than at a missing flag.
+
+**Fix.** Set `MODAL_ENVIRONMENT=dev` once for the shell instead of remembering
+a flag on every subcommand.
+
+**Lesson.** When a tool takes a per-invocation context flag, put it in the
+environment. Forgetting it does not fail loudly; it succeeds against the wrong
+scope and reports a confusing error about that scope.
+
+## 20. A container fell back to a default credential
+
+**Symptom.** Every node and client got `unauthorized: bad token` against a
+freshly rented container. The token was correct on the caller's side.
+
+**Cause.** The deployment script had `TOKEN = os.environ.get("REMOUNT_TOKEN",
+"rent-token")` at module level. That line is evaluated inside the container,
+where the caller's environment does not exist. It fell back to the hardcoded
+default, putting a guessable shared token on a public tunnel.
+
+**Fix.** Pass the token as an explicit run argument and raise when it is
+absent.
+
+**Lesson.** Any default credential is a real credential. A fallback that works
+is worse than a failure, because it works insecurely and says nothing. Code
+that reads an environment variable must be clear about which machine's
+environment it will read.
+
+## 21. A scripted edit did nothing and reported success
+
+**Symptom.** Adding a protocol constant appeared to work. The build then failed
+with `undefined: proto.OpDiag`.
+
+**Cause.** The patch matched `OpTimerList  = "timer.list"` with two spaces.
+`gofmt` had already realigned that const block to a different width, so the
+replacement matched nothing. The script had no way to notice and printed its
+success message anyway.
+
+**Fix.** Assert the postcondition after patching. Prefer a pattern tolerant of
+whitespace.
+
+**Lesson.** An edit that cannot fail is an edit that can silently not happen.
+Check that the intended change is present, not that the command exited zero.
+
+## 22. Moving a workspace carried 400 MB of node_modules
+
+**Symptom.** A cross-vendor move took 38 seconds. An empty workspace moves in
+about a second.
+
+**Cause.** A snapshot is the whole filesystem, and the agent's harness had been
+installed into the workspace with `npm install`. Every move uploaded and
+downloaded the entire dependency tree.
+
+**Fix.** Create the workspace with `--exclude node_modules` and reinstall on
+the far side, or accept the transfer knowingly.
+
+**Lesson.** Snapshot portability has a size cost paid on every move. Exclude
+anything reproducible from a lockfile.
+
+---
+
+## Patterns in these mistakes
+
+Almost all of them fall into four groups.
+
+**State that outlives a connection.** Mistakes 1, 3, 4, 6 and 15 were all cases
+where something persisted past the socket that created it and code assumed
+otherwise. The session log, the workspace on disk, the lease, and the control
+plane's database all outlive connections. Code that ties their lifetime to a
+connection is wrong.
+
+**Ordering assumptions.** Mistakes 2, 5, 8 and 9 assumed one thing would finish
+before another started. A stream beat its own open response. A claim beat its
+own restore. Two offers beat each other. The fix each time was to make the
+dependency explicit: a buffer, a state, a reservation, a renewal.
+
+**Things that looked successful while doing nothing.** Mistakes 7, 12, 13, 14,
+16 and 21 all returned success or silence for an operation that had no effect.
+A cancelled append, a dead session with a valid id, a dropped flag, a queued
+workspace with no eligible node, an install that never ran, a text edit that
+matched nothing. Every one of these would have been caught faster by a check
+that the intended effect had happened rather than that the call had returned.
+
+**A failure that reports itself as someone else's problem.** Mistakes 18, 19
+and 20 all produced a message pointing away from the cause. The platform said
+it lacked capacity when our own single-container ceiling was the constraint. A
+missing flag surfaced as a permissions error about an environment we never
+meant to use. A wrong token surfaced as `unauthorized` rather than as the
+silent fallback that produced it. The habit that works is to state the
+hypothesis, then design the cheapest experiment that would falsify it, rather
+than believing the loudest message.
+
+The race detector found three of these. The simulation package found six.
+Running against a real vendor found seven more that no simulation would have.
+
+---
+
+## 23. macOS killed the binary with signal 9 after an in-place copy
+
+**Symptom.** Every invocation of the CLI exited immediately with status 137 and
+printed nothing at all, including `remount version`. The server it talked to
+was healthy and answering `/healthz`.
+
+**Cause.** The binary had been updated with `cp` over an existing file. That
+writes through the same inode, so macOS sees the pages of a code-signed
+executable change underneath it and kills the process with SIGKILL. Status 137
+is 128 plus 9.
+
+**Fix.** Remove the file before copying, so the new binary gets a fresh inode.
+`install` and `mv` are also safe, because both replace the directory entry.
+
+```sh
+rm -f ./remount && cp /path/to/remount .
+```
+
+**Lesson.** A process that dies with no output has usually been killed by
+something outside it. The exit status names the signal, and 137 means SIGKILL
+rather than a bug in the program.
+
+**How it was found.** Running the command without a pipe, so the exit status
+was visible rather than shadowed by the exit status of `head`.
+
+## 24. A health check printed "healthy" while checking nothing
+
+**Symptom.** `remount doctor` reported healthy on a deployment where the
+node-consistency check could not run at all.
+
+**Cause.** The deep node call needs an entitlement, and the client was not
+attaching one, so every node returned "unauthorized". Doctor treated that as a
+node worth skipping and moved on, then printed its summary with no errors.
+
+**Fix.** Two changes. The client now attaches a grant for a workspace the
+control plane says that node holds. Doctor emits `node.diag_unavailable` when
+a check cannot run, and says explicitly that those workspaces were not
+checked.
+
+**Lesson.** The worst output a diagnostic tool can produce is a clean bill of
+health it did not earn. A check that cannot run is not a passing check, and
+"skipped" must never render as "fine".
+
+**How it was found.** Reading the output of a live run and noticing that a
+warning about an unreachable node sat directly above the word "healthy".
+
+## 25. A read of guarded state one line after the unlock
+
+**Symptom.** One simulation test failed under the race detector roughly one run
+in four. The report named two lines that both appeared to be inside the same
+critical section, which made it look like a false positive from the tool.
+
+```
+Write at 0x00c000220270 by goroutine 82:
+  control.(*Control).wsReady()  control.go:853
+Previous read at 0x00c000220270 by goroutine 77:
+  control.(*Control).wsClaim()  control.go:814
+```
+
+**Cause.** Line 813 released the lock and line 814 read `ws.State` while
+formatting the error message.
+
+```go
+if ws.State != proto.WSPending {
+    c.mu.Unlock()
+    return nil, proto.Err(proto.CodeConflict, "workspace %s is %s", id, ws.State)
+}
+```
+
+The read is on the return line, so it reads like part of the guarded block. It
+is not.
+
+**Fix.** Hoist the value before unlocking, in `internal/control/control.go`.
+
+```go
+state := ws.State
+c.mu.Unlock()
+return nil, proto.Err(proto.CodeConflict, "workspace %s is %s", id, state)
+```
+
+**Lesson.** An error message is a read of shared state like any other. Two
+useful habits follow: assume the race detector is right when it names two
+lines that look safe, and read the line numbers rather than the shape of the
+code.
+
+**How it was found.** The race detector, on the fourth of eight repeated runs
+of a single test. It had passed the full suite several times before this.
+
+**What was done about the class.** `scripts/lint-locks.sh` now walks forward
+from every unlock and flags a read of guarded state before the next return or
+closing brace. It is wired into `make lint` and CI. Verified in both
+directions: it catches the historical bug when reintroduced, and it passes on
+the fixed tree. It found one further instance of the same class in `wsCreate`,
+where the newly created workspace was published to the shared map and then
+read after unlocking, which was fixed the same way. Two annotated exceptions
+carry `lint:locks-ok` with the reason.

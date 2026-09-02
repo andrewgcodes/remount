@@ -1,0 +1,226 @@
+# AGENTS.md
+
+Read this before changing anything in the repo. It is operational: what the
+code is, how to build and test it, what must stay true, and where each kind of
+change goes.
+
+## What this is
+
+Remount is a protocol and a single Go binary that gives an AI agent a computer
+it can run on from anywhere. The agent's computer is a **workspace**: a
+filesystem plus processes that can be snapshotted, moved to another node, put
+to sleep, and reattached mid-command without losing output. The workspace never
+holds a credential; the node's broker substitutes real secrets at the network
+edge and every decision lands in one event log.
+
+## Build and test
+
+```sh
+make          # vet + test + build a static binary
+make race     # the suite under the race detector
+make cover    # coverage summary
+make dist     # linux/darwin × amd64/arm64 static binaries in dist/
+make demo     # remount standalone on 127.0.0.1:7443
+```
+
+**Tests must pass under `-race`.** Three real bugs in this codebase were only
+visible there: a live pointer escaping the control-plane mutex, a lease
+expiring during a slow restore, and a renew interval longer than the lease.
+If `make race` is red, the change is not done.
+
+Go 1.27, `CGO_ENABLED=0` everywhere. SQLite is `modernc.org/sqlite`, pure Go,
+so the binary stays static.
+
+## Layout
+
+| Path | Owns |
+|---|---|
+| `cmd/remount` | the single binary: `server`, `up`, `standalone`, and the client CLI |
+| `internal/proto` | the one frame type, every request and response body, op names, event names, error codes |
+| `internal/transport` | `Conn` and `Peer`: WebSocket, in-memory pipe with fault injection, request correlation |
+| `internal/session` | the sequenced output log with spill, cursors, exec/pty/port runners, the session manager |
+| `internal/fsops` | jailed filesystem operations, server-side search, atomic multi-edit |
+| `internal/workspace` | the `Backend` interface, `process` and `docker` backends |
+| `internal/artifact` | content-addressed blob store, deterministic tar.gz snapshots and restore |
+| `internal/eventlog` | the canonical log, memory and SQLite stores, subscriptions with backfill |
+| `internal/broker` | the egress credential broker: substitution, leak blocking, allow lists, audit |
+| `internal/relay` | frame routing by destination id; authenticates hellos; interprets nothing else |
+| `internal/control` | claim queue, leases, generations, timers, bindings, grants, re-adoption |
+| `internal/node` | the supervisor: uplink, claims, materialize, sessions, snapshots, `.remount/env` |
+| `internal/client` | the Go SDK with reconnect, reattach, orphan buffering, idempotent calls |
+| `internal/server` | HTTP surface: `/v1/link`, `/v1/artifacts/{id}`, `/v1/events`, `/healthz` |
+| `internal/metrics` | dependency-free counters and gauges rendered as Prometheus text |
+| `internal/sim` | the whole system in one process with fault injection; the failure model lives here |
+| `internal/ids` | prefixed, time-sortable ids |
+| `spec/PROTOCOL.md` | the normative wire protocol |
+| `docs/` | design, tutorial, operations, harness integration, ADRs |
+| `examples/` | a minimal real agent loop against the SDK |
+| `deploy/` | the Modal deployment that was actually run |
+
+## Invariants
+
+Check your own change against every line here before calling it done.
+
+| Invariant | Where it is enforced |
+|---|---|
+| The workspace is trusted with nothing. Secrets, policy and lifecycle live in the node or control plane. | `broker`, `node`, ADR 10 |
+| A state change that emits no event is a bug. | `control.emit`, `node.emit`; tests assert on events |
+| Seq 0 of every session is the `info` chunk and the `exit` chunk is last. | `session.Manager.Open`, `session.finish` |
+| A replay gap is reported with a `gap` chunk, never silent, never fatal to the session. | `node.subscribe` |
+| Input is deduplicated by `iseq`; a retried keystroke is never applied twice. | `session.Input` |
+| A grant is bound to a workspace generation and refused after a move. | `node.authorize`, `control.VerifyGrant` |
+| A placeholder sent to a host its binding does not cover is blocked and recorded as `leak_blocked`. | `broker.proxy` |
+| `ws.ready` gates `claimed`; a client never talks to a node that is still restoring. | `control.wsClaim`, `control.wsReady`, `node.materialize` |
+| A node renews its leases at no more than one third of the lease interval, including while materializing. | `node.renewLoop`, `node.renew` |
+| Every mutating request carries an idempotency key and a replay is a no-op. | `client`, `control.wsCreate`, `session.Manager.Open` |
+| `.remount/env` is rewritten on every materialize and never travels in a snapshot. | `node.writeWorkspaceEnv`, `node.snapshot` |
+| Anything returned from under `control.mu` is a copy, never a live pointer. | `control.snapshotWS` and every `cp := *ws` |
+
+## Where a change goes
+
+| I want to | Touch |
+|---|---|
+| add a node operation a client can call | op constant and body types in `internal/proto/types.go`; dispatch case in `internal/node/node.go`; SDK method in `internal/client/client.go`; row in `spec/PROTOCOL.md` §7; a test in `internal/sim/sim_test.go` |
+| add a control-plane operation | same, but dispatch in `internal/control/control.go` and §6 of the spec |
+| add an event type | constant in `internal/proto/types.go`, emit at the state change, list it in `spec/PROTOCOL.md` §11 |
+| add a workspace backend | implement `workspace.Backend` in `internal/workspace`, register it in `buildNode` in `cmd/remount/main.go`, advertise honest `Caps` |
+| change the wire format | `internal/proto/proto.go`; additive fields only, or bump `proto.Version` |
+| change what the broker allows | `internal/broker/broker.go`; add a case to `broker_test.go` first |
+| change lease or claim semantics | `internal/control/control.go` and a sim test that cuts a node with `w.cut` |
+| add a CLI subcommand | `cmd/remount/main.go`; parse flags with `parse(fs, args)`, never `fs.Parse` |
+| add a metric | a named var in `internal/metrics/metrics.go`, then increment it at the site |
+| record a design decision | a new file in `docs/adr/`, never an edit to an existing one |
+
+## Testing philosophy
+
+`internal/sim` is the important package. It builds a server, several nodes and
+clients in one process, connected through `transport.Pipe` with a per-connection
+hook that can drop or sever frames. Every row of the failure model in
+`docs/design.md` has a test there.
+
+```go
+w := newWorld(t)                   // server + relay + artifact store
+n := w.node("n1", labels)          // a node dialing in through a pipe
+c := w.client("c1")                // a client
+ws := mustWS(t, c, spec)           // create and wait for claimed
+w.cut("n1")                        // sever every connection that peer holds
+```
+
+`w.cut` is the fault injector. Cut a client mid-stream and assert the output is
+byte-identical. Cut a node permanently and assert another node claims from the
+last snapshot. Cut a node briefly and assert the session kept running.
+
+Unit packages test their own contract: the session log's eviction and spill, the
+broker's decisions against a TLS test server, the jail against symlink escapes.
+The sim tests check that the contracts compose.
+
+Keep test contexts generous. The `go test -timeout` is the real bound, and the
+race detector makes everything several times slower.
+
+## Deploying to a cloud sandbox
+
+`deploy/modal_app.py` is the deployment that was actually run. These rules cost
+real time to learn and apply to any similar platform.
+
+- **Set the platform's environment in your shell, not per command.**
+  `MODAL_ENVIRONMENT=dev` once. A flag remembered on `deploy` and forgotten on
+  `run` sends the second command to a different environment, and the error
+  names that environment rather than the missing flag.
+- **Never let a container read a credential from a module-level env default.**
+  That line runs inside the container, where your environment does not exist,
+  so it takes the default. A default credential on a public tunnel is a real
+  credential. Pass secrets as explicit run arguments and fail when absent.
+- **Stop a pinned singleton before redeploying it.** The control plane must be
+  exactly one container, so a rolling deploy has no free slot and waits
+  forever. The platform reports that as a capacity problem.
+- **Exclude reproducible directories from snapshots.** `--exclude node_modules`
+  turns a 38 second move back into a one second move.
+- **A harness discovers the broker at run time.** Source `.remount/env` in the
+  launcher. The broker's address is different on every node and after every
+  move.
+
+
+## Lock discipline
+
+The control plane guards its workspace map with one mutex. The failure mode
+that actually happened is a read of guarded state on the line after the
+unlock, usually while formatting an error:
+
+```go
+if ws.State != proto.WSPending {
+    c.mu.Unlock()
+    return nil, proto.Err(..., ws.State)   // race: read after unlock
+}
+```
+
+Hoist the value first. `make lint` runs `scripts/lint-locks.sh`, which walks
+forward from every unlock and flags a guarded read before the next return or
+brace. Suppress a genuine false positive with a `lint:locks-ok` comment and a
+reason on the line above.
+
+Two further rules from the same family:
+
+- Never return a pointer into control-plane state. The caller serializes it
+  without the lock. Return a copy.
+- Lifecycle work triggered by a request that returns immediately needs
+  `context.WithoutCancel`, or it is cancelled the moment the handler returns.
+
+## Observability
+
+Three depths, all with `--json`:
+
+| Command | Use |
+|---|---|
+| `remount status` | is anything wrong right now |
+| `remount inspect WS` | one workspace, down to session log positions and bytes on disk |
+| `remount doctor --deep` | re-hash every artifact and report damage or disagreement |
+| `remount metrics` | raw counters |
+
+`scripts/collect.sh` gathers all of it into one JSON document and
+`scripts/explain.py` turns that into prose that leads with the verdict. Use
+those two when debugging a deployment rather than issuing a dozen commands.
+
+A check that cannot run must never render as a pass. `doctor` emits
+`node.diag_unavailable` and names what went unchecked, because an unearned
+"healthy" is the most dangerous output a diagnostic can produce.
+
+## Gotchas that have already cost time
+
+- **Go's `flag` stops at the first positional.** `remount ws move WS --node X`
+  silently ignored `--node`. Every subcommand parses through `parse(fs, args)`,
+  which permutes flags ahead of positionals. Do not call `fs.Parse` directly.
+- **`grep ... | head` always exits 0.** A leak scan written that way reports
+  "leak found" for no matches and "clean" for nothing. Capture grep's own count
+  and prove the scan works by planting a canary the same scan must find.
+- **Never return a live pointer from under `control.mu`.** The caller
+  serializes it without the lock. The race detector found this twice.
+- **Use `context.WithoutCancel` for lifecycle work started by a request that
+  returns immediately.** The webhook handler passed `r.Context()` into the
+  control plane and the event append was cancelled the instant it returned 202.
+- **The node starts streaming before the open response arrives.** The client
+  buffers chunks for session ids it has not registered yet. If you add a new
+  session-opening call, register through `client.register`.
+- **Two offers for one workspace reach the same node.** Reserve the id in
+  `n.materializing` before calling `ws.claim`, or the second claim looks like a
+  re-adoption and two materializations fight over one directory.
+- **The broker's address changes on every materialize.** Read
+  `.remount/env` at start-up. Do not bake `REMOUNT_BROKER` into a file that
+  travels in a snapshot.
+- **A hosted control plane must be exactly one process.** A serverless
+  endpoint that scales out is N control planes with N databases.
+- **Assert the postcondition after a scripted text edit.** `gofmt` realigns
+  const blocks, so an exact-match patch written against the old alignment
+  matches nothing and still reports success. Check that the change is present,
+  not that the command exited zero.
+
+## Style
+
+- Comments say why, not what. The what is the code.
+- Every exported identifier has a doc comment.
+- Errors that cross the wire carry a stable `proto` code. Use `proto.Err(code,
+  format, ...)`; callers match on `Code`, never on message text.
+- One idea per function. `dispatch` is a switch that calls named methods.
+- No new dependencies without a reason written in the pull request. The binary
+  is static and 13 MB; keep it that way.
+- Prefer a sim test to a mock. If the behavior involves two peers, it belongs in
+  `internal/sim`.

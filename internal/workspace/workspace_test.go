@@ -1,0 +1,188 @@
+package workspace
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/session"
+)
+
+func TestProcessBackendLifecycle(t *testing.T) {
+	ctx := context.Background()
+	be, err := NewProcess(filepath.Join(t.TempDir(), "ws"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if be.Name() != "process" || be.Caps().Isolation != "none" {
+		t.Fatal("caps")
+	}
+	h, err := be.Create(ctx, "ws_1", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := be.Create(ctx, "ws_1", proto.WorkspaceSpec{}, nil); err == nil {
+		t.Fatal("duplicate create allowed")
+	}
+	if err := h.FS().Write("hello.txt", []byte("hi"), 0, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.FS().Mkdir("sub"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Prepare resolves cwd inside the root and merges env.
+	spec := session.Spec{Kind: proto.SessionExec, Program: []string{"sh", "-c", "pwd; echo $HOME; echo $FOO"}, Cwd: "sub", Env: []string{"FOO=bar"}}
+	if err := h.Prepare(&spec); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(spec.Cwd, "/ws_1/sub") {
+		t.Fatal(spec.Cwd)
+	}
+	m := session.NewManager(session.ManagerOptions{})
+	defer m.Close()
+	s, _ := m.Open(spec)
+	out := drain(t, s)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 3 || !strings.HasSuffix(lines[0], "/ws_1/sub") || !strings.HasSuffix(lines[1], "/ws_1") || lines[2] != "bar" {
+		t.Fatalf("%q", out)
+	}
+	bad := session.Spec{Cwd: "../../etc"}
+	if err := h.Prepare(&bad); err == nil {
+		t.Fatal("escape not caught")
+	}
+	missing := session.Spec{Cwd: "nope"}
+	if err := h.Prepare(&missing); err == nil {
+		t.Fatal("missing cwd not caught")
+	}
+
+	// Snapshot -> restore into a new workspace, possibly on another backend instance.
+	var buf bytes.Buffer
+	if err := h.Snapshot(ctx, []string{"sub"}, &buf); err != nil {
+		t.Fatal(err)
+	}
+	be2, _ := NewProcess(filepath.Join(t.TempDir(), "ws2"))
+	h2, err := be2.Create(ctx, "ws_1", proto.WorkspaceSpec{}, bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := h2.FS().Read("hello.txt", 0, 0)
+	if err != nil || string(r.Data) != "hi" {
+		t.Fatal(err)
+	}
+	if _, err := h2.FS().Stat("sub"); err == nil {
+		t.Fatal("excluded dir restored")
+	}
+
+	// Adopt after "restart".
+	h3, err := be2.Adopt(ctx, "ws_1")
+	if err != nil || h3.ID() != "ws_1" {
+		t.Fatal(err)
+	}
+	if _, err := be2.Adopt(ctx, "ws_missing"); err == nil {
+		t.Fatal("adopted nothing")
+	}
+	if err := h2.Destroy(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(be2.Dir, "ws_1")); !os.IsNotExist(err) {
+		t.Fatal("not destroyed")
+	}
+}
+
+func TestMergeEnvAndRegistry(t *testing.T) {
+	env := MergeEnv([]string{"A=1", "B=2", "junk"}, []string{"B=3", "C=4"})
+	if strings.Join(env, ",") != "A=1,B=3,C=4" {
+		t.Fatal(env)
+	}
+	if got := MapEnv(map[string]string{"z": "1", "a": "2"}); got[0] != "a=2" {
+		t.Fatal(got)
+	}
+	p, _ := NewProcess(t.TempDir())
+	r := NewRegistry(p)
+	if b, err := r.Get(""); err != nil || b.Name() != "process" {
+		t.Fatal(err)
+	}
+	if _, err := r.Get("firecracker"); err == nil {
+		t.Fatal("unknown backend returned")
+	}
+	info := HostInfo(r.Names())
+	if info.CPU == 0 || info.OS == "" || len(info.Backends) != 1 {
+		t.Fatalf("%+v", info)
+	}
+	empty := NewRegistry()
+	if _, err := empty.Get(""); err == nil {
+		t.Fatal("empty registry")
+	}
+}
+
+func TestDockerBackendUnavailableIsClean(t *testing.T) {
+	d, _ := NewDocker(t.TempDir(), "")
+	d.Binary = "definitely-not-docker-" + t.Name()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := d.Create(ctx, "ws_x", proto.WorkspaceSpec{}, nil); err == nil {
+		t.Fatal("expected unsupported")
+	}
+	if d.Caps().Isolation != "container" {
+		t.Fatal("caps")
+	}
+}
+
+// TestDockerBackendReal runs only when a docker daemon is reachable.
+func TestDockerBackendReal(t *testing.T) {
+	d, _ := NewDocker(filepath.Join(t.TempDir(), "d"), "alpine:3.20")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := d.Available(ctx); err != nil {
+		t.Skipf("docker not available: %v", err)
+	}
+	h, err := d.Create(ctx, "ws_dk", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Destroy(ctx)
+	h.FS().Write("f.txt", []byte("from host"), 0, false, false)
+	spec := session.Spec{Kind: proto.SessionExec, Program: []string{"sh", "-c", "cat f.txt; echo $REMOUNT_WORKSPACE; pwd"}}
+	if err := h.Prepare(&spec); err != nil {
+		t.Fatal(err)
+	}
+	m := session.NewManager(session.ManagerOptions{})
+	defer m.Close()
+	s, _ := m.Open(spec)
+	out := drain(t, s)
+	if !strings.Contains(out, "from host") || !strings.Contains(out, "ws_dk") || !strings.Contains(out, "/work") {
+		t.Fatalf("%q", out)
+	}
+	if _, err := d.Adopt(ctx, "ws_dk"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func drain(t *testing.T, s *session.Session) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var out []byte
+	c := s.Log.CursorAt(0)
+	for {
+		chunks, err := c.Next(ctx, 0)
+		if err == io.EOF {
+			return string(out)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, ch := range chunks {
+			if ch.Stream == proto.StreamStdout || ch.Stream == proto.StreamStderr {
+				out = append(out, ch.Data...)
+			}
+		}
+	}
+}

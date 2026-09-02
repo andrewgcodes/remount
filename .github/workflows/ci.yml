@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          check-latest: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: vet
+        run: go vet ./...
+      # Catches reads of mutex-guarded state after an unlock, a class of race
+      # that only shows up intermittently under -race.
+      - name: lock discipline
+        run: ./scripts/lint-locks.sh .
+      - name: test
+        run: go test -count=1 -timeout 600s ./...
+      # The failure model lives in internal/sim and is where races would show.
+      - name: race
+        run: go test -race -count=1 -timeout 1200s ./...
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+      - name: cross-compile every platform
+        run: make dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remount-binaries
+          path: dist/
