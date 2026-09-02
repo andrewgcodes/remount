@@ -22,12 +22,42 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"remount.dev/remount/internal/metrics"
 )
 
 // Prefix of every artifact id.
 const Prefix = "art_sha256:"
+
+var (
+	// ErrDigestMismatch means a caller-supplied artifact id did not match the
+	// bytes received. The temporary bytes are never published in this case.
+	ErrDigestMismatch = errors.New("artifact: digest mismatch")
+	// ErrTooLarge means an input exceeded the configured compressed-byte
+	// limit. At most limit+1 bytes are read before the upload is rejected.
+	ErrTooLarge = errors.New("artifact: compressed data exceeds limit")
+)
+
+// RestoreLimits bounds the resources consumed while expanding an artifact.
+// The compressed size is bounded by the artifact store; these limits protect
+// the node from a small gzip stream expanding until it fills the workspace
+// volume.
+type RestoreLimits struct {
+	MaxExpandedBytes int64
+	MaxEntries       int
+	MaxPathBytes     int
+	MaxDepth         int
+}
+
+// DefaultRestoreLimits are deliberately generous enough for ordinary source
+// trees while still putting a finite ceiling on hostile archives.
+var DefaultRestoreLimits = RestoreLimits{
+	MaxExpandedBytes: 8 << 30,
+	MaxEntries:       1_000_000,
+	MaxPathBytes:     4096,
+	MaxDepth:         256,
+}
 
 // ID formats a digest.
 func ID(sum []byte) string { return Prefix + hex.EncodeToString(sum) }
@@ -67,6 +97,27 @@ func (s *Store) pathFor(digest string) string {
 // Put stores the stream and returns its id. Content is hashed while written;
 // an existing blob is left untouched (it is identical by construction).
 func (s *Store) Put(r io.Reader) (string, int64, error) {
+	return s.put(r, "", 0)
+}
+
+// PutLimit is Put with a compressed-byte limit. A non-positive limit means
+// unlimited. Rejected bytes remain private temporary files and are removed.
+func (s *Store) PutLimit(r io.Reader, maxBytes int64) (string, int64, error) {
+	return s.put(r, "", maxBytes)
+}
+
+// PutExpected stores r only if its digest is expected. This is the safe path
+// for HTTP uploads/downloads: a mismatched body is never made visible and
+// therefore cannot collide with, or prompt deletion of, an existing blob.
+func (s *Store) PutExpected(expected string, r io.Reader, maxBytes int64) (int64, error) {
+	if _, err := Digest(expected); err != nil {
+		return 0, err
+	}
+	_, n, err := s.put(r, expected, maxBytes)
+	return n, err
+}
+
+func (s *Store) put(r io.Reader, expected string, maxBytes int64) (string, int64, error) {
 	tmp, err := os.CreateTemp(s.dir, ".put-*")
 	if err != nil {
 		return "", 0, err
@@ -74,11 +125,29 @@ func (s *Store) Put(r io.Reader) (string, int64, error) {
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(tmp, h), r)
-	if cerr := tmp.Close(); err == nil {
-		err = cerr
+	source := r
+	if maxBytes > 0 {
+		source = &io.LimitedReader{R: r, N: maxBytes + 1}
 	}
+	n, err := io.Copy(io.MultiWriter(tmp, h), source)
 	if err != nil {
+		_ = tmp.Close()
+		return "", 0, err
+	}
+	if maxBytes > 0 && n > maxBytes {
+		_ = tmp.Close()
+		return "", n, fmt.Errorf("%w: maximum is %d bytes", ErrTooLarge, maxBytes)
+	}
+	got := ID(h.Sum(nil))
+	if expected != "" && got != expected {
+		_ = tmp.Close()
+		return "", n, fmt.Errorf("%w: body is %s", ErrDigestMismatch, got)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return "", 0, err
+	}
+	if err := tmp.Close(); err != nil {
 		return "", 0, err
 	}
 	digest := hex.EncodeToString(h.Sum(nil))
@@ -87,12 +156,12 @@ func (s *Store) Put(r io.Reader) (string, int64, error) {
 		return "", 0, err
 	}
 	if _, err := os.Stat(dst); err == nil {
-		return ID(h.Sum(nil)), n, nil
+		return got, n, nil
 	}
 	if err := os.Rename(tmpName, dst); err != nil {
 		return "", 0, err
 	}
-	return ID(h.Sum(nil)), n, nil
+	return got, n, nil
 }
 
 // Open returns a reader for id.
@@ -136,7 +205,7 @@ func (s *Store) Verify(id string) error {
 	}
 	if ID(h.Sum(nil)) != id {
 		metrics.ArtifactMiss.Inc()
-		return errors.New("artifact: digest mismatch")
+		return ErrDigestMismatch
 	}
 	return nil
 }
@@ -198,19 +267,23 @@ func Snapshot(root string, excludes []string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
+	rr, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer rr.Close()
 	var paths []string
-	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(rr.FS(), ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if p == root {
+		if p == "." {
 			return nil
 		}
-		rel, _ := filepath.Rel(root, p)
-		rel = filepath.ToSlash(rel)
+		rel := filepath.ToSlash(p)
 		if Excluded(rel, excludes) {
 			if d.IsDir() {
-				return filepath.SkipDir
+				return fs.SkipDir
 			}
 			return nil
 		}
@@ -224,20 +297,46 @@ func Snapshot(root string, excludes []string, w io.Writer) error {
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
 	for _, rel := range paths {
-		host := filepath.Join(root, filepath.FromSlash(rel))
-		info, err := os.Lstat(host)
+		name := filepath.FromSlash(rel)
+		info, err := rr.Lstat(name)
 		if err != nil {
 			return err
 		}
 		link := ""
 		if info.Mode()&os.ModeSymlink != 0 {
-			link, err = os.Readlink(host)
+			link, err = rr.Readlink(name)
 			if err != nil {
 				return err
 			}
+			if err := validateSymlinkTarget(rel, link); err != nil {
+				return err
+			}
+		}
+		var file *os.File
+		if info.Mode().IsRegular() {
+			// Open first and derive the header from that descriptor. The path
+			// can change while a workspace is live; using one descriptor for
+			// metadata and bytes prevents a stale-size tar header.
+			file, err = openSnapshotFile(rr, name)
+			if err != nil {
+				return err
+			}
+			opened, statErr := file.Stat()
+			if statErr != nil {
+				file.Close()
+				return statErr
+			}
+			if !opened.Mode().IsRegular() {
+				file.Close()
+				return fmt.Errorf("artifact: %q changed type during snapshot", rel)
+			}
+			info = opened
 		}
 		hdr, err := tar.FileInfoHeader(info, link)
 		if err != nil {
+			if file != nil {
+				file.Close()
+			}
 			return err
 		}
 		hdr.Name = rel
@@ -249,17 +348,19 @@ func Snapshot(root string, excludes []string, w io.Writer) error {
 		hdr.AccessTime, hdr.ChangeTime = hdr.ModTime, hdr.ModTime
 		hdr.Format = tar.FormatPAX
 		if err := tw.WriteHeader(hdr); err != nil {
+			if file != nil {
+				file.Close()
+			}
 			return err
 		}
-		if info.Mode().IsRegular() {
-			f, err := os.Open(host)
+		if file != nil {
+			_, err = io.CopyN(tw, file, hdr.Size)
+			closeErr := file.Close()
 			if err != nil {
 				return err
 			}
-			_, err = io.Copy(tw, f)
-			f.Close()
-			if err != nil {
-				return err
+			if closeErr != nil {
+				return closeErr
 			}
 		}
 	}
@@ -269,24 +370,104 @@ func Snapshot(root string, excludes []string, w io.Writer) error {
 	return gz.Close()
 }
 
-// Restore extracts a snapshot into root, which must exist. Entries that
-// would escape root are rejected.
+// Restore extracts a snapshot into root, which must exist. Extraction first
+// happens in a private sibling directory and is committed only after every
+// entry has passed containment and resource-limit checks.
 func Restore(root string, r io.Reader) error {
+	return RestoreWithLimits(root, r, DefaultRestoreLimits)
+}
+
+// RestoreWithLimits is Restore with caller-supplied expansion limits. Zero
+// fields inherit the corresponding default.
+func RestoreWithLimits(root string, r io.Reader, limits RestoreLimits) error {
+	limits = normalizeRestoreLimits(limits)
 	root, err := filepath.Abs(root)
 	if err != nil {
 		return err
 	}
+	st, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	if !st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("artifact: restore root must be a real directory")
+	}
+	stage, err := os.MkdirTemp(filepath.Dir(root), ".remount-restore-*")
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.RemoveAll(stage)
+		}
+	}()
+	if err := extract(stage, r, limits); err != nil {
+		return err
+	}
+	backup := stage + ".old"
+	if err := os.Rename(root, backup); err != nil {
+		return err
+	}
+	if err := os.Rename(stage, root); err != nil {
+		_ = os.Rename(backup, root)
+		return err
+	}
+	if err := syncDir(filepath.Dir(root)); err != nil {
+		// Best-effort rollback while both directory names are still reserved.
+		_ = os.Rename(root, stage)
+		_ = os.Rename(backup, root)
+		return err
+	}
+	committed = true
+	// Cleanup after the durable commit is maintenance, not restore failure. A
+	// leftover backup is preferable to a caller deleting the new live tree
+	// because it received an error after the commit point.
+	if err := os.RemoveAll(backup); err != nil {
+		return nil
+	}
+	_ = syncDir(filepath.Dir(root))
+	return nil
+}
+
+func normalizeRestoreLimits(l RestoreLimits) RestoreLimits {
+	d := DefaultRestoreLimits
+	if l.MaxExpandedBytes > 0 {
+		d.MaxExpandedBytes = l.MaxExpandedBytes
+	}
+	if l.MaxEntries > 0 {
+		d.MaxEntries = l.MaxEntries
+	}
+	if l.MaxPathBytes > 0 {
+		d.MaxPathBytes = l.MaxPathBytes
+	}
+	if l.MaxDepth > 0 {
+		d.MaxDepth = l.MaxDepth
+	}
+	return d
+}
+
+func extract(root string, r io.Reader, limits RestoreLimits) error {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return err
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
+	rr, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer rr.Close()
 	type deferredMode struct {
-		path string
-		mode os.FileMode
+		name  string
+		mode  os.FileMode
+		mtime time.Time
 	}
 	var dirs []deferredMode
+	seen := make(map[string]struct{})
+	var entries int
+	var expanded int64
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -295,59 +476,167 @@ func Restore(root string, r io.Reader) error {
 		if err != nil {
 			return err
 		}
-		for _, comp := range strings.Split(hdr.Name, "/") {
-			if comp == ".." {
-				return fmt.Errorf("artifact: entry %q escapes root", hdr.Name)
-			}
+		entries++
+		if entries > limits.MaxEntries {
+			return fmt.Errorf("artifact: archive has more than %d entries", limits.MaxEntries)
 		}
-		name := path.Clean("/" + hdr.Name)
-		if name == "/" {
+		name, err := validateArchiveName(hdr.Name, limits)
+		if err != nil {
+			return err
+		}
+		if name == "." {
 			continue
 		}
-		host := filepath.Join(root, filepath.FromSlash(name))
-		if !strings.HasPrefix(host, root+string(filepath.Separator)) {
-			return fmt.Errorf("artifact: entry %q escapes root", hdr.Name)
+		if _, ok := seen[name]; ok {
+			return fmt.Errorf("artifact: duplicate entry %q", hdr.Name)
+		}
+		seen[name] = struct{}{}
+		if hdr.Size < 0 || hdr.Size > limits.MaxExpandedBytes-expanded {
+			return fmt.Errorf("artifact: expanded data exceeds %d bytes", limits.MaxExpandedBytes)
+		}
+		expanded += hdr.Size
+		osName := filepath.FromSlash(name)
+		if err := rejectSymlinkParents(rr, osName); err != nil {
+			return fmt.Errorf("artifact: entry %q: %w", hdr.Name, err)
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(host, 0o755); err != nil {
+			if err := rr.MkdirAll(osName, 0o755); err != nil {
 				return err
 			}
-			dirs = append(dirs, deferredMode{host, os.FileMode(hdr.Mode).Perm()})
-		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(host), 0o755); err != nil {
+			dirs = append(dirs, deferredMode{osName, os.FileMode(hdr.Mode).Perm(), hdr.ModTime})
+		case tar.TypeReg, tar.TypeRegA:
+			if err := rr.MkdirAll(filepath.Dir(osName), 0o755); err != nil {
 				return err
 			}
-			f, err := os.OpenFile(host, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode).Perm()|0o200)
+			f, err := rr.OpenFile(osName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, os.FileMode(hdr.Mode).Perm()|0o200)
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(f, tr); err != nil {
+			if _, err := io.CopyN(f, tr, hdr.Size); err != nil {
+				f.Close()
+				return err
+			}
+			if err := f.Sync(); err != nil {
 				f.Close()
 				return err
 			}
 			if err := f.Close(); err != nil {
 				return err
 			}
-			_ = os.Chmod(host, os.FileMode(hdr.Mode).Perm())
-			_ = os.Chtimes(host, hdr.ModTime, hdr.ModTime)
-		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(host), 0o755); err != nil {
+			if err := rr.Chmod(osName, os.FileMode(hdr.Mode).Perm()); err != nil {
 				return err
 			}
-			_ = os.Remove(host)
-			if err := os.Symlink(hdr.Linkname, host); err != nil {
+			if err := rr.Chtimes(osName, hdr.ModTime, hdr.ModTime); err != nil {
+				return err
+			}
+		case tar.TypeSymlink:
+			if err := validateSymlinkTarget(name, hdr.Linkname); err != nil {
+				return err
+			}
+			if err := rr.MkdirAll(filepath.Dir(osName), 0o755); err != nil {
+				return err
+			}
+			if err := rr.Symlink(filepath.FromSlash(hdr.Linkname), osName); err != nil {
 				return err
 			}
 		default:
-			// Devices, fifos, hard links: not part of a portable snapshot.
+			return fmt.Errorf("artifact: unsupported entry type %d for %q", hdr.Typeflag, hdr.Name)
 		}
 	}
 	// Apply directory modes last so read-only dirs don't block extraction.
 	for i := len(dirs) - 1; i >= 0; i-- {
-		_ = os.Chmod(dirs[i].path, dirs[i].mode)
+		if err := rr.Chmod(dirs[i].name, dirs[i].mode); err != nil {
+			return err
+		}
+		if err := rr.Chtimes(dirs[i].name, dirs[i].mtime, dirs[i].mtime); err != nil {
+			return err
+		}
+		f, err := rr.Open(dirs[i].name)
+		if err != nil {
+			return err
+		}
+		err = f.Sync()
+		_ = f.Close()
+		if err != nil {
+			return err
+		}
+	}
+	f, err := rr.Open(".")
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	_ = f.Close()
+	return err
+}
+
+func validateArchiveName(name string, limits RestoreLimits) (string, error) {
+	if name == "" || strings.IndexByte(name, 0) >= 0 || path.IsAbs(name) || filepath.IsAbs(name) || filepath.VolumeName(name) != "" {
+		return "", fmt.Errorf("artifact: invalid entry name %q", name)
+	}
+	name = strings.ReplaceAll(name, "\\", "/")
+	clean := path.Clean(name)
+	if clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", fmt.Errorf("artifact: entry %q escapes root", name)
+	}
+	if len(clean) > limits.MaxPathBytes {
+		return "", fmt.Errorf("artifact: entry path exceeds %d bytes", limits.MaxPathBytes)
+	}
+	if clean != "." && len(strings.Split(clean, "/")) > limits.MaxDepth {
+		return "", fmt.Errorf("artifact: entry path exceeds depth %d", limits.MaxDepth)
+	}
+	return clean, nil
+}
+
+func validateSymlinkTarget(name, target string) error {
+	if target == "" || strings.IndexByte(target, 0) >= 0 || path.IsAbs(target) || filepath.IsAbs(target) || filepath.VolumeName(target) != "" {
+		return fmt.Errorf("artifact: symlink %q has invalid target %q", name, target)
+	}
+	target = strings.ReplaceAll(target, "\\", "/")
+	resolved := path.Clean(path.Join(path.Dir(name), target))
+	if resolved == ".." || strings.HasPrefix(resolved, "../") {
+		return fmt.Errorf("artifact: symlink %q escapes root", name)
 	}
 	return nil
+}
+
+func rejectSymlinkParents(root *os.Root, name string) error {
+	parent := filepath.Dir(name)
+	if parent == "." {
+		return nil
+	}
+	cur := ""
+	for _, part := range strings.Split(filepath.ToSlash(parent), "/") {
+		if cur == "" {
+			cur = part
+		} else {
+			cur = filepath.Join(cur, part)
+		}
+		st, err := root.Lstat(cur)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if st.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlink parent %q is not permitted", cur)
+		}
+		if !st.IsDir() {
+			return fmt.Errorf("parent %q is not a directory", cur)
+		}
+	}
+	return nil
+}
+
+func syncDir(name string) error {
+	f, err := os.Open(name)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 // SnapshotToStore snapshots root straight into the store and returns the id.

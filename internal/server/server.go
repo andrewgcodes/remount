@@ -5,10 +5,12 @@ package server
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -17,6 +19,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"remount.dev/remount/internal/artifact"
@@ -34,8 +37,21 @@ type Options struct {
 	Token    string
 	Bindings []control.Binding
 	LeaseSec int64
-	Logger   *slog.Logger
+	// MaxArtifactBytes bounds one uploaded compressed artifact. Default 8 GiB.
+	MaxArtifactBytes int64
+	Logger           *slog.Logger
+	// Mode declares the deployment trust posture.
+	Mode          string
+	Authenticator control.Authenticator
+	Authorizer    control.Authorizer
+	ApprovedNodes map[string]control.NodeApproval
 }
+
+const (
+	ModeStandalone             = "standalone"
+	ModeProductionSingleTenant = "production-single-tenant"
+	ModeProductionMultiTenant  = "production-multi-tenant"
+)
 
 // Server is a running Remount server.
 type Server struct {
@@ -48,12 +64,33 @@ type Server struct {
 	http    *http.Server
 	ln      net.Listener
 	logger  *slog.Logger
+
+	mu          sync.RWMutex
+	ready       chan struct{}
+	readyOnce   sync.Once
+	readyErr    error
+	serving     bool
+	serveCalled bool
+	closed      bool
+	closeOnce   sync.Once
+	closeErr    error
+	tempArtDir  string
 }
 
 // New builds a server. Call Serve or Handler.
 func New(opts Options) (*Server, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
+	}
+	if opts.MaxArtifactBytes <= 0 {
+		opts.MaxArtifactBytes = 8 << 30
+	}
+	if opts.Mode == "" {
+		opts.Mode = ModeStandalone
+	}
+	floor, err := validateSecurityMode(opts)
+	if err != nil {
+		return nil, err
 	}
 	dbPath := ":memory:"
 	artDir := ""
@@ -71,24 +108,70 @@ func New(opts Options) (*Server, error) {
 	if artDir == "" {
 		d, err := os.MkdirTemp("", "remount-artifacts-")
 		if err != nil {
+			_ = sq.Close()
 			return nil, err
 		}
 		artDir = d
 	}
 	store, err := artifact.NewStore(artDir)
 	if err != nil {
+		_ = sq.Close()
+		if opts.DataDir == "" {
+			_ = os.RemoveAll(artDir)
+		}
 		return nil, err
 	}
 	log := eventlog.New(sq)
 	ctrl, err := control.New(control.Options{DB: sq.DB(), Log: log, Token: opts.Token,
-		Bindings: opts.Bindings, LeaseSec: opts.LeaseSec, Logger: opts.Logger, Artifacts: store})
+		Bindings: opts.Bindings, LeaseSec: opts.LeaseSec, Logger: opts.Logger, Artifacts: store,
+		Authenticator: opts.Authenticator, Authorizer: opts.Authorizer, ApprovedNodes: opts.ApprovedNodes,
+		SecurityProfileFloor: floor})
 	if err != nil {
+		_ = log.Close()
+		if opts.DataDir == "" {
+			_ = os.RemoveAll(artDir)
+		}
 		return nil, err
 	}
 	r := relay.New(ctrl)
 	ctrl.Attach(r)
 	ctrl.Start()
-	return &Server{opts: opts, Control: ctrl, Relay: r, Store: store, Log: log, db: sq.DB(), logger: opts.Logger}, nil
+	s := &Server{
+		opts: opts, Control: ctrl, Relay: r, Store: store, Log: log, db: sq.DB(), logger: opts.Logger,
+		ready: make(chan struct{}),
+	}
+	if opts.DataDir == "" {
+		s.tempArtDir = artDir
+	}
+	return s, nil
+}
+
+func validateSecurityMode(opts Options) (string, error) {
+	switch opts.Mode {
+	case ModeStandalone:
+		return proto.SecurityLocal, nil
+	case ModeProductionSingleTenant, ModeProductionMultiTenant:
+		if opts.Token == "" || opts.Authenticator == nil || opts.Authorizer == nil || len(opts.ApprovedNodes) == 0 {
+			return "", fmt.Errorf("server: %s requires a node token, authenticator, authorizer, and approved nodes", opts.Mode)
+		}
+		profile := proto.SecurityIsolated
+		if opts.Mode == ModeProductionMultiTenant {
+			profile = proto.SecurityMultiTenant
+		}
+		for nodeID, approval := range opts.ApprovedNodes {
+			if len(approval.PubKey) != ed25519.PublicKeySize || len(approval.Info.BackendDescriptors) == 0 {
+				return "", fmt.Errorf("server: approved node %s lacks a key or backend descriptors", nodeID)
+			}
+			for _, descriptor := range approval.Info.BackendDescriptors {
+				if err := proto.ValidateBackendSecurity(proto.SecuritySpec{Profile: profile}, descriptor); err != nil {
+					return "", fmt.Errorf("server: approved node %s backend %s cannot satisfy %s: %w", nodeID, descriptor.Name, profile, err)
+				}
+			}
+		}
+		return profile, nil
+	default:
+		return "", fmt.Errorf("server: unknown security mode %q", opts.Mode)
+	}
 }
 
 // Handler returns the HTTP mux.
@@ -107,52 +190,155 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = io.WriteString(w, sb.String())
 	})
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/readyz", s.handleHealth)
+	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "peers": len(s.Relay.Peers())})
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
 	return mux
 }
 
 // Serve listens on addr until ctx ends.
 func (s *Server) Serve(ctx context.Context, addr string) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return errors.New("server: closed")
+	}
+	if s.serveCalled {
+		s.mu.Unlock()
+		return errors.New("server: Serve called more than once")
+	}
+	s.serveCalled = true
+	s.mu.Unlock()
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
+		s.mu.Lock()
+		s.readyErr = err
+		s.mu.Unlock()
+		s.readyOnce.Do(func() { close(s.ready) })
 		return err
 	}
+	httpServer := &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 30 * time.Second}
+	s.mu.Lock()
+	if s.closed {
+		closedErr := errors.New("server: closed before listen became ready")
+		s.readyErr = closedErr
+		s.mu.Unlock()
+		_ = ln.Close()
+		s.readyOnce.Do(func() { close(s.ready) })
+		return closedErr
+	}
 	s.ln = ln
-	s.http = &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 30 * time.Second}
+	s.http = httpServer
+	s.serving = true
+	s.mu.Unlock()
+	s.readyOnce.Do(func() { close(s.ready) })
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = s.http.Shutdown(sctx)
+		_ = httpServer.Shutdown(sctx)
 	}()
-	err = s.http.Serve(ln)
+	err = httpServer.Serve(ln)
 	if errors.Is(err, http.ErrServerClosed) {
 		err = nil
 	}
+	s.mu.Lock()
+	s.serving = false
+	if err != nil {
+		s.readyErr = err
+	}
+	s.mu.Unlock()
 	return err
 }
 
 // Addr returns the bound address after Serve.
 func (s *Server) Addr() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.ln == nil {
 		return ""
 	}
 	return s.ln.Addr().String()
 }
 
+// WaitReady waits until Serve has bound its listener or failed.
+func (s *Server) WaitReady(ctx context.Context) (string, error) {
+	select {
+	case <-s.ready:
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		if s.readyErr != nil {
+			return "", s.readyErr
+		}
+		if s.ln == nil {
+			return "", errors.New("server: listener unavailable")
+		}
+		return s.ln.Addr().String(), nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
 // Close stops everything.
 func (s *Server) Close() error {
-	s.Relay.Close()
-	s.Control.Stop()
-	return s.Log.Close()
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		httpServer := s.http
+		if !s.serveCalled {
+			s.readyErr = errors.New("server: closed before Serve")
+			s.readyOnce.Do(func() { close(s.ready) })
+		}
+		s.mu.Unlock()
+		var errs []error
+		if httpServer != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			errs = append(errs, httpServer.Shutdown(ctx))
+			cancel()
+		}
+		s.Relay.Close()
+		s.Control.Stop()
+		errs = append(errs, s.Log.Close())
+		if s.tempArtDir != "" {
+			errs = append(errs, os.RemoveAll(s.tempArtDir))
+		}
+		s.closeErr = errors.Join(errs...)
+	})
+	return s.closeErr
 }
 
 // AcceptConn serves an already-established transport (tests, embedded use).
 func (s *Server) AcceptConn(ctx context.Context, conn transport.Conn) error {
+	s.mu.RLock()
+	closed := s.closed
+	s.mu.RUnlock()
+	if closed {
+		_ = conn.Close()
+		return errors.New("server: closed")
+	}
 	return s.Relay.Serve(ctx, conn)
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	closed := s.closed
+	serving := s.serving
+	serveCalled := s.serveCalled
+	s.mu.RUnlock()
+	dbErr := s.db.PingContext(r.Context())
+	ready := !closed && dbErr == nil && (!serveCalled || serving)
+	w.Header().Set("Content-Type", "application/json")
+	if !ready {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	body := map[string]any{"ok": ready, "peers": len(s.Relay.Peers()), "serving": serving, "security_mode": s.opts.Mode, "security_ready": ready}
+	if dbErr != nil {
+		body["database"] = dbErr.Error()
+	}
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 func (s *Server) handleLink(w http.ResponseWriter, r *http.Request) {
@@ -184,14 +370,20 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodPut:
-		got, n, err := s.Store.Put(r.Body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if r.ContentLength > s.opts.MaxArtifactBytes {
+			http.Error(w, artifact.ErrTooLarge.Error(), http.StatusRequestEntityTooLarge)
 			return
 		}
-		if got != id {
-			_ = s.Store.Delete(got)
-			http.Error(w, "digest mismatch: body is "+got, http.StatusBadRequest)
+		n, err := s.Store.PutExpected(id, r.Body, s.opts.MaxArtifactBytes)
+		if err != nil {
+			status := http.StatusInternalServerError
+			switch {
+			case errors.Is(err, artifact.ErrTooLarge):
+				status = http.StatusRequestEntityTooLarge
+			case errors.Is(err, artifact.ErrDigestMismatch):
+				status = http.StatusBadRequest
+			}
+			http.Error(w, err.Error(), status)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

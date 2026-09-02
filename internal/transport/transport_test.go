@@ -94,6 +94,40 @@ func TestPeerFailsPendingOnClose(t *testing.T) {
 	<-pa.Done()
 }
 
+func TestPeerRejectsForgedResponseSource(t *testing.T) {
+	a, b := Pipe(8)
+	stray := make(chan *proto.Frame, 1)
+	pa := NewPeer(a, HandlerFunc(func(_ context.Context, _ *Peer, f *proto.Frame) {
+		stray <- f
+	}))
+	pb := NewPeer(b, HandlerFunc(func(ctx context.Context, p *Peer, f *proto.Frame) {
+		if f.T != proto.KindReq {
+			return
+		}
+		_ = p.Send(ctx, &proto.Frame{V: proto.Version, T: proto.KindRes, ID: f.ID, Op: f.Op, From: "attacker", Body: proto.MustMarshal("forged")})
+		_ = p.Send(ctx, &proto.Frame{V: proto.Version, T: proto.KindRes, ID: f.ID, Op: f.Op, From: "expected", Body: proto.MustMarshal("real")})
+	}))
+	defer pa.Close()
+	defer pb.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var got string
+	if err := pa.Call(ctx, "expected", "source-bound", nil, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got != "real" {
+		t.Fatalf("forged response won correlation: %q", got)
+	}
+	select {
+	case f := <-stray:
+		if f.From != "attacker" {
+			t.Fatalf("unexpected stray source %q", f.From)
+		}
+	case <-ctx.Done():
+		t.Fatal("forged response was not rejected")
+	}
+}
+
 func TestPipeHookDrops(t *testing.T) {
 	a, b := Pipe(8)
 	dropped := 0

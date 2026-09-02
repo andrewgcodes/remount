@@ -82,17 +82,18 @@ func (e *Error) Is(target error) bool {
 
 // Stable error codes.
 const (
-	CodeBadRequest   = "bad_request"
-	CodeNotFound     = "not_found"
-	CodeUnsupported  = "unsupported"
-	CodeUnauthorized = "unauthorized"
-	CodeConflict     = "conflict"
-	CodeEvicted      = "evicted"     // requested seq is older than the retained log
-	CodeUnreachable  = "unreachable" // relay: destination peer not connected
-	CodeInternal     = "internal"
-	CodeTimeout      = "timeout"
-	CodeClosed       = "closed"
-	CodeDenied       = "denied" // policy denied
+	CodeBadRequest        = "bad_request"
+	CodeNotFound          = "not_found"
+	CodeUnsupported       = "unsupported"
+	CodeUnauthorized      = "unauthorized"
+	CodeConflict          = "conflict"
+	CodeEvicted           = "evicted"     // requested seq is older than the retained log
+	CodeUnreachable       = "unreachable" // relay: destination peer not connected
+	CodeInternal          = "internal"
+	CodeTimeout           = "timeout"
+	CodeClosed            = "closed"
+	CodeDenied            = "denied" // policy denied
+	CodeResourceExhausted = "resource_exhausted"
 )
 
 // Err builds an *Error.
@@ -134,6 +135,13 @@ func MustMarshal(v any) []byte {
 		panic(err)
 	}
 	return b
+}
+
+// HelloProofBytes returns the deterministic bytes a node signs. Proof itself
+// is omitted to avoid a recursive signature.
+func HelloProofBytes(h Hello) []byte {
+	h.Proof = nil
+	return MustMarshal(h)
 }
 
 // EncodeFrame serializes a frame. The transport prefixes its own length.
@@ -191,4 +199,135 @@ func NewEvent(to, typ string, body any) *Frame {
 		b = MustMarshal(body)
 	}
 	return &Frame{V: Version, T: KindEvent, To: to, Op: typ, Body: b}
+}
+
+// NormalizeSecurity applies profile defaults without weakening explicit
+// requirements. Callers must still validate the selected backend.
+func NormalizeSecurity(s SecuritySpec) (SecuritySpec, error) {
+	if s.Profile == "" {
+		s.Profile = SecurityLocal
+	}
+	switch s.Profile {
+	case SecurityLocal:
+		if s.MinIsolation == "" {
+			s.MinIsolation = "none"
+		}
+	case SecurityIsolated:
+		if s.MinIsolation == "" {
+			s.MinIsolation = "container"
+		}
+		if s.Network.Default == "" {
+			s.Network.Default = "deny"
+		}
+		s.Audit.Required = true
+	case SecurityMultiTenant:
+		if s.MinIsolation == "" {
+			s.MinIsolation = "microvm"
+		}
+		s.RequireSiblingIsolation = true
+		s.RequireEnforcedEgress = true
+		if s.SecretMode == "" {
+			s.SecretMode = "brokered"
+		}
+		s.Network.Default = "deny"
+		s.Audit.Required = true
+	default:
+		return SecuritySpec{}, Err(CodeBadRequest, "unknown security profile %q", s.Profile)
+	}
+	if isolationRank(s.MinIsolation) < 0 {
+		return SecuritySpec{}, Err(CodeBadRequest, "unknown minimum isolation %q", s.MinIsolation)
+	}
+	if s.SecretMode != "" && s.SecretMode != "none" && s.SecretMode != "brokered" {
+		return SecuritySpec{}, Err(CodeBadRequest, "unknown secret mode %q", s.SecretMode)
+	}
+	if s.Network.Default != "" && s.Network.Default != "deny" && s.Network.Default != "allow" {
+		return SecuritySpec{}, Err(CodeBadRequest, "unknown network default %q", s.Network.Default)
+	}
+	if s.Profile != SecurityLocal && s.Network.Default == "allow" {
+		return SecuritySpec{}, Err(CodeDenied, "non-local security profiles cannot default-allow egress")
+	}
+	return s, nil
+}
+
+func isolationRank(s string) int {
+	switch s {
+	case "none", "":
+		return 0
+	case "process_sandbox":
+		return 1
+	case "container":
+		return 2
+	case "microvm":
+		return 3
+	default:
+		return -1
+	}
+}
+
+// ValidateBackendSecurity checks one backend descriptor against a workspace's
+// normalized security contract.
+func ValidateBackendSecurity(policy SecuritySpec, backend BackendDescriptor) error {
+	p, err := NormalizeSecurity(policy)
+	if err != nil {
+		return err
+	}
+	if isolationRank(backend.Security.Isolation) < isolationRank(p.MinIsolation) {
+		return Err(CodeDenied, "isolation %s is weaker than required %s", backend.Security.Isolation, p.MinIsolation)
+	}
+	if p.RequireSiblingIsolation && !backend.Security.SiblingIsolation {
+		return Err(CodeDenied, "sibling isolation is required")
+	}
+	if p.RequireEnforcedEgress && backend.Security.EgressMode != "enforced_gateway" {
+		return Err(CodeDenied, "enforced egress is required")
+	}
+	if p.SecretMode == "brokered" && backend.Security.BrokerIdentity == "none" {
+		return Err(CodeDenied, "an authenticated broker is required")
+	}
+	if p.Profile == SecurityMultiTenant {
+		if !backend.Security.MultiTenant || !backend.Security.NetworkNamespace || !backend.Security.DeviceIsolation {
+			return Err(CodeDenied, "backend is not approved for multi-tenant execution")
+		}
+	}
+	return nil
+}
+
+// StrengthenSecurity raises requested to at least floor. It never clears an
+// explicit requirement from requested.
+func StrengthenSecurity(requested SecuritySpec, floor string) (SecuritySpec, error) {
+	p, err := NormalizeSecurity(requested)
+	if err != nil {
+		return SecuritySpec{}, err
+	}
+	f, err := NormalizeSecurity(SecuritySpec{Profile: floor})
+	if err != nil {
+		return SecuritySpec{}, err
+	}
+	profileRank := func(profile string) int {
+		switch profile {
+		case SecurityLocal:
+			return 0
+		case SecurityIsolated:
+			return 1
+		case SecurityMultiTenant:
+			return 2
+		default:
+			return -1
+		}
+	}
+	if profileRank(f.Profile) > profileRank(p.Profile) {
+		p.Profile = f.Profile
+	}
+	if isolationRank(f.MinIsolation) > isolationRank(p.MinIsolation) {
+		p.MinIsolation = f.MinIsolation
+	}
+	p.RequireSiblingIsolation = p.RequireSiblingIsolation || f.RequireSiblingIsolation
+	p.RequireEnforcedEgress = p.RequireEnforcedEgress || f.RequireEnforcedEgress
+	p.Audit.Required = p.Audit.Required || f.Audit.Required
+	if f.SecretMode == "brokered" {
+		p.SecretMode = "brokered"
+	}
+	if f.Network.Default == "deny" {
+		p.Network.Default = "deny"
+	}
+	return NormalizeSecurity(p)
 }

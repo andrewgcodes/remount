@@ -1,13 +1,21 @@
 package artifact
 
 import (
+	"archive/tar"
 	"bytes"
+	"crypto/sha256"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func digestFor(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return ID(sum[:])
+}
 
 func TestStorePutOpenVerify(t *testing.T) {
 	s, err := NewStore(t.TempDir())
@@ -49,6 +57,48 @@ func TestStorePutOpenVerify(t *testing.T) {
 	}
 	if err := s.Delete(id); err != nil || s.Has(id) {
 		t.Fatal("delete")
+	}
+}
+
+func TestStorePutExpectedNeverPublishesOrDeletesMismatch(t *testing.T) {
+	s, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := "already-valid-body"
+	bodyID, _, err := s.Put(strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wanted := digestFor("different expected bytes")
+	n, err := s.PutExpected(wanted, strings.NewReader(body), 1<<20)
+	if !errors.Is(err, ErrDigestMismatch) || n != int64(len(body)) {
+		t.Fatalf("PutExpected mismatch = (%d, %v)", n, err)
+	}
+	if !s.Has(bodyID) {
+		t.Fatal("mismatched upload deleted an existing valid blob")
+	}
+	if s.Has(wanted) {
+		t.Fatal("mismatched upload was published under the requested id")
+	}
+	ids, err := s.List()
+	if err != nil || len(ids) != 1 || ids[0] != bodyID {
+		t.Fatalf("store contents after mismatch = %v, %v", ids, err)
+	}
+}
+
+func TestStorePutLimitRejectsBeforePublication(t *testing.T) {
+	s, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, n, err := s.PutLimit(strings.NewReader("12345"), 4)
+	if !errors.Is(err, ErrTooLarge) || id != "" || n != 5 {
+		t.Fatalf("PutLimit = (%q, %d, %v)", id, n, err)
+	}
+	ids, listErr := s.List()
+	if listErr != nil || len(ids) != 0 {
+		t.Fatalf("oversized input was published: %v, %v", ids, listErr)
 	}
 }
 
@@ -139,6 +189,74 @@ func TestRestoreRejectsEscape(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(dst), "evil")); err == nil {
 		t.Fatal("evil file written")
+	}
+}
+
+func TestRestoreRejectsSymlinkWriteThrough(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "workspace")
+	outside := filepath.Join(parent, "outside")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	archive := buildTarEntries(t,
+		testTarEntry{header: tar.Header{Name: "escape", Typeflag: tar.TypeSymlink, Linkname: outside, Mode: 0o777}},
+		testTarEntry{header: tar.Header{Name: "escape/victim", Typeflag: tar.TypeReg, Mode: 0o644}, body: "PWNED"},
+	)
+	if err := Restore(root, bytes.NewReader(archive)); err == nil {
+		t.Fatal("absolute symlink target accepted")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "victim")); !os.IsNotExist(err) {
+		t.Fatalf("archive wrote outside root: %v", err)
+	}
+}
+
+func TestRestoreRejectsRelativeSymlinkEscapeAndHardLinks(t *testing.T) {
+	for name, archive := range map[string][]byte{
+		"relative symlink": buildTarEntries(t,
+			testTarEntry{header: tar.Header{Name: "dir/escape", Typeflag: tar.TypeSymlink, Linkname: "../../outside", Mode: 0o777}},
+		),
+		"hard link": buildTarEntries(t,
+			testTarEntry{header: tar.Header{Name: "hard", Typeflag: tar.TypeLink, Linkname: "target", Mode: 0o644}},
+		),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := Restore(t.TempDir(), bytes.NewReader(archive)); err == nil {
+				t.Fatal("hostile entry accepted")
+			}
+		})
+	}
+}
+
+func TestRestoreIsTransactionalAndBounded(t *testing.T) {
+	root := t.TempDir()
+	marker := filepath.Join(root, "keep")
+	if err := os.WriteFile(marker, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	archive := buildTarEntries(t,
+		testTarEntry{header: tar.Header{Name: "one", Typeflag: tar.TypeReg, Mode: 0o644}, body: "1234"},
+		testTarEntry{header: tar.Header{Name: "two", Typeflag: tar.TypeReg, Mode: 0o644}, body: "5678"},
+	)
+	limits := RestoreLimits{MaxExpandedBytes: 7, MaxEntries: 10, MaxPathBytes: 128, MaxDepth: 8}
+	if err := RestoreWithLimits(root, bytes.NewReader(archive), limits); err == nil {
+		t.Fatal("expanded byte limit was not enforced")
+	}
+	got, err := os.ReadFile(marker)
+	if err != nil || string(got) != "original" {
+		t.Fatalf("failed restore changed destination: %q, %v", got, err)
+	}
+
+	limits.MaxExpandedBytes = 100
+	limits.MaxEntries = 1
+	if err := RestoreWithLimits(root, bytes.NewReader(archive), limits); err == nil {
+		t.Fatal("entry limit was not enforced")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("failed restore removed destination: %v", err)
 	}
 }
 

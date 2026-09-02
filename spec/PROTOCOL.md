@@ -55,7 +55,7 @@ Rules that make version skew survivable:
 
 Error codes are stable: `bad_request`, `not_found`, `unsupported`,
 `unauthorized`, `conflict`, `evicted`, `unreachable`, `internal`, `timeout`,
-`closed`, `denied`.
+`closed`, `denied`, and `resource_exhausted`.
 
 ## 3. Hello
 
@@ -65,15 +65,21 @@ it. The relay answers with a `res` carrying the same `id`.
 ```
 Hello  { peer, role: "node"|"client", token, caps: [string],
          pubkey: bytes (nodes: ed25519), labels: {string:string},
-         principal: string (clients), node: NodeInfo? }
+         principal: string (ignored as authority), node: NodeInfo?,
+         issued_at: int64, nonce: bytes, proof: bytes }
 
-HelloOK { peer, caps, server, now: int64, pubkey: bytes, lease_sec: int64 }
+HelloOK { peer, caps, server, now: int64, pubkey: bytes, lease_sec: int64,
+          subject: string, tenant: string }
 ```
 
-A node MUST present a stable `n_` id and its ed25519 public key. The control
-plane pins the key on first sight and refuses a different key for that id
-afterwards. A client MAY present a previously assigned `c_` id to keep it across
-reconnects, or leave it empty to be assigned one.
+A node MUST present a stable `n_` id and its ed25519 public key. `proof` is an
+Ed25519 signature over deterministic CBOR of the Hello with `proof` omitted;
+`issued_at` must be fresh and `nonce` is single-use. Production enrollment
+binds the key, labels, and backend descriptors to an operator-approved node
+record. A client MAY present a previously assigned `c_` id to keep it across
+reconnects, or leave it empty to be assigned one. Client-selected `principal`,
+workspace principal, labels, and capabilities are never authorization input;
+the control plane derives subject and tenant from the presented credential.
 
 `HelloOK.pubkey` is the control plane's grant-signing key. Nodes verify grants
 with it. `lease_sec` tells a node how often it must renew claims. A node MUST
@@ -86,15 +92,17 @@ issued by the control plane and verified by the node, so the node needs no
 connection to the control plane to authorize a request.
 
 ```
-GrantClaims { client, ws, node, principal, exp: int64, gen: uint64 }
+GrantClaims { client, ws, node, principal, tenant, authz_revision,
+              exp: int64, gen: uint64 }
 Grant       { claims: GrantClaims, sig: bytes, node: string }
 ```
 
 `sig` is ed25519 over the deterministic CBOR encoding of `claims`. A node MUST
 reject a grant whose signature fails, whose `exp` has passed, whose `client`,
 `ws` or `node` does not match the request, or whose `gen` differs from the
-workspace's current generation. The generation check is what makes a stale grant
-useless after a workspace moves.
+workspace's current generation, tenant, or ACL revision. The generation and
+authorization-revision checks make stale grants useless after a move or policy
+change.
 
 Clients obtain grants with `op: grant` against `control` and cache them.
 
@@ -152,20 +160,23 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `ws.create` | C | `WSCreateReq{spec, idem}` → `Workspace` |
 | `ws.get` | C | `WSGetReq{id}` → `Workspace` |
 | `ws.list` | C | → `WSListRes{workspaces}` |
-| `ws.destroy` | C | `WSGetReq{id}` → `{}` |
+| `ws.destroy` | C | `WSGetReq{id, idem}` → `{}` |
 | `ws.move` | C | `WSMoveReq{id, requires?, placement?, idem}` → `Workspace` |
-| `ws.sleep` | C | `WSSleepReq{id, after_sec\|at\|on}` → `Timer` |
-| `ws.wake` | C | `WSGetReq{id}` → `Workspace` |
+| `ws.sleep` | C | `WSSleepReq{id, after_sec\|at\|on, idem}` → `Timer` |
+| `ws.wake` | C | `WSGetReq{id, idem}` → `Workspace` |
 | `grant` | C | `GrantReq{ws}` → `Grant` |
 | `node.list` | C | → `NodeListRes{nodes}` |
 | `timer.list` | C | → `TimerListRes{timers}` |
-| `events.tail` | C | `EventsTailReq{from, follow, ws}` → history, or a stream of `ev` frames with `op: "log"` |
+| `events.tail` | C | `EventsTailReq{from, follow, ws, sub}` → history, or a stream of `ev` frames with `op: "log"` |
+| `events.stop` | C | `EventsStopReq{sub}` → `{}` |
 | `events.post` | C N | `EventPost{events}` → `{}` |
 | `ws.claim` | N | `WSClaimReq{id}` → `WSClaimRes{workspace, lease_sec}` |
 | `ws.ready` | N | `WSReadyReq{id, gen}` → `{}` |
-| `ws.renew` | N | `WSRenewReq{ids, gen}` → `{}` |
+| `ws.renew` | N | `WSRenewReq{ids, gen}` → `WSRenewRes{results}`; each result explicitly says continue/fence/destroy/reconcile |
 | `ws.released` | N | `WSReleasedReq{id, gen, snapshot, reason}` → `{}` |
+| `ws.snapshot.commit` | N | `WSSnapshotCommitReq{id, gen, snapshot}` → `{}` |
 | `binding.lease` | N | `BindingLeaseReq{ws}` → `BindingLeaseRes{leases}` |
+| `diag` | C | `DiagReq{verify}` → control diagnostics |
 
 Every mutating request carries an `idem` key. Replaying a request with the same
 key is a no-op that returns the original result. This is what makes a retry
@@ -200,6 +211,10 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `ws.snapshot` | `WSSnapshotReq{ws, upload}` → `WSSnapshotRes{artifact, bytes}` |
 | `ws.info` | `WSGetReq{id}` → `WSInfoRes{ws, backend, root, sessions, broker}` |
 | `node.status` | → `NodeStatus` |
+| `node.diag` | `NodeDiagReq{ws, verify}` → node diagnostics |
+| `ws.release` | control only: `WSReleaseReq{ws, gen, snapshot, reason}` → `WSReleasedReq`; `preparing:true` means poll with the identical request |
+| `ws.release.commit` | control only: `WSReleaseCommitReq{id, gen, snapshot}` → `{}` and authorizes source deletion |
+| `ws.release.abort` | control only: `WSReleaseCommitReq{id, gen}` → `{}` and resumes the retained source |
 
 Session kinds are `exec`, `pty` and `port`.
 
@@ -302,32 +317,39 @@ portable across nodes, operating systems, architectures and vendors. A move
 across machines restarts processes; the filesystem, the identity and the policy
 travel.
 
-`PUT /v1/artifacts/{id}` stores a blob and verifies the digest matches the id.
+`PUT /v1/artifacts/{id}` stores a blob in a private temporary file, enforces the
+configured compressed-size limit, and publishes it only after the digest
+matches the id.
 `GET /v1/artifacts/{id}` retrieves it. A node fetching an artifact verifies the
 digest itself and refuses a mismatch.
 
 ## 11. The event log
 
-Every consequential action is an event, and the log is the source of truth.
-Workspace state, the audit trail and any UI are consumers of it.
+Every consequential action is an event. Transactionally persisted resource
+tables are the control plane's recovery source of truth; the append-only event
+log is the canonical audit and subscription history.
 
 ```
-Event { seq, at, stream, principal, node, type, payload, cause }
+Event { event_id, seq, received_at, observed_at, origin, actor, tenant,
+        workspace, generation, operation_id, producer_seq,
+        stream, principal, node, type, payload, cause }
 ```
 
 `stream` is a workspace or node id, so a workspace's whole history is one filter.
 
-`seq` is the control plane's arrival order and is the only total order. `at` is
-the clock of whichever machine originated the event. A node posts its events
-asynchronously, so two events can arrive in an order that differs from their
-timestamps, and a reader that cares about causality should use `cause` rather
-than inferring it from either field.
+`seq` is assigned by the control plane and is the only total order.
+`received_at`, authenticated `origin`/`actor`, tenant, workspace and generation
+are assigned or verified outside the workspace. `observed_at` is the producer's
+clock and is not authoritative. Nodes post an ordered outbox with a monotonic
+`producer_seq`; exact retries are deduplicated and skipped ranges create an
+`event.producer_gap` record. A reader that cares about causality should use
+`cause` rather than infer it from timestamps.
 Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `ws.claiming`, `ws.claimed`, `ws.released`, `ws.moved`, `ws.paused`,
 `ws.resumed`, `ws.snapshot`, `ws.restored`, `ws.destroyed`,
 `ws.lease_expired`, `s.opened`, `s.exited`, `fs.write`, `fs.edit`, `fs.remove`,
 `cred.used`, `egress.allowed`, `egress.denied`, `timer.set`, `timer.fired`,
-`peer.gone`.
+`peer.gone`, `ws.fenced`, and `event.producer_gap`.
 
 `POST /v1/events` appends an event out of band. This is how a webhook wakes a
 sleeping workspace.

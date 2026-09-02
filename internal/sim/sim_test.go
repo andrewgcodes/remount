@@ -7,6 +7,7 @@ package sim
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -38,8 +39,9 @@ type world struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 
-	mu    sync.Mutex
-	conns []*fault // every live pipe end handed to a dialer
+	mu          sync.Mutex
+	conns       []*fault // every live pipe end handed to a dialer
+	nodeCancels map[string]context.CancelFunc
 }
 
 // fault wraps a pipe end so tests can cut it.
@@ -57,7 +59,10 @@ func newWorld(t *testing.T, bindings ...control.Binding) *world {
 	}
 	hs := httptest.NewServer(srv.Handler())
 	ctx, cancel := context.WithCancel(context.Background())
-	w := &world{t: t, artifactDir: filepath.Join(dataDir, "artifacts"), srv: srv, http: hs, ctx: ctx, cancel: cancel}
+	w := &world{
+		t: t, artifactDir: filepath.Join(dataDir, "artifacts"), srv: srv,
+		http: hs, ctx: ctx, cancel: cancel, nodeCancels: make(map[string]context.CancelFunc),
+	}
 	t.Cleanup(func() {
 		cancel()
 		hs.Close()
@@ -97,19 +102,40 @@ func (w *world) cut(who string) int {
 	return n
 }
 
+// stopNode models a process death: it prevents reconnects and cuts any
+// connection that was already established. Repeated calls are harmless.
+func (w *world) stopNode(name string) {
+	w.mu.Lock()
+	cancel := w.nodeCancels[name]
+	delete(w.nodeCancels, name)
+	w.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	w.cut(name)
+}
+
 func (w *world) node(name string, labels map[string]string) *node.Node {
+	return w.nodeWithBrokerRoots(name, labels, nil)
+}
+
+func (w *world) nodeWithBrokerRoots(name string, labels map[string]string, roots *x509.CertPool) *node.Node {
 	w.t.Helper()
 	dir := filepath.Join(w.t.TempDir(), name)
 	n, err := node.New(node.Options{
 		DataDir: dir, Dialer: w.dialer(name), Token: "tok", Labels: labels,
 		ArtifactURL: w.http.URL + "/v1/artifacts", Allow: []string{"127.0.0.1"}, AllowPrivate: []string{"127.0.0.1", "localhost"},
+		BrokerRootCAs: roots,
 	})
 	if err != nil {
 		w.t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(w.ctx)
+	w.mu.Lock()
+	w.nodeCancels[name] = cancel
+	w.mu.Unlock()
 	go n.Run(ctx)
-	w.t.Cleanup(cancel)
+	w.t.Cleanup(func() { w.stopNode(name) })
 	select {
 	case <-n.Online():
 	case <-time.After(5 * time.Second):
@@ -429,18 +455,7 @@ func TestNodeDeathMovesWorkspaceFromSnapshot(t *testing.T) {
 	if holderName == "" {
 		t.Fatalf("unknown holder %s", moved.Node)
 	}
-	stop := make(chan struct{})
-	go func() {
-		for {
-			w.cut(holderName)
-			select {
-			case <-stop:
-				return
-			case <-time.After(80 * time.Millisecond):
-			}
-		}
-	}()
-	defer close(stop)
+	w.stopNode(holderName)
 
 	// The other zone=a node must pick it up (lease is 2s) at a higher gen.
 	deadline := time.Now().Add(40 * time.Second)
@@ -588,18 +603,20 @@ func TestWorkspaceEnvFileIsRefreshedAndNotSnapshotted(t *testing.T) {
 // the bound host and blocks it elsewhere; every decision is an event.
 func TestSecretBlindWorkspace(t *testing.T) {
 	var gotAuth atomic.Value
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth.Store(r.Header.Get("Authorization"))
 		io.WriteString(w, "ok")
 	}))
 	defer up.Close()
-	upHost := strings.TrimPrefix(up.URL, "http://")
+	upHost := strings.TrimPrefix(up.URL, "https://")
 	w := newWorld(t, control.Binding{ID: "b_api", Secret: "sk-REAL-SECRET", Destinations: []string{upHost}, TTLSec: 60})
-	w.node("n1", nil)
+	roots := x509.NewCertPool()
+	roots.AddCert(up.Certificate())
+	w.nodeWithBrokerRoots("n1", nil, roots)
 	c := w.client("c1")
 	ws := mustWS(t, c, proto.WorkspaceSpec{
 		Bindings: []string{"b_api"},
-		Env:      map[string]string{"API_KEY": "ref:b_api", "API_URL": "${REMOUNT_BROKER}/http/" + upHost},
+		Env:      map[string]string{"API_KEY": "ref:b_api", "API_URL": "${REMOUNT_BROKER}/d/" + upHost},
 	})
 	ctx := ctxT(t, 60*time.Second)
 	// 1. The environment holds only the placeholder.
@@ -763,7 +780,9 @@ func TestPlacementWaitsForEligibleNode(t *testing.T) {
 	}
 }
 
-// Idempotent exec: the same idempotency key twice runs one process.
+// Idempotent exec: an exact retry returns one process, while reusing the key
+// with different arguments is an explicit conflict rather than silently
+// returning a semantically unrelated session.
 func TestIdempotentExec(t *testing.T) {
 	w := newWorld(t)
 	w.node("n1", nil)
@@ -775,12 +794,20 @@ func TestIdempotentExec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := c.Exec(ctx, proto.SOpenReq{WS: ws.ID, Program: []string{"sh", "-c", "echo second > pid"}, IdempotencyKey: key})
+	b, err := c.Exec(ctx, proto.SOpenReq{WS: ws.ID, Program: []string{"sh", "-c", "echo $$ > pid; sleep 0.2"}, IdempotencyKey: key})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if a.ID != b.ID {
 		t.Fatalf("two sessions for one key: %s %s", a.ID, b.ID)
+	}
+	if _, err := c.Exec(ctx, proto.SOpenReq{WS: ws.ID, Program: []string{"sh", "-c", "echo second > pid"}, IdempotencyKey: key}); err == nil {
+		t.Fatal("idempotency key reuse with different arguments succeeded")
+	} else {
+		var pe *proto.Error
+		if !errors.As(err, &pe) || pe.Code != proto.CodeConflict {
+			t.Fatalf("key reuse error = %v, want conflict", err)
+		}
 	}
 	client.Copy(a, nil, nil)
 	out, _ := c.ReadFile(ctx, ws.ID, "pid")
@@ -828,6 +855,61 @@ func TestNodeRestartAdoptsLocalWorkspaces(t *testing.T) {
 	if err != nil || string(b) != "survives restart" {
 		t.Fatalf("%v %q", err, b)
 	}
+}
+
+func TestConcurrentEventTailsAreIndependent(t *testing.T) {
+	w := newWorld(t)
+	c := w.client("c1")
+	ctx1, cancel1 := context.WithCancel(w.ctx)
+	ctx2, cancel2 := context.WithCancel(w.ctx)
+	defer cancel2()
+	first, err := c.TailEvents(ctx1, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := c.TailEvents(ctx2, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "test.concurrent-tail.first"
+	if err := c.PostEvent(ctxT(t, 5*time.Second), proto.Event{Type: want}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor := func(ch <-chan proto.Event, typ string) {
+		t.Helper()
+		deadline := time.After(5 * time.Second)
+		for {
+			select {
+			case event, ok := <-ch:
+				if !ok {
+					t.Fatalf("tail closed before %s", typ)
+				}
+				if event.Type == typ {
+					return
+				}
+			case <-deadline:
+				t.Fatalf("timed out waiting for %s", typ)
+			}
+		}
+	}
+	waitFor(first, want)
+	waitFor(second, want)
+	cancel1()
+	closed := false
+	deadline := time.After(5 * time.Second)
+	for !closed {
+		select {
+		case _, ok := <-first:
+			closed = !ok
+		case <-deadline:
+			t.Fatal("cancelled tail did not close")
+		}
+	}
+	want = "test.concurrent-tail.second"
+	if err := c.PostEvent(ctxT(t, 5*time.Second), proto.Event{Type: want}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(second, want)
 }
 
 // The docker backend is exercised end-to-end only when a daemon is present.
