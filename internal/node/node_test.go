@@ -332,3 +332,177 @@ func TestPendingMutationFromRestartIsNeverReapplied(t *testing.T) {
 		t.Fatalf("restart replay err=%v applied=%v", err, applied)
 	}
 }
+
+func TestQuarantineFencesAndDestroyCommitIsIdempotent(t *testing.T) {
+	n := newTestNode(t, nil)
+	backend, err := n.opts.Backends.Get("process")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := backend.Create(context.Background(), "ws_quarantine", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.FS().Write("keep", []byte("evidence"), 0o600, false, false); err != nil {
+		t.Fatal(err)
+	}
+	w := &ws{Workspace: proto.Workspace{ID: "ws_quarantine", Generation: 7, State: proto.WSClaimed}, handle: handle}
+	n.mu.Lock()
+	n.workspaces[w.ID] = w
+	n.deadlines[w.ID] = time.Now().Add(time.Hour)
+	n.mu.Unlock()
+
+	req := &proto.WSQuarantineReq{OperationID: "fleet_one", WS: w.ID, Gen: 7, Action: proto.FleetActionDestroy}
+	res, err := n.quarantine(context.Background(), req)
+	if err != nil || !res.Fenced || res.Snapshot == "" || res.Backend != "process" {
+		t.Fatalf("quarantine=%#v err=%v", res, err)
+	}
+	n.mu.Lock()
+	_, serving := n.workspaces[w.ID]
+	_, retained := n.quarantined[w.ID]
+	n.mu.Unlock()
+	if serving || !retained {
+		t.Fatalf("serving=%v retained=%v", serving, retained)
+	}
+	if got, err := os.ReadFile(filepath.Join(handle.FS().Root(), "keep")); err != nil || string(got) != "evidence" {
+		t.Fatalf("evidence before commit=%q err=%v", got, err)
+	}
+	replayed, err := n.quarantine(context.Background(), req)
+	if err != nil || replayed.Snapshot != res.Snapshot {
+		t.Fatalf("quarantine replay=%#v err=%v", replayed, err)
+	}
+
+	commit := &proto.WSQuarantineCommitReq{
+		OperationID: req.OperationID, WS: req.WS, Gen: req.Gen,
+		Backend: res.Backend, Snapshot: res.Snapshot,
+	}
+	mismatched := *commit
+	mismatched.Snapshot = "sha256:not-the-checkpoint"
+	if err := n.quarantineCommit(context.Background(), &mismatched); err == nil {
+		t.Fatal("destroy commit with a mismatched checkpoint was accepted")
+	}
+	if _, err := os.Stat(handle.FS().Root()); err != nil {
+		t.Fatalf("mismatched destroy commit changed source: %v", err)
+	}
+
+	// A restarted node must be able to verify the durable phase-one proof and
+	// complete destruction without re-running the checkpoint.
+	restarted, err := New(Options{
+		DataDir: n.opts.DataDir,
+		Dialer: transport.DialFunc(func(context.Context) (transport.Conn, error) {
+			return nil, errors.New("unused test dialer")
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.sessions.Close()
+	if err := restarted.quarantineCommit(context.Background(), commit); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(handle.FS().Root()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("workspace still exists after commit: %v", err)
+	}
+	if err := restarted.quarantineCommit(context.Background(), commit); err != nil {
+		t.Fatalf("destroy commit replay: %v", err)
+	}
+}
+
+func TestQuarantineSnapshotsRetainedWorkspaceBeforeDestroy(t *testing.T) {
+	n := newTestNode(t, nil)
+	backend, err := n.opts.Backends.Get("process")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := backend.Create(context.Background(), "ws_retained", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.FS().Write("keep", []byte("forensic evidence"), 0o600, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.FS().Write("excluded", []byte("reproducible"), 0o600, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.FS().Mkdir(EnvFileDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.FS().Write(EnvFilePath, []byte("node-local"), 0o600, false, false); err != nil {
+		t.Fatal(err)
+	}
+	root := handle.FS().Root()
+	_ = handle.FS().Close()
+	n.mu.Lock()
+	n.quarantined["ws_retained"] = struct{}{}
+	n.mu.Unlock()
+
+	req := &proto.WSQuarantineReq{
+		OperationID: "fleet_retained", WS: "ws_retained", Gen: 4,
+		Action: proto.FleetActionDestroy, Backend: "process", Exclude: []string{"excluded"},
+	}
+	res, err := n.quarantine(context.Background(), req)
+	if err != nil || !res.Fenced || res.Backend != "process" || res.Snapshot == "" || res.Warning != "" {
+		t.Fatalf("retained quarantine=%#v err=%v", res, err)
+	}
+	r, _, err := n.store.Open(res.Snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := t.TempDir()
+	if err := artifact.Restore(restored, r); err != nil {
+		r.Close()
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(restored, "keep")); err != nil || string(got) != "forensic evidence" {
+		t.Fatalf("restored evidence=%q err=%v", got, err)
+	}
+	for _, omitted := range []string{"excluded", EnvFilePath} {
+		if _, err := os.Stat(filepath.Join(restored, omitted)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("excluded path %q restored: %v", omitted, err)
+		}
+	}
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("retained source disappeared before commit: %v", err)
+	}
+	if err := n.quarantineCommit(context.Background(), &proto.WSQuarantineCommitReq{
+		OperationID: req.OperationID, WS: req.WS, Gen: req.Gen,
+		Backend: res.Backend, Snapshot: res.Snapshot,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retained source still exists after proven commit: %v", err)
+	}
+}
+
+func TestQuarantineCommitWithoutPhaseOneProofCannotDelete(t *testing.T) {
+	n := newTestNode(t, nil)
+	backend, err := n.opts.Backends.Get("process")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := backend.Create(context.Background(), "ws_unproven", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := handle.FS().Root()
+	_ = handle.FS().Close()
+	n.mu.Lock()
+	n.quarantined["ws_unproven"] = struct{}{}
+	n.mu.Unlock()
+
+	err = n.quarantineCommit(context.Background(), &proto.WSQuarantineCommitReq{
+		OperationID: "fleet_unproven", WS: "ws_unproven", Gen: 2,
+		Backend: "process", Snapshot: "sha256:unproven",
+	})
+	var protocolErr *proto.Error
+	if !errors.As(err, &protocolErr) || protocolErr.Code != proto.CodeConflict {
+		t.Fatalf("unproven commit error=%v", err)
+	}
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("unproven commit changed source: %v", err)
+	}
+}

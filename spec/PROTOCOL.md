@@ -18,8 +18,8 @@ Nodes and clients both connect **outbound only**. The relay forwards frames
 between them by destination id and never interprets a frame body. The control
 plane is a peer named `control` that happens to live inside the relay process.
 
-Seven resources: **Node**, **Workspace**, **Session**, **Artifact**,
-**Binding**, **Timer**, **Principal**.
+Eight resources: **Node**, **Workspace**, **Session**, **Artifact**,
+**Binding**, **Timer**, **Principal**, **FleetOperation**.
 
 ## 2. Frames
 
@@ -167,6 +167,9 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `grant` | C | `GrantReq{ws}` → `Grant` |
 | `node.list` | C | → `NodeListRes{nodes}` |
 | `timer.list` | C | → `TimerListRes{timers}` |
+| `fleet.quarantine` | C | `FleetQuarantineReq{selector, action, deadline?\|timeout_ms?, idem}` → `FleetOperation` |
+| `fleet.get` | C | `FleetGetReq{id}` → `FleetOperation` |
+| `fleet.list` | C | → `FleetListRes{operations}` |
 | `events.tail` | C | `EventsTailReq{from, follow, ws, sub}` → history, or a stream of `ev` frames with `op: "log"` |
 | `events.stop` | C | `EventsStopReq{sub}` → `{}` |
 | `events.post` | C N | `EventPost{events}` → `{}` |
@@ -205,7 +208,9 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `fs.write` | `FSWriteReq{ws, path, d, mode, append, mkdirp, idem}` → `{}` |
 | `fs.list` | `FSListReq{ws, path}` → `FSListRes{entries}` |
 | `fs.stat` | `FSStatReq{ws, path}` → `FSStatRes{entry}` |
-| `fs.mkdir` / `fs.remove` / `fs.rename` | see types | → `{}` |
+| `fs.mkdir` | `FSMkdirReq{ws, path, idem}` → `{}` |
+| `fs.remove` | `FSRemoveReq{ws, path, recursive, idem}` → `{}` |
+| `fs.rename` | `FSRenameReq{ws, old, new, idem}` → `{}` |
 | `fs.search` | `FSSearchReq{ws, path, pattern, glob, max}` → `FSSearchRes{matches, truncated}` |
 | `fs.edit` | `FSEditReq{ws, path, edits, idem}` → `FSEditRes{replacements}` |
 | `ws.snapshot` | `WSSnapshotReq{ws, upload}` → `WSSnapshotRes{artifact, bytes}` |
@@ -215,12 +220,67 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `ws.release` | control only: `WSReleaseReq{ws, gen, snapshot, reason}` → `WSReleasedReq`; `preparing:true` means poll with the identical request |
 | `ws.release.commit` | control only: `WSReleaseCommitReq{id, gen, snapshot}` → `{}` and authorizes source deletion |
 | `ws.release.abort` | control only: `WSReleaseCommitReq{id, gen}` → `{}` and resumes the retained source |
+| `ws.quarantine` | control only: `WSQuarantineReq{operation, ws, gen, action, backend, exclude}` → `WSQuarantineRes{fenced, gen, action, backend, snapshot?, warning?}` |
+| `ws.quarantine.commit` | control only: `WSQuarantineCommitReq{operation, ws, gen, backend, snapshot}` → `{}` and authorizes deletion only after an exact durable phase-one proof |
 
 Session kinds are `exec`, `pty` and `port`.
 
 `fs.edit` is atomic across all edits in one request. Each edit's `old` must
 match exactly once unless `all` is set. If any edit fails to apply, the file is
 not written and the response is `conflict`.
+
+Node mutations with an `idem` key are write-ahead journaled. The node persists
+and fsyncs a `pending` intent before applying the effect, then persists and
+fsyncs the completed response before acknowledging it. An intent that is still
+`pending` after restart has an unknown outcome and MUST return `conflict`; it
+MUST NOT be applied automatically. Reusing a key with different arguments also
+returns `conflict`.
+
+### 7.1 Fleet containment
+
+A `FleetOperation` is a durable, selector-frozen incident response:
+
+```
+WorkspaceSelector { all, tenant, principal, run, node, model, backend,
+                    labels, created_after, created_before }
+
+FleetOperation { id, selector, action, requested_by, tenant, state,
+                 created_at, deadline, updated_at, results }
+
+FleetOperationResult { workspace, node, backend, generation, state,
+                       fenced, acknowledged, snapshot, error, updated_at }
+```
+
+The allowed actions are `freeze`, `revoke_egress`, `checkpoint`, `stop`, and
+`destroy`. Every action is containment: the node first removes the target from
+its serving map, revokes broker access, invalidates grants/subscriptions and
+stops sessions. `checkpoint` and `destroy` additionally require a verified
+snapshot. `destroy` is two phase: control first durably commits the advanced
+generation, terminal workspace state, and snapshot reference; only then may it
+send `ws.quarantine.commit`. A node MUST match that commit against the exact,
+durably journaled phase-one generation, action, backend and snapshot before it
+deletes the retained source.
+
+An empty selector is invalid; callers must supply at least one constraint or
+set `all:true`. The matching workspace ids and their physical holder
+generation are frozen when the operation is created, so workspaces created
+later are not silently included. Tenant administrators are confined to their
+tenant; global administrators may select across tenants.
+
+Operation states are `pending`, `running`, `completed`, and `partial`; target
+states are `pending`, `acknowledged`, and `failed`. A deadline or relative
+`timeout_ms` may be supplied, but not both. The default is five minutes and the
+maximum is 24 hours. At the deadline the operation becomes `partial` if targets
+remain pending, making the bounded result visible to the caller. Control keeps
+retrying pending targets after that report so an unreachable node can
+eventually be fenced; a later terminal operation may also escalate an already
+quarantined target while preserving its original physical generation.
+
+`fleet.quarantine` is idempotent by `(authenticated tenant, subject, idem)`.
+The selector and target list, operation id, and deadline survive control
+restart. `fleet.get` and `fleet.list` expose per-target acknowledgement and
+errors. A zero-target selection is a successful completed operation and emits
+both requested and completed audit events.
 
 ## 8. Sessions are logs, not sockets
 
@@ -349,7 +409,9 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `ws.resumed`, `ws.snapshot`, `ws.restored`, `ws.destroyed`,
 `ws.lease_expired`, `s.opened`, `s.exited`, `fs.write`, `fs.edit`, `fs.remove`,
 `cred.used`, `egress.allowed`, `egress.denied`, `timer.set`, `timer.fired`,
-`peer.gone`, `ws.fenced`, and `event.producer_gap`.
+`peer.gone`, `ws.fenced`, `event.producer_gap`,
+`fleet.quarantine.requested`, `fleet.quarantine.target`, and
+`fleet.quarantine.completed`.
 
 `POST /v1/events` appends an event out of band. This is how a webhook wakes a
 sleeping workspace.
@@ -371,6 +433,11 @@ wrong and that a conformance suite should check:
 7. A node renews at no more than one third of the lease.
 8. Two concurrent offers for the same workspace to the same node must not
    produce two materializations.
+9. A fleet destroy never deletes a retained source until its checkpoint and
+   advanced fence are durable in control and its node has an exact phase-one
+   journal proof.
+10. A fleet operation reports pending/unreachable targets by its deadline and
+    resumes their reconciliation after control restart.
 
 ## 13. Versioning
 

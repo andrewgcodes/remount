@@ -169,6 +169,9 @@ type Control struct {
 	producerSeq   map[string]uint64                // authenticated node -> last accepted event seq
 	producerLocks map[string]*sync.Mutex           // serialize batches from one node
 	mutationLocks map[string]*sync.Mutex           // serialize duplicate logical mutations
+	fleetOps      map[string]*proto.FleetOperation
+	fleetLocks    map[string]*sync.Mutex
+	fleetWake     chan struct{}
 
 	requestMu      sync.Mutex
 	requestSlots   chan struct{}
@@ -195,6 +198,10 @@ type tailState struct {
 }
 
 type mutationWorkspaceResult struct {
+	ID string `cbor:"id"`
+}
+
+type mutationFleetResult struct {
 	ID string `cbor:"id"`
 }
 
@@ -233,6 +240,7 @@ func New(opts Options) (*Control, error) {
 		bindings: map[string]Binding{}, tails: map[string]map[string]*tailState{},
 		lifecycle: map[string]*sync.Mutex{}, proofs: map[string]int64{}, producerSeq: map[string]uint64{},
 		producerLocks: map[string]*sync.Mutex{}, mutationLocks: map[string]*sync.Mutex{},
+		fleetOps: map[string]*proto.FleetOperation{}, fleetLocks: map[string]*sync.Mutex{}, fleetWake: make(chan struct{}, 1),
 		requestSlots: make(chan struct{}, opts.MaxConcurrentRequests), overloadSlots: make(chan struct{}, overloadLimit),
 		requestCtx: requestCtx, requestCancel: requestCancel, acceptRequests: true,
 		started: opts.Now(), stop: make(chan struct{}),
@@ -273,8 +281,9 @@ func (c *Control) PublicKey() ed25519.PublicKey { return c.key.Public().(ed25519
 // Start runs the lease/timer/offer loops.
 func (c *Control) Start() {
 	c.startOnce.Do(func() {
-		c.wg.Add(1)
+		c.wg.Add(2)
 		go c.loop()
+		go c.fleetLoop()
 	})
 }
 
@@ -318,6 +327,7 @@ CREATE TABLE IF NOT EXISTS assignments (
 	created_at INTEGER NOT NULL,
 	PRIMARY KEY(workspace, generation, node)
 );
+CREATE TABLE IF NOT EXISTS fleet_operations (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS keys (name TEXT PRIMARY KEY, priv BLOB NOT NULL);
 `)
 	return err
@@ -448,6 +458,30 @@ func (c *Control) load() error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
+	rows, err = c.db.Query(`SELECT data FROM fleet_operations`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var b []byte
+		if err := rows.Scan(&b); err != nil {
+			rows.Close()
+			return err
+		}
+		var operation proto.FleetOperation
+		if err := proto.Unmarshal(b, &operation); err != nil {
+			rows.Close()
+			return fmt.Errorf("decode fleet operation: %w", err)
+		}
+		c.fleetOps[operation.ID] = &operation
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
 	rows, err = c.db.Query(`SELECT id, pubkey, data FROM nodes`)
 	if err != nil {
 		return err
@@ -526,6 +560,50 @@ func (c *Control) persistClaim(ws *proto.Workspace) error {
 	}
 	if _, err := tx.Exec(`INSERT OR IGNORE INTO assignments(workspace, generation, node, tenant, created_at) VALUES(?,?,?,?,?)`,
 		ws.ID, ws.Generation, ws.Node, ws.Tenant, c.now().UnixMilli()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (c *Control) persistFleetOperation(operation *proto.FleetOperation) error {
+	operation.UpdatedAt = c.now().UnixMilli()
+	_, err := c.db.Exec(`INSERT OR REPLACE INTO fleet_operations(id, data) VALUES(?,?)`,
+		operation.ID, proto.MustMarshal(operation))
+	return err
+}
+
+func (c *Control) persistFleetOperationAndMutation(operation *proto.FleetOperation, scope, key string, request any) error {
+	operation.UpdatedAt = c.now().UnixMilli()
+	tx, err := c.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO fleet_operations(id, data) VALUES(?,?)`,
+		operation.ID, proto.MustMarshal(operation)); err != nil {
+		return err
+	}
+	if err := c.insertMutationTx(tx, scope, key, proto.OpFleetQuarantine, request,
+		mutationFleetResult{ID: operation.ID}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (c *Control) persistWorkspaceAndFleetOperation(ws *proto.Workspace, operation *proto.FleetOperation) error {
+	ws.UpdatedAt = c.now().UnixMilli()
+	operation.UpdatedAt = c.now().UnixMilli()
+	tx, err := c.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`,
+		ws.ID, proto.MustMarshal(ws)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO fleet_operations(id, data) VALUES(?,?)`,
+		operation.ID, proto.MustMarshal(operation)); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -656,6 +734,30 @@ func (c *Control) emit(ctx context.Context, typ, stream, principal, node string,
 	err := c.log.Append(ctx, e)
 	if err != nil {
 		c.logger.Error("emit", "type", typ, "err", err)
+		return 0
+	}
+	return e.Seq
+}
+
+func (c *Control) emitFleetEvent(ctx context.Context, typ, stream, node string, operation *proto.FleetOperation, payload any) uint64 {
+	now := c.now().UnixMilli()
+	e := &proto.Event{
+		EventID: ids.New("ev"), ReceivedAt: now, Origin: "control", Actor: operation.RequestedBy,
+		Principal: operation.RequestedBy, Tenant: operation.Tenant, OperationID: operation.ID,
+		Type: typ, Stream: stream, Node: node,
+	}
+	if payload != nil {
+		e.Payload = proto.MustMarshal(payload)
+	}
+	if strings.HasPrefix(stream, "ws_") {
+		c.mu.Lock()
+		if ws := c.workspaces[stream]; ws != nil {
+			e.Tenant, e.Workspace, e.Generation = ws.Tenant, ws.ID, ws.Generation
+		}
+		c.mu.Unlock()
+	}
+	if err := c.log.Append(ctx, e); err != nil {
+		c.logger.Error("emit fleet event", "type", typ, "operation", operation.ID, "err", err)
 		return 0
 	}
 	return e.Seq
@@ -1084,6 +1186,39 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return struct{}{}, c.wsSnapshotCommit(ctx, f.From, req)
+	case proto.OpFleetQuarantine:
+		req, err := decode[proto.FleetQuarantineReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		resourceTenant := req.Selector.Tenant
+		if resourceTenant == "" {
+			resourceTenant = subject.Tenant
+		}
+		if err := c.check(ctx, subject, ActionAdmin, Resource{Kind: "fleet", Tenant: resourceTenant}); err != nil {
+			return nil, err
+		}
+		return c.fleetQuarantine(ctx, subject, req)
+	case proto.OpFleetGet:
+		req, err := decode[proto.FleetGetReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.fleetGet(ctx, subject, req.ID)
+	case proto.OpFleetList:
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.fleetList(ctx, subject)
 	case proto.OpNodeList:
 		subject, err := c.subjectOf(f.From)
 		if err != nil {
@@ -2223,6 +2358,625 @@ func (c *Control) offerPending(ctx context.Context) {
 	for _, o := range offers {
 		_ = c.send.Send(ctx, proto.NewEvent(o.node, proto.EvWSOffer, proto.WSGetReq{ID: o.ws}))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// durable fleet quarantine
+// ---------------------------------------------------------------------------
+
+func cloneFleetOperation(in *proto.FleetOperation) *proto.FleetOperation {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Selector.Labels = cloneMap(in.Selector.Labels)
+	out.Results = append([]proto.FleetOperationResult(nil), in.Results...)
+	return &out
+}
+
+func selectorSpecified(selector proto.WorkspaceSelector) bool {
+	return selector.All || selector.Tenant != "" || selector.Principal != "" || selector.Run != "" ||
+		selector.Node != "" || selector.Model != "" || selector.Backend != "" || len(selector.Labels) > 0 ||
+		selector.CreatedAfter != 0 || selector.CreatedBefore != 0
+}
+
+func validFleetAction(action string) bool {
+	switch action {
+	case proto.FleetActionFreeze, proto.FleetActionRevokeEgress, proto.FleetActionCheckpoint,
+		proto.FleetActionStop, proto.FleetActionDestroy:
+		return true
+	default:
+		return false
+	}
+}
+
+const maxFleetOperationDuration = 24 * time.Hour
+
+func fleetStateTerminal(state string) bool {
+	return state == proto.FleetStateCompleted || state == proto.FleetStatePartial
+}
+
+func fleetHasPending(operation *proto.FleetOperation) bool {
+	for _, result := range operation.Results {
+		if result.State == proto.FleetTargetPending {
+			return true
+		}
+	}
+	return false
+}
+
+func fleetTarget(operation *proto.FleetOperation, workspace string) (proto.FleetOperationResult, bool) {
+	if operation != nil {
+		for _, result := range operation.Results {
+			if result.Workspace == workspace {
+				return result, true
+			}
+		}
+	}
+	return proto.FleetOperationResult{}, false
+}
+
+func (c *Control) fleetRPCContext(parent context.Context, operation *proto.FleetOperation) (context.Context, context.CancelFunc) {
+	timeout := 20 * time.Second
+	if operation.State != proto.FleetStatePartial {
+		remainingMillis := operation.Deadline - c.now().UnixMilli()
+		if remainingMillis <= 0 {
+			ctx, cancel := context.WithCancel(parent)
+			cancel()
+			return ctx, func() {}
+		}
+		if remainingMillis < timeout.Milliseconds() {
+			timeout = time.Duration(remainingMillis) * time.Millisecond
+		}
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func workspaceMatches(selector proto.WorkspaceSelector, ws *proto.Workspace, backend string) bool {
+	if ws == nil || ws.State == proto.WSDestroyed {
+		return false
+	}
+	if selector.Tenant != "" && selector.Tenant != ws.Tenant {
+		return false
+	}
+	if selector.Principal != "" && selector.Principal != ws.Spec.Principal && selector.Principal != ws.Owner {
+		return false
+	}
+	if selector.Run != "" && selector.Run != ws.Spec.Run {
+		return false
+	}
+	if selector.Node != "" && selector.Node != ws.Node {
+		return false
+	}
+	if selector.Model != "" && selector.Model != ws.Spec.Model {
+		return false
+	}
+	if selector.Backend != "" && selector.Backend != backend {
+		return false
+	}
+	if selector.CreatedAfter != 0 && ws.CreatedAt < selector.CreatedAfter {
+		return false
+	}
+	if selector.CreatedBefore != 0 && ws.CreatedAt > selector.CreatedBefore {
+		return false
+	}
+	for key, value := range selector.Labels {
+		if ws.Spec.Labels[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Control) fleetQuarantine(ctx context.Context, subject Subject, request *proto.FleetQuarantineReq) (*proto.FleetOperation, error) {
+	req := *request
+	req.Selector.Labels = cloneMap(request.Selector.Labels)
+	if req.Action == "" {
+		req.Action = proto.FleetActionFreeze
+	}
+	if !validFleetAction(req.Action) {
+		return nil, proto.Err(proto.CodeBadRequest, "unknown fleet action %q", req.Action)
+	}
+	if req.IdempotencyKey == "" {
+		return nil, proto.Err(proto.CodeBadRequest, "fleet quarantine requires an idempotency key")
+	}
+	if !selectorSpecified(req.Selector) {
+		return nil, proto.Err(proto.CodeBadRequest, "fleet quarantine requires a selector or selector.all=true")
+	}
+	if req.Selector.CreatedAfter != 0 && req.Selector.CreatedBefore != 0 &&
+		req.Selector.CreatedAfter > req.Selector.CreatedBefore {
+		return nil, proto.Err(proto.CodeBadRequest, "fleet selector creation-time range is inverted")
+	}
+	if !hasRole(subject, "admin") {
+		if req.Selector.Tenant == "" {
+			req.Selector.Tenant = subject.Tenant
+		} else if req.Selector.Tenant != subject.Tenant {
+			return nil, proto.Err(proto.CodeDenied, "tenant administrator cannot quarantine another tenant")
+		}
+	}
+	now := c.now().UnixMilli()
+	if req.DeadlineMillis != 0 && req.TimeoutMillis != 0 {
+		return nil, proto.Err(proto.CodeBadRequest, "fleet quarantine accepts deadline or timeout, not both")
+	}
+	maxDurationMillis := maxFleetOperationDuration.Milliseconds()
+	deadline := req.DeadlineMillis
+	if req.TimeoutMillis < 0 || req.TimeoutMillis > maxDurationMillis {
+		return nil, proto.Err(proto.CodeBadRequest, "fleet quarantine timeout must be between 1ms and %s", maxFleetOperationDuration)
+	}
+	if req.TimeoutMillis > 0 {
+		deadline = now + req.TimeoutMillis
+	} else if deadline == 0 {
+		deadline = now + (5 * time.Minute).Milliseconds()
+	}
+	if deadline <= now || deadline-now > maxDurationMillis {
+		return nil, proto.Err(proto.CodeBadRequest, "fleet quarantine deadline must be in the future")
+	}
+	scope := subject.Tenant + "|" + subject.ID + "|fleet.quarantine"
+	unlockMutation := c.lockMutation(scope, req.IdempotencyKey)
+	defer unlockMutation()
+	var prior mutationFleetResult
+	if hit, err := c.mutationLookup(scope, req.IdempotencyKey, proto.OpFleetQuarantine, req, &prior); err != nil {
+		return nil, err
+	} else if hit {
+		return c.fleetGet(ctx, subject, prior.ID)
+	}
+
+	operationTenant := req.Selector.Tenant
+	if operationTenant == "" && !hasRole(subject, "admin") {
+		operationTenant = subject.Tenant
+	}
+	operation := &proto.FleetOperation{
+		ID: ids.New("fleet"), Selector: req.Selector, Action: req.Action,
+		RequestedBy: subject.ID, Tenant: operationTenant, State: proto.FleetStatePending,
+		CreatedAt: now, UpdatedAt: now, Deadline: deadline,
+	}
+	c.mu.Lock()
+	for _, ws := range c.workspaces {
+		backend := ws.Spec.Requires.Backend
+		if backend == "" && ws.Node != "" {
+			backend, _ = c.eligibleBackendLocked(ws, c.nodes[ws.Node])
+		}
+		if workspaceMatches(req.Selector, ws, backend) {
+			operation.Results = append(operation.Results, proto.FleetOperationResult{
+				Workspace: ws.ID, Node: ws.Node, Backend: backend,
+				Generation: ws.Generation, State: proto.FleetTargetPending, UpdatedAt: now,
+			})
+		}
+	}
+	sort.Slice(operation.Results, func(i, j int) bool {
+		return operation.Results[i].Workspace < operation.Results[j].Workspace
+	})
+	if len(operation.Results) == 0 {
+		operation.State = proto.FleetStateCompleted
+	}
+	if err := c.persistFleetOperationAndMutation(operation, scope, req.IdempotencyKey, req); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	c.fleetOps[operation.ID] = operation
+	out := cloneFleetOperation(operation)
+	c.mu.Unlock()
+	metrics.FleetOperations.Inc()
+	c.emitFleetEvent(ctx, proto.EvFleetRequested, operation.ID, "", operation, map[string]any{
+		"action": operation.Action, "selector": operation.Selector, "targets": len(operation.Results),
+	})
+	if operation.State == proto.FleetStateCompleted {
+		metrics.FleetOperationsCompleted.Inc()
+		c.emitFleetEvent(ctx, proto.EvFleetCompleted, operation.ID, "", operation, map[string]any{
+			"state": operation.State, "targets": 0,
+		})
+	} else {
+		c.signalFleet()
+	}
+	return out, nil
+}
+
+func (c *Control) fleetGet(ctx context.Context, subject Subject, id string) (*proto.FleetOperation, error) {
+	c.mu.Lock()
+	operation := cloneFleetOperation(c.fleetOps[id])
+	c.mu.Unlock()
+	if operation == nil {
+		return nil, proto.Err(proto.CodeNotFound, "fleet operation %s", id)
+	}
+	if err := c.check(ctx, subject, ActionAdmin,
+		Resource{Kind: "fleet-operation", ID: id, Tenant: operation.Tenant, Owner: operation.RequestedBy}); err != nil {
+		return nil, err
+	}
+	return operation, nil
+}
+
+func (c *Control) fleetList(ctx context.Context, subject Subject) (*proto.FleetListRes, error) {
+	c.mu.Lock()
+	operations := make([]*proto.FleetOperation, 0, len(c.fleetOps))
+	for _, operation := range c.fleetOps {
+		operations = append(operations, cloneFleetOperation(operation))
+	}
+	c.mu.Unlock()
+	out := &proto.FleetListRes{}
+	for _, operation := range operations {
+		if c.check(ctx, subject, ActionAdmin, Resource{
+			Kind: "fleet-operation", ID: operation.ID, Tenant: operation.Tenant, Owner: operation.RequestedBy,
+		}) == nil {
+			out.Operations = append(out.Operations, *operation)
+		}
+	}
+	sort.Slice(out.Operations, func(i, j int) bool { return out.Operations[i].CreatedAt < out.Operations[j].CreatedAt })
+	return out, nil
+}
+
+func (c *Control) signalFleet() {
+	select {
+	case c.fleetWake <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Control) lockFleet(id string) func() {
+	c.mu.Lock()
+	lock := c.fleetLocks[id]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		c.fleetLocks[id] = lock
+	}
+	c.mu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
+
+func (c *Control) fleetLoop() {
+	defer c.wg.Done()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		c.runFleetPending(c.requestCtx)
+		select {
+		case <-c.stop:
+			return
+		case <-c.fleetWake:
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *Control) runFleetPending(ctx context.Context) {
+	c.mu.Lock()
+	var ids []string
+	for id, operation := range c.fleetOps {
+		if operation.State == proto.FleetStatePending || operation.State == proto.FleetStateRunning ||
+			(operation.State == proto.FleetStatePartial && fleetHasPending(operation)) {
+			ids = append(ids, id)
+		}
+	}
+	c.mu.Unlock()
+	sort.Strings(ids)
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		c.runFleetOperation(ctx, id)
+	}
+}
+
+func (c *Control) runFleetOperation(ctx context.Context, id string) {
+	unlock := c.lockFleet(id)
+	defer unlock()
+	c.mu.Lock()
+	operation := cloneFleetOperation(c.fleetOps[id])
+	c.mu.Unlock()
+	if operation == nil || (operation.State != proto.FleetStatePending && operation.State != proto.FleetStateRunning &&
+		(operation.State != proto.FleetStatePartial || !fleetHasPending(operation))) {
+		return
+	}
+	startedState := operation.State
+	if operation.State != proto.FleetStateRunning {
+		if operation.State == proto.FleetStatePending {
+			operation.State = proto.FleetStateRunning
+			if err := c.persistFleetOperation(operation); err != nil {
+				c.logger.Error("persist fleet operation start", "operation", id, "err", err)
+				return
+			}
+			c.mu.Lock()
+			c.fleetOps[id] = operation
+			c.mu.Unlock()
+		}
+	}
+	for index := range operation.Results {
+		if ctx.Err() != nil {
+			return
+		}
+		if startedState != proto.FleetStatePartial && c.now().UnixMilli() >= operation.Deadline {
+			break
+		}
+		c.processFleetTarget(ctx, id, index)
+	}
+
+	c.mu.Lock()
+	operation = cloneFleetOperation(c.fleetOps[id])
+	c.mu.Unlock()
+	if operation == nil {
+		return
+	}
+	pending, failed := false, false
+	for _, result := range operation.Results {
+		switch result.State {
+		case proto.FleetTargetPending:
+			pending = true
+		case proto.FleetTargetFailed:
+			failed = true
+		}
+	}
+	terminal := false
+	switch {
+	case !pending && !failed:
+		operation.State, terminal = proto.FleetStateCompleted, true
+	case !pending:
+		operation.State, terminal = proto.FleetStatePartial, true
+	case c.now().UnixMilli() >= operation.Deadline:
+		operation.State, terminal = proto.FleetStatePartial, true
+	default:
+		operation.State = proto.FleetStateRunning
+	}
+	if err := c.persistFleetOperation(operation); err != nil {
+		c.logger.Error("persist fleet operation result", "operation", id, "err", err)
+		return
+	}
+	c.mu.Lock()
+	c.fleetOps[id] = operation
+	c.mu.Unlock()
+	firstTerminal := !fleetStateTerminal(startedState) && terminal
+	if firstTerminal {
+		metrics.FleetOperationsCompleted.Inc()
+	}
+	if firstTerminal || (startedState == proto.FleetStatePartial && operation.State == proto.FleetStateCompleted) {
+		c.emitFleetEvent(ctx, proto.EvFleetCompleted, id, "", operation, map[string]any{
+			"state": operation.State, "targets": len(operation.Results),
+		})
+	}
+}
+
+func (c *Control) processFleetTarget(ctx context.Context, operationID string, index int) {
+	c.mu.Lock()
+	operation := cloneFleetOperation(c.fleetOps[operationID])
+	if operation == nil || index >= len(operation.Results) || operation.Results[index].State != proto.FleetTargetPending {
+		c.mu.Unlock()
+		return
+	}
+	target := operation.Results[index]
+	c.mu.Unlock()
+
+	unlock := c.lockLifecycle(target.Workspace)
+	defer unlock()
+	if operation.Action == proto.FleetActionDestroy && target.Fenced {
+		c.commitFleetDestroy(ctx, operation, index)
+		return
+	}
+
+	c.mu.Lock()
+	ws := c.workspaces[target.Workspace]
+	if ws == nil {
+		target.State = proto.FleetTargetFailed
+		target.Error = "workspace disappeared"
+		target.UpdatedAt = c.now().UnixMilli()
+		operation.Results[index] = target
+		if err := c.persistFleetOperation(operation); err == nil {
+			c.fleetOps[operationID] = operation
+		}
+		c.mu.Unlock()
+		return
+	}
+	previousOperationID := ws.QuarantineOperation
+	if previousOperationID != "" && previousOperationID != operationID {
+		previousOperation := c.fleetOps[previousOperationID]
+		previousTarget, found := fleetTarget(previousOperation, target.Workspace)
+		if previousOperation == nil || !fleetStateTerminal(previousOperation.State) || !found {
+			target.State = proto.FleetTargetFailed
+			target.Error = "workspace belongs to another active or inconsistent quarantine operation"
+			target.UpdatedAt = c.now().UnixMilli()
+			operation.Results[index] = target
+			if err := c.persistFleetOperation(operation); err == nil {
+				c.fleetOps[operationID] = operation
+			}
+			c.mu.Unlock()
+			return
+		}
+		// Preserve the generation and physical holder that the earlier fence
+		// targeted. Control may already have advanced its authoritative
+		// generation, while the retained source still identifies the old one.
+		target.Node = previousTarget.Node
+		target.Generation = previousTarget.Generation
+		target.Backend = previousTarget.Backend
+	}
+	if ws.QuarantineOperation != operationID {
+		if previousOperationID == "" {
+			target.Node, target.Generation = ws.Node, ws.Generation
+			target.Backend = ws.Spec.Requires.Backend
+			if target.Backend == "" && target.Node != "" {
+				target.Backend, _ = c.eligibleBackendLocked(ws, c.nodes[target.Node])
+			}
+		}
+		next := *ws
+		next.QuarantineOperation = operationID
+		if next.QuarantinedAt == 0 {
+			next.QuarantinedAt = c.now().UnixMilli()
+		}
+		if target.Node == "" {
+			next.Generation++
+			next.LeaseUntil = 0
+			next.AuthzRevision++
+			if operation.Action == proto.FleetActionDestroy {
+				next.State = proto.WSDestroyed
+				next.Node = ""
+			} else {
+				next.State = proto.WSFailed
+			}
+			target.Snapshot = ws.LastSnapshot
+			target.Fenced, target.Acknowledged = true, true
+			target.State = proto.FleetTargetAcknowledged
+			target.UpdatedAt = c.now().UnixMilli()
+			operation.Results[index] = target
+			if err := c.persistWorkspaceAndFleetOperation(&next, operation); err != nil {
+				c.mu.Unlock()
+				return
+			}
+			*ws = next
+			c.fleetOps[operationID] = operation
+			c.mu.Unlock()
+			metrics.FleetTargetsFenced.Inc()
+			c.emitFleetEvent(ctx, proto.EvFleetTarget, target.Workspace, target.Node, operation,
+				map[string]any{"operation": operationID, "action": operation.Action, "acknowledged": true})
+			return
+		}
+		next.State = proto.WSQuiescing
+		operation.Results[index] = target
+		if err := c.persistWorkspaceAndFleetOperation(&next, operation); err != nil {
+			c.mu.Unlock()
+			return
+		}
+		*ws = next
+		c.fleetOps[operationID] = operation
+	}
+	exclude := append([]string(nil), ws.Spec.Exclude...)
+	c.mu.Unlock()
+
+	var response proto.WSQuarantineRes
+	request := proto.WSQuarantineReq{
+		OperationID: operationID, WS: target.Workspace, Gen: target.Generation, Action: operation.Action,
+		Backend: target.Backend, Exclude: exclude,
+	}
+	var requestErr error
+	if c.send == nil || !c.send.Online(target.Node) {
+		requestErr = proto.Err(proto.CodeUnreachable, "node %s is offline", target.Node)
+	} else {
+		rctx, cancel := c.fleetRPCContext(ctx, operation)
+		requestErr = c.send.Request(rctx, target.Node, proto.OpWSQuarantine, request, &response)
+		cancel()
+	}
+	if requestErr != nil {
+		var protocolErr *proto.Error
+		if errors.As(requestErr, &protocolErr) && protocolErr.Code == proto.CodeNotFound {
+			response.Fenced = true
+			response.Generation = request.Gen
+			response.Action = request.Action
+			response.Backend = request.Backend
+			requestErr = nil
+		}
+	}
+
+	c.mu.Lock()
+	operation = cloneFleetOperation(c.fleetOps[operationID])
+	ws = c.workspaces[target.Workspace]
+	if operation == nil || ws == nil || index >= len(operation.Results) || ws.QuarantineOperation != operationID {
+		c.mu.Unlock()
+		return
+	}
+	target = operation.Results[index]
+	next := *ws
+	if next.Generation == target.Generation {
+		next.Generation++
+		next.AuthzRevision++
+	}
+	next.State = proto.WSFailed
+	next.LeaseUntil = 0
+	target.UpdatedAt = c.now().UnixMilli()
+	if requestErr != nil {
+		target.Error = requestErr.Error()
+		target.State = proto.FleetTargetPending
+	} else if !response.Fenced {
+		target.Error = "node did not affirm fencing"
+		target.State = proto.FleetTargetFailed
+	} else if response.Generation != target.Generation || response.Action != operation.Action {
+		target.Error = "node quarantine acknowledgement does not match request"
+		target.State = proto.FleetTargetFailed
+	} else {
+		target.Fenced = true
+		if response.Backend != "" {
+			target.Backend = response.Backend
+		}
+		target.Snapshot = response.Snapshot
+		if response.Warning != "" {
+			target.Error = response.Warning
+			target.State = proto.FleetTargetFailed
+		} else if (operation.Action == proto.FleetActionCheckpoint || operation.Action == proto.FleetActionDestroy) && response.Snapshot == "" {
+			target.Error = "node did not return a checkpoint"
+			target.State = proto.FleetTargetFailed
+		} else if response.Snapshot != "" {
+			if c.opts.Artifacts != nil {
+				if err := c.opts.Artifacts.Verify(response.Snapshot); err != nil {
+					target.Error = "checkpoint verification failed: " + err.Error()
+					target.State = proto.FleetTargetFailed
+				}
+			}
+			if target.State != proto.FleetTargetFailed {
+				next.LastSnapshot = response.Snapshot
+				next.Spec.RestoreFrom = response.Snapshot
+			}
+		}
+		if target.State == proto.FleetTargetPending {
+			if operation.Action == proto.FleetActionDestroy {
+				next.State = proto.WSDestroyed
+				next.Node = ""
+				target.Error = "fenced and checkpointed; destruction acknowledgement pending"
+			} else {
+				target.Acknowledged = true
+				target.State = proto.FleetTargetAcknowledged
+				target.Error = ""
+			}
+		}
+	}
+	operation.Results[index] = target
+	if err := c.persistWorkspaceAndFleetOperation(&next, operation); err != nil {
+		c.mu.Unlock()
+		return
+	}
+	*ws = next
+	c.fleetOps[operationID] = operation
+	c.mu.Unlock()
+	metrics.FleetTargetsFenced.Inc()
+	c.emitFleetEvent(ctx, proto.EvFleetTarget, target.Workspace, target.Node, operation, map[string]any{
+		"operation": operationID, "action": operation.Action, "acknowledged": target.Acknowledged,
+		"state": target.State, "error": target.Error,
+	})
+	if operation.Action == proto.FleetActionDestroy && target.Fenced && target.State == proto.FleetTargetPending {
+		c.commitFleetDestroy(ctx, operation, index)
+	}
+}
+
+func (c *Control) commitFleetDestroy(ctx context.Context, operation *proto.FleetOperation, index int) {
+	target := operation.Results[index]
+	if c.send == nil || !c.send.Online(target.Node) {
+		target.Error = fmt.Sprintf("node %s is unreachable; fenced source destruction remains pending", target.Node)
+		target.UpdatedAt = c.now().UnixMilli()
+		operation.Results[index] = target
+		c.persistFleetOnly(operation)
+		return
+	}
+	request := proto.WSQuarantineCommitReq{
+		OperationID: operation.ID, WS: target.Workspace, Gen: target.Generation,
+		Backend: target.Backend, Snapshot: target.Snapshot,
+	}
+	rctx, cancel := c.fleetRPCContext(ctx, operation)
+	err := c.send.Request(rctx, target.Node, proto.OpWSQuarantineCommit, request, nil)
+	cancel()
+	if err != nil {
+		target.Error = "destroy acknowledgement pending: " + err.Error()
+	} else {
+		target.Acknowledged = true
+		target.State = proto.FleetTargetAcknowledged
+		target.Error = ""
+	}
+	target.UpdatedAt = c.now().UnixMilli()
+	operation.Results[index] = target
+	c.persistFleetOnly(operation)
+}
+
+func (c *Control) persistFleetOnly(operation *proto.FleetOperation) {
+	if err := c.persistFleetOperation(operation); err != nil {
+		c.logger.Error("persist fleet target", "operation", operation.ID, "err", err)
+		return
+	}
+	c.mu.Lock()
+	c.fleetOps[operation.ID] = operation
+	c.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
