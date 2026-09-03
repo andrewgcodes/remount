@@ -39,9 +39,30 @@ handler does not interpret their bodies.
 
 ## Try it in 60 seconds
 
+One command runs a coding harness in a fresh workspace against a key it never
+sees. With nothing listening on the default local address, `remount run` starts
+`remount standalone` in the background for you, turns every provider key in
+your environment into a brokered binding, and picks the one the recipe uses.
+
 ```sh
 go build -o remount ./cmd/remount
+export OPENAI_API_KEY=sk-...
+./remount run opencode --dir . -- 'add a README'
+```
 
+```
+started remount standalone in the background (pid 4242, data ~/.local/share/remount, ...)
+using binding b_openai ($OPENAI_API_KEY) for opencode
+workspace ws_06g6d1z9g849pkqcxxfy7z99m4 created
+```
+
+The key stays in the standalone's process environment; the workspace gets a
+placeholder and `remount events WS` shows every `cred.used`. Set
+`REMOUNT_AUTOSTART=0` or `REMOUNT_SERVER` to opt out of the background start.
+
+The pieces underneath:
+
+```sh
 # Server + node in one process, no account, no token.
 ./remount standalone --data ./data &
 export REMOUNT_SERVER=http://127.0.0.1:7443

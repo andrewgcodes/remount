@@ -81,6 +81,15 @@ func cmdHandoff(ctx context.Context, args []string) error {
 			o.Run.Cols, o.Run.Rows = uint16(w), uint16(h)
 		}
 	}
+	if o.Recipe != nil {
+		var err error
+		if o.Run.Bindings, err = defaultBindings(o.Recipe, o.Run.Bindings, c.localBindings(ctx)); err != nil {
+			return err
+		}
+	}
+	if _, err := c.ensureLocalServer(ctx); err != nil {
+		return err
+	}
 	cl := c.client()
 	defer cl.Close()
 	res, err := launch.Handoff(ctx, cl, o)
@@ -160,6 +169,9 @@ func cmdResume(ctx context.Context, args []string) error {
 		if w, h, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
 			o.Cols, o.Rows = uint16(w), uint16(h)
 		}
+	}
+	if _, err := c.ensureLocalServer(ctx); err != nil {
+		return err
 	}
 	cl := c.client()
 	defer cl.Close()

@@ -107,6 +107,26 @@ func TestRunOpenCodeDockerIntegration(t *testing.T) {
 	if _, err := c.ReadFile(ctx, ws.ID, "opencode.json"); err == nil {
 		t.Fatal("recipe wrote opencode.json into the project root")
 	}
+	// The key is in zero workspace files, including the harness's own state
+	// and .remount/env; the planted canary proves the scan reads them. The
+	// container wrote as root, so the tree is scanned after the snapshot
+	// pass that re-owns it to the node, exactly as it would travel.
+	if _, err := c.Snapshot(ctx, ws.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	info, err := c.WorkspaceInfo(ctx, ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hits := scanForToken(t, info.Root, key); len(hits) != 0 {
+		t.Fatalf("provider key on workspace disk: %v", hits)
+	}
+	if err := c.WriteFile(ctx, ws.ID, "canary.txt", []byte("x "+key+" y\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if hits := scanForToken(t, info.Root, key); len(hits) != 1 || filepath.Base(hits[0]) != "canary.txt" {
+		t.Fatalf("scan did not find the planted canary: %v", hits)
+	}
 
 	time.Sleep(300 * time.Millisecond)
 	evs, err := c.ReadEvents(ctx, 1, ws.ID)

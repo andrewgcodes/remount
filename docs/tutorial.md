@@ -19,7 +19,39 @@ go build -o remount ./cmd/remount
 remount dev
 ```
 
-## 2. Start standalone and run a command
+## 2. One command
+
+If you have a provider key in your environment, the whole thing is one
+command. `remount run` finds nothing at `http://127.0.0.1:7443`, starts
+`remount standalone` in the background with a data directory under
+`~/.local/share/remount` (or `$XDG_DATA_HOME/remount`, or `$REMOUNT_DATA`),
+writes a bindings file that references your keys by variable name — never by
+value — and picks the binding the recipe consumes.
+
+```sh
+export OPENAI_API_KEY=sk-...
+./remount run opencode --dir . -- 'Create GREETING.txt containing hello.'
+```
+
+```
+started remount standalone in the background (pid 168858, data /home/you/.local/share/remount, log .../standalone.log); stop it with: kill 168858
+provider bindings from the environment: b_openai ($OPENAI_API_KEY)
+using binding b_openai ($OPENAI_API_KEY) for opencode
+workspace ws_06g6d1z9g849pkqcxxfy7z99m4 created
+installing opencode
+session s_06g6d1za3qk2nvrsjq5y3jwn94 (Ctrl-C detaches; reattach with: remount attach ws_… s_…)
+```
+
+The next `remount run` or `remount resume` reuses that standalone. Everything
+in the rest of this tutorial works against it too; skip the `standalone` and
+`export` lines below if you went this way. `REMOUNT_AUTOSTART=0` disables the
+background start, and any explicit `--server` / `REMOUNT_SERVER` or token
+does as well: the CLI only ever starts a server at the default local address.
+The standalone inherits the environment of the `remount run` that started it,
+so after changing a key, stop it (the pid is in `standalone.pid` in the data
+directory) and let the next run start a fresh one.
+
+## 3. Start standalone by hand and run a command
 
 `remount standalone` runs the control plane, the relay and one node in a single
 process. It needs no token and no account. It is how you try things out.
@@ -62,7 +94,7 @@ hello from mac-mini.local
 The exit code of the command becomes the exit code of `remount exec`. Stdout and
 stderr come through on the same streams you would expect.
 
-## 3. An interactive shell
+## 4. An interactive shell
 
 `remount sh` opens a session of kind `pty`. A pty session has a real terminal
 behind it, so line editing, colours, `top` and resizing all work. The default
@@ -84,7 +116,7 @@ $ exit
 travel with it. Terminal resizes are forwarded, and the shell exits when you
 type `exit`.
 
-## 4. The filesystem
+## 5. The filesystem
 
 Every filesystem operation is served by the node and jailed to the workspace
 root. Paths are workspace-relative; `/src/a.go` and `src/a.go` name the same
@@ -126,7 +158,7 @@ or nothing is written and the command tells you why.
 remount: conflict: edit 0: old string not found
 ```
 
-## 5. Reconnect without losing output
+## 6. Reconnect without losing output
 
 Start a command that runs for a while, then kill the client half way through.
 
@@ -167,7 +199,7 @@ gap:
 [remount: output seq 0-311 elided]
 ```
 
-## 6. A second machine, and a move
+## 7. A second machine, and a move
 
 On another computer, enroll it as a node. Only outbound access to the server is
 needed; the node exposes no inbound listener. Labels are how you address groups
@@ -294,7 +326,7 @@ NEW=$(./remount ws create --repo github.com/acme/app@main --repo-depth 1 --json 
 Inside the workspace `git fetch` and `git push` route through
 `$REMOUNT_GIT_CONNECTOR` and reach only that repository.
 
-## 7. Sleep and wake
+## 8. Sleep and wake
 
 A sleeping workspace has no node. Its last snapshot is kept, its timers are
 durable, and it costs only storage.
@@ -348,7 +380,7 @@ The workspace wakes within a second of the post.
 ]
 ```
 
-## 8. Secrets the workspace never holds
+## 9. Secrets the workspace never holds
 
 Stop the standalone process and write a bindings file. A binding is a secret,
 the destinations it may be sent to, and the placeholder the workspace will hold
@@ -526,7 +558,7 @@ keeps running; her client fetches a fresh grant the next time it needs one.
 In standalone mode every client is the same local administrator, so try this
 against `remount server` with an authenticator that tells principals apart.
 
-## 9. Watch everything
+## 10. Watch everything
 
 Transactional resource rows are the source of lifecycle/recovery truth. The
 event log is the ordered audit and observation history. Follow it live:
