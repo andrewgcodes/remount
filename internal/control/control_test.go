@@ -99,7 +99,7 @@ func signedNodeHello(t *testing.T, id, token string, info proto.NodeInfo) (proto
 		t.Fatal(err)
 	}
 	h := proto.Hello{
-		Peer: id, Role: proto.RoleNode, Token: token, Caps: []string{proto.CapabilityV1}, PubKey: key.Public().(ed25519.PublicKey),
+		Peer: id, Role: proto.RoleNode, Token: token, Caps: proto.PeerCapabilities(), PubKey: key.Public().(ed25519.PublicKey),
 		Node: &info, IssuedAt: time.Now().UnixMilli(), Nonce: make([]byte, 32),
 	}
 	if _, err := rand.Read(h.Nonce); err != nil {

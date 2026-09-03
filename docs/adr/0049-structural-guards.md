@@ -1,4 +1,4 @@
-# ADR 0022: Structural guards ahead of the durable runtime
+# ADR 0049: Structural guards ahead of the durable runtime
 
 ## Status
 

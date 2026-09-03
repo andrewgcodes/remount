@@ -189,9 +189,9 @@ Back on the first machine, confirm both nodes are online:
 ```
 
 ```
-ID                              ONLINE  OS/ARCH       CPU  MEM_MiB  BACKENDS  LABELS                      WORKSPACES
-n_06g67csz3wmes8mengggemdaa4    true    linux/amd64   32   131072   process   map[owner:you zone:gpu]     0
-n_06g67jsx1an8pfy8r9exe5tgyw    true    darwin/arm64  10   32768    process   map[standalone:true]        1
+ID                              ONLINE  OS/ARCH       CPU  MEM_MiB  BACKENDS  PROTOCOL       LABELS                      WORKSPACES
+n_06g67csz3wmes8mengggemdaa4    true    linux/amd64   32   131072   process   v1,authz-push  map[owner:you zone:gpu]     0
+n_06g67jsx1an8pfy8r9exe5tgyw    true    darwin/arm64  10   32768    process   v1,authz-push  map[standalone:true]        1
 ```
 
 Now move the workspace. The current node snapshots the filesystem, the control

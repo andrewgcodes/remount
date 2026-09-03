@@ -209,6 +209,19 @@ type nodeState struct {
 	PubKey []byte
 }
 
+// requireDeploymentCapabilities refuses a peer that negotiated fewer
+// capabilities than the deployment's security floor requires. The floor is
+// the profile every workspace here is strengthened to, so a peer lacking one
+// of its capabilities could never serve any workspace and would only weaken
+// the property the profile promises (ADR 0040).
+func (c *Control) requireDeploymentCapabilities(role string, negotiated []string) error {
+	missing := proto.MissingCapabilities(negotiated, proto.SecurityCapabilities(c.opts.SecurityProfileFloor))
+	if len(missing) == 0 {
+		return nil
+	}
+	return proto.Err(proto.CodeUnsupported, "%s lacks protocol capabilities %s required by security profile %q", role, strings.Join(missing, ","), c.opts.SecurityProfileFloor)
+}
+
 type tailState struct {
 	cancel context.CancelFunc
 }
@@ -618,7 +631,7 @@ func (c *Control) load() error {
 }
 
 // transact commits resource rows and the events describing them as one
-// SQLite transaction (ADR 0023). Callers hold c.mu; the lock order is
+// SQLite transaction (ADR 0050). Callers hold c.mu; the lock order is
 // c.mu then the log's mutex, and nothing acquires them the other way round.
 func (c *Control) transact(fn func(tx *eventlog.Tx) error, events []*proto.Event) error {
 	err := c.log.Transact(context.Background(), c.db, func(tx *eventlog.Tx) error {
@@ -1048,7 +1061,7 @@ func (c *Control) saveNode(id string, n *nodeState, events ...*proto.Event) {
 
 // newEvent builds a control-originated event. It takes no lock; the caller,
 // which holds c.mu, attributes the event to a workspace with stampWS and
-// stages it in the transaction that commits the resource (ADR 0023).
+// stages it in the transaction that commits the resource (ADR 0050).
 func (c *Control) newEvent(typ, stream, principal, node string, payload any) *proto.Event {
 	now := c.now().UnixMilli()
 	e := &proto.Event{
@@ -1097,6 +1110,9 @@ func (c *Control) fleetEvent(typ, stream, node string, operation *proto.FleetOpe
 func (c *Control) Authenticate(ctx context.Context, h *proto.Hello) (string, *proto.HelloOK, error) {
 	caps, err := proto.NegotiateCapabilities(h.Caps)
 	if err != nil {
+		return "", nil, err
+	}
+	if err := c.requireDeploymentCapabilities(h.Role, caps); err != nil {
 		return "", nil, err
 	}
 	ok := &proto.HelloOK{Caps: caps, Server: "remount", Now: c.now().UnixMilli(), PubKey: c.PublicKey(), LeaseSec: c.opts.LeaseSec}
@@ -1203,6 +1219,9 @@ func (c *Control) PeerConnected(ctx context.Context, id string, h *proto.Hello) 
 		n.PubKey = h.PubKey
 		n.Status.ID = id
 		n.Status.Labels = h.Labels
+		// Authenticate already refused a hello without v1, so the negotiated
+		// set is exactly what both sides implement.
+		n.Status.Protocol, _ = proto.NegotiateCapabilities(h.Caps)
 		if h.Node != nil {
 			n.Status.Info = *h.Node
 		}
@@ -2812,6 +2831,9 @@ func (c *Control) eligibleBackendLocked(ws *proto.Workspace, n *nodeState) (stri
 		if !contains(n.Status.Info.Caps, cap) {
 			return "", false
 		}
+	}
+	if len(proto.MissingCapabilities(n.Status.Protocol, proto.SecurityCapabilities(ws.Spec.Security.Profile))) > 0 {
+		return "", false
 	}
 	for _, rule := range ws.Spec.Security.Network.Rules {
 		if rule.Connector != "" && !contains(n.Status.Info.Connectors, rule.Connector) {

@@ -175,7 +175,7 @@ func (c *Client) Connect(ctx context.Context) (*transport.Peer, error) {
 	}
 	p := transport.NewPeer(conn, transport.HandlerFunc(c.handle))
 	hctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	ok, err := transport.Hello(hctx, p, proto.Hello{Peer: c.ID(), Role: proto.RoleClient, Token: c.opts.Token, Caps: []string{proto.CapabilityV1}, Principal: c.opts.Principal})
+	ok, err := transport.Hello(hctx, p, proto.Hello{Peer: c.ID(), Role: proto.RoleClient, Token: c.opts.Token, Caps: proto.PeerCapabilities(), Principal: c.opts.Principal})
 	cancel()
 	if err != nil {
 		p.Close()
