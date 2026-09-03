@@ -21,4 +21,3 @@ env:
 command: ["aider", "--message", "{{.Task}}", "--no-git"]
 resume_command: ["aider", "--restore-chat-history", "--message", "{{.Task}}", "--no-git"]
 state_dirs: [".aider.chat.history.md", ".aider.input.history", ".aider.tags.cache.v4"]
-path_keyed: true

@@ -43,6 +43,10 @@ type Caps struct {
 	FilesystemBoundary string
 	NetworkNamespace   bool
 	DeviceIsolation    bool
+	// MountPath: the backend honors WorkspaceSpec.MountPath (the workspace
+	// has its own mount namespace). A backend without one must refuse a
+	// spec that sets it rather than symlink host paths into its jail.
+	MountPath bool
 }
 
 // Describer reports a backend's identity and evidence-bearing capabilities.
@@ -259,6 +263,9 @@ func (p *Process) Caps() Caps {
 func (p *Process) root(id string) string { return filepath.Join(p.Dir, id) }
 
 func (p *Process) Create(ctx context.Context, id string, spec proto.WorkspaceSpec, restore io.Reader) (Handle, error) {
+	if spec.MountPath != "" && spec.MountPath != proto.DefaultMountPath {
+		return nil, proto.Err(proto.CodeUnsupported, "process backend cannot materialize at %s: it has no mount namespace", spec.MountPath)
+	}
 	root := p.root(id)
 	if _, err := os.Stat(root); err == nil {
 		return nil, proto.Err(proto.CodeConflict, "workspace %s already exists on this node", id)
@@ -380,7 +387,7 @@ func (d *Docker) Caps() Caps {
 	return Caps{
 		Isolation: "container", Snapshots: "fs", EgressEnforced: false,
 		EgressMode: "cooperative_proxy", BrokerIdentity: "token", FilesystemBoundary: "bind_mount",
-		NetworkNamespace: true, DeviceIsolation: true,
+		NetworkNamespace: true, DeviceIsolation: true, MountPath: true,
 	}
 }
 
@@ -409,6 +416,13 @@ func (d *Docker) Create(ctx context.Context, id string, spec proto.WorkspaceSpec
 	if err := d.Available(ctx); err != nil {
 		return nil, proto.Err(proto.CodeUnsupported, "%v", err)
 	}
+	if err := proto.ValidateMountPath(spec.MountPath); err != nil {
+		return nil, err
+	}
+	mount := spec.MountPath
+	if mount == "" {
+		mount = proto.DefaultMountPath
+	}
 	root := filepath.Join(d.Dir, id)
 	if _, err := os.Stat(root); err == nil {
 		return nil, proto.Err(proto.CodeConflict, "workspace %s already exists on this node", id)
@@ -428,7 +442,7 @@ func (d *Docker) Create(ctx context.Context, id string, spec proto.WorkspaceSpec
 	}
 	name := d.container(id)
 	args := []string{"run", "-d", "--name", name, "--init",
-		"-v", root + ":/work", "-w", "/work",
+		"-v", root + ":" + mount, "-w", mount,
 		"--add-host", "host.docker.internal:host-gateway",
 		"--label", "remount.workspace=" + id,
 	}
@@ -443,7 +457,7 @@ func (d *Docker) Create(ctx context.Context, id string, spec proto.WorkspaceSpec
 		_ = os.RemoveAll(root)
 		return nil, proto.Err(proto.CodeInternal, "docker run: %s", strings.TrimSpace(string(out)))
 	}
-	return d.handle(id, root, name)
+	return d.handle(id, root, name, mount)
 }
 
 func (d *Docker) Adopt(ctx context.Context, id string) (Handle, error) {
@@ -461,20 +475,52 @@ func (d *Docker) Adopt(ctx context.Context, id string) (Handle, error) {
 			return nil, proto.Err(proto.CodeInternal, "docker start: %s", strings.TrimSpace(string(out)))
 		}
 	}
-	return d.handle(id, root, name)
+	// The container is the durable record of where the tree is mounted.
+	out, err = exec.CommandContext(ctx, d.Binary, "inspect", "--format", "{{range .Mounts}}{{.Source}}\t{{.Destination}}\n{{end}}", name).CombinedOutput()
+	if err != nil {
+		return nil, proto.Err(proto.CodeInternal, "inspect mounts of %s: %s", name, strings.TrimSpace(string(out)))
+	}
+	mount := mountDestination(string(out), root)
+	return d.handle(id, root, name, mount)
 }
 
-func (d *Docker) handle(id, root, name string) (Handle, error) {
+// mountDestination picks the container path of the bind mount whose host
+// source is root from `docker inspect` output (one "source\tdestination" per
+// line). A lone mount is taken as-is so a symlinked data dir still resolves.
+func mountDestination(inspect, root string) string {
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSpace(inspect), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	for _, line := range lines {
+		src, dst, ok := strings.Cut(line, "\t")
+		if ok && src == root && dst != "" {
+			return dst
+		}
+	}
+	if len(lines) == 1 {
+		if _, dst, ok := strings.Cut(lines[0], "\t"); ok && dst != "" {
+			return dst
+		}
+	}
+	return proto.DefaultMountPath
+}
+
+func (d *Docker) handle(id, root, name, mount string) (Handle, error) {
 	f, err := fsops.New(root)
 	if err != nil {
 		return nil, err
 	}
-	return &dockerHandle{id: id, root: f.Root(), fs: f, name: name, bin: d.Binary}, nil
+	return &dockerHandle{id: id, root: f.Root(), fs: f, name: name, bin: d.Binary, mount: mount}, nil
 }
 
 type dockerHandle struct {
 	id, root, name, bin string
-	fs                  *fsops.FS
+	// mount is the tree's path inside the container (WorkspaceSpec.MountPath).
+	mount string
+	fs    *fsops.FS
 }
 
 func (h *dockerHandle) ID() string      { return h.id }
@@ -492,20 +538,20 @@ func (h *dockerHandle) Prepare(spec *session.Spec) error {
 		spec.Host = strings.TrimSpace(string(out))
 		return nil
 	}
-	cwd := "/work"
+	cwd := h.mount
 	if spec.Cwd != "" {
 		c, err := h.fs.Resolve(spec.Cwd)
 		if err != nil {
 			return err
 		}
 		rel, _ := filepath.Rel(h.root, c)
-		cwd = filepath.ToSlash(filepath.Join("/work", rel))
+		cwd = filepath.ToSlash(filepath.Join(h.mount, rel))
 	}
 	args := []string{"exec", "-i", "-w", cwd}
 	if spec.Kind == proto.SessionPTY {
 		args = append(args, "-t")
 	}
-	env := MergeEnv([]string{"HOME=/work", "USER=root", "LANG=C.UTF-8", "REMOUNT_WORKSPACE=" + h.id}, spec.Env)
+	env := MergeEnv([]string{"HOME=" + h.mount, "USER=root", "LANG=C.UTF-8", "REMOUNT_WORKSPACE=" + h.id}, spec.Env)
 	for _, kv := range env {
 		args = append(args, "-e", kv)
 	}
@@ -526,7 +572,7 @@ func (h *dockerHandle) reown(ctx context.Context) error {
 		return nil
 	}
 	owner := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
-	out, err := exec.CommandContext(ctx, h.bin, "exec", h.name, "chown", "-R", owner, "/work").CombinedOutput()
+	out, err := exec.CommandContext(ctx, h.bin, "exec", h.name, "chown", "-R", owner, h.mount).CombinedOutput()
 	if err != nil {
 		return proto.Err(proto.CodeInternal, "docker exec chown: %s", strings.TrimSpace(string(out)))
 	}
@@ -630,7 +676,7 @@ func (r *Registry) Descriptors() []proto.BackendDescriptor {
 				BrokerIdentity: caps.BrokerIdentity, FilesystemBoundary: caps.FilesystemBoundary,
 				NetworkNamespace: caps.NetworkNamespace, DeviceIsolation: caps.DeviceIsolation,
 			},
-			Runtime: proto.RuntimeCaps{Snapshots: caps.Snapshots, Display: caps.Display},
+			Runtime: proto.RuntimeCaps{Snapshots: caps.Snapshots, Display: caps.Display, MountPath: caps.MountPath},
 		})
 	}
 	return out

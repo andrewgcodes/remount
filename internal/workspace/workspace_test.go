@@ -246,3 +246,37 @@ func TestKindOfTrustsOnlyKnownClaims(t *testing.T) {
 		t.Fatalf("process handle kind %q disagrees with advertised Caps.Snapshots %q", got, p.Caps().Snapshots)
 	}
 }
+
+func TestProcessBackendRefusesForeignMountPathAndDockerParsesMounts(t *testing.T) {
+	p := &Process{Dir: t.TempDir()}
+	if p.Caps().MountPath {
+		t.Fatal("process backend must not claim a mount namespace")
+	}
+	if _, err := p.Create(context.Background(), "ws_mp", proto.WorkspaceSpec{MountPath: "/home/me/proj"}, nil); err == nil {
+		t.Fatal("process backend accepted a mount path it would have to symlink")
+	}
+	if _, err := os.Stat(filepath.Join(p.Dir, "ws_mp")); err == nil {
+		t.Fatal("refused workspace left a directory behind")
+	}
+	h, err := p.Create(context.Background(), "ws_default", proto.WorkspaceSpec{MountPath: proto.DefaultMountPath}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = h.Destroy(context.Background())
+
+	if !(&Docker{}).Caps().MountPath {
+		t.Fatal("docker backend owns a mount namespace and must say so")
+	}
+	root := "/data/ws/ws_1"
+	for _, tc := range []struct{ in, want string }{
+		{"/data/ws/ws_1\t/home/me/proj\n", "/home/me/proj"},
+		{"/other\t/x\n/data/ws/ws_1\t/home/me/proj\n", "/home/me/proj"},
+		{"/resolved/elsewhere\t/lone\n", "/lone"},
+		{"/a\t/x\n/b\t/y\n", proto.DefaultMountPath},
+		{"", proto.DefaultMountPath},
+	} {
+		if got := mountDestination(tc.in, root); got != tc.want {
+			t.Fatalf("mountDestination(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

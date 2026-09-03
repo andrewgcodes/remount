@@ -451,3 +451,87 @@ func captureStdout(t *testing.T, f func()) string {
 	_ = w.Close()
 	return <-done
 }
+
+func TestRunQueueFlagsValidateBeforeDialing(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	queue := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(queue, []byte("# plan\nfirst\nsecond \\\n  continued\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	empty := filepath.Join(dir, "empty.txt")
+	if err := os.WriteFile(empty, []byte("# nothing\n\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"sleep needs queue", []string{"opencode", "--binding", "b_openai", "--sleep-after", "1h", "--", "x"}, "need --queue"},
+		{"queue and continue", []string{"opencode", "--binding", "b_openai", "--queue", queue, "--queue-continue", "q_1"}, "mutually exclusive"},
+		{"both sleeps", []string{"opencode", "--binding", "b_openai", "--queue", queue, "--sleep-after", "1h", "--sleep-until", "09:00"}, "mutually exclusive"},
+		{"negative sleep", []string{"opencode", "--binding", "b_openai", "--queue", queue, "--sleep-after", "-1s"}, "negative"},
+		{"bad clock", []string{"opencode", "--binding", "b_openai", "--queue", queue, "--sleep-until", "9am"}, "HH:MM"},
+		{"queue with task", []string{"opencode", "--binding", "b_openai", "--queue", queue, "--", "x"}, "nothing may follow"},
+		{"queue with detach", []string{"opencode", "--binding", "b_openai", "--queue", queue, "--detach"}, "foreground"},
+		{"custom cannot queue", []string{"custom", "--queue", queue}, "cannot run a queue"},
+		{"missing file", []string{"opencode", "--binding", "b_openai", "--queue", filepath.Join(dir, "nope.txt")}, "nope.txt"},
+		{"empty file", []string{"opencode", "--binding", "b_openai", "--queue", empty}, "at least one task"},
+		{"bad sandbox still checked", []string{"opencode", "--binding", "b_openai", "--queue", queue, "--sandbox", "loose"}, "--sandbox"},
+		{"bad mount path", []string{"opencode", "--binding", "b_openai", "--mount-path", "relative", "--", "x"}, "absolute"},
+		{"mount path on process", []string{"opencode", "--binding", "b_openai", "--mount-path", "/home/me/x", "--backend", "process", "--", "x"}, "mount namespace"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := cmdRun(ctx, tc.args)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("args=%q error=%v want %q", tc.args, err, tc.want)
+			}
+		})
+	}
+	tasks, err := readQueueFile(queue)
+	if err != nil || len(tasks) != 2 || tasks[0] != "first" || tasks[1] != "second \n  continued" {
+		t.Fatalf("tasks=%q err=%v", tasks, err)
+	}
+}
+
+func TestHandoffAndResumeValidateBeforeDialing(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"help", []string{"help"}, "handoff ["},
+		{"positional", []string{"extra"}, "handoff ["},
+		{"unknown recipe", []string{"--recipe", "nope", "--home", home}, "nope"},
+		{"negative timeout", []string{"--timeout", "-1s", "--home", home}, "negative"},
+		{"bad binding", []string{"--binding", "b_x:nopreset", "--home", home}, "nopreset"},
+	} {
+		t.Run("handoff "+tc.name, func(t *testing.T) {
+			err := cmdHandoff(ctx, tc.args)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("args=%q error=%v want %q", tc.args, err, tc.want)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"no ws", nil, "resume WS"},
+		{"two ws", []string{"ws_a", "ws_b"}, "resume WS"},
+		{"unknown recipe", []string{"ws_a", "--recipe", "nope"}, "nope"},
+		{"negative timeout", []string{"ws_a", "--timeout", "-1s"}, "negative"},
+	} {
+		t.Run("resume "+tc.name, func(t *testing.T) {
+			err := cmdResume(ctx, tc.args)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("args=%q error=%v want %q", tc.args, err, tc.want)
+			}
+		})
+	}
+}

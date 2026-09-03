@@ -156,6 +156,9 @@ type Options struct {
 	// MaxBasesPerTenant bounds pinned base images, each of which holds an
 	// artifact out of garbage collection. Zero selects 256.
 	MaxBasesPerTenant int
+	// MaxQueuesPerTenant bounds task queues, which are pruned with their
+	// workspace. Zero selects 4096.
+	MaxQueuesPerTenant int
 }
 
 // ArtifactStore is the part of the blob store the control plane inspects.
@@ -192,6 +195,7 @@ type Control struct {
 	fleetOps              map[string]*proto.FleetOperation
 	fleetLocks            map[string]*keyedMutex
 	bases                 map[string]*proto.Base // baseKey(tenant, name) -> pinned snapshot
+	queues                map[string]*proto.Queue
 	fleetWake             chan struct{}
 	timerReservations     int
 	timerReservationsByWS map[string]int
@@ -273,7 +277,7 @@ func New(opts Options) (*Control, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	if opts.MaxConcurrentRequests < 0 || opts.MaxEvents < 0 || opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 || opts.MaxBasesPerTenant < 0 ||
+	if opts.MaxConcurrentRequests < 0 || opts.MaxEvents < 0 || opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 || opts.MaxBasesPerTenant < 0 || opts.MaxQueuesPerTenant < 0 ||
 		opts.MaxMutationRecords < 0 || opts.MaxTimers < 0 || opts.MaxTimersPerWorkspace < 0 {
 		return nil, errors.New("control: resource limits must not be negative")
 	}
@@ -298,6 +302,9 @@ func New(opts Options) (*Control, error) {
 	if opts.MaxBasesPerTenant <= 0 {
 		opts.MaxBasesPerTenant = 256
 	}
+	if opts.MaxQueuesPerTenant <= 0 {
+		opts.MaxQueuesPerTenant = 4096
+	}
 	requestCtx, requestCancel := context.WithCancel(context.Background())
 	overloadLimit := opts.MaxConcurrentRequests / 8
 	if overloadLimit < 8 {
@@ -315,6 +322,7 @@ func New(opts Options) (*Control, error) {
 		producerLocks: map[string]*keyedMutex{}, mutationLocks: map[string]*keyedMutex{},
 		fleetOps: map[string]*proto.FleetOperation{}, fleetLocks: map[string]*keyedMutex{}, fleetWake: make(chan struct{}, 1),
 		bases:                 map[string]*proto.Base{},
+		queues:                map[string]*proto.Queue{},
 		timerReservationsByWS: map[string]int{},
 		requestSlots:          make(chan struct{}, opts.MaxConcurrentRequests), overloadSlots: make(chan struct{}, overloadLimit),
 		requestCtx: requestCtx, requestCancel: requestCancel, acceptRequests: true,
@@ -413,6 +421,7 @@ CREATE TABLE IF NOT EXISTS assignments (
 );
 CREATE TABLE IF NOT EXISTS fleet_operations (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS bases (tenant TEXT NOT NULL, name TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(tenant, name));
+CREATE TABLE IF NOT EXISTS queues (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS keys (name TEXT PRIMARY KEY, priv BLOB NOT NULL);
 `)
 	return err
@@ -611,6 +620,30 @@ func (c *Control) load() error {
 			return fmt.Errorf("decode base: %w", err)
 		}
 		c.bases[baseKey(base.Tenant, base.Name)] = &base
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	rows, err = c.db.Query(`SELECT data FROM queues`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var b []byte
+		if err := rows.Scan(&b); err != nil {
+			rows.Close()
+			return err
+		}
+		var q proto.Queue
+		if err := proto.Unmarshal(b, &q); err != nil {
+			rows.Close()
+			return fmt.Errorf("decode queue: %w", err)
+		}
+		c.queues[q.ID] = &q
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -897,8 +930,21 @@ func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int)
 			return RecordPruneResult{}, err
 		}
 	}
+	// Queues go with their workspace: they are meaningless without the
+	// tree they drove, and pruning them here keeps the map bounded.
+	var queueCandidates []string
 	for _, candidate := range workspaceCandidates {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM workspaces WHERE id=?`, candidate.id); err != nil {
+			return RecordPruneResult{}, err
+		}
+		for id, q := range c.queues {
+			if q.WS == candidate.id {
+				queueCandidates = append(queueCandidates, id)
+			}
+		}
+	}
+	for _, id := range queueCandidates {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM queues WHERE id=?`, id); err != nil {
 			return RecordPruneResult{}, err
 		}
 	}
@@ -999,6 +1045,9 @@ func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int)
 	}
 	for _, candidate := range workspaceCandidates {
 		delete(c.workspaces, candidate.id)
+	}
+	for _, id := range queueCandidates {
+		delete(c.queues, id)
 	}
 	result := RecordPruneResult{
 		Mutations: mutations, Timers: int64(len(timerCandidates)),
@@ -1654,6 +1703,46 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return struct{}{}, c.baseRemove(ctx, subject, req)
+	case proto.OpQueueCreate:
+		req, err := decode[proto.QueueCreateReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.queueCreate(ctx, subject, req)
+	case proto.OpQueueGet:
+		req, err := decode[proto.QueueGetReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.queueGet(ctx, subject, req.ID)
+	case proto.OpQueueList:
+		req, err := decode[proto.QueueListReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.queueList(ctx, subject, req)
+	case proto.OpQueueAdvance:
+		req, err := decode[proto.QueueAdvanceReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.queueAdvance(ctx, subject, req)
 	case proto.OpNodeList:
 		subject, err := c.subjectOf(f.From)
 		if err != nil {
@@ -1774,6 +1863,12 @@ func (c *Control) wsCreate(ctx context.Context, subject Subject, req *proto.WSCr
 	req.Spec.Principal = subject.ID
 	if req.Spec.Base != "" && req.Spec.RestoreFrom != "" {
 		return nil, proto.Err(proto.CodeBadRequest, "base and restore_from are mutually exclusive")
+	}
+	if err := proto.ValidateMountPath(req.Spec.MountPath); err != nil {
+		return nil, err
+	}
+	if req.Spec.MountPath == proto.DefaultMountPath {
+		req.Spec.MountPath = ""
 	}
 	scope := subject.Tenant + "|" + subject.ID + "|workspace.create"
 	unlockMutation := c.lockMutation(scope, req.IdempotencyKey)
@@ -3061,6 +3156,11 @@ func (c *Control) eligibleBackendLocked(ws *proto.Workspace, n *nodeState) (stri
 	}
 	for _, descriptor := range descriptors {
 		if r.Backend != "" && descriptor.Name != r.Backend {
+			continue
+		}
+		// A backend without its own mount namespace would have to symlink a
+		// host path into the jail to honor MountPath; refuse instead.
+		if ws.Spec.MountPath != "" && !descriptor.Runtime.MountPath {
 			continue
 		}
 		if err := proto.ValidateBackendSecurity(ws.Spec.Security, descriptor); err == nil {

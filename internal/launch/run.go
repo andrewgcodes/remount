@@ -36,6 +36,16 @@ type Options struct {
 	Model    string
 	Exclude  []string
 	Resume   bool
+	// MountPath pins where the tree appears inside the workspace (ADR 0041).
+	// A handoff sets it to the local checkout's path so path-keyed harness
+	// state stays valid; only namespaced backends can claim such a workspace.
+	MountPath string
+	// Labels are merged into the workspace's labels at create.
+	Labels map[string]string
+	// BeforeOpen runs once the workspace is claimed and the harness is
+	// installed, before the session opens. A queue driver records its
+	// durable state here so the first task cannot run unrecorded.
+	BeforeOpen func(ctx context.Context, ws *proto.Workspace) error
 
 	// PTY opens the harness on a pseudo-terminal (attached mode).
 	PTY        bool
@@ -177,18 +187,39 @@ func (o *Options) Validate() (*Plan, error) {
 		return plan, nil
 	}
 
+	if err := proto.ValidateMountPath(o.MountPath); err != nil {
+		return nil, err
+	}
+	if o.MountPath != "" && o.MountPath != proto.DefaultMountPath && o.Backend == "process" {
+		return nil, fmt.Errorf("--backend process cannot mount the tree at %s: it has no mount namespace (ADR 0041); use docker", o.MountPath)
+	}
 	spec := proto.WorkspaceSpec{
 		Name: o.Name, Image: o.Image, RestoreFrom: o.RestoreFrom, Base: o.Base,
-		Requires: proto.Requires{Backend: o.Backend},
-		Env:      map[string]string{},
-		Exclude:  append([]string(nil), o.Exclude...),
-		Labels:   map[string]string{"remount.recipe": r.Name},
+		Requires:  proto.Requires{Backend: o.Backend},
+		Env:       map[string]string{},
+		Exclude:   append([]string(nil), o.Exclude...),
+		Labels:    map[string]string{},
+		MountPath: o.MountPath,
 	}
+	for k, v := range o.Labels {
+		spec.Labels[k] = v
+	}
+	// The recipe and its bindings are recorded so `remount resume` can
+	// rebuild the launch without the original command line.
+	spec.Labels[LabelRecipe] = r.Name
 	if spec.Image == "" {
 		spec.Image = r.Image
 	}
+	specs := make([]string, 0, len(o.Bindings))
 	for _, b := range o.Bindings {
 		spec.Bindings = append(spec.Bindings, b.ID)
+		specs = append(specs, b.String())
+	}
+	if len(specs) > 0 {
+		spec.Labels[LabelBindings] = strings.Join(specs, ",")
+	}
+	if o.Model != "" {
+		spec.Labels[LabelModel] = o.Model
 	}
 	for k, v := range sessionEnv {
 		spec.Env[k] = v
@@ -254,6 +285,15 @@ func egressPolicy(r *Recipe, bindings []Binding, security, sandbox string) proto
 	return policy
 }
 
+// Workspace labels written by Start and read back by Resume.
+const (
+	LabelRecipe   = "remount.recipe"
+	LabelBindings = "remount.bindings"
+	LabelModel    = "remount.model"
+	// LabelOrigin is the local directory a handoff came from.
+	LabelOrigin = "remount.origin"
+)
+
 // Start materializes (or reuses) the workspace, installs the harness, writes
 // the launcher under .remount/launch and opens the session. The returned
 // session is live; the caller drives or detaches from it.
@@ -273,6 +313,7 @@ func Start(ctx context.Context, cl *client.Client, o Options) (*Result, error) {
 			return nil, err
 		}
 		res.Created = true
+		res.Workspace = ws
 		fmt.Fprintf(stderr, "workspace %s created\n", ws.ID)
 		wait := o.WaitClaimed
 		if wait <= 0 {
@@ -285,6 +326,8 @@ func Start(ctx context.Context, cl *client.Client, o Options) (*Result, error) {
 			hint := "is a matching node online?"
 			if o.Security != proto.SecurityLocal {
 				hint = "--security " + o.Security + " needs a node whose backend enforces egress; the process and docker backends only cooperate"
+			} else if o.MountPath != "" {
+				hint = "mounting the tree at " + o.MountPath + " needs a node with a namespaced backend such as docker; the process backend cannot"
 			}
 			return res, fmt.Errorf("%s created but not claimed: %w (%s)", res.workspaceID(plan), err, hint)
 		}
@@ -310,6 +353,11 @@ func Start(ctx context.Context, cl *client.Client, o Options) (*Result, error) {
 	if o.Recipe.Install != "" {
 		fmt.Fprintf(stderr, "installing %s\n", o.Recipe.Name)
 		if err := runInstall(ctx, cl, wsID, plan.SessionEnv, o.Recipe.Install, stderr); err != nil {
+			return res, err
+		}
+	}
+	if o.BeforeOpen != nil {
+		if err := o.BeforeOpen(ctx, res.Workspace); err != nil {
 			return res, err
 		}
 	}

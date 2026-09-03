@@ -1,6 +1,10 @@
 package proto
 
-import "time"
+import (
+	"path"
+	"strings"
+	"time"
+)
 
 // ---------------------------------------------------------------------------
 // hello
@@ -81,6 +85,9 @@ type BackendSecurityCaps struct {
 type RuntimeCaps struct {
 	Snapshots string `cbor:"snapshots" json:"snapshots"` // fs | fs+mem
 	Display   bool   `cbor:"display,omitempty" json:"display,omitempty"`
+	// MountPath: the backend can materialize a workspace at an arbitrary
+	// WorkspaceSpec.MountPath inside the workspace's mount namespace.
+	MountPath bool `cbor:"mount_path,omitempty" json:"mount_path,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +143,41 @@ type WorkspaceSpec struct {
 	Exclude     []string          `cbor:"exclude,omitempty" json:"exclude,omitempty"` // snapshot path globs to skip (node_modules, .venv …)
 	Security    SecuritySpec      `cbor:"security,omitempty" json:"security,omitempty"`
 	ACL         WorkspaceACL      `cbor:"acl,omitempty" json:"acl,omitempty"`
+	// MountPath is where the workspace filesystem appears inside the
+	// workspace's own mount namespace; "" means DefaultMountPath. Harnesses
+	// key state on the working directory, so a handoff sets this to the
+	// local checkout's path and their --continue/--resume find that state
+	// unchanged. Only backends that advertise RuntimeCaps.MountPath may claim
+	// a workspace that sets it.
+	MountPath string `cbor:"mount_path,omitempty" json:"mount_path,omitempty"`
+}
+
+// DefaultMountPath is where a workspace is materialized when the spec does
+// not say otherwise.
+const DefaultMountPath = "/work"
+
+// ValidateMountPath rejects a MountPath a node could not honor safely: it
+// must be absolute, clean, not the filesystem root and not under the node's
+// own reserved paths.
+func ValidateMountPath(p string) error {
+	if p == "" {
+		return nil
+	}
+	if len(p) > 1024 {
+		return Err(CodeBadRequest, "mount_path is longer than 1024 bytes")
+	}
+	if !strings.HasPrefix(p, "/") {
+		return Err(CodeBadRequest, "mount_path %q must be absolute", p)
+	}
+	if path.Clean(p) != p || strings.Contains(p, "\x00") {
+		return Err(CodeBadRequest, "mount_path %q must be a clean path", p)
+	}
+	for _, reserved := range []string{"/", "/proc", "/sys", "/dev", "/etc", "/bin", "/sbin", "/lib", "/usr", "/var", "/run", "/boot"} {
+		if p == reserved || strings.HasPrefix(p, reserved+"/") {
+			return Err(CodeBadRequest, "mount_path %q is a system path", p)
+		}
+	}
+	return nil
 }
 
 const (
@@ -284,6 +326,10 @@ const (
 	OpBaseCreate       = "base.create"        // BaseCreateReq -> Base (pins a snapshot under a tenant-scoped name)
 	OpBaseList         = "base.list"          // -> BaseListRes
 	OpBaseRemove       = "base.remove"        // BaseRemoveReq -> {}
+	OpQueueCreate      = "queue.create"       // QueueCreateReq -> Queue (durable task list for one workspace)
+	OpQueueGet         = "queue.get"          // QueueGetReq -> Queue
+	OpQueueList        = "queue.list"         // QueueListReq -> QueueListRes
+	OpQueueAdvance     = "queue.advance"      // QueueAdvanceReq -> Queue (records one task's outcome, moves the cursor)
 )
 
 type WSCreateReq struct {
@@ -503,6 +549,112 @@ type BaseCreateReq struct {
 // BaseListRes lists the bases visible to the caller, sorted by name.
 type BaseListRes struct {
 	Bases []Base `cbor:"bases" json:"bases"`
+}
+
+// Queue states.
+const (
+	QueueRunning = "running" // a task is running or is due to run next
+	QueueDone    = "done"    // every task finished with exit 0
+	QueueFailed  = "failed"  // Items[Cursor] exited non-zero; the cursor stays on it
+)
+
+// QueueItem is one task of a Queue with its outcome once it has run. Task text
+// is control-plane data, never written into the workspace; events about the
+// item carry only its index and exit.
+type QueueItem struct {
+	Task       string `cbor:"task" json:"task"`
+	Session    string `cbor:"session,omitempty" json:"session,omitempty"`
+	Exit       int    `cbor:"exit,omitempty" json:"exit,omitempty"`
+	Signal     string `cbor:"signal,omitempty" json:"signal,omitempty"`
+	Attempts   int    `cbor:"attempts,omitempty" json:"attempts,omitempty"`
+	FinishedAt int64  `cbor:"finished_at,omitempty" json:"finished_at,omitempty"`
+}
+
+// Queue is a durable, ordered list of harness tasks for one workspace
+// (ADR 0041). It survives moves of the workspace and restarts of the control
+// plane because it is a control-plane resource; a driver reads it back and
+// continues from Cursor.
+type Queue struct {
+	ID     string      `cbor:"id" json:"id"`
+	WS     string      `cbor:"ws" json:"ws"`
+	Tenant string      `cbor:"tenant" json:"tenant"`
+	Owner  string      `cbor:"owner" json:"owner"`
+	Recipe string      `cbor:"recipe,omitempty" json:"recipe,omitempty"`
+	Items  []QueueItem `cbor:"items" json:"items"`
+	Cursor int         `cbor:"cursor" json:"cursor"` // index of the next task to run; len(Items) when done
+	Status string      `cbor:"status" json:"status"`
+	// SleepAfterSec and SleepUntil record the pause between tasks the driver
+	// asked for, so a resumed driver honors the same rhythm.
+	SleepAfterSec int64  `cbor:"sleep_after_sec,omitempty" json:"sleep_after_sec,omitempty"`
+	SleepUntil    string `cbor:"sleep_until,omitempty" json:"sleep_until,omitempty"` // HH:MM, local to the driver
+	CreatedAt     int64  `cbor:"created_at" json:"created_at"`
+	UpdatedAt     int64  `cbor:"updated_at" json:"updated_at"`
+}
+
+// Queue bounds. A queue is control-plane state written by a driver that may
+// be a script, so the task list is sized like a request, not like a file.
+const (
+	MaxQueueItems    = 256
+	MaxQueueTaskSize = 16 << 10
+)
+
+// ValidateQueueTasks is the admission check for a queue's task list, shared
+// by the control plane and the CLI so a bad file is refused before anything
+// is created.
+func ValidateQueueTasks(tasks []string) error {
+	if len(tasks) == 0 {
+		return Err(CodeBadRequest, "queue needs at least one task")
+	}
+	if len(tasks) > MaxQueueItems {
+		return Err(CodeBadRequest, "queue has %d tasks; the limit is %d", len(tasks), MaxQueueItems)
+	}
+	for i, t := range tasks {
+		if strings.TrimSpace(t) == "" {
+			return Err(CodeBadRequest, "queue task %d is empty", i)
+		}
+		if len(t) > MaxQueueTaskSize {
+			return Err(CodeBadRequest, "queue task %d is %d bytes; the limit is %d", i, len(t), MaxQueueTaskSize)
+		}
+	}
+	return nil
+}
+
+// QueueCreateReq creates a queue for a workspace the caller may write. One
+// unfinished queue per workspace: a second create is a conflict.
+type QueueCreateReq struct {
+	WS             string   `cbor:"ws" json:"ws"`
+	Recipe         string   `cbor:"recipe,omitempty" json:"recipe,omitempty"`
+	Tasks          []string `cbor:"tasks" json:"tasks"`
+	SleepAfterSec  int64    `cbor:"sleep_after_sec,omitempty" json:"sleep_after_sec,omitempty"`
+	SleepUntil     string   `cbor:"sleep_until,omitempty" json:"sleep_until,omitempty"`
+	IdempotencyKey string   `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// QueueGetReq fetches one queue.
+type QueueGetReq struct {
+	ID string `cbor:"id" json:"id"`
+}
+
+// QueueListReq lists the caller's queues, optionally for one workspace.
+type QueueListReq struct {
+	WS string `cbor:"ws,omitempty" json:"ws,omitempty"`
+}
+
+// QueueListRes is the queues visible to the caller, oldest first.
+type QueueListRes struct {
+	Queues []Queue `cbor:"queues" json:"queues"`
+}
+
+// QueueAdvanceReq records the outcome of Items[Index], which must be the
+// cursor. Exit 0 moves the cursor on; anything else marks the queue failed
+// and leaves the cursor so a later driver can retry.
+type QueueAdvanceReq struct {
+	ID             string `cbor:"id" json:"id"`
+	Index          int    `cbor:"index" json:"index"`
+	Session        string `cbor:"session,omitempty" json:"session,omitempty"`
+	Exit           int    `cbor:"exit" json:"exit"`
+	Signal         string `cbor:"signal,omitempty" json:"signal,omitempty"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
 }
 
 // BaseRemoveReq unpins a base. Workspaces already created from it keep their
@@ -1229,6 +1381,8 @@ const (
 	EvFleetCompleted = "fleet.quarantine.completed"
 	EvBaseCreated    = "base.created"
 	EvBaseRemoved    = "base.removed"
+	EvQueueCreated   = "queue.created"           // payload {queue, ws, items}
+	EvQueueAdvanced  = "queue.advanced"          // one queued task finished; payload {queue, index, exit, status}
 	EvRunStarted     = "run.started"             // a harness launch opened its session; payload {s, recipe, task_hash, sandbox, auth}
 	EvRunFinished    = "run.finished"            // that session exited; payload {s, recipe, exit, signal}
 	EvAuthWSResident = "auth.workspace_resident" // a launch relies on a login the harness keeps inside the workspace; payload {s, recipe}

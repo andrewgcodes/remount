@@ -118,6 +118,10 @@ func run(ctx context.Context, argv []string) error {
 		return cmdBase(ctx, args)
 	case "run":
 		return cmdRun(ctx, args)
+	case "handoff":
+		return cmdHandoff(ctx, args)
+	case "resume":
+		return cmdResume(ctx, args)
 	case "binding":
 		return cmdBinding(ctx, args)
 	case "status":
@@ -195,6 +199,9 @@ func usage() {
   remount base ls | rm NAME                                              named snapshots for ws create --base (pinned until rm)
   remount run RECIPE [--dir . | --base NAME | --ws WS] [--binding b_openai]... [--detach] -- TASK
                                       seed a workspace, install a harness (claude, codex, opencode, openhands, goose, gemini, aider, cline, custom), run it
+  remount run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM]   run the file's tasks in order in one workspace, checkpointing or sleeping between them
+  remount handoff [--recipe R] [--task T] [--dir .]                      move this checkout and the harness's conversation into a workspace and keep it going
+  remount resume WS [--task T]        rejoin a running harness, or wake the workspace and continue the conversation
   remount binding preset ls           provider presets a --binding may name
   remount nodes | events [--follow] [--ws WS] | timers
 

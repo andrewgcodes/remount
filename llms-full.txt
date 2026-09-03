@@ -186,6 +186,9 @@ append-only event log is the durable audit and observation record.
 | `remount attach WS SESSION --from N` | reattach to a running session |
 | `remount fs read\|write\|ls\|stat\|rm\|mv\|mkdir\|search\|edit` | workspace filesystem |
 | `remount port WS PORT` | forward a port out of the workspace |
+| `remount run RECIPE [--dir .] [--binding b_openai] -- TASK` | seed a workspace, install a coding harness, run it against brokered keys |
+| `remount run RECIPE --queue FILE [--sleep-after D]` | run a file of tasks in order in one workspace; progress lives on the control plane |
+| `remount handoff` / `remount resume WS` | move this checkout and the harness's conversation into a workspace; pick it back up from anywhere |
 | `remount nodes` / `events` / `timers` | inspect the fleet |
 | `remount fleet quarantine ...` | durably fence, checkpoint, stop or destroy an incident scope |
 | `remount status` / `inspect` / `doctor` / `metrics` | inspect health and capacity |
@@ -735,6 +738,52 @@ honors `OPENAI_API_KEY` and `OPENAI_BASE_URL`; `remount binding preset ls`
 lists the other providers. [harness-integration.md](harness-integration.md)
 has the full recipe table and the two kinds of auth.
 
+### Hand off a conversation, and a night's worth of tasks
+
+`remount handoff` moves the checkout you are in *and* the harness's
+conversation into a workspace and keeps it going. The recipe is detected from
+the state under your home directory; the tree lands at the same absolute path
+inside the workspace when the harness keys its history on it, which is why
+this one wants a `docker` node:
+
+```sh
+cd ~/proj
+remount handoff --binding b_anthropic --task "carry on with the failing test"
+```
+
+```
+uploaded 212 files (1840233 bytes) as art_sha256:…
+handed off /home/me/proj (212 files) with claude state .claude,.claude.json to ws_06g6cq… at /home/me/proj
+attach: remount attach ws_06g6cq… s_06g6cq…
+resume later: remount resume ws_06g6cq…
+bring it back: remount pull ws_06g6cq…
+```
+
+Later, from any machine, `remount resume ws_06g6cq…` attaches if the agent is
+still going, wakes the workspace if it went to sleep, and otherwise starts the
+harness's own resume command in the same conversation.
+
+A list of tasks runs the same way, one after another in one workspace, with
+the progress kept on the server so the run survives the workspace sleeping
+and moving:
+
+```sh
+cat > tonight.txt <<'TASKS'
+# one task per line; \ continues a line
+Fix the flaky TestReconnect and make the suite green.
+Update CHANGELOG.md for the 0.4 release.
+Open a PR titled "0.4" with a summary of the changes.
+TASKS
+remount run codex --dir proj --binding b_openai --queue tonight.txt --sleep-after 20m
+```
+
+Each task is a `run` session; between tasks the workspace checkpoints (or here
+sleeps for twenty minutes on a durable timer). A task that exits non-zero stops
+the queue with the cursor on it, and `remount run codex --queue-continue
+q_06g6cr…` retries from there. `remount events --ws WS` shows
+`queue.advanced{index, exit}` per task; the tasks themselves are never in the
+log.
+
 ### Sharing a workspace, and taking it back
 
 A workspace's ACL names who else may use it. Only the owner (or an
@@ -850,6 +899,45 @@ recipe's declared `hosts` for `GET`/`HEAD` (so the harness can install itself
 even when read-only), and `full` adds `CONNECT` to those hosts. Those two profiles need
 a node whose backend enforces egress; the `process` and `docker` backends only
 cooperate through `HTTPS_PROXY`, so they serve `local`.
+
+### Hand-off, resume and queues
+
+The recipe's `resume_command`, `state_dirs` and `path_keyed` fields drive the
+unattended workflow (ADR 0041).
+
+```sh
+cd ~/proj                       # a checkout with a Claude Code conversation open
+remount handoff --task "finish the refactor and open a PR"
+```
+
+`handoff` finds the harness whose state directory exists under your home
+(`--recipe` when several do), packs the checkout and that state into one
+artifact, and starts the `resume_command` in a new workspace. For a
+`path_keyed` recipe — Claude Code, Codex, OpenCode, Gemini and Cline key their
+per-project state on the absolute path of the working tree — the tree is
+mounted at the same absolute path inside the workspace, which needs a node
+with a mount namespace (`docker`). A `process`-only deployment leaves the
+workspace `pending` and `handoff` says so; it never creates a symlink on the
+node to fake the path. Goose, OpenHands and aider keep path-independent state
+and run on either backend at `/work`.
+
+`remount resume WS` picks the conversation back up: it attaches if a harness
+session is still running, otherwise wakes the workspace if it sleeps and runs
+the `resume_command` with `--task` (default "Continue where you left off.").
+The recipe, bindings and model come from the workspace's labels, so the
+command needs nothing but the id.
+
+`remount run RECIPE --queue tasks.txt` runs one task per line in one
+workspace, in order, and records progress as a control-plane `Queue`
+resource rather than in the tree. Between tasks it checkpoints, or with
+`--sleep-after 30m` / `--sleep-until 02:00` puts the workspace to sleep on a
+durable timer and waits for it to come back — on whichever node claims it. A
+non-zero exit stops the queue with the cursor on that task;
+`remount run RECIPE --queue-continue QUEUE` retries it and carries on, from a
+different machine if need be. Events record `queue.advanced{index, exit}`,
+never the task text. `remount ws sleep WS --on EVENT` is the same mechanism
+for waking on an external event (a merged PR, a Slack reply) and is the
+intended hook for event-driven queues.
 
 ### Provider bindings are presets
 

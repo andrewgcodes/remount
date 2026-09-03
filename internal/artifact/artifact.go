@@ -777,44 +777,115 @@ type SnapshotStats struct {
 // layout is identical to Snapshot, so Restore and ApplyOverlay accept the
 // output unchanged.
 func SnapshotFiltered(root string, skip func(rel string, isDir bool) bool, w io.Writer) (SnapshotStats, error) {
+	return SnapshotTrees([]Tree{{Root: root, Skip: skip}}, w)
+}
+
+// Tree is one local directory that SnapshotTrees places into an archive.
+type Tree struct {
+	// Root is the local directory to walk.
+	Root string
+	// Prefix is the slash-separated archive directory the tree lands under;
+	// "" is the archive root. Prefix directories are created in the archive.
+	Prefix string
+	// Skip filters entries by their path relative to Root (see
+	// SnapshotFiltered); nil keeps everything.
+	Skip func(rel string, isDir bool) bool
+}
+
+// SnapshotTrees writes one tar.gz combining several local trees, each under
+// its own archive prefix, in sorted archive order. Two trees may not produce
+// the same archive path; that is an error rather than a silent overwrite.
+// The layout is identical to Snapshot, so Restore and ApplyOverlay accept the
+// output unchanged.
+func SnapshotTrees(trees []Tree, w io.Writer) (SnapshotStats, error) {
 	var stats SnapshotStats
-	root, err := filepath.Abs(root)
-	if err != nil {
-		return stats, err
+	type entry struct {
+		root  *os.Root // nil for a synthesized prefix directory
+		name  string   // path inside root, OS separators
+		isDir bool
 	}
-	rr, err := os.OpenRoot(root)
-	if err != nil {
-		return stats, err
-	}
-	defer rr.Close()
+	entries := map[string]entry{}
 	var paths []string
-	err = fs.WalkDir(rr.FS(), ".", func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if p == "." {
+	// Directories may coincide across trees (a checkout's .claude/ and a
+	// home's .claude/ merge); anything else at the same archive path is a
+	// conflict, never a silent overwrite.
+	add := func(archive string, e entry) error {
+		prior, dup := entries[archive]
+		if !dup {
+			entries[archive] = e
+			paths = append(paths, archive)
 			return nil
 		}
-		rel := filepath.ToSlash(p)
-		if skip != nil && skip(rel, d.IsDir()) {
-			stats.Skipped++
-			if d.IsDir() {
-				return fs.SkipDir
+		if prior.isDir && e.isDir {
+			if prior.root == nil {
+				entries[archive] = e
 			}
 			return nil
 		}
-		paths = append(paths, rel)
-		return nil
-	})
-	if err != nil {
-		return stats, err
+		return fmt.Errorf("artifact: %q is produced by two trees", archive)
+	}
+	for _, t := range trees {
+		root, err := filepath.Abs(t.Root)
+		if err != nil {
+			return stats, err
+		}
+		rr, err := os.OpenRoot(root)
+		if err != nil {
+			return stats, err
+		}
+		defer rr.Close()
+		prefix := strings.Trim(t.Prefix, "/")
+		if prefix != "" {
+			if prefix != path.Clean(prefix) || prefix == ".." || strings.HasPrefix(prefix, "../") {
+				return stats, fmt.Errorf("artifact: bad archive prefix %q", t.Prefix)
+			}
+			parts := strings.Split(prefix, "/")
+			for i := range parts {
+				if err := add(strings.Join(parts[:i+1], "/"), entry{isDir: true}); err != nil {
+					return stats, err
+				}
+			}
+		}
+		err = fs.WalkDir(rr.FS(), ".", func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if p == "." {
+				return nil
+			}
+			rel := filepath.ToSlash(p)
+			if t.Skip != nil && t.Skip(rel, d.IsDir()) {
+				stats.Skipped++
+				if d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			archive := rel
+			if prefix != "" {
+				archive = prefix + "/" + rel
+			}
+			return add(archive, entry{root: rr, name: filepath.FromSlash(p), isDir: d.IsDir()})
+		})
+		if err != nil {
+			return stats, err
+		}
 	}
 	sort.Strings(paths)
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
 	writeErr := func(err error) (SnapshotStats, error) { return stats, err }
 	for _, rel := range paths {
-		name := filepath.FromSlash(rel)
+		e := entries[rel]
+		if e.root == nil {
+			hdr := &tar.Header{Name: rel + "/", Mode: 0o755, Typeflag: tar.TypeDir, Format: tar.FormatPAX}
+			stats.Dirs++
+			if err := tw.WriteHeader(hdr); err != nil {
+				return writeErr(err)
+			}
+			continue
+		}
+		rr, name := e.root, e.name
 		info, err := rr.Lstat(name)
 		if err != nil {
 			return writeErr(err)
