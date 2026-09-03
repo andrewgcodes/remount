@@ -11,6 +11,7 @@ package artifact
 import (
 	"archive/tar"
 	"compress/gzip"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -754,13 +755,36 @@ func Excluded(rel string, excludes []string) bool {
 // Snapshot writes a tar.gz of root to w. Entries are written in sorted
 // order so identical trees produce identical bytes (and thus ids).
 func Snapshot(root string, excludes []string, w io.Writer) error {
+	_, err := SnapshotFiltered(root, func(rel string, _ bool) bool { return Excluded(rel, excludes) }, w)
+	return err
+}
+
+// SnapshotStats counts what one snapshot contained.
+type SnapshotStats struct {
+	Files    int
+	Dirs     int
+	Symlinks int
+	// Bytes is the uncompressed regular-file payload.
+	Bytes int64
+	// Skipped counts entries the filter rejected; a skipped directory counts
+	// once, not per descendant.
+	Skipped int
+}
+
+// SnapshotFiltered is Snapshot with a caller-supplied filter. skip receives
+// the slash-separated relative path and whether it is a directory; returning
+// true omits the entry (and, for a directory, everything under it). The tar
+// layout is identical to Snapshot, so Restore and ApplyOverlay accept the
+// output unchanged.
+func SnapshotFiltered(root string, skip func(rel string, isDir bool) bool, w io.Writer) (SnapshotStats, error) {
+	var stats SnapshotStats
 	root, err := filepath.Abs(root)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	rr, err := os.OpenRoot(root)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	defer rr.Close()
 	var paths []string
@@ -772,7 +796,8 @@ func Snapshot(root string, excludes []string, w io.Writer) error {
 			return nil
 		}
 		rel := filepath.ToSlash(p)
-		if Excluded(rel, excludes) {
+		if skip != nil && skip(rel, d.IsDir()) {
+			stats.Skipped++
 			if d.IsDir() {
 				return fs.SkipDir
 			}
@@ -782,25 +807,26 @@ func Snapshot(root string, excludes []string, w io.Writer) error {
 		return nil
 	})
 	if err != nil {
-		return err
+		return stats, err
 	}
 	sort.Strings(paths)
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
+	writeErr := func(err error) (SnapshotStats, error) { return stats, err }
 	for _, rel := range paths {
 		name := filepath.FromSlash(rel)
 		info, err := rr.Lstat(name)
 		if err != nil {
-			return err
+			return writeErr(err)
 		}
 		link := ""
 		if info.Mode()&os.ModeSymlink != 0 {
 			link, err = rr.Readlink(name)
 			if err != nil {
-				return err
+				return writeErr(err)
 			}
 			if err := validateSymlinkTarget(rel, link); err != nil {
-				return err
+				return writeErr(err)
 			}
 		}
 		var file *os.File
@@ -810,16 +836,16 @@ func Snapshot(root string, excludes []string, w io.Writer) error {
 			// metadata and bytes prevents a stale-size tar header.
 			file, err = openSnapshotFile(rr, name)
 			if err != nil {
-				return err
+				return writeErr(err)
 			}
 			opened, statErr := file.Stat()
 			if statErr != nil {
 				file.Close()
-				return statErr
+				return writeErr(statErr)
 			}
 			if !opened.Mode().IsRegular() {
 				file.Close()
-				return fmt.Errorf("artifact: %q changed type during snapshot", rel)
+				return writeErr(fmt.Errorf("artifact: %q changed type during snapshot", rel))
 			}
 			info = opened
 		}
@@ -828,11 +854,18 @@ func Snapshot(root string, excludes []string, w io.Writer) error {
 			if file != nil {
 				file.Close()
 			}
-			return err
+			return writeErr(err)
 		}
 		hdr.Name = rel
-		if info.IsDir() {
+		switch {
+		case info.IsDir():
 			hdr.Name += "/"
+			stats.Dirs++
+		case link != "":
+			stats.Symlinks++
+		default:
+			stats.Files++
+			stats.Bytes += hdr.Size
 		}
 		hdr.Uid, hdr.Gid = 0, 0
 		hdr.Uname, hdr.Gname = "", ""
@@ -842,23 +875,152 @@ func Snapshot(root string, excludes []string, w io.Writer) error {
 			if file != nil {
 				file.Close()
 			}
-			return err
+			return writeErr(err)
 		}
 		if file != nil {
 			_, err = io.CopyN(tw, file, hdr.Size)
 			closeErr := file.Close()
 			if err != nil {
-				return err
+				return writeErr(err)
 			}
 			if closeErr != nil {
-				return closeErr
+				return writeErr(closeErr)
 			}
 		}
 	}
 	if err := tw.Close(); err != nil {
-		return err
+		return stats, err
 	}
-	return gz.Close()
+	return stats, gz.Close()
+}
+
+// OverlayResult reports what ApplyOverlay placed into the target tree.
+type OverlayResult struct {
+	// Paths lists every regular file and symlink that was replaced or created,
+	// slash-separated and relative to root, in archive order.
+	Paths []string
+	Dirs  int
+	Bytes int64
+}
+
+// OverlayStageDir is the directory under root where ApplyOverlay stages an
+// archive before moving entries into place. It is the same directory the node
+// reserves for `.remount/env`, which snapshots already exclude.
+const OverlayStageDir = ".remount"
+
+// ApplyOverlay extracts a snapshot archive over an existing tree without
+// removing anything the archive does not name. The archive is fully expanded
+// and validated in a staging directory inside root first, so a hostile or
+// truncated archive changes nothing; entries are then moved into place one at
+// a time with rename, so every file is either its old bytes or its new bytes
+// and never a partial write. Directories are created as needed. An entry that
+// would replace a directory with a file (or vice versa), or that names
+// anything under OverlayStageDir, is refused after the entries before it have
+// already landed; the returned result names exactly what landed.
+func ApplyOverlay(root string, r io.Reader, limits RestoreLimits) (OverlayResult, error) {
+	var res OverlayResult
+	limits = normalizeRestoreLimits(limits)
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return res, err
+	}
+	rr, err := os.OpenRoot(root)
+	if err != nil {
+		return res, err
+	}
+	defer rr.Close()
+	if err := rr.MkdirAll(OverlayStageDir, 0o755); err != nil {
+		return res, err
+	}
+	stageRel, err := mkdirTempIn(rr, OverlayStageDir, "overlay-")
+	if err != nil {
+		return res, err
+	}
+	defer func() { _ = rr.RemoveAll(stageRel) }()
+	if err := extract(filepath.Join(root, stageRel), r, limits); err != nil {
+		return res, err
+	}
+	stage, err := rr.OpenRoot(stageRel)
+	if err != nil {
+		return res, err
+	}
+	defer stage.Close()
+	// Validate every destination before the first rename so a refusal never
+	// leaves the tree half-overlaid. Directories are created afterwards and
+	// files land last, each by a single rename.
+	var dirs, files []string
+	err = fs.WalkDir(stage.FS(), ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p == "." {
+			return nil
+		}
+		rel := filepath.ToSlash(p)
+		if rel == OverlayStageDir || strings.HasPrefix(rel, OverlayStageDir+"/") {
+			return fmt.Errorf("artifact: overlay may not write %q", rel)
+		}
+		osName := filepath.FromSlash(rel)
+		if err := rejectSymlinkParents(rr, osName); err != nil {
+			return fmt.Errorf("artifact: overlay %q: %w", rel, err)
+		}
+		if d.IsDir() {
+			if st, err := rr.Lstat(osName); err == nil && !st.IsDir() {
+				return fmt.Errorf("artifact: overlay %q would replace a file with a directory", rel)
+			}
+			dirs = append(dirs, rel)
+			return nil
+		}
+		if st, err := rr.Lstat(osName); err == nil && st.IsDir() {
+			return fmt.Errorf("artifact: overlay %q would replace a directory", rel)
+		}
+		files = append(files, rel)
+		return nil
+	})
+	if err != nil {
+		return res, err
+	}
+	for _, rel := range dirs {
+		if err := rr.MkdirAll(filepath.FromSlash(rel), 0o755); err != nil {
+			return res, err
+		}
+		res.Dirs++
+	}
+	for _, rel := range files {
+		osName := filepath.FromSlash(rel)
+		info, err := stage.Lstat(osName)
+		if err != nil {
+			return res, err
+		}
+		if err := rr.Rename(filepath.Join(stageRel, osName), osName); err != nil {
+			return res, err
+		}
+		res.Paths = append(res.Paths, rel)
+		if info.Mode().IsRegular() {
+			res.Bytes += info.Size()
+		}
+	}
+	return res, syncDir(root)
+}
+
+// mkdirTempIn creates a uniquely named directory under parent (relative to
+// rr) and returns its path relative to rr.
+func mkdirTempIn(rr *os.Root, parent, prefix string) (string, error) {
+	var random [8]byte
+	for attempt := 0; attempt < 100; attempt++ {
+		if _, err := rand.Read(random[:]); err != nil {
+			return "", err
+		}
+		name := filepath.Join(parent, prefix+hex.EncodeToString(random[:]))
+		err := rr.Mkdir(name, 0o700)
+		if err == nil {
+			return name, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+	}
+	return "", errors.New("artifact: could not create staging directory")
 }
 
 // Restore extracts a snapshot into root, which must exist. Extraction first

@@ -2306,6 +2306,32 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		return result, nil
+	case proto.OpFSApplyTar:
+		req, err := decode[proto.FSApplyTarReq](f)
+		if err != nil {
+			return nil, err
+		}
+		w, err := n.authorize(f.From, req.WS, req.Grant)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := artifact.Digest(req.Artifact); err != nil {
+			return nil, proto.Err(proto.CodeBadRequest, "fs.apply_tar: %v", err)
+		}
+		clean := *req
+		clean.Grant = nil
+		key := n.mutationKey(f.From, w.ID, proto.OpFSApplyTar, req.IdempotencyKey)
+		raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
+			return n.applyTar(ctx, w, req.Artifact, f.From)
+		})
+		if err != nil {
+			return nil, err
+		}
+		var result proto.FSApplyTarRes
+		if err := proto.Unmarshal(raw, &result); err != nil {
+			return nil, err
+		}
+		return result, nil
 	case proto.OpWSSnapshot:
 		req, err := decode[proto.WSSnapshotReq](f)
 		if err != nil {
@@ -2408,7 +2434,10 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 	if w.broker != nil {
 		base = w.broker.BaseURL()
 	}
-	env = broker.ResolveEnv(env, base, w.leases)
+	n.mu.Lock()
+	leases := slices.Clone(w.leases)
+	n.mu.Unlock()
+	env = broker.ResolveEnv(env, base, leases)
 	var envList []string
 	if w.broker != nil {
 		envList = append(envList, w.broker.EnvFor()...)
@@ -2840,6 +2869,40 @@ func (n *Node) fetchArtifact(ctx context.Context, id string) (io.ReadCloser, err
 	}
 	r, _, err := n.store.Open(id)
 	return r, err
+}
+
+// applyTar overlays an uploaded artifact onto a workspace tree. The fetch
+// happens before the tree lock so a slow download never blocks other file
+// operations; the overlay itself holds the lock because every rename must be
+// ordered against concurrent fs.* mutations.
+func (n *Node) applyTar(ctx context.Context, w *ws, id, client string) ([]byte, error) {
+	rc, err := n.fetchArtifact(ctx, id)
+	if err != nil {
+		return nil, proto.Err(proto.CodeNotFound, "fs.apply_tar: %v", err)
+	}
+	defer rc.Close()
+	unlock, err := n.lockWorkspaceTree(w, true)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	limits := artifact.RestoreLimits{MaxCompressedBytes: n.opts.MaxArtifactBytes}
+	res, err := artifact.ApplyOverlay(w.handle.FS().Root(), rc, limits)
+	// Whatever landed before a mid-archive refusal is real state; record it
+	// before reporting the failure.
+	if len(res.Paths) > 0 || res.Dirs > 0 {
+		n.emit(proto.EvFSApplyTar, w.ID, w.Spec.Principal, map[string]any{
+			"artifact": id, "files": len(res.Paths), "dirs": res.Dirs, "bytes": res.Bytes, "client": client,
+			"complete": err == nil,
+		})
+		for _, p := range res.Paths {
+			n.emit(proto.EvFSWrite, w.ID, w.Spec.Principal, map[string]any{"path": p, "artifact": id, "client": client})
+		}
+	}
+	if err != nil {
+		return nil, proto.Err(proto.CodeBadRequest, "fs.apply_tar: %v", err)
+	}
+	return proto.Marshal(proto.FSApplyTarRes{Files: len(res.Paths), Dirs: res.Dirs, Bytes: res.Bytes})
 }
 
 func (n *Node) snapshot(ctx context.Context, w *ws, upload bool) (string, int64, error) {

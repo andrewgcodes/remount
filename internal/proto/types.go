@@ -611,6 +611,10 @@ const (
 	OpFSRename = "fs.rename"
 	OpFSSearch = "fs.search"
 	OpFSEdit   = "fs.edit"
+	// OpFSApplyTar overlays an uploaded artifact onto the workspace tree:
+	// FSApplyTarReq -> FSApplyTarRes. Every file lands atomically by rename;
+	// nothing the archive does not name is removed.
+	OpFSApplyTar = "fs.apply_tar"
 
 	OpWSSnapshot         = "ws.snapshot"          // WSSnapshotReq -> WSSnapshotRes
 	OpWSRelease          = "ws.release"           // control -> node: WSReleaseReq -> WSReleasedReq
@@ -886,6 +890,23 @@ type FSEditRes struct {
 	Replacements int `cbor:"replacements" json:"replacements"`
 }
 
+// FSApplyTarReq names an artifact already present in the control plane's
+// store (uploaded with PUT /v1/artifacts/{id}) to overlay onto the workspace.
+type FSApplyTarReq struct {
+	WS             string `cbor:"ws" json:"ws"`
+	Artifact       string `cbor:"artifact" json:"artifact"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+}
+
+// FSApplyTarRes reports what the overlay wrote. Files counts regular files
+// and symlinks that were created or replaced.
+type FSApplyTarRes struct {
+	Files int   `cbor:"files" json:"files"`
+	Dirs  int   `cbor:"dirs" json:"dirs"`
+	Bytes int64 `cbor:"bytes" json:"bytes"`
+}
+
 // ---- workspace on node ----
 
 type WSSnapshotReq struct {
@@ -1108,6 +1129,7 @@ const (
 	EvSExited        = "s.exited"
 	EvSInput         = "s.input"
 	EvFSWrite        = "fs.write"
+	EvFSApplyTar     = "fs.apply_tar" // one overlay applied; payload carries artifact and counts, fs.write follows per path
 	EvFSMkdir        = "fs.mkdir"
 	EvFSEdit         = "fs.edit"
 	EvFSRemove       = "fs.remove"

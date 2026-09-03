@@ -241,6 +241,29 @@ failover state. Request an authoritative checkpoint when recovery must use it.
 The authoritative path fences Remount-managed execution, uploads the blob, and
 commits the digest for the current generation before it reports success.
 
+### Working from a local checkout
+
+A workspace can start as a copy of a directory on your machine, and changes
+can flow both ways. Packing honors `.gitignore` and `.remountignore`, skips
+`node_modules`, `.venv`, `target`, `dist` and `__pycache__`, and includes
+`.git` so the agent can commit (pass `--include-git=false` to leave it out).
+
+```sh
+WS=$(./remount ws create --dir ~/src/myapp --json | jq -r .id)
+
+# after editing locally: overlay the changed tree onto the workspace
+./remount push $WS --dir ~/src/myapp
+
+# after the agent has worked: bring its tree back, refusing to clobber
+# uncommitted local changes unless you say so
+./remount pull $WS --dir ~/src/myapp
+./remount pull $WS --dir ~/src/myapp --force
+```
+
+`push` never deletes files the archive does not name, and every file lands
+atomically; `pull` never deletes local files either and reports the ones it
+left in place.
+
 ## 7. Sleep and wake
 
 A sleeping workspace has no node. Its last snapshot is kept, its timers are

@@ -36,6 +36,7 @@ import (
 
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/control"
+	"remount.dev/remount/internal/localfs"
 	"remount.dev/remount/internal/node"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/server"
@@ -104,6 +105,10 @@ func run(ctx context.Context, argv []string) error {
 		return cmdAttach(ctx, args)
 	case "fs":
 		return cmdFS(ctx, args)
+	case "push":
+		return cmdPush(ctx, args)
+	case "pull":
+		return cmdPull(ctx, args)
 	case "port":
 		return cmdPort(ctx, args)
 	case "fleet":
@@ -170,12 +175,14 @@ func usage() {
   remount up          enroll this machine as a node (outbound only)
   remount standalone  server + node in one process (try it on a laptop)
 
-  remount ws create [--name N] [--backend B] [--image IMG] [--security PROFILE] [--egress-rule JSON] [--binding ID]
+  remount ws create [--name N] [--dir PATH] [--backend B] [--image IMG] [--security PROFILE] [--egress-rule JSON] [--binding ID]
   remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS [--authoritative] | acl WS [--reader P]... [--writer P]...
   remount exec WS -- cmd args...      run a command (stdout/stderr/exit streamed)
   remount sh WS [cmd]                 interactive shell (pty)
   remount attach WS SESSION [--from N]
   remount fs read|write|ls|stat|rm|mv|search|edit WS ...
+  remount push WS [--dir .] [--include-git=false] [--exclude GLOB]...   upload a local directory over the workspace
+  remount pull WS [--dir .] [--force]                                   snapshot the workspace and write what differs locally
   remount port WS PORT [--local 127.0.0.1:PORT]
   remount fleet quarantine --action freeze (--all | SELECTORS...) | ls | get OPERATION
   remount nodes | events [--follow] [--ws WS] | timers
@@ -319,7 +326,10 @@ func (c *common) dialer() transport.Dialer {
 
 func (c *common) client() *client.Client {
 	principal := envOr("REMOUNT_PRINCIPAL", envOr("USER", "cli"))
-	return client.New(client.Options{Dialer: c.dialer(), Token: c.token, Principal: principal})
+	return client.New(client.Options{
+		Dialer: c.dialer(), Token: c.token, Principal: principal,
+		ArtifactURL: strings.TrimSuffix(c.server, "/") + "/v1/artifacts",
+	})
 }
 
 func printJSON(v any) {
@@ -693,6 +703,9 @@ func cmdWS(ctx context.Context, args []string) error {
 		var egressRules egressRuleFlag
 		fs.Var(&bindings, "binding", "binding id (repeatable)")
 		fs.Var(&exclude, "exclude", "snapshot exclude glob (repeatable)")
+		dir := fs.String("dir", "", "seed the workspace from this local directory (honors .gitignore and .remountignore)")
+		includeGit := fs.Bool("include-git", true, "with --dir: include .git so the agent can commit")
+		restoreFrom := fs.String("restore-from", "", "seed the workspace from an existing artifact id")
 		securityProfile := fs.String("security", "", "security profile: local, isolated, multi_tenant")
 		minIsolation := fs.String("min-isolation", "", "minimum backend isolation: none, process_sandbox, container, microvm")
 		requireSiblingIsolation := fs.Bool("require-sibling-isolation", false, "require a backend with sibling isolation")
@@ -709,10 +722,20 @@ func cmdWS(ctx context.Context, args []string) error {
 		if *principal != "" {
 			return errors.New("--principal is not supported; authenticated caller identity is authoritative")
 		}
+		if *dir != "" && *restoreFrom != "" {
+			return errors.New("--dir and --restore-from are mutually exclusive")
+		}
 		cl := c.client()
 		defer cl.Close()
+		if *dir != "" {
+			id, _, err := uploadDir(ctx, cl, *dir, localfs.PackOptions{ExcludeGit: !*includeGit, Excludes: exclude})
+			if err != nil {
+				return err
+			}
+			*restoreFrom = id
+		}
 		spec := proto.WorkspaceSpec{
-			Name: *name, Run: *run, Model: *model, Labels: workspaceLabels, Image: *image,
+			Name: *name, Run: *run, Model: *model, Labels: workspaceLabels, Image: *image, RestoreFrom: *restoreFrom,
 			Requires:  proto.Requires{Backend: *backend, CPU: *cpu, MemMiB: *mem},
 			Placement: proto.Placement{Allow: labels, Node: *nodeID},
 			Bindings:  bindings, Env: env, Exclude: exclude,

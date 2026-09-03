@@ -346,6 +346,7 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `fs.rename` | `FSRenameReq{ws, old, new, idem}` → `{}` |
 | `fs.search` | `FSSearchReq{ws, path, pattern, glob, max}` → `FSSearchRes{matches, truncated}` |
 | `fs.edit` | `FSEditReq{ws, path, edits, idem}` → `FSEditRes{replacements}` |
+| `fs.apply_tar` | `FSApplyTarReq{ws, artifact, idem}` → `FSApplyTarRes{files, dirs, bytes}` |
 | `ws.snapshot` | `WSSnapshotReq{ws, upload, authoritative, idem}` → `WSSnapshotRes{artifact, bytes, consistency, authoritative}` |
 | `ws.info` | `WSGetReq{id}` → `WSInfoRes{ws, backend, root, sessions, broker}` |
 | `node.status` | → `NodeStatus` |
@@ -361,6 +362,15 @@ Session kinds are `exec`, `pty` and `port`.
 `fs.edit` is atomic across all edits in one request. Each edit's `old` must
 match exactly once unless `all` is set. If any edit fails to apply, the file is
 not written and the response is `conflict`.
+
+`fs.apply_tar` overlays an artifact (§10) onto the workspace tree. The node
+fetches and fully validates the archive under the same limits as a restore
+before it touches the tree; every regular file then lands by rename into its
+final path, so a reader never sees a partially written file. Paths the archive
+does not name are left in place, `.remount/` is refused, and an entry that
+would replace a directory with a file, or write through a symlinked parent,
+fails the whole request with `bad_request`. The response counts what was
+written; the node emits one `fs.apply_tar` event and one `fs.write` per path.
 
 Node mutations with an `idem` key are write-ahead journaled. The node persists
 and fsyncs a `pending` intent before applying the effect, then persists and
@@ -586,6 +596,14 @@ matches the id.
 `GET /v1/artifacts/{id}` retrieves it. A node fetching an artifact verifies the
 digest itself and refuses a mismatch.
 
+A client seeds a workspace from a local directory by producing the same
+deterministic archive (the reference implementation's `localfs.Pack` honors
+`.gitignore`, `.remountignore`, and a default exclude list, and never packs
+`.remount/`), uploading it with `PUT`, and passing the id as
+`WorkspaceSpec.restore_from`. Later local changes travel the same way and are
+applied with `fs.apply_tar` (§7); a pull is a `ws.snapshot` with `upload:true`
+followed by `GET`.
+
 ## 11. The event log
 
 Every consequential action is an event. Transactionally persisted resource
@@ -618,11 +636,15 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `ws.claiming`, `ws.claimed`, `ws.released`, `ws.moved`, `ws.paused`,
 `ws.resumed`, `ws.snapshot`, `ws.restored`, `ws.destroyed`,
 `ws.lease_expired`, `ws.acl`, `authz.revoked`, `s.opened`, `s.exited`,
-`fs.write`, `fs.edit`, `fs.remove`,
+`fs.write`, `fs.edit`, `fs.remove`, `fs.apply_tar`,
 `cred.used`, `egress.allowed`, `egress.denied`, `timer.set`, `timer.fired`,
 `peer.gone`, `ws.fenced`, `ws.state_changed`, `event.producer_gap`,
 `fleet.quarantine.requested`, `fleet.quarantine.target`, and
 `fleet.quarantine.completed`.
+
+`fs.apply_tar` summarizes one overlay: `artifact`, `files`, `dirs`, `bytes`,
+and `complete:false` when a refusal partway through left some files written.
+Each written path also gets its own `fs.write` carrying `path` and `artifact`.
 
 `ws.acl` records an ACL change with the new lists, the principals it revoked
 and the resulting `authz_revision`. `authz.revoked` is the node's record of
