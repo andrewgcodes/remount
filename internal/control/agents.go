@@ -687,6 +687,59 @@ func (c *Control) agentWake(ctx context.Context, principal, agentID, wsID, timer
 	return c.persistAgent(a, events...)
 }
 
+// agentWakeRequest is agent.wake: a client wants the workspace back without
+// prompting the harness. It is idempotent per key and a no-op for an agent
+// that is not sleeping.
+func (c *Control) agentWakeRequest(ctx context.Context, subject Subject, req *proto.AgentWakeReq) (*proto.Agent, error) {
+	if req.ID == "" {
+		return nil, proto.Err(proto.CodeBadRequest, "agent id is required")
+	}
+	switch req.By {
+	case "":
+		req.By = proto.AgentWokenByRequest
+	case proto.AgentWokenByRequest, proto.AgentWokenByPreview, proto.AgentWokenByDiff:
+	default:
+		return nil, proto.Err(proto.CodeBadRequest, "by must be request, preview or diff")
+	}
+	a, err := c.agentCopy(req.ID)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.agentAuthorize(ctx, subject, a, ActionExecute); err != nil {
+		return nil, err
+	}
+	if agentTerminal(a.Status) {
+		return nil, proto.Err(proto.CodeConflict, "agent %s is %s", a.ID, a.Status)
+	}
+	scope := a.Tenant + "|" + a.ID + "|agent.wake"
+	unlockMutation := c.lockMutation(scope, req.IdempotencyKey)
+	defer unlockMutation()
+	var prior mutationAgentResult
+	if hit, err := c.mutationLookup(scope, req.IdempotencyKey, proto.OpAgentWake, *req, &prior); err != nil {
+		return nil, err
+	} else if hit {
+		return c.agentCopy(a.ID)
+	}
+	if a.Status == proto.AgentSleeping {
+		if err := c.agentWake(ctx, subject.ID, a.ID, a.WS, a.WakeTimer, req.By, derivedIdem(req.IdempotencyKey, "wake")); err != nil {
+			return nil, err
+		}
+	}
+	c.mu.Lock()
+	live := c.agents[a.ID]
+	if live == nil {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeNotFound, "agent %s", a.ID)
+	}
+	if err := c.persistAgentAndMutation(live, scope, req.IdempotencyKey, proto.OpAgentWake, *req, mutationAgentResult{ID: live.ID}); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	cp := copyAgent(live)
+	c.mu.Unlock()
+	return cp, nil
+}
+
 // ---------------------------------------------------------------------------
 // agent.cancel
 // ---------------------------------------------------------------------------

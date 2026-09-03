@@ -366,6 +366,9 @@ const (
 	// OpAgentTranscript reads the control plane's durable copy of the
 	// transcript. It never touches the node, so it never wakes a workspace.
 	OpAgentTranscript = "agent.transcript" // AgentTranscriptReq -> AgentTranscriptRes
+	// OpAgentWake resumes a sleeping agent's workspace without sending it a
+	// message: a preview or a diff wants the tree, not a turn.
+	OpAgentWake = "agent.wake" // AgentWakeReq -> Agent
 
 	OpApprovalList   = "approval.list"   // ApprovalListReq -> ApprovalListRes
 	OpApprovalGet    = "approval.get"    // ApprovalGetReq -> Approval
@@ -402,6 +405,23 @@ type AgentGetReq struct {
 	ID             string `cbor:"id" json:"id"`
 	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
 }
+
+// AgentWakeReq resumes a sleeping agent's workspace. By names the surface
+// that asked (AgentWokenByPreview, AgentWokenByDiff or AgentWokenByRequest)
+// and lands in the agent.woken event.
+type AgentWakeReq struct {
+	ID             string `cbor:"id" json:"id"`
+	By             string `cbor:"by,omitempty" json:"by,omitempty"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// agent.woken payload "by" values a client may supply. The control plane
+// adds message, approval and timer on its own wakes.
+const (
+	AgentWokenByRequest = "request"
+	AgentWokenByPreview = "preview"
+	AgentWokenByDiff    = "diff"
+)
 
 // AgentListReq filters the agents the subject may read.
 type AgentListReq struct {
@@ -642,7 +662,7 @@ const (
 	EvAgentTurn        = "agent.turn"         // payload {agent, run, message, stop_reason, tokens}
 	EvAgentWaiting     = "agent.waiting"      // payload {agent, kind: input|approval}
 	EvAgentSlept       = "agent.slept"        // payload {agent, ws, timer}
-	EvAgentWoken       = "agent.woken"        // payload {agent, ws, by: message|approval|timer|preview}
+	EvAgentWoken       = "agent.woken"        // payload {agent, ws, by: message|approval|timer|request|preview|diff}
 	EvAgentForked      = "agent.forked"       // payload {agent, from, snapshot}
 	EvAgentFailed      = "agent.failed"       // payload {agent, reason}
 	EvAgentFinished    = "agent.finished"     // payload {agent, reason}
