@@ -769,7 +769,7 @@ func TestAgentScheduledStartHoldsUntilDue(t *testing.T) {
 		t.Fatalf("run started early: %+v (start_at %d)", done.Runs, startAt.UnixMilli())
 	}
 	text := string(mirrorBytes(t, ctx, c, a.ID, 0))
-	if strings.Index(text, "first") > strings.Index(text, "second") || strings.Index(text, "first") < 0 {
+	if !strings.Contains(text, "first") || strings.Index(text, "first") > strings.Index(text, "second") {
 		t.Fatalf("turn order: %s", text)
 	}
 }
