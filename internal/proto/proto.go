@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -347,6 +348,7 @@ func NormalizeSecurity(s SecuritySpec) (SecuritySpec, error) {
 			rule.Ports = append([]uint16(nil), rule.Ports...)
 			rule.Methods = append([]string(nil), rule.Methods...)
 			rule.PathPrefixes = append([]string(nil), rule.PathPrefixes...)
+			rule.Redact = append([]string(nil), rule.Redact...)
 		}
 	}
 	if s.Profile == "" {
@@ -465,6 +467,20 @@ func normalizeEgressRule(rule *EgressRule, seen map[string]struct{}) error {
 	}
 	if rule.MaxRequests < 0 || rule.MaxRequestBytes < 0 || rule.MaxResponseBytes < 0 {
 		return Err(CodeBadRequest, "egress rule %q has a negative limit", rule.ID)
+	}
+	if len(rule.Redact) > 16 {
+		return Err(CodeBadRequest, "egress rule %q has more than 16 response redactions", rule.ID)
+	}
+	if len(rule.Redact) > 0 && (rule.Protocol == EgressProtocolConnect || rule.Connector != "") {
+		return Err(CodeBadRequest, "egress rule %q cannot redact a CONNECT or managed-connector response", rule.ID)
+	}
+	for _, expression := range rule.Redact {
+		if expression == "" || len(expression) > 4096 {
+			return Err(CodeBadRequest, "egress rule %q has an invalid response redaction length", rule.ID)
+		}
+		if _, err := regexp.Compile(expression); err != nil {
+			return Err(CodeBadRequest, "egress rule %q has invalid response redaction: %v", rule.ID, err)
+		}
 	}
 	if rule.SharedState == "" {
 		if rule.Connector == EgressConnectorPackage {

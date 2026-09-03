@@ -929,6 +929,49 @@ func TestTypedEgressRuleEnforcesRequestAndResponseBytes(t *testing.T) {
 	}
 }
 
+func TestTypedEgressRuleRedactsResponseBeforeWorkspace(t *testing.T) {
+	const secret = "sk-live-super-secret"
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "first="+secret+" second="+secret)
+	}))
+	defer srv.Close()
+	parsed, _ := url.Parse(srv.URL)
+	roots := x509.NewCertPool()
+	roots.AddCert(srv.Certificate())
+	rec := &recorder{}
+	b := New(Options{
+		WS: "ws_redact", Principal: "alice", AllowPrivate: []string{"127.0.0.1"}, RootCAs: roots, Audit: rec.add,
+		Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+			ID: "redacted-api", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{parsed.Host},
+			Methods: []string{http.MethodGet}, Redact: []string{`sk-[a-z-]+`},
+		}}},
+	})
+	if _, err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	resp, body := get(t, DestURL(b.BaseURL(), parsed.Host)+"/", nil)
+	if resp.StatusCode != http.StatusOK || strings.Contains(body, secret) || strings.Count(body, "[redacted]") != 2 {
+		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+	}
+	audit := rec.last()
+	if audit.Decision != DecisionRedacted || audit.Redactions != 2 || audit.ResponseBytes != int64(len("first="+secret+" second="+secret)) {
+		t.Fatalf("redaction audit = %+v", audit)
+	}
+}
+
+func TestTypedEgressRuleRejectsInvalidResponseRedaction(t *testing.T) {
+	b := New(Options{
+		Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+			ID: "bad", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{"example.com"}, Redact: []string{"["},
+		}}},
+	})
+	if _, err := b.Start(); err == nil {
+		_ = b.Close()
+		t.Fatal("invalid response redaction was accepted")
+	}
+}
+
 func TestTypedPolicyRejectsPathAndAuthorityAmbiguity(t *testing.T) {
 	up := newUpstream(t)
 	b := New(Options{
