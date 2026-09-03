@@ -1455,25 +1455,34 @@ func syncDir(name string) error {
 }
 
 // SnapshotToStore snapshots root straight into the store and returns the id.
-func SnapshotToStore(s *Store, root string, excludes []string) (string, int64, error) {
+func SnapshotToStore(s BlobStore, root string, excludes []string) (string, int64, error) {
 	pr, pw := io.Pipe()
+	done := make(chan error, 1)
 	go func() {
-		pw.CloseWithError(Snapshot(root, excludes, pw))
+		err := Snapshot(root, excludes, pw)
+		_ = pw.CloseWithError(err)
+		done <- err
 	}()
 	id, n, err := s.Put(pr)
 	if err != nil {
-		pr.CloseWithError(err)
+		_ = pr.CloseWithError(err)
+	}
+	snapshotErr := <-done
+	if err != nil {
 		return "", 0, err
+	}
+	if snapshotErr != nil {
+		return "", 0, snapshotErr
 	}
 	return id, n, nil
 }
 
 // RestoreFromStore restores id into root.
-func RestoreFromStore(s *Store, id, root string) error {
+func RestoreFromStore(s BlobStore, id, root string) (err error) {
 	r, _, err := s.Open(id)
 	if err != nil {
 		return err
 	}
-	defer r.Close()
+	defer func() { err = errors.Join(err, r.Close()) }()
 	return Restore(root, r)
 }
