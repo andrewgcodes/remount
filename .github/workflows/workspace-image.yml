@@ -1,0 +1,49 @@
+name: workspace-image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore: ['docs/**', '**.md']
+  pull_request:
+    paths: ['images/workspace/**', '.github/workflows/workspace-image.yml']
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: log in to ghcr
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: image tags
+        id: tags
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/remount-workspace"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "tags=${repo}:${GITHUB_REF_NAME},${repo}:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=${repo}:latest" >> "$GITHUB_OUTPUT"
+          fi
+      - name: build and push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: images/workspace
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          provenance: true
+      - name: smoke test the contract
+        if: github.event_name == 'pull_request'
+        run: |
+          docker build -t remount-workspace:ci images/workspace
+          docker run --rm remount-workspace:ci sh -c 'git --version && curl --version | head -1 && node --version && npm --version && python3 --version && uv --version && rg --version | head -1 && jq --version'

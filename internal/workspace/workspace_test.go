@@ -28,7 +28,7 @@ func TestBackendRootsAreAbsolute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !filepath.IsAbs(p.Dir) || !filepath.IsAbs(d.Dir) || d.Image != "ubuntu:24.04" {
+	if !filepath.IsAbs(p.Dir) || !filepath.IsAbs(d.Dir) || d.Image != DefaultImage("dev") {
 		t.Fatalf("process=%q docker=%q image=%q", p.Dir, d.Dir, d.Image)
 	}
 }
@@ -202,6 +202,17 @@ func drain(t *testing.T, s *session.Session) string {
 			if ch.Stream == proto.StreamStdout || ch.Stream == proto.StreamStderr {
 				out = append(out, ch.Data...)
 			}
+		}
+	}
+}
+
+func TestDefaultImageTracksRelease(t *testing.T) {
+	if got := DefaultImage("v1.4.0"); got != DefaultImageRepository+":v1.4.0" {
+		t.Fatalf("release binary must pin its own image tag: %q", got)
+	}
+	for _, v := range []string{"dev", "", "v1.4.0-dirty", "abc123"} {
+		if got := DefaultImage(v); got != DefaultImageRepository+":latest" {
+			t.Fatalf("DefaultImage(%q) = %q", v, got)
 		}
 	}
 }

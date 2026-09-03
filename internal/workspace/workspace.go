@@ -315,14 +315,30 @@ type Docker struct {
 	err     error
 }
 
+// DefaultImageRepository is the registry path of the image CI builds from
+// images/workspace/Dockerfile. docs/images.md is the contract.
+const DefaultImageRepository = "ghcr.io/andrewgcodes/remount-workspace"
+
+// DefaultImage returns the docker image a workspace gets when its spec names
+// none. A release binary pins the tag built alongside it; a development build
+// (`dev`, or any version that is not a release tag) tracks `latest`.
+func DefaultImage(version string) string {
+	if strings.HasPrefix(version, "v") && !strings.Contains(version, "-dirty") {
+		return DefaultImageRepository + ":" + version
+	}
+	return DefaultImageRepository + ":latest"
+}
+
 // NewDocker creates the backend; the daemon is checked lazily on first use.
+// An empty defaultImage selects DefaultImage("dev"); pass an explicit image
+// such as ubuntu:24.04 to keep a plain distro workspace.
 func NewDocker(dir, defaultImage string) (*Docker, error) {
 	dir, err := backendRoot(dir)
 	if err != nil {
 		return nil, err
 	}
 	if defaultImage == "" {
-		defaultImage = "ubuntu:24.04"
+		defaultImage = DefaultImage("dev")
 	}
 	return &Docker{Dir: dir, Image: defaultImage, Binary: "docker"}, nil
 }

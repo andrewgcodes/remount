@@ -476,7 +476,7 @@ func cmdUp(ctx context.Context, args []string) error {
 	labels := kvFlag{}
 	fs.Var(labels, "label", "node label k=v (repeatable)")
 	backends := fs.String("backend", "process", "comma-separated backends: process,docker")
-	image := fs.String("image", "ubuntu:24.04", "default docker image")
+	image := fs.String("image", workspace.DefaultImage(version), "default docker image (ubuntu:24.04 for a plain distro)")
 	artifactBytes := fs.Int64("artifact-object-bytes", 8<<30, "maximum compressed bytes per cached artifact")
 	artifactStoreBytes := fs.Int64("artifact-store-bytes", 32<<30, "maximum node artifact-cache bytes")
 	artifactObjects := fs.Int("artifact-store-objects", 50_000, "maximum node artifact-cache objects")
@@ -654,7 +654,7 @@ func cmdStandalone(ctx context.Context, args []string) error {
 		return err
 	}
 	c := common{server: "http://" + addr}
-	n, err := buildNode(filepath.Join(*data, "node"), c, map[string]string{"standalone": "true"}, *backends, "ubuntu:24.04", allow, []string{"127.0.0.1", "localhost"}, nodeResourceOptions{})
+	n, err := buildNode(filepath.Join(*data, "node"), c, map[string]string{"standalone": "true"}, *backends, workspace.DefaultImage(version), allow, []string{"127.0.0.1", "localhost"}, nodeResourceOptions{})
 	if err != nil {
 		return err
 	}
