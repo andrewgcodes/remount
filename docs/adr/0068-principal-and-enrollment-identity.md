@@ -19,10 +19,12 @@ with only an operator whose tenant is `*` able to cross tenants.
 
 Node enrollment credentials are 256-bit random opaque bearers, live for at
 most ten minutes and are consumed atomically. Persistence stores only their
-SHA-256 digests. Issuance, consumption and expiry are committed with an audit
-event by the identity store. A second concurrent consume is unauthorized.
-Pools place the plaintext token only in the provider's protected environment,
-never argv, provider labels, a machine record or an event.
+SHA-256 digests. Consumption, the node-id/public-key binding and
+`node.enrolled` are one SQLite/outbox transaction. A second distinct node or
+key cannot consume the credential; the enrolled node reconnects by signing its
+hello with the already-bound private key, without needing any reusable node
+secret. Pools place the plaintext token only in the provider's protected
+environment, never argv, provider labels, a machine record or an event.
 
 The identity package implements the control plane's existing authentication
 and authorization seams. OIDC device flow is an exchange adapter; it does not
@@ -44,4 +46,3 @@ create a second token or authorization model.
 Identity is derived only from a verified, live, unrevoked credential. A node
 enrollment token can commit at most one registration, and only its digest is
 durable. Tenant isolation is evaluated before role permissions.
-

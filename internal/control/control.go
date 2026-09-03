@@ -66,6 +66,23 @@ type Authenticator interface {
 	Authenticate(context.Context, Credential) (Subject, error)
 }
 
+// NodeIdentity is the server-authoritative placement identity attached to an
+// enrolled node. Hello labels are never authoritative when this is returned by
+// a NodeAuthenticator.
+type NodeIdentity struct {
+	Tenant string
+	Pool   string
+	Labels map[string]string
+	Fresh  bool
+}
+
+// NodeAuthenticator atomically enrolls a new node key or verifies an already
+// enrolled key. A successful first enrollment must durably bind the key and
+// its node.enrolled event before returning.
+type NodeAuthenticator interface {
+	AuthenticateNode(context.Context, string, string, []byte) (NodeIdentity, error)
+}
+
 // Authorizer decides an action on a resource after authentication.
 type Authorizer interface {
 	Check(context.Context, Subject, string, Resource) error
@@ -128,7 +145,10 @@ type Options struct {
 	Now           func() time.Time // injectable clock for tests
 	Authenticator Authenticator
 	Authorizer    Authorizer
-	ApprovedNodes map[string]NodeApproval
+	// NodeAuthenticator replaces the legacy shared node token and static
+	// approval map with one-time enrollment plus durable key bindings.
+	NodeAuthenticator NodeAuthenticator
+	ApprovedNodes     map[string]NodeApproval
 	// SharedSubject is used by the legacy single-token/standalone profile.
 	// Client-selected Hello.Principal is always ignored.
 	SharedSubject Subject
@@ -1312,7 +1332,10 @@ func (c *Control) PeerConnected(ctx context.Context, id string, h *proto.Hello) 
 		n.Status.Online = true
 		n.Status.LastSeen = c.now().UnixMilli()
 		var events []*proto.Event
-		if fresh {
+		// A dynamic node authenticator commits the durable key binding and its
+		// enrollment event before accepting the hello. Legacy/static enrollment
+		// continues to record that transition here.
+		if fresh && c.opts.NodeAuthenticator == nil {
 			events = append(events, c.newEvent(proto.EvNodeEnrolled, id, "", id, h.Labels))
 		}
 		events = append(events, c.newEvent(proto.EvNodeOnline, id, "", id, nil))

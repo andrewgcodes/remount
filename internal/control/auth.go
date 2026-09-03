@@ -23,24 +23,42 @@ func (c *Control) Authenticate(ctx context.Context, h *proto.Hello) (string, *pr
 	ok := &proto.HelloOK{Caps: caps, Server: "remount", Now: c.now().UnixMilli(), PubKey: c.PublicKey(), LeaseSec: c.opts.LeaseSec}
 	switch h.Role {
 	case proto.RoleNode:
-		if c.opts.Token != "" && subtle.ConstantTimeCompare([]byte(h.Token), []byte(c.opts.Token)) != 1 {
-			return "", nil, proto.Err(proto.CodeUnauthorized, "bad node token")
-		}
 		if h.Peer == "" || !strings.HasPrefix(h.Peer, "n_") || len(h.PubKey) != ed25519.PublicKeySize {
 			return "", nil, proto.Err(proto.CodeBadRequest, "node hello needs an n_ id and an ed25519 public key")
 		}
 		if err := c.verifyNodeProofLocked(h); err != nil {
 			return "", nil, err
 		}
+		if c.opts.NodeAuthenticator != nil {
+			identity, err := c.opts.NodeAuthenticator.AuthenticateNode(ctx, h.Peer, h.Token, append([]byte(nil), h.PubKey...))
+			if err != nil || identity.Tenant == "" {
+				return "", nil, proto.Err(proto.CodeUnauthorized, "node enrollment failed")
+			}
+			h.Labels = cloneMap(identity.Labels)
+			if h.Labels == nil {
+				h.Labels = map[string]string{}
+			}
+			h.Labels["tenant"] = identity.Tenant
+			if identity.Pool != "" {
+				h.Labels["pool"] = identity.Pool
+			}
+			if err := c.validateDynamicNode(h); err != nil {
+				return "", nil, err
+			}
+		} else if c.opts.Token != "" && subtle.ConstantTimeCompare([]byte(h.Token), []byte(c.opts.Token)) != 1 {
+			return "", nil, proto.Err(proto.CodeUnauthorized, "bad node token")
+		}
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if approval, required := c.opts.ApprovedNodes[h.Peer]; required || c.opts.ApprovedNodes != nil {
-			if !required || subtle.ConstantTimeCompare(approval.PubKey, h.PubKey) != 1 {
-				return "", nil, proto.Err(proto.CodeUnauthorized, "node is not operator-approved")
+		if c.opts.NodeAuthenticator == nil {
+			if approval, required := c.opts.ApprovedNodes[h.Peer]; required || c.opts.ApprovedNodes != nil {
+				if !required || subtle.ConstantTimeCompare(approval.PubKey, h.PubKey) != 1 {
+					return "", nil, proto.Err(proto.CodeUnauthorized, "node is not operator-approved")
+				}
+				h.Labels = cloneMap(approval.Labels)
+				info := approval.Info
+				h.Node = &info
 			}
-			h.Labels = cloneMap(approval.Labels)
-			info := approval.Info
-			h.Node = &info
 		}
 		if n, exists := c.nodes[h.Peer]; exists && len(n.PubKey) > 0 && subtle.ConstantTimeCompare(n.PubKey, h.PubKey) != 1 {
 			return "", nil, proto.Err(proto.CodeUnauthorized, "node id %s is registered to a different key", h.Peer)
@@ -77,6 +95,18 @@ func (c *Control) Authenticate(ctx context.Context, h *proto.Hello) (string, *pr
 	default:
 		return "", nil, proto.Err(proto.CodeBadRequest, "unknown role %q", h.Role)
 	}
+}
+
+func (c *Control) validateDynamicNode(h *proto.Hello) error {
+	if h.Node == nil || len(h.Node.BackendDescriptors) == 0 {
+		return proto.Err(proto.CodeUnauthorized, "enrolled node has no backend descriptors")
+	}
+	for _, descriptor := range h.Node.BackendDescriptors {
+		if err := proto.ValidateBackendSecurity(proto.SecuritySpec{Profile: c.opts.SecurityProfileFloor}, descriptor); err != nil {
+			return proto.Err(proto.CodeUnauthorized, "enrolled node backend %s cannot satisfy %s", descriptor.Name, c.opts.SecurityProfileFloor)
+		}
+	}
+	return nil
 }
 
 func (c *Control) verifyNodeProofLocked(h *proto.Hello) error {
