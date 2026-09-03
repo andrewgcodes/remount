@@ -2,6 +2,7 @@ package broker
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -957,6 +958,67 @@ func TestTypedEgressRuleRedactsResponseBeforeWorkspace(t *testing.T) {
 	audit := rec.last()
 	if audit.Decision != DecisionRedacted || audit.Redactions != 2 || audit.ResponseBytes != int64(len("first="+secret+" second="+secret)) {
 		t.Fatalf("redaction audit = %+v", audit)
+	}
+}
+
+func TestApproveModeNeverReachesUpstreamBeforeDurableDecision(t *testing.T) {
+	var reached atomic.Int64
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached.Add(1)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+	parsed, _ := url.Parse(srv.URL)
+	roots := x509.NewCertPool()
+	roots.AddCert(srv.Certificate())
+	var mu sync.Mutex
+	allowed := false
+	var fingerprints []string
+	b := New(Options{
+		WS: "ws_approve", Generation: 7, Principal: "agent:alice", AllowPrivate: []string{"127.0.0.1"}, RootCAs: roots,
+		ApprovalWait: time.Millisecond, Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+			ID: "approval", Mode: proto.EgressModeApprove, Protocol: proto.EgressProtocolHTTPS, Hosts: []string{parsed.Host}, Methods: []string{"POST"},
+		}}},
+		Approval: func(_ context.Context, req proto.EgressApprovalReq) (*proto.EgressApprovalRes, error) {
+			mu.Lock()
+			fingerprints = append(fingerprints, req.Fingerprint)
+			permit := allowed
+			mu.Unlock()
+			if permit {
+				return &proto.EgressApprovalRes{ID: "ap_test", Status: proto.ApprovalDecided, Allowed: true}, nil
+			}
+			return &proto.EgressApprovalRes{ID: "ap_test", Status: proto.ApprovalPending}, nil
+		},
+	})
+	if _, err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	destination := DestURL(b.BaseURL(), parsed.Host) + "/repos?a=1"
+	resp, err := http.Post(destination, "application/json", strings.NewReader(`{"x":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden || resp.Header.Get("X-Remount-Approval") != "ap_test" || resp.Header.Get("Retry-After") == "" || reached.Load() != 0 {
+		t.Fatalf("pending status=%d headers=%v reached=%d", resp.StatusCode, resp.Header, reached.Load())
+	}
+	mu.Lock()
+	allowed = true
+	mu.Unlock()
+	resp, err = http.Post(destination, "application/json", strings.NewReader(`{"x":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "ok" || reached.Load() != 1 {
+		t.Fatalf("approved status=%d body=%q reached=%d", resp.StatusCode, body, reached.Load())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(fingerprints) != 2 || fingerprints[0] != fingerprints[1] {
+		t.Fatalf("retry fingerprints = %v", fingerprints)
 	}
 }
 

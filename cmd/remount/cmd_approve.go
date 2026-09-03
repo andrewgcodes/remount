@@ -15,13 +15,24 @@ import (
 // cmdApprovals lists approvals, pending ones by default. It is what a human
 // runs to find out why an Agent is waiting.
 func cmdApprovals(ctx context.Context, args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "ls":
+			args = args[1:]
+		case "approve":
+			return cmdApprove(ctx, args[1:])
+		case "deny":
+			return cmdApprove(ctx, append(args[1:], "--deny"))
+		}
+	}
 	fs := flag.NewFlagSet("approvals", flag.ExitOnError)
 	var c common
 	c.flags(fs)
 	agent := fs.String("agent", "", "only this Agent's approvals")
+	kind := fs.String("kind", "", "tool_call | elicitation | egress")
 	status := fs.String("status", proto.ApprovalPending, "pending | decided | expired | all")
 	parse(fs, args)
-	if err := arity(fs, 0, 0, "approvals [--agent ID] [--status S]"); err != nil {
+	if err := arity(fs, 0, 0, "approvals ls [--agent ID] [--kind K] [--status S]"); err != nil {
 		return err
 	}
 	if *status == "all" {
@@ -29,7 +40,7 @@ func cmdApprovals(ctx context.Context, args []string) error {
 	}
 	cl := c.client()
 	defer cl.Close()
-	list, err := cl.ListApprovals(ctx, proto.ApprovalListReq{Agent: *agent, Status: *status})
+	list, err := cl.ListApprovals(ctx, proto.ApprovalListReq{Agent: *agent, Kind: *kind, Status: *status})
 	if err != nil {
 		return err
 	}
@@ -57,6 +68,7 @@ func cmdApprove(ctx context.Context, args []string) error {
 	option := fs.String("option", "", "option id the harness offered (tool_call), or allow|deny (egress)")
 	deny := fs.Bool("deny", false, "reject the request")
 	content := fs.String("content", "", "JSON object answering an elicitation")
+	remember := fs.String("remember", "", "egress decision scope: none | host | rule")
 	parse(fs, args)
 	if err := arity(fs, 1, 1, "approve ID [--option X | --deny | --content JSON]"); err != nil {
 		return err
@@ -70,7 +82,7 @@ func cmdApprove(ctx context.Context, args []string) error {
 	if set > 1 {
 		return errors.New("approve: --option, --deny and --content are exclusive")
 	}
-	req := proto.ApprovalDecideReq{ID: fs.Arg(0), Option: *option, Denied: *deny}
+	req := proto.ApprovalDecideReq{ID: fs.Arg(0), Option: *option, Denied: *deny, Remember: *remember}
 	if *content != "" {
 		var probe map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(*content), &probe); err != nil {

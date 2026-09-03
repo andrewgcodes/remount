@@ -1024,6 +1024,82 @@ func TestTypedWorkspaceEgressPolicyIsEnforcedAndAttributed(t *testing.T) {
 	}
 }
 
+func TestApproveModeParksBeforeUpstreamAndResumesAfterDecision(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = io.WriteString(w, "approved")
+	}))
+	defer up.Close()
+	upHost := strings.TrimPrefix(up.URL, "https://")
+	roots := x509.NewCertPool()
+	roots.AddCert(up.Certificate())
+	w := newWorld(t)
+	w.nodeWithBrokerRoots("n1", nil, roots)
+	c := w.client("approval-owner")
+	ws := mustWS(t, c, proto.WorkspaceSpec{
+		Env: map[string]string{"API_URL": "${REMOUNT_BROKER}/d/" + upHost},
+		Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+			ID: "review-api", Mode: proto.EgressModeApprove, Protocol: proto.EgressProtocolHTTPS,
+			Hosts: []string{upHost}, Methods: []string{http.MethodPost}, PathPrefixes: []string{"/mutate"},
+		}}}},
+	})
+	ctx := ctxT(t, 60*time.Second)
+	type runResult struct {
+		out, errOut []byte
+		exit        *proto.ExitInfo
+		err         error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		out, errOut, exit, err := c.Run(ctx, ws.ID, "sh", "-c", `curl --fail --silent -X POST -d '{"change":true}' "$API_URL/mutate"`)
+		done <- runResult{out: out, errOut: errOut, exit: exit, err: err}
+	}()
+	var pending proto.Approval
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		list, err := c.ListApprovals(ctx, proto.ApprovalListReq{Kind: proto.ApprovalEgress, Status: proto.ApprovalPending})
+		if err == nil && len(list) == 1 {
+			pending = list[0]
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if pending.ID == "" {
+		t.Fatal("egress approval did not become visible")
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("undecided request reached upstream: hits=%d", hits.Load())
+	}
+	if _, err := c.DecideApproval(ctx, proto.ApprovalDecideReq{ID: pending.ID, Remember: proto.ApprovalRememberNone}); err != nil {
+		t.Fatal(err)
+	}
+	result := <-done
+	if result.err != nil || result.exit == nil || result.exit.Code != 0 || string(result.out) != "approved" || hits.Load() != 1 {
+		t.Fatalf("approved run err=%v exit=%+v stdout=%q stderr=%q hits=%d", result.err, result.exit, result.out, result.errOut, hits.Load())
+	}
+	time.Sleep(200 * time.Millisecond)
+	events, err := c.ReadEvents(ctx, 1, ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pendingSeq, allowedSeq uint64
+	for _, event := range events {
+		if event.Type == proto.EvEgressPending {
+			pendingSeq = event.Seq
+		}
+		if event.Type == proto.EvEgressAllowed {
+			var payload map[string]any
+			if proto.Unmarshal(event.Payload, &payload) == nil && payload["decision_id"] == pending.ID {
+				allowedSeq = event.Seq
+			}
+		}
+	}
+	if pendingSeq == 0 || allowedSeq <= pendingSeq {
+		t.Fatalf("approval event order pending=%d allowed=%d events=%+v", pendingSeq, allowedSeq, events)
+	}
+}
+
 func TestHostileWorkspacesUseIsolatedReadOnlyPackageConnector(t *testing.T) {
 	payload := []byte("immutable wheel from approved registry")
 	digestBytes := sha256.Sum256(payload)

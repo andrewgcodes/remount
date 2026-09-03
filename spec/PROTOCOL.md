@@ -239,7 +239,7 @@ Each `WorkspaceSpec` carries an enforceable security contract:
 SecuritySpec { profile, min_isolation, require_sibling_isolation,
                require_enforced_egress, secret_mode, network, audit }
 NetworkPolicy { default: "deny"|"allow", rules: [EgressRule] }
-EgressRule { id, connector?, protocol, hosts, ports, methods, path_prefixes,
+EgressRule { id, mode?: "allow"|"deny"|"approve", connector?, protocol, hosts, ports, methods, path_prefixes,
              max_requests, max_request_bytes, max_response_bytes, redact?,
              shared_state, repos?, push? }
 RepoSpec    { url, ref?, depth? }
@@ -367,9 +367,9 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `agent.fork` | C | `AgentForkReq{id, name?, task?, policy?, idem}` → `Agent`; snapshots the workspace and starts a child from the copy with the same harness session |
 | `agent.destroy` | C | `AgentGetReq{id, idem}` → `{}`; destroys the workspace only if the agent created it |
 | `agent.transcript` | C | `AgentTranscriptReq{id, from?, limit?}` → `AgentTranscriptRes{records, next, gap?, done?}`; a page of the durable transcript mirror from cursor `from`, never touching the workspace (§6.2) |
-| `approval.list` | C | `ApprovalListReq{agent?, status?}` → `ApprovalListRes{approvals}`; pending only unless `status` is given |
+| `approval.list` | C | `ApprovalListReq{agent?, kind?, status?}` → `ApprovalListRes{approvals}`; pending only unless `status` is given |
 | `approval.get` | C | `ApprovalGetReq{id}` → `Approval` |
-| `approval.decide` | C | `ApprovalDecideReq{id, option?, denied?, content?, idem}` → `Approval`; the decision commits before it is handed to the run |
+| `approval.decide` | C | `ApprovalDecideReq{id, option?, denied?, content?, remember?, idem}` → `Approval`; the decision commits before it is handed to the run; egress `remember` is `none`, `host`, or `rule` |
 | `grant` | C | `GrantReq{ws}` → `Grant` |
 | `node.list` | C | → `NodeListRes{nodes}` |
 | `timer.list` | C | → `TimerListRes{timers}` |
@@ -385,6 +385,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `ws.released` | N | `WSReleasedReq{id, gen, snapshot, reason, failed?}` → `{}`; `failed:true` means materialization could not complete and control holds the workspace out of placement with a growing delay (1s doubling to 30s, reset by the next `ws.ready`) instead of re-offering it at once |
 | `ws.snapshot.commit` | N | `WSSnapshotCommitReq{id, gen, snapshot}` → `{}` |
 | `binding.lease` | N | `BindingLeaseReq{ws, gen}` → `BindingLeaseRes{leases}` |
+| `egress.approval` | N | `EgressApprovalReq{ws, gen, principal, rule, host, method, path_hash, body_hash, fingerprint, wait_ms?}` → `EgressApprovalRes{id, status, allowed?, expires_at?}`; only the current generation holder may create the durable approval |
 | `agent.report` | N | `AgentReport{agent, run, ws, gen, seq, kind, ...}` → `{}`; one observation about a run, fenced to the node, generation and run, deduplicated by `seq` (§6.1); `kind: transcript` carries `chunks[]` for the mirror (§6.2) |
 | `diag` | C | `DiagReq{verify}` → control diagnostics |
 
@@ -490,9 +491,10 @@ backend or a security profile above `local`.
 An `Approval` is a question the harness asked that policy routed to a human:
 
 ```
-Approval { id, tenant, owner, agent, ws, run, kind, title, tool_call,
+Approval { id, tenant, owner, agent, ws, run, principal, rule, host, method,
+           path_hash, body_hash, fingerprint, kind, title, tool_call,
            tool_kind, locations[], options[], detail, status, decision,
-           delivered_at, created_at, updated_at }
+           delivered_at, created_at, updated_at, expires_at }
 ```
 
 `kind` is `tool_call` (an ACP `session/request_permission`), `elicitation`
@@ -514,7 +516,13 @@ one the harness offered; an empty `option` without `denied` picks the first
 `elicitation`: `content` must be a JSON object (the form fields) unless
 `denied`, which discards any content; `option` is refused. `egress`: `option`
 is `allow`, `deny` or absent (allow), `denied` also denies, and the recorded
-decision always carries `option: allow|deny`. A node may only park
+decision always carries `option: allow|deny` and `remember: none|host|rule`.
+Egress rows are idempotent on the request fingerprint and bound to the current
+workspace generation. The broker waits at most 30 seconds, then returns `403`
+with `X-Remount-Approval` and `Retry-After`; the row remains durable for ten
+minutes. A resubmitted identical request passes after an allow decision.
+`remember: host` also appends an allow rule and emits `policy.updated` in the
+same transaction. A node may only park
 `tool_call` and `elicitation`; `egress` rows come from the broker. A second
 decision on any row is `conflict`; a replay with the same idempotency key
 returns the row as decided.
@@ -1011,7 +1019,8 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `agent.tool_call`, `agent.waiting`, `agent.cancelled`, `agent.slept`,
 `agent.woken`, `agent.forked`, `agent.failed`, `agent.finished`,
 `agent.destroyed`, `agent.child.finished`, `approval.pending`,
-`approval.decided`, `approval.expired` and `export.cursor.advanced`.
+`approval.decided`, `approval.expired`, `egress.pending`, `egress.allowed`,
+`egress.denied`, `policy.updated` and `export.cursor.advanced`.
 
 Agent events are on the workspace stream and every one carries `agent`.
 `agent.created` carries `ws`, `owns_ws`, `recipe`, `mode`, `task_hash`,
