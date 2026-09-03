@@ -291,3 +291,24 @@ func TestWorkspaceCreateRejectsClientSelectedPrincipalBeforeDial(t *testing.T) {
 		t.Fatalf("error=%v", err)
 	}
 }
+
+func TestEventsSessionFilterAndJSONShape(t *testing.T) {
+	opened := proto.Event{Seq: 1, Type: proto.EvSOpened, Stream: "ws_1", Workspace: "ws_1", Generation: 2, Session: "s_1",
+		Payload: proto.MustMarshal(map[string]any{"s": "s_1"})}
+	exited := proto.Event{Seq: 2, Type: proto.EvSExited, Stream: "ws_1", Session: "s_2"}
+	created := proto.Event{Seq: 3, Type: proto.EvWSCreated, Stream: "ws_1"}
+	f := eventFilter{Session: "s_1"}
+	if !f.match(opened) || f.match(exited) || f.match(created) {
+		t.Fatal("--session must select only events attributed to that session")
+	}
+	if (eventFilter{}).match(created) != true {
+		t.Fatal("no filter matches everything")
+	}
+	got := eventJSON(opened)
+	if got["session"] != "s_1" || got["workspace"] != "ws_1" || got["generation"] != uint64(2) {
+		t.Fatalf("json shape %+v", got)
+	}
+	if _, ok := eventJSON(created)["session"]; ok {
+		t.Fatal("unattributed events must not carry a session key")
+	}
+}

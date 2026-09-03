@@ -3880,6 +3880,7 @@ func (c *Control) eventsPost(ctx context.Context, from string, req *proto.EventP
 			e.Node = ""
 			e.Tenant = subject.Tenant
 			e.Generation = 0
+			e.Session = "" // only the node that runs a session may attribute to it
 			if e.Stream != "" {
 				ws, err := c.authorizeWorkspace(ctx, from, e.Stream, ActionWrite)
 				if err != nil {

@@ -288,3 +288,25 @@ func TestSubscriptionCloseWakesBlockedNext(t *testing.T) {
 	// Idempotent close must not panic.
 	sub.Close()
 }
+
+func TestSQLitePersistsSessionAttribution(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.db")
+	s, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &proto.Event{Type: proto.EvSOpened, Stream: "ws_1", Session: "s_1", At: 1}
+	if err := s.Append(context.Background(), e); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s2, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	got, err := s2.Read(context.Background(), 1, "", 10)
+	if err != nil || len(got) != 1 || got[0].Session != "s_1" {
+		t.Fatalf("session attribution did not round-trip: %+v %v", got, err)
+	}
+}

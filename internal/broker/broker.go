@@ -33,11 +33,13 @@ import (
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
+	"os"
 	pathpkg "path"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"remount.dev/remount/internal/connector"
@@ -54,6 +56,24 @@ const (
 	DecisionExpired         = "expired"         // lease TTL passed; fail closed
 	DecisionUnauthenticated = "unauthenticated" // caller lacks this workspace broker's capability
 	DecisionLimitExceeded   = "limit_exceeded"  // a typed rule exhausted its request or byte budget
+)
+
+// Upstream failure classes recorded on a credential-use audit whose request
+// produced no response headers. Classes, never raw error text: the text can
+// embed the destination or a redacted secret's shape.
+const (
+	ErrorClassDNS       = "dns"
+	ErrorClassRefused   = "connection_refused"
+	ErrorClassReset     = "connection_reset"
+	ErrorClassTimeout   = "timeout"
+	ErrorClassTLS       = "tls"
+	ErrorClassCanceled  = "canceled"
+	ErrorClassEOF       = "eof"
+	ErrorClassRedirect  = "redirect_rejected"
+	ErrorClassLimit     = "response_limit"
+	ErrorClassPrivate   = "non_public_address"
+	ErrorClassConnector = "connector"
+	ErrorClassOther     = "upstream"
 )
 
 // Audit is one broker decision.
@@ -74,7 +94,8 @@ type Audit struct {
 	Method        string
 	Path          string
 	Reason        string
-	Status        int // upstream status when known
+	Status        int    // upstream status when known; 0 when no response headers arrived
+	Error         string // ErrorClass* when a credential was released but the upstream failed
 	RequestBytes  int64
 	ResponseBytes int64
 }
@@ -958,11 +979,7 @@ func (b *Broker) packageProxy(w http.ResponseWriter, r *http.Request, host, requ
 		http.Error(w, "remount broker: "+rejected.public, rejected.status)
 		return
 	}
-	for id := range used {
-		released := audit
-		released.Decision, released.Binding, released.Reason = DecisionSubstituted, id, "credential released to managed package connector"
-		b.emit(released)
-	}
+	credUse := b.credentialUse(audit, used, "credential released to managed package connector")
 	target := &url.URL{Scheme: proto.EgressProtocolHTTPS, Host: authority, Path: requestPath, RawQuery: query}
 	response, err := managed.Execute(r.Context(), connector.ConnectorRequest{
 		Workspace: b.opts.WS, Tenant: b.opts.Tenant, Principal: b.opts.Principal,
@@ -982,12 +999,14 @@ func (b *Broker) packageProxy(w http.ResponseWriter, r *http.Request, host, requ
 				audit.Decision = DecisionLimitExceeded
 			}
 		}
+		credUse(0, ErrorClassConnector)
 		b.emit(audit)
 		http.Error(w, "remount broker: "+audit.Reason, status)
 		return
 	}
 	defer response.Body.Close()
 	audit.Status = response.StatusCode
+	credUse(response.StatusCode, "")
 	audit.ResponseBytes = response.ContentLength
 	if response.Provenance.SHA256 != "" {
 		audit.Digest = "sha256:" + response.Provenance.SHA256
@@ -1119,14 +1138,9 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 		r.ContentLength = bodyBytes
 		r.GetBody = nil
 	}
-	// Record credential release before attempting outbound I/O. An upstream
-	// reset or a cancelled workspace request cannot erase this forensic fact.
-	for id := range used {
-		a := audit
-		a.Decision, a.Binding, a.Reason = DecisionSubstituted, id, "credential released to outbound transport"
-		b.emit(a)
-	}
+	credUse := b.credentialUse(audit, used, "credential released to outbound transport")
 	// 3. Forward.
+	defer credUse(0, ErrorClassOther) // a handler path that produced neither headers nor an error
 	target := &url.URL{Scheme: scheme, Host: authority}
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -1150,25 +1164,30 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 			if errors.Is(err, errResponseLimit) {
 				audit.Decision, audit.Reason, audit.Status = DecisionLimitExceeded, errResponseLimit.Error(), http.StatusBadGateway
 				emit = false // ModifyResponse recorded the rejected response.
+			} else if errors.Is(err, errRedirectRejected) {
+				emit = false // ModifyResponse recorded the rejected redirect.
 			} else {
 				audit.Decision, audit.Reason, audit.Status = DecisionDenied, "upstream: "+err.Error(), http.StatusBadGateway
+				credUse(0, classifyUpstreamError(err))
 			}
 			if emit {
 				b.emit(audit)
 			}
-			http.Error(w, "remount broker: "+audit.Reason, audit.Status)
+			http.Error(w, "remount broker: "+audit.Reason, http.StatusBadGateway)
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			audit.Status = resp.StatusCode
 			if err := b.rewriteRedirect(resp); err != nil {
+				credUse(resp.StatusCode, ErrorClassRedirect)
 				audit.Decision, audit.Reason = DecisionDenied, err.Error()
 				b.emit(audit)
-				return err
+				return fmt.Errorf("%w: %v", errRedirectRejected, err)
 			}
 			if policy.rule.MaxResponseBytes > 0 {
 				audit.ResponseBytes = resp.ContentLength
 				if resp.ContentLength > policy.rule.MaxResponseBytes {
 					resp.Body.Close()
+					credUse(resp.StatusCode, ErrorClassLimit)
 					audit.Decision, audit.Reason = DecisionLimitExceeded, "response body exceeds rule limit"
 					b.emit(audit)
 					return errResponseLimit
@@ -1183,6 +1202,7 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 					},
 				}
 			}
+			credUse(resp.StatusCode, "")
 			a := audit
 			a.Decision = DecisionAllowed
 			b.emit(a)
@@ -1190,6 +1210,65 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 		},
 	}
 	rp.ServeHTTP(w, r)
+}
+
+var errRedirectRejected = errors.New("upstream redirect rejected")
+
+// credentialUse returns the one-shot recorder for the `substituted` audits of
+// a request. cred.used is the record of what a released credential bought,
+// so it is emitted once the outcome is known: the upstream status when
+// response headers arrived, or status 0 and a failure class when they did
+// not. Exactly one audit per released binding, whichever path fires first.
+func (b *Broker) credentialUse(audit Audit, used map[string]bool, reason string) func(status int, class string) {
+	if len(used) == 0 {
+		return func(int, string) {}
+	}
+	var once sync.Once
+	return func(status int, class string) {
+		once.Do(func() {
+			for id := range used {
+				a := audit
+				a.Decision, a.Binding, a.Reason = DecisionSubstituted, id, reason
+				a.Status, a.Error = status, class
+				b.emit(a)
+			}
+		})
+	}
+}
+
+// classifyUpstreamError maps a transport failure to an ErrorClass.
+func classifyUpstreamError(err error) string {
+	var dnsErr *net.DNSError
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, context.Canceled):
+		return ErrorClassCanceled
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
+		return ErrorClassTimeout
+	case errors.As(err, &dnsErr):
+		return ErrorClassDNS
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return ErrorClassRefused
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE):
+		return ErrorClassReset
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return ErrorClassEOF
+	}
+	var tlsRecord tls.RecordHeaderError
+	var tlsAlert tls.AlertError
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &tlsRecord) || errors.As(err, &tlsAlert) || errors.As(err, &certErr) {
+		return ErrorClassTLS
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return ErrorClassTimeout
+	}
+	if strings.Contains(err.Error(), "non-public address") {
+		return ErrorClassPrivate
+	}
+	return ErrorClassOther
 }
 
 // rewriteRedirect keeps every hop on the capability-bearing broker URL. An
