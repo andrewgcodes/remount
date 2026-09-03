@@ -2838,6 +2838,32 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 			}
 			return &res, nil
 		},
+		BudgetReserve: func(ctx context.Context, req proto.BudgetReserveReq) (*proto.BudgetReservation, error) {
+			n.mu.Lock()
+			p := n.peer
+			n.mu.Unlock()
+			if p == nil {
+				return nil, proto.Err(proto.CodeUnreachable, "control connection lost before budget reservation")
+			}
+			var res proto.BudgetReservation
+			if err := p.Call(ctx, proto.PeerControl, proto.OpBudgetReserve, req, &res); err != nil {
+				return nil, err
+			}
+			return &res, nil
+		},
+		BudgetSettle: func(ctx context.Context, req proto.BudgetSettleReq) (*proto.BudgetSettlement, error) {
+			n.mu.Lock()
+			p := n.peer
+			n.mu.Unlock()
+			if p == nil {
+				return nil, proto.Err(proto.CodeUnreachable, "control connection lost before budget settlement")
+			}
+			var res proto.BudgetSettlement
+			if err := p.Call(ctx, proto.PeerControl, proto.OpBudgetSettle, req, &res); err != nil {
+				return nil, err
+			}
+			return &res, nil
+		},
 		Audit: func(a broker.Audit) {
 			typ := proto.EvEgressAllowed
 			switch a.Decision {

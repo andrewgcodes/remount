@@ -370,6 +370,12 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `approval.list` | C | `ApprovalListReq{agent?, kind?, status?}` → `ApprovalListRes{approvals}`; pending only unless `status` is given |
 | `approval.get` | C | `ApprovalGetReq{id}` → `Approval` |
 | `approval.decide` | C | `ApprovalDecideReq{id, option?, denied?, content?, remember?, idem}` → `Approval`; the decision commits before it is handed to the run; egress `remember` is `none`, `host`, or `rule` |
+| `budget.create` | C | `BudgetCreateReq{budget, idem}` → `Budget`; immutable tenant-scoped definition attached to a tenant, workspace, principal, or binding |
+| `budget.list` | C | `BudgetListReq{}` → `BudgetListRes{budgets}`; caller's tenant only |
+| `budget.remove` | C | `BudgetRemoveReq{id, idem}` → `{}`; stops new admission while retained reservations remain settleable and auditable |
+| `budget.reserve` | N | `BudgetReserveReq{key, ws, gen, principal, bindings, provider, model, input_tokens, max_output_tokens, metered}` → `BudgetReservation`; current generation holder only, before secret substitution or upstream I/O |
+| `budget.settle` | N | `BudgetSettleReq{reservation, mode, input_tokens?, output_tokens?}` → `BudgetSettlement`; owning node only, exact replay is a no-op |
+| `usage.get` | C | `UsageReq{tenant?, ws?, principal?, binding?, window?}` → `UsageRes{usage}` |
 | `grant` | C | `GrantReq{ws}` → `Grant` |
 | `node.list` | C | → `NodeListRes{nodes}` |
 | `timer.list` | C | → `TimerListRes{timers}` |
@@ -574,6 +580,7 @@ route table, streaming formats and bounds are in `docs/api.md`.
 ```
 POST   /v1/session                      mint the browser cookie from a header credential
 DELETE /v1/session                      clear it
+GET    /v1/usage                        usage.get
 POST   /v1/agents                       agent.create      201 + Location
 GET    /v1/agents                       agent.list
 GET    /v1/agents/{id}                  agent.get
@@ -1020,7 +1027,9 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `agent.woken`, `agent.forked`, `agent.failed`, `agent.finished`,
 `agent.destroyed`, `agent.child.finished`, `approval.pending`,
 `approval.decided`, `approval.expired`, `egress.pending`, `egress.allowed`,
-`egress.denied`, `policy.updated` and `export.cursor.advanced`.
+`egress.denied`, `policy.updated`, `budget.created`, `budget.removed`,
+`budget.reserved`, `budget.settled`, `budget.expired`, `budget.unmetered`
+and `export.cursor.advanced`.
 
 Agent events are on the workspace stream and every one carries `agent`.
 `agent.created` carries `ws`, `owns_ws`, `recipe`, `mode`, `task_hash`,

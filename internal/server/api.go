@@ -244,6 +244,7 @@ func idem(r *http.Request) []client.OperationOption {
 func (s *Server) apiRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/session", s.handleSessionCreate)
 	mux.HandleFunc("DELETE /v1/session", s.handleSessionDelete)
+	mux.HandleFunc("GET /v1/usage", s.handleUsage)
 	mux.HandleFunc("POST /v1/agents", s.handleAgentCreate)
 	mux.HandleFunc("GET /v1/agents", s.handleAgentList)
 	mux.HandleFunc("GET /v1/agents/{id}", s.handleAgentGet)
@@ -260,6 +261,27 @@ func (s *Server) apiRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/agents/{id}/ports/{port}", s.handlePortRoot)
 	mux.HandleFunc("/v1/agents/{id}/ports/{port}/{rest...}", s.handlePort)
 	mux.HandleFunc("GET /a/{id}", s.handleAgentLink)
+}
+
+func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
+	cl, release := s.apiClient(w, r, false)
+	if cl == nil {
+		return
+	}
+	defer release()
+	query := r.URL.Query()
+	usage, err := cl.Usage(r.Context(), proto.UsageReq{
+		Tenant: query.Get("tenant"), WS: query.Get("ws"), Principal: query.Get("principal"),
+		Binding: query.Get("binding"), Window: query.Get("window"),
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if usage == nil {
+		usage = []proto.Usage{}
+	}
+	writeJSON(w, http.StatusOK, proto.UsageRes{Usage: usage})
 }
 
 // cors wraps the API with the operator's origin allow list. A UI hosted on

@@ -95,6 +95,7 @@ Check your own change against every line here before calling it done.
 | A grant is bound to a workspace generation and refused after a move. | `node.authorize`, `control.VerifyGrant` |
 | A placeholder sent to a host its binding does not cover is blocked and recorded as `leak_blocked`. | `broker.proxy` |
 | Approve-mode egress releases no upstream byte before a durable, generation-bound request fingerprint is allowed; timeout remains a retryable durable approval. | `broker.awaitApproval`, `control.egressApproval` |
+| A governed request reserves every matching hard budget before secret substitution or upstream I/O; settlement, node loss, and TTL expiry remain durably charged and observable. | `broker.reserveBudget`, `control.budgetReserve`, `control.expireBudgets` (ADR 0067) |
 | `ws.ready` gates `claimed`; a client never talks to a node that is still restoring. | `control.wsClaim`, `control.wsReady`, `node.materialize` |
 | A node renews its leases at no more than one third of the lease interval, including while materializing. | `node.renewLoop`, `node.renew` |
 | Every mutating request carries an idempotency key and a replay is a no-op. | `client`, `control.wsCreate`, `session.Manager.Open` |
@@ -105,6 +106,7 @@ Check your own change against every line here before calling it done.
 | Authorization is revalidated after acquiring the workspace tree boundary. A queued stale operation never touches the handle. | `node.lockWorkspaceTree` |
 | Cancellation is not completion. Snapshot producers and managed sessions are joined before locks, capacity or success are released. | `node.snapshotRaw`, `session.Manager.KillWorkspace` |
 | Session output loss is an explicit `gap` and public helpers return `evicted`; incomplete output is never reported complete. | `session.Log`, `client.Copy`, `client.Run` |
+| A session-log range moves from disk to blob only after its immutable artifact and contiguous reference commit; retention dereferences before releasing capacity, and replay is byte-identical or an explicit tier-named gap. | `session.Log` tier transitions (ADR 0073) |
 | Every retained collection and staging path has admission, accounting, cleanup and an observable rejection or degradation signal. | resource options, GC loops, diagnostics and quota metrics |
 | `Session.Wait` is the active-capacity handoff: accounting is committed before exit becomes observable. | `session.finish`, `session.Manager.markInactive` |
 | A check that cannot run is unavailable, never healthy. | `doctor`, `node.diag_unavailable`, `scripts/explain.py` |
@@ -112,6 +114,7 @@ Check your own change against every line here before calling it done.
 | Identity comes only from a live, unrevoked signed credential; one-time node enrollment is digest-only and atomically consumed once. Tenant isolation precedes role checks. | `identity.Manager`, the configured identity `Store` |
 | Artifact ids are plaintext digests, but encrypted physical objects are tenant/key-version scoped. Publication is atomic, decrypt verifies authentication and plaintext digest, and retired keys remain until verified migration. | `artifact/encrypted` (ADR 0065) |
 | Enforced-gateway networking is deny-first: the sandbox starts with its veth down, the broker-only rule commits before link activation, and any setup error or revoke synchronously deletes the veth before serviceability changes. | `netns`, `workspace/gvisor`, `node.materialize` (ADR 0061) |
+| Vendor drivers provision one whole node for one tenant per machine; vendor network controls never upgrade backend capabilities. | `provision` drivers + `pool.Spec` tenant boundary (ADR 0062) |
 
 ## Where a change goes
 

@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+// MaxTokenCount is the closed upper bound accepted by the authority. Brokers
+// use it when a provider request omits a finite output bound or references
+// external media whose token cost cannot be derived before release.
+const MaxTokenCount int64 = 1_000_000_000_000
+
 // Window is a rolling usage interval supported by budget policy.
 type Window string
 
@@ -89,10 +94,12 @@ var (
 
 // Subject identifies every supported budget attachment for one request.
 type Subject struct {
-	Tenant    string
-	Workspace string
-	Principal string
-	Binding   string
+	Tenant     string
+	Workspace  string
+	Generation uint64
+	Principal  string
+	Binding    string
+	Bindings   []string
 }
 
 // Budget is an attached rolling-window policy. A zero limit disables that
@@ -161,10 +168,22 @@ type Settlement struct {
 	EstimatedCostUnavailable bool
 }
 
+// Record is the durable representation of one reservation and its optional
+// terminal settlement. It is exported so an authoritative control-plane
+// adapter can commit one bounded row without serializing the whole ledger.
+type Record struct {
+	Request     ReserveRequest
+	Reservation Reservation
+	Settlement  *Settlement
+	SettleInput SettleRequest
+	TerminalAt  time.Time
+}
+
 // ExpiryResult reports conservative reservations committed by expiry or node
 // death. IDs are returned so the caller can emit one event per transition.
 type ExpiryResult struct {
 	ReservationIDs []string
+	CollectedIDs   []string
 }
 
 // UsageQuery selects current rolling counters. Empty fields are wildcards;
@@ -235,7 +254,7 @@ type Store interface {
 type AdminStore interface {
 	Store
 	PutBudget(context.Context, Budget) error
-	DeleteBudget(context.Context, string) error
+	DeleteBudget(context.Context, string, string) error
 	Budgets(context.Context) ([]Budget, error)
 }
 

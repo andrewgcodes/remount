@@ -371,6 +371,32 @@ func TestPoolSubcommandsValidateBeforeDialing(t *testing.T) {
 	}
 }
 
+func TestBudgetCommandsValidateBeforeDialing(t *testing.T) {
+	if err := cmdBudget(context.Background(), nil); err == nil {
+		t.Fatal("budget without subcommand accepted")
+	}
+	for _, args := range [][]string{
+		{"create", "limit", "--max-requests", "1"},
+		{"create", "limit", "--attach", "workspace:ws_a"},
+		{"create", "limit", "--attach", "other:id", "--max-requests", "1"},
+		{"create", "bad id", "--attach", "tenant:team", "--max-requests", "1"},
+		{"rm"},
+	} {
+		if err := cmdBudget(context.Background(), args); err == nil {
+			t.Fatalf("budget args %v reached dial", args)
+		}
+	}
+	if err := cmdBudget(context.Background(), []string{"wat"}); err == nil || !strings.Contains(err.Error(), "unknown budget subcommand") {
+		t.Fatalf("error=%v", err)
+	}
+	if err := cmdUsage(context.Background(), []string{"--window", "forever"}); err == nil {
+		t.Fatal("usage accepted invalid window")
+	}
+	if err := cmdUsage(context.Background(), []string{"extra"}); err == nil {
+		t.Fatal("usage accepted positional argument")
+	}
+}
+
 func TestRunValidatesBeforeDialing(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {

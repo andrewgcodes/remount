@@ -77,7 +77,7 @@ func run(ctx context.Context, argv []string) error {
 	}
 	cmd, args := argv[0], argv[1:]
 	switch cmd {
-	case "ws", "fs", "fleet", "pool", "run", "agent":
+	case "ws", "fs", "fleet", "pool", "budget", "run", "agent":
 		if len(args) > 0 && !isFlag(args[0]) {
 			args = append(append([]string{args[0]}, globals...), args[1:]...)
 		} else {
@@ -119,6 +119,10 @@ func run(ctx context.Context, argv []string) error {
 		return cmdBase(ctx, args)
 	case "pool":
 		return cmdPool(ctx, args)
+	case "budget":
+		return cmdBudget(ctx, args)
+	case "usage":
+		return cmdUsage(ctx, args)
 	case "run":
 		return cmdRun(ctx, args)
 	case "handoff":
@@ -207,6 +211,8 @@ func usage() {
   remount fleet quarantine --action freeze (--all | SELECTORS...) | ls | get OPERATION
   remount base ls | rm NAME                                              named snapshots for ws create --base (pinned until rm)
   remount pool create NAME --vendor V --backend B [--min 0 --max 5] | ls | get NAME | rm NAME
+  remount budget create ID --attach KIND:ID [--window 1d] [--max-requests N] [--max-tokens N] | ls | rm ID
+  remount usage [--tenant T] [--ws WS] [--principal P] [--binding B] [--window 1h|1d|30d]
   remount run RECIPE [--dir . | --base NAME | --repo URL[@REF] | --ws WS] [--binding b_openai]... [--detach] -- TASK
                                       seed a workspace, install a harness (claude, codex, opencode, openhands, goose, gemini, aider, cline, custom), run it
   remount run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM]   run the file's tasks in order in one workspace, checkpointing or sleeping between them
