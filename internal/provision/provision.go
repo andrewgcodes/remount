@@ -90,6 +90,12 @@ func (b Bootstrap) Validate() error {
 	if strings.TrimSpace(b.EnrollmentToken) == "" {
 		return errors.New("provision: one-time enrollment token is required")
 	}
+	return b.ValidateTemplate()
+}
+
+// ValidateTemplate checks the non-secret bootstrap fields before an
+// enrollment token has been minted for one concrete machine.
+func (b Bootstrap) ValidateTemplate() error {
 	server, err := url.Parse(b.ServerURL)
 	if err != nil || server.Host == "" || (server.Scheme != "https" && server.Scheme != "http") {
 		return fmt.Errorf("provision: server URL must be an absolute http(s) URL")
