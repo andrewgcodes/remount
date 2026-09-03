@@ -195,10 +195,25 @@ type Process struct {
 
 // NewProcess creates the backend rooted at dir.
 func NewProcess(dir string) (*Process, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	dir, err := backendRoot(dir)
+	if err != nil {
 		return nil, err
 	}
 	return &Process{Dir: dir}, nil
+}
+
+// backendRoot creates dir and returns it as an absolute path. Backends hand
+// workspace roots to other programs (docker bind mounts) and outlive any
+// working directory the node started in.
+func backendRoot(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("backend root %q: %w", dir, err)
+	}
+	if err := os.MkdirAll(abs, 0o700); err != nil {
+		return "", err
+	}
+	return abs, nil
 }
 
 func (p *Process) Name() string { return "process" }
@@ -302,7 +317,8 @@ type Docker struct {
 
 // NewDocker creates the backend; the daemon is checked lazily on first use.
 func NewDocker(dir, defaultImage string) (*Docker, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	dir, err := backendRoot(dir)
+	if err != nil {
 		return nil, err
 	}
 	if defaultImage == "" {

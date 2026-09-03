@@ -190,6 +190,21 @@ func parse(fs *flag.FlagSet, args []string) {
 	_ = fs.Parse(append(flags, positional...))
 }
 
+// absFlagPath resolves a directory flag against the current working directory.
+// Nodes hand the path to backends (Docker bind mounts need absolute paths) and
+// long-running processes may change directory, so relative data roots are a
+// latent bug rather than a convenience.
+func absFlagPath(flagName, value string) (string, error) {
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("--%s must not be empty", flagName)
+	}
+	abs, err := filepath.Abs(value)
+	if err != nil {
+		return "", fmt.Errorf("--%s %q: %w", flagName, value, err)
+	}
+	return abs, nil
+}
+
 func envOr(k, d string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -332,8 +347,13 @@ func cmdServer(ctx context.Context, args []string) error {
 	if *token == "" && !*insecure {
 		return errors.New("--token is required (or --insecure for local experiments)")
 	}
-	if err := os.MkdirAll(*data, 0o700); err != nil {
+	dataDir, err := absFlagPath("data", *data)
+	if err != nil {
 		return err
+	}
+	*data = dataDir
+	if err := os.MkdirAll(*data, 0o700); err != nil {
+		return fmt.Errorf("--data %s: %w", *data, err)
 	}
 	b, err := loadBindings(*bindings)
 	if err != nil {
@@ -393,6 +413,11 @@ func cmdUp(ctx context.Context, args []string) error {
 	fs.Var(&allow, "allow", "host pattern workspaces may reach without a credential (repeatable)")
 	fs.Var(&allowPrivate, "allow-private", "host pattern allowed to resolve to a private address (repeatable)")
 	parse(fs, args)
+	dataDir, err := absFlagPath("data", *data)
+	if err != nil {
+		return err
+	}
+	*data = dataDir
 	n, err := buildNode(*data, c, labels, *backends, *image, allow, allowPrivate, nodeResourceOptions{
 		artifactBytes: *artifactBytes, artifactStoreBytes: *artifactStoreBytes, artifactObjects: *artifactObjects,
 		artifactRetention: *artifactRetention, artifactGCInterval: *artifactGCInterval,
@@ -447,6 +472,9 @@ type nodeResourceOptions struct {
 }
 
 func buildNode(data string, c common, labels map[string]string, backends, image string, allow, allowPrivate []string, resources nodeResourceOptions) (*node.Node, error) {
+	if !filepath.IsAbs(data) {
+		return nil, fmt.Errorf("node data directory %q must be absolute", data)
+	}
 	var list []workspace.Backend
 	for _, b := range strings.Split(backends, ",") {
 		switch strings.TrimSpace(b) {
@@ -506,8 +534,13 @@ func cmdStandalone(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(*data, 0o700); err != nil {
+	dataDir, err := absFlagPath("data", *data)
+	if err != nil {
 		return err
+	}
+	*data = dataDir
+	if err := os.MkdirAll(*data, 0o700); err != nil {
+		return fmt.Errorf("--data %s: %w", *data, err)
 	}
 	srv, err := server.New(server.Options{DataDir: filepath.Join(*data, "server"), Bindings: b, Logger: slog.Default(), Mode: server.ModeStandalone})
 	if err != nil {

@@ -14,6 +14,25 @@ import (
 	"remount.dev/remount/internal/session"
 )
 
+func TestBackendRootsAreAbsolute(t *testing.T) {
+	wd, _ := os.Getwd()
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+	p, err := NewProcess("rel/ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := NewDocker("rel/docker", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(p.Dir) || !filepath.IsAbs(d.Dir) || d.Image != "ubuntu:24.04" {
+		t.Fatalf("process=%q docker=%q image=%q", p.Dir, d.Dir, d.Image)
+	}
+}
+
 func TestProcessBackendLifecycle(t *testing.T) {
 	ctx := context.Background()
 	be, err := NewProcess(filepath.Join(t.TempDir(), "ws"))
