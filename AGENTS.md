@@ -107,6 +107,7 @@ Check your own change against every line here before calling it done.
 | Every retained collection and staging path has admission, accounting, cleanup and an observable rejection or degradation signal. | resource options, GC loops, diagnostics and quota metrics |
 | `Session.Wait` is the active-capacity handoff: accounting is committed before exit becomes observable. | `session.finish`, `session.Manager.markInactive` |
 | A check that cannot run is unavailable, never healthy. | `doctor`, `node.diag_unavailable`, `scripts/explain.py` |
+| Identity comes only from a live, unrevoked signed credential; one-time node enrollment is digest-only and atomically consumed once. Tenant isolation precedes role checks. | `identity.Manager`, the configured identity `Store` |
 
 ## Where a change goes
 
