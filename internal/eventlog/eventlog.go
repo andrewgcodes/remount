@@ -74,6 +74,11 @@ func (l *Log) Append(ctx context.Context, e *proto.Event) error {
 		return err
 	}
 	metrics.EventsAppended.Inc()
+	l.fanOutLocked(e)
+	return nil
+}
+
+func (l *Log) fanOutLocked(e *proto.Event) {
 	for s := range l.subs {
 		if s.stream != "" && s.stream != e.Stream {
 			continue
@@ -85,7 +90,6 @@ func (l *Log) Append(ctx context.Context, e *proto.Event) error {
 			s.markLagged(e.Seq)
 		}
 	}
-	return nil
 }
 
 // Read delegates to the store.
@@ -100,6 +104,66 @@ func (l *Log) Read(ctx context.Context, from uint64, stream string, limit int) (
 		return nil, &proto.Error{Code: proto.CodeEvicted, Msg: "requested events are older than retention", Oldest: first}
 	}
 	return l.store.Read(ctx, from, stream, limit)
+}
+
+// Exporter copies a contiguous range of the log to a sink. Every audit export
+// destination (a file, object storage, a SIEM) is built on this one contract
+// so retention, redaction and resumption are decided in one place.
+type Exporter interface {
+	// Export sends events with from <= seq <= to to sink in order, stopping
+	// at the first sink error, and returns the last sequence delivered. A
+	// zero to means "through the newest event". A from below the oldest
+	// retained sequence is CodeEvicted carrying Oldest so the caller can
+	// record the hole instead of silently skipping it.
+	Export(ctx context.Context, from, to uint64, sink func(proto.Event) error) (uint64, error)
+}
+
+var _ Exporter = (*Log)(nil)
+
+// exportPage bounds one store read during Export so an export of a large log
+// never pins the whole range in memory.
+const exportPage = 512
+
+// Export implements Exporter by paging through the store.
+func (l *Log) Export(ctx context.Context, from, to uint64, sink func(proto.Event) error) (uint64, error) {
+	first, err := l.store.First(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if from == 0 {
+		from = first
+	} else if from < first {
+		return 0, &proto.Error{Code: proto.CodeEvicted, Msg: "requested events are older than retention", Oldest: first}
+	}
+	if to == 0 {
+		if to, err = l.store.Last(ctx); err != nil {
+			return 0, err
+		}
+	}
+	var last uint64
+	for from <= to {
+		if err := ctx.Err(); err != nil {
+			return last, err
+		}
+		page, err := l.store.Read(ctx, from, "", exportPage)
+		if err != nil {
+			return last, err
+		}
+		if len(page) == 0 {
+			return last, nil
+		}
+		for _, e := range page {
+			if e.Seq > to {
+				return last, nil
+			}
+			if err := sink(e); err != nil {
+				return last, err
+			}
+			last = e.Seq
+		}
+		from = last + 1
+	}
+	return last, nil
 }
 
 // First returns the oldest retained event sequence.
@@ -394,7 +458,8 @@ func OpenSQLite(path string) (*SQLite, error) {
 		workspace TEXT NOT NULL DEFAULT '',
 		generation INTEGER NOT NULL DEFAULT 0,
 		operation_id TEXT NOT NULL DEFAULT '',
-		producer_seq INTEGER NOT NULL DEFAULT 0
+		producer_seq INTEGER NOT NULL DEFAULT 0,
+		session TEXT NOT NULL DEFAULT ''
 	); CREATE INDEX IF NOT EXISTS events_stream ON events(stream, seq);
 	CREATE TABLE IF NOT EXISTS event_producers (
 		node TEXT PRIMARY KEY,
@@ -411,6 +476,7 @@ func OpenSQLite(path string) (*SQLite, error) {
 		{"actor", "TEXT NOT NULL DEFAULT ''"}, {"tenant", "TEXT NOT NULL DEFAULT ''"},
 		{"workspace", "TEXT NOT NULL DEFAULT ''"}, {"generation", "INTEGER NOT NULL DEFAULT 0"},
 		{"operation_id", "TEXT NOT NULL DEFAULT ''"}, {"producer_seq", "INTEGER NOT NULL DEFAULT 0"},
+		{"session", "TEXT NOT NULL DEFAULT ''"},
 	}
 	rows, err := db.Query(`PRAGMA table_info(events)`)
 	if err != nil {
@@ -456,12 +522,26 @@ func (s *SQLite) DB() *sql.DB { return s.db }
 func (s *SQLite) Append(ctx context.Context, e *proto.Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.ExecContext(ctx, `INSERT INTO events(
+	return insertEvent(ctx, s.db, e)
+}
+
+// AppendTx implements TxStore. The transaction owns the database's single
+// connection, so no other append can interleave before it commits.
+func (s *SQLite) AppendTx(ctx context.Context, tx *sql.Tx, e *proto.Event) error {
+	return insertEvent(ctx, tx, e)
+}
+
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func insertEvent(ctx context.Context, db execer, e *proto.Event) error {
+	res, err := db.ExecContext(ctx, `INSERT INTO events(
 		at, stream, principal, node, type, payload, cause, event_id, received_at,
-		observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq
-	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq, session
+	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		e.At, e.Stream, e.Principal, e.Node, e.Type, e.Payload, e.Cause, e.EventID, e.ReceivedAt,
-		e.ObservedAt, e.Origin, e.Actor, e.Tenant, e.Workspace, e.Generation, e.OperationID, e.ProducerSeq)
+		e.ObservedAt, e.Origin, e.Actor, e.Tenant, e.Workspace, e.Generation, e.OperationID, e.ProducerSeq, e.Session)
 	if err != nil {
 		return err
 	}
@@ -481,11 +561,11 @@ func (s *SQLite) Read(ctx context.Context, from uint64, stream string, limit int
 	var err error
 	if stream == "" {
 		rows, err = s.db.QueryContext(ctx, `SELECT seq, at, stream, principal, node, type, payload, cause,
-			event_id, received_at, observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq
+			event_id, received_at, observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq, session
 			FROM events WHERE seq >= ? ORDER BY seq LIMIT ?`, from, limit)
 	} else {
 		rows, err = s.db.QueryContext(ctx, `SELECT seq, at, stream, principal, node, type, payload, cause,
-			event_id, received_at, observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq
+			event_id, received_at, observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq, session
 			FROM events WHERE seq >= ? AND stream = ? ORDER BY seq LIMIT ?`, from, stream, limit)
 	}
 	if err != nil {
@@ -498,7 +578,7 @@ func (s *SQLite) Read(ctx context.Context, from uint64, stream string, limit int
 		if err := rows.Scan(
 			&e.Seq, &e.At, &e.Stream, &e.Principal, &e.Node, &e.Type, &e.Payload, &e.Cause,
 			&e.EventID, &e.ReceivedAt, &e.ObservedAt, &e.Origin, &e.Actor, &e.Tenant,
-			&e.Workspace, &e.Generation, &e.OperationID, &e.ProducerSeq,
+			&e.Workspace, &e.Generation, &e.OperationID, &e.ProducerSeq, &e.Session,
 		); err != nil {
 			return nil, err
 		}

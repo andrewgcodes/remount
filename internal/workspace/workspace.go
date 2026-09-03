@@ -43,6 +43,10 @@ type Caps struct {
 	FilesystemBoundary string
 	NetworkNamespace   bool
 	DeviceIsolation    bool
+	// MountPath: the backend honors WorkspaceSpec.MountPath (the workspace
+	// has its own mount namespace). A backend without one must refuse a
+	// spec that sets it rather than symlink host paths into its jail.
+	MountPath bool
 }
 
 // Describer reports a backend's identity and evidence-bearing capabilities.
@@ -80,6 +84,24 @@ type Identity interface {
 	Backend() string
 }
 
+// Mounter reports where the tree appears to processes running inside the
+// workspace. Harness protocols that speak in absolute paths (ACP) need it to
+// translate between the harness's view and the node's jail.
+type Mounter interface {
+	// MountPath is the tree's root as the workspace's processes see it.
+	MountPath() string
+}
+
+// MountPathOf returns the in-workspace root of h: the backend's answer when
+// it has a mount namespace, otherwise the host-side jail root, which is the
+// same directory the processes see.
+func MountPathOf(h Handle) string {
+	if m, ok := h.(Mounter); ok {
+		return m.MountPath()
+	}
+	return h.FS().Root()
+}
+
 // Filesystem exposes the backend's jailed host-side filesystem adapter.
 type Filesystem interface {
 	// FS returns the jailed filesystem view.
@@ -95,6 +117,18 @@ type SessionPreparer interface {
 	Prepare(spec *session.Spec) error
 }
 
+// CheckpointKind names what a checkpoint archive captures. It is the value a
+// backend's Caps.Snapshots advertises and the value stored on a snapshot so a
+// restore knows whether processes resume or restart.
+type CheckpointKind string
+
+const (
+	// CheckpointFS is the filesystem alone; processes restart on restore.
+	CheckpointFS CheckpointKind = "fs"
+	// CheckpointFSMem is filesystem plus process memory; processes resume.
+	CheckpointFSMem CheckpointKind = "fs+mem"
+)
+
 // Checkpointer owns snapshot consistency. Snapshot is explicitly live and may
 // observe concurrent workspace writes. Checkpoint must freeze backend-managed
 // execution until the archive is complete; the node additionally excludes its
@@ -104,6 +138,25 @@ type Checkpointer interface {
 	Snapshot(ctx context.Context, excludes []string, w io.Writer) error
 	// Checkpoint streams a quiesced tar.gz suitable for authoritative failover.
 	Checkpoint(ctx context.Context, excludes []string, w io.Writer) error
+}
+
+// MemoryCheckpointer is implemented by handles whose Checkpoint captures more
+// than the filesystem. A handle that does not implement it is CheckpointFS;
+// callers use KindOf and never type-assert on a concrete backend.
+type MemoryCheckpointer interface {
+	Checkpointer
+	// CheckpointKind reports what Checkpoint will produce for this handle.
+	CheckpointKind() CheckpointKind
+}
+
+// KindOf reports the checkpoint kind a handle produces. Only a kind the
+// handle itself claims is trusted; an unknown claim degrades to CheckpointFS
+// so a caller never records a memory snapshot that is not one.
+func KindOf(h Checkpointer) CheckpointKind {
+	if m, ok := h.(MemoryCheckpointer); ok && m.CheckpointKind() == CheckpointFSMem {
+		return CheckpointFSMem
+	}
+	return CheckpointFS
 }
 
 // Destroyer permanently removes one materialization.
@@ -195,10 +248,25 @@ type Process struct {
 
 // NewProcess creates the backend rooted at dir.
 func NewProcess(dir string) (*Process, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	dir, err := backendRoot(dir)
+	if err != nil {
 		return nil, err
 	}
 	return &Process{Dir: dir}, nil
+}
+
+// backendRoot creates dir and returns it as an absolute path. Backends hand
+// workspace roots to other programs (docker bind mounts) and outlive any
+// working directory the node started in.
+func backendRoot(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("backend root %q: %w", dir, err)
+	}
+	if err := os.MkdirAll(abs, 0o700); err != nil {
+		return "", err
+	}
+	return abs, nil
 }
 
 func (p *Process) Name() string { return "process" }
@@ -213,6 +281,9 @@ func (p *Process) Caps() Caps {
 func (p *Process) root(id string) string { return filepath.Join(p.Dir, id) }
 
 func (p *Process) Create(ctx context.Context, id string, spec proto.WorkspaceSpec, restore io.Reader) (Handle, error) {
+	if spec.MountPath != "" && spec.MountPath != proto.DefaultMountPath {
+		return nil, proto.Err(proto.CodeUnsupported, "process backend cannot materialize at %s: it has no mount namespace", spec.MountPath)
+	}
 	root := p.root(id)
 	if _, err := os.Stat(root); err == nil {
 		return nil, proto.Err(proto.CodeConflict, "workspace %s already exists on this node", id)
@@ -300,13 +371,30 @@ type Docker struct {
 	err     error
 }
 
+// DefaultImageRepository is the registry path of the image CI builds from
+// images/workspace/Dockerfile. docs/images.md is the contract.
+const DefaultImageRepository = "ghcr.io/andrewgcodes/remount-workspace"
+
+// DefaultImage returns the docker image a workspace gets when its spec names
+// none. A release binary pins the tag built alongside it; a development build
+// (`dev`, or any version that is not a release tag) tracks `latest`.
+func DefaultImage(version string) string {
+	if strings.HasPrefix(version, "v") && !strings.Contains(version, "-dirty") {
+		return DefaultImageRepository + ":" + version
+	}
+	return DefaultImageRepository + ":latest"
+}
+
 // NewDocker creates the backend; the daemon is checked lazily on first use.
+// An empty defaultImage selects DefaultImage("dev"); pass an explicit image
+// such as ubuntu:24.04 to keep a plain distro workspace.
 func NewDocker(dir, defaultImage string) (*Docker, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	dir, err := backendRoot(dir)
+	if err != nil {
 		return nil, err
 	}
 	if defaultImage == "" {
-		defaultImage = "ubuntu:24.04"
+		defaultImage = DefaultImage("dev")
 	}
 	return &Docker{Dir: dir, Image: defaultImage, Binary: "docker"}, nil
 }
@@ -317,7 +405,7 @@ func (d *Docker) Caps() Caps {
 	return Caps{
 		Isolation: "container", Snapshots: "fs", EgressEnforced: false,
 		EgressMode: "cooperative_proxy", BrokerIdentity: "token", FilesystemBoundary: "bind_mount",
-		NetworkNamespace: true, DeviceIsolation: true,
+		NetworkNamespace: true, DeviceIsolation: true, MountPath: true,
 	}
 }
 
@@ -346,6 +434,13 @@ func (d *Docker) Create(ctx context.Context, id string, spec proto.WorkspaceSpec
 	if err := d.Available(ctx); err != nil {
 		return nil, proto.Err(proto.CodeUnsupported, "%v", err)
 	}
+	if err := proto.ValidateMountPath(spec.MountPath); err != nil {
+		return nil, err
+	}
+	mount := spec.MountPath
+	if mount == "" {
+		mount = proto.DefaultMountPath
+	}
 	root := filepath.Join(d.Dir, id)
 	if _, err := os.Stat(root); err == nil {
 		return nil, proto.Err(proto.CodeConflict, "workspace %s already exists on this node", id)
@@ -365,7 +460,7 @@ func (d *Docker) Create(ctx context.Context, id string, spec proto.WorkspaceSpec
 	}
 	name := d.container(id)
 	args := []string{"run", "-d", "--name", name, "--init",
-		"-v", root + ":/work", "-w", "/work",
+		"-v", root + ":" + mount, "-w", mount,
 		"--add-host", "host.docker.internal:host-gateway",
 		"--label", "remount.workspace=" + id,
 	}
@@ -380,7 +475,7 @@ func (d *Docker) Create(ctx context.Context, id string, spec proto.WorkspaceSpec
 		_ = os.RemoveAll(root)
 		return nil, proto.Err(proto.CodeInternal, "docker run: %s", strings.TrimSpace(string(out)))
 	}
-	return d.handle(id, root, name)
+	return d.handle(id, root, name, mount)
 }
 
 func (d *Docker) Adopt(ctx context.Context, id string) (Handle, error) {
@@ -398,25 +493,58 @@ func (d *Docker) Adopt(ctx context.Context, id string) (Handle, error) {
 			return nil, proto.Err(proto.CodeInternal, "docker start: %s", strings.TrimSpace(string(out)))
 		}
 	}
-	return d.handle(id, root, name)
+	// The container is the durable record of where the tree is mounted.
+	out, err = exec.CommandContext(ctx, d.Binary, "inspect", "--format", "{{range .Mounts}}{{.Source}}\t{{.Destination}}\n{{end}}", name).CombinedOutput()
+	if err != nil {
+		return nil, proto.Err(proto.CodeInternal, "inspect mounts of %s: %s", name, strings.TrimSpace(string(out)))
+	}
+	mount := mountDestination(string(out), root)
+	return d.handle(id, root, name, mount)
 }
 
-func (d *Docker) handle(id, root, name string) (Handle, error) {
+// mountDestination picks the container path of the bind mount whose host
+// source is root from `docker inspect` output (one "source\tdestination" per
+// line). A lone mount is taken as-is so a symlinked data dir still resolves.
+func mountDestination(inspect, root string) string {
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSpace(inspect), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	for _, line := range lines {
+		src, dst, ok := strings.Cut(line, "\t")
+		if ok && src == root && dst != "" {
+			return dst
+		}
+	}
+	if len(lines) == 1 {
+		if _, dst, ok := strings.Cut(lines[0], "\t"); ok && dst != "" {
+			return dst
+		}
+	}
+	return proto.DefaultMountPath
+}
+
+func (d *Docker) handle(id, root, name, mount string) (Handle, error) {
 	f, err := fsops.New(root)
 	if err != nil {
 		return nil, err
 	}
-	return &dockerHandle{id: id, root: f.Root(), fs: f, name: name, bin: d.Binary}, nil
+	return &dockerHandle{id: id, root: f.Root(), fs: f, name: name, bin: d.Binary, mount: mount}, nil
 }
 
 type dockerHandle struct {
 	id, root, name, bin string
-	fs                  *fsops.FS
+	// mount is the tree's path inside the container (WorkspaceSpec.MountPath).
+	mount string
+	fs    *fsops.FS
 }
 
-func (h *dockerHandle) ID() string      { return h.id }
-func (h *dockerHandle) Backend() string { return "docker" }
-func (h *dockerHandle) FS() *fsops.FS   { return h.fs }
+func (h *dockerHandle) ID() string        { return h.id }
+func (h *dockerHandle) Backend() string   { return "docker" }
+func (h *dockerHandle) FS() *fsops.FS     { return h.fs }
+func (h *dockerHandle) MountPath() string { return h.mount }
 
 func (h *dockerHandle) Prepare(spec *session.Spec) error {
 	if spec.Kind == proto.SessionPort {
@@ -429,20 +557,20 @@ func (h *dockerHandle) Prepare(spec *session.Spec) error {
 		spec.Host = strings.TrimSpace(string(out))
 		return nil
 	}
-	cwd := "/work"
+	cwd := h.mount
 	if spec.Cwd != "" {
 		c, err := h.fs.Resolve(spec.Cwd)
 		if err != nil {
 			return err
 		}
 		rel, _ := filepath.Rel(h.root, c)
-		cwd = filepath.ToSlash(filepath.Join("/work", rel))
+		cwd = filepath.ToSlash(filepath.Join(h.mount, rel))
 	}
 	args := []string{"exec", "-i", "-w", cwd}
 	if spec.Kind == proto.SessionPTY {
 		args = append(args, "-t")
 	}
-	env := MergeEnv([]string{"HOME=/work", "USER=root", "LANG=C.UTF-8", "REMOUNT_WORKSPACE=" + h.id}, spec.Env)
+	env := MergeEnv([]string{"HOME=" + h.mount, "USER=root", "LANG=C.UTF-8", "REMOUNT_WORKSPACE=" + h.id}, spec.Env)
 	for _, kv := range env {
 		args = append(args, "-e", kv)
 	}
@@ -454,11 +582,33 @@ func (h *dockerHandle) Prepare(spec *session.Spec) error {
 	return nil
 }
 
+// reown hands the bind mount back to the node's uid. The container runs as
+// root, so everything a harness writes lands on the host owned by root; a
+// non-root node could then neither snapshot a 0600 file nor delete the tree.
+// Runs inside the container so it works even when the node cannot chown.
+func (h *dockerHandle) reown(ctx context.Context) error {
+	if os.Getuid() == 0 {
+		return nil
+	}
+	owner := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	out, err := exec.CommandContext(ctx, h.bin, "exec", h.name, "chown", "-R", owner, h.mount).CombinedOutput()
+	if err != nil {
+		return proto.Err(proto.CodeInternal, "docker exec chown: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func (h *dockerHandle) Snapshot(ctx context.Context, excludes []string, w io.Writer) error {
+	if err := h.reown(ctx); err != nil {
+		return err
+	}
 	return artifact.Snapshot(h.root, excludes, w)
 }
 
 func (h *dockerHandle) Checkpoint(ctx context.Context, excludes []string, w io.Writer) (err error) {
+	if err := h.reown(ctx); err != nil { // a paused container cannot exec
+		return err
+	}
 	out, err := exec.CommandContext(ctx, h.bin, "pause", h.name).CombinedOutput()
 	if err != nil {
 		return proto.Err(proto.CodeInternal, "docker pause: %s", strings.TrimSpace(string(out)))
@@ -477,6 +627,9 @@ func (h *dockerHandle) Checkpoint(ctx context.Context, excludes []string, w io.W
 
 func (h *dockerHandle) Destroy(ctx context.Context) error {
 	_ = h.fs.Close()
+	// Best effort: the container may already be gone or stopped, and a failed
+	// chown surfaces as the RemoveAll error below if it matters.
+	_ = h.reown(ctx)
 	out, err := exec.CommandContext(ctx, h.bin, "rm", "-f", h.name).CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "No such container") {
 		return proto.Err(proto.CodeInternal, "docker rm: %s", strings.TrimSpace(string(out)))
@@ -542,7 +695,7 @@ func (r *Registry) Descriptors() []proto.BackendDescriptor {
 				BrokerIdentity: caps.BrokerIdentity, FilesystemBoundary: caps.FilesystemBoundary,
 				NetworkNamespace: caps.NetworkNamespace, DeviceIsolation: caps.DeviceIsolation,
 			},
-			Runtime: proto.RuntimeCaps{Snapshots: caps.Snapshots, Display: caps.Display},
+			Runtime: proto.RuntimeCaps{Snapshots: caps.Snapshots, Display: caps.Display, MountPath: caps.MountPath},
 		})
 	}
 	return out

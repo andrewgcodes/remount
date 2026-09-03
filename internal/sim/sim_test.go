@@ -46,6 +46,11 @@ type world struct {
 	mu          sync.Mutex
 	conns       []*fault // every live pipe end handed to a dialer
 	nodeCancels map[string]context.CancelFunc
+	// peerHooks and serverHooks rewrite or drop frames sent by, respectively,
+	// the named peer and the server on that peer's connections. They model a
+	// peer built from a different release.
+	peerHooks   map[string]func(*proto.Frame) bool
+	serverHooks map[string]func(*proto.Frame) bool
 }
 
 // fault wraps a pipe end so tests can cut it.
@@ -56,8 +61,18 @@ type fault struct {
 
 func newWorld(t *testing.T, bindings ...control.Binding) *world {
 	t.Helper()
+	return newWorldWith(t, func(o *server.Options) { o.Bindings = bindings })
+}
+
+// newWorldWith starts a world after letting the test adjust the server options.
+func newWorldWith(t *testing.T, adjust func(*server.Options)) *world {
+	t.Helper()
 	dataDir := filepath.Join(t.TempDir(), "server")
-	srv, err := server.New(server.Options{DataDir: dataDir, Token: "tok", Bindings: bindings, LeaseSec: 2})
+	opts := server.Options{DataDir: dataDir, Token: "tok", LeaseSec: 2}
+	if adjust != nil {
+		adjust(&opts)
+	}
+	srv, err := server.New(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,6 +81,7 @@ func newWorld(t *testing.T, bindings ...control.Binding) *world {
 	w := &world{
 		t: t, artifactDir: filepath.Join(dataDir, "artifacts"), srv: srv,
 		http: hs, ctx: ctx, cancel: cancel, nodeCancels: make(map[string]context.CancelFunc),
+		peerHooks: make(map[string]func(*proto.Frame) bool), serverHooks: make(map[string]func(*proto.Frame) bool),
 	}
 	t.Cleanup(func() {
 		cancel()
@@ -79,6 +95,14 @@ func newWorld(t *testing.T, bindings ...control.Binding) *world {
 func (w *world) dialer(who string) transport.Dialer {
 	return transport.DialFunc(func(ctx context.Context) (transport.Conn, error) {
 		a, b := transport.Pipe(256)
+		w.mu.Lock()
+		if hook := w.peerHooks[who]; hook != nil {
+			transport.SetHook(a, hook)
+		}
+		if hook := w.serverHooks[who]; hook != nil {
+			transport.SetHook(b, hook)
+		}
+		w.mu.Unlock()
 		go w.srv.AcceptConn(w.ctx, b)
 		f := &fault{Conn: a, who: who}
 		w.mu.Lock()
@@ -125,12 +149,21 @@ func (w *world) node(name string, labels map[string]string) *node.Node {
 
 func (w *world) nodeWithBrokerRoots(name string, labels map[string]string, roots *x509.CertPool) *node.Node {
 	w.t.Helper()
+	return w.nodeWith(name, func(o *node.Options) { o.Labels, o.BrokerRootCAs = labels, roots })
+}
+
+// nodeWith starts a node after letting the test adjust the default options.
+func (w *world) nodeWith(name string, adjust func(*node.Options)) *node.Node {
+	w.t.Helper()
 	dir := filepath.Join(w.t.TempDir(), name)
-	n, err := node.New(node.Options{
-		DataDir: dir, Dialer: w.dialer(name), Token: "tok", Labels: labels,
+	opts := node.Options{
+		DataDir: dir, Dialer: w.dialer(name), Token: "tok",
 		ArtifactURL: w.http.URL + "/v1/artifacts", Allow: []string{"127.0.0.1"}, AllowPrivate: []string{"127.0.0.1", "localhost"},
-		BrokerRootCAs: roots,
-	})
+	}
+	if adjust != nil {
+		adjust(&opts)
+	}
+	n, err := node.New(opts)
 	if err != nil {
 		w.t.Fatal(err)
 	}
@@ -149,7 +182,12 @@ func (w *world) nodeWithBrokerRoots(name string, labels map[string]string, roots
 }
 
 func (w *world) client(name string) *client.Client {
-	c := client.New(client.Options{Dialer: w.dialer(name), Token: "tok", Principal: "a_" + name})
+	return w.clientWithToken(name, "tok")
+}
+
+// clientWithToken connects as whichever subject the server maps token to.
+func (w *world) clientWithToken(name, token string) *client.Client {
+	c := client.New(client.Options{Dialer: w.dialer(name), Token: token, Principal: "a_" + name, ArtifactURL: w.http.URL + "/v1/artifacts"})
 	w.t.Cleanup(func() { c.Close() })
 	return c
 }
@@ -248,18 +286,56 @@ func TestExecEndToEnd(t *testing.T) {
 	if !names["src"] || !names[".remount"] || len(ents) != 2 {
 		t.Fatalf("%+v", ents)
 	}
-	// Events made it to the control plane's canonical log.
-	evs, err := c.ReadEvents(ctx, 1, ws.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	types := map[string]int{}
-	for _, e := range evs {
-		types[e.Type]++
+	// Events made it to the control plane's canonical log. Node events travel
+	// through an asynchronous outbox, so wait for the last command's s.exited
+	// rather than asserting on a single read.
+	var evs []proto.Event
+	var types map[string]int
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		evs, err = c.ReadEvents(ctx, 1, ws.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		types = map[string]int{}
+		for _, e := range evs {
+			types[e.Type]++
+		}
+		if types[proto.EvSExited] >= types[proto.EvSOpened] && types[proto.EvSOpened] > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	for _, want := range []string{proto.EvWSCreated, proto.EvWSClaimed, proto.EvSOpened, proto.EvSExited, proto.EvFSWrite, proto.EvFSEdit} {
 		if types[want] == 0 {
 			t.Errorf("missing event %s in %v", want, types)
+		}
+	}
+	// Session events carry their session id as a first-class field, and the
+	// opened/exited pair of one command agree, so `events --session` needs no
+	// payload parsing.
+	opened := map[string]int{}
+	for _, e := range evs {
+		switch e.Type {
+		case proto.EvSOpened, proto.EvSExited:
+			if e.Session == "" {
+				t.Errorf("%s seq %d lacks session", e.Type, e.Seq)
+			}
+			var payload struct {
+				S string `cbor:"s"`
+			}
+			if err := proto.Unmarshal(e.Payload, &payload); err != nil || payload.S != e.Session {
+				t.Errorf("%s session %q payload %q err %v", e.Type, e.Session, payload.S, err)
+			}
+			opened[e.Session]++
+		default:
+			if e.Session != "" {
+				t.Errorf("%s seq %d attributed to session %q", e.Type, e.Seq, e.Session)
+			}
+		}
+	}
+	for sid, n := range opened {
+		if n != 2 {
+			t.Errorf("session %s has %d s.* events, want opened+exited", sid, n)
 		}
 	}
 	// Node status and lists.
@@ -791,6 +867,13 @@ func TestSecretBlindWorkspace(t *testing.T) {
 		switch e.Type {
 		case proto.EvCredUsed:
 			used++
+			var payload struct {
+				Status int    `cbor:"status"`
+				Error  string `cbor:"error"`
+			}
+			if err := proto.Unmarshal(e.Payload, &payload); err != nil || payload.Status != 200 || payload.Error != "" {
+				t.Errorf("cred.used records upstream outcome: %+v %v", payload, err)
+			}
 		case proto.EvEgressDenied:
 			denied++
 		}
@@ -812,6 +895,61 @@ func TestSecretBlindWorkspace(t *testing.T) {
 	})
 	if found {
 		t.Fatal("secret on workspace disk")
+	}
+}
+
+// D1: a workspace whose broker is not on loopback (Docker's
+// host.docker.internal) still reaches $REMOUNT_BROKER directly when a
+// proxy-honoring client has HTTPS_PROXY set: one substituted cred.used, no
+// leak_blocked. 127.0.0.2 stands in for the container-visible host address.
+func TestProxyHonoringClientReachesNonLoopbackBroker(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.2:0")
+	if err != nil {
+		t.Skipf("127.0.0.2 not bindable: %v", err)
+	}
+	probe.Close()
+	var gotAuth atomic.Value
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth.Store(r.Header.Get("Authorization"))
+		io.WriteString(w, "ok")
+	}))
+	defer up.Close()
+	upHost := strings.TrimPrefix(up.URL, "https://")
+	w := newWorld(t, control.Binding{ID: "b_api", Secret: "sk-REAL-SECRET", Destinations: []string{upHost}, TTLSec: 60})
+	roots := x509.NewCertPool()
+	roots.AddCert(up.Certificate())
+	w.nodeWith("n1", func(o *node.Options) { o.BrokerRootCAs, o.BrokerAdvertiseHost = roots, "127.0.0.2" })
+	c := w.client("c1")
+	ws := mustWS(t, c, proto.WorkspaceSpec{
+		Bindings: []string{"b_api"},
+		Env:      map[string]string{"API_KEY": "ref:b_api", "API_URL": "${REMOUNT_BROKER}/d/" + upHost},
+	})
+	ctx := ctxT(t, 60*time.Second)
+	out, _, _, _ := c.Run(ctx, ws.ID, "sh", "-c", `echo "$REMOUNT_BROKER"; echo "$HTTPS_PROXY"; echo "$NO_PROXY"`)
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 3 || !strings.HasPrefix(lines[0], "http://127.0.0.2:") || !strings.Contains(lines[1], "@127.0.0.2:") || !strings.Contains(","+lines[2]+",", ",127.0.0.2,") {
+		t.Fatalf("env: %q", out)
+	}
+	out, errb, exit, _ := c.Run(ctx, ws.ID, "sh", "-c", `curl -s -H "Authorization: Bearer $API_KEY" "$API_URL/v1/thing"`)
+	if exit.Code != 0 || string(out) != "ok" {
+		t.Fatalf("curl failed: %d %q %q", exit.Code, out, errb)
+	}
+	if gotAuth.Load() != "Bearer sk-REAL-SECRET" {
+		t.Fatalf("upstream saw %v", gotAuth.Load())
+	}
+	time.Sleep(200 * time.Millisecond)
+	evs, _ := c.ReadEvents(ctx, 1, ws.ID)
+	var used, denied int
+	for _, e := range evs {
+		switch e.Type {
+		case proto.EvCredUsed:
+			used++
+		case proto.EvEgressDenied:
+			denied++
+		}
+	}
+	if used != 1 || denied != 0 {
+		t.Fatalf("cred.used=%d egress.denied=%d", used, denied)
 	}
 }
 

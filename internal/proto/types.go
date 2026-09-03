@@ -1,6 +1,10 @@
 package proto
 
-import "time"
+import (
+	"path"
+	"strings"
+	"time"
+)
 
 // ---------------------------------------------------------------------------
 // hello
@@ -81,6 +85,9 @@ type BackendSecurityCaps struct {
 type RuntimeCaps struct {
 	Snapshots string `cbor:"snapshots" json:"snapshots"` // fs | fs+mem
 	Display   bool   `cbor:"display,omitempty" json:"display,omitempty"`
+	// MountPath: the backend can materialize a workspace at an arbitrary
+	// WorkspaceSpec.MountPath inside the workspace's mount namespace.
+	MountPath bool `cbor:"mount_path,omitempty" json:"mount_path,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +133,7 @@ type WorkspaceSpec struct {
 	Labels      map[string]string `cbor:"labels,omitempty" json:"labels,omitempty"`
 	Image       string            `cbor:"image,omitempty" json:"image,omitempty"`               // backend-specific (docker image); ignored by process
 	RestoreFrom string            `cbor:"restore_from,omitempty" json:"restore_from,omitempty"` // artifact id to restore the filesystem from
+	Base        string            `cbor:"base,omitempty" json:"base,omitempty"`                 // tenant base name; control resolves it into RestoreFrom at create
 	Requires    Requires          `cbor:"requires" json:"requires"`
 	Placement   Placement         `cbor:"placement" json:"placement"`
 	Bindings    []string          `cbor:"bindings,omitempty" json:"bindings,omitempty"`   // secret binding ids this workspace may use
@@ -135,6 +143,45 @@ type WorkspaceSpec struct {
 	Exclude     []string          `cbor:"exclude,omitempty" json:"exclude,omitempty"` // snapshot path globs to skip (node_modules, .venv …)
 	Security    SecuritySpec      `cbor:"security,omitempty" json:"security,omitempty"`
 	ACL         WorkspaceACL      `cbor:"acl,omitempty" json:"acl,omitempty"`
+	// MountPath is where the workspace filesystem appears inside the
+	// workspace's own mount namespace; "" means DefaultMountPath. Harnesses
+	// key state on the working directory, so a handoff sets this to the
+	// local checkout's path and their --continue/--resume find that state
+	// unchanged. Only backends that advertise RuntimeCaps.MountPath may claim
+	// a workspace that sets it.
+	MountPath string `cbor:"mount_path,omitempty" json:"mount_path,omitempty"`
+	// Repo is cloned into the tree by the node, through its own broker,
+	// before ws.ready. It is exclusive with RestoreFrom and Base: a wake or
+	// move restores the snapshot instead and never clones again.
+	Repo RepoSpec `cbor:"repo,omitempty" json:"repo,omitempty"`
+}
+
+// DefaultMountPath is where a workspace is materialized when the spec does
+// not say otherwise.
+const DefaultMountPath = "/work"
+
+// ValidateMountPath rejects a MountPath a node could not honor safely: it
+// must be absolute, clean, not the filesystem root and not under the node's
+// own reserved paths.
+func ValidateMountPath(p string) error {
+	if p == "" {
+		return nil
+	}
+	if len(p) > 1024 {
+		return Err(CodeBadRequest, "mount_path is longer than 1024 bytes")
+	}
+	if !strings.HasPrefix(p, "/") {
+		return Err(CodeBadRequest, "mount_path %q must be absolute", p)
+	}
+	if path.Clean(p) != p || strings.Contains(p, "\x00") {
+		return Err(CodeBadRequest, "mount_path %q must be a clean path", p)
+	}
+	for _, reserved := range []string{"/", "/proc", "/sys", "/dev", "/etc", "/bin", "/sbin", "/lib", "/usr", "/var", "/run", "/boot"} {
+		if p == reserved || strings.HasPrefix(p, reserved+"/") {
+			return Err(CodeBadRequest, "mount_path %q is a system path", p)
+		}
+	}
+	return nil
 }
 
 const (
@@ -192,6 +239,11 @@ type EgressRule struct {
 	MaxRequestBytes  int64    `cbor:"max_request_bytes,omitempty" json:"max_request_bytes,omitempty"`
 	MaxResponseBytes int64    `cbor:"max_response_bytes,omitempty" json:"max_response_bytes,omitempty"`
 	SharedState      string   `cbor:"shared_state,omitempty" json:"shared_state,omitempty"`
+	// Repos names the repositories a git connector rule covers as
+	// "owner/name" or "owner/*"; Push additionally permits git-receive-pack.
+	// Both are refused on every other connector.
+	Repos []string `cbor:"repos,omitempty" json:"repos,omitempty"`
+	Push  bool     `cbor:"push,omitempty" json:"push,omitempty"`
 }
 
 type AuditPolicy struct {
@@ -204,6 +256,17 @@ type WorkspaceACL struct {
 	Readers []string `cbor:"readers,omitempty" json:"readers,omitempty"`
 	Writers []string `cbor:"writers,omitempty" json:"writers,omitempty"`
 }
+
+// AuthzRevocation is one principal losing access to a workspace at one
+// authorization revision.
+type AuthzRevocation struct {
+	Revision  uint64 `cbor:"rev" json:"rev"`
+	Principal string `cbor:"principal" json:"principal"`
+}
+
+// MaxRetainedRevocations bounds Workspace.Revocations. A node whose known
+// revision is older than the oldest retained entry is told to reset.
+const MaxRetainedRevocations = 64
 
 // Idle policies (durations in seconds; 0 = disabled).
 type Idle struct {
@@ -225,6 +288,12 @@ type Workspace struct {
 	Tenant        string        `cbor:"tenant,omitempty" json:"tenant,omitempty"`
 	Owner         string        `cbor:"owner,omitempty" json:"owner,omitempty"`
 	AuthzRevision uint64        `cbor:"authz_revision,omitempty" json:"authz_revision,omitempty"`
+	// Revocations records which principals lost access at which authorization
+	// revision, newest last, so a node renewing from an older revision learns
+	// exactly whose sessions to close. Entries below RevocationFloor have been
+	// pruned; a node behind the floor must fail closed for the whole workspace.
+	Revocations     []AuthzRevocation `cbor:"revocations,omitempty" json:"revocations,omitempty"`
+	RevocationFloor uint64            `cbor:"revocation_floor,omitempty" json:"revocation_floor,omitempty"`
 	// QuarantineOperation identifies the durable fleet operation that fenced
 	// this workspace. It prevents restart reconciliation from treating an
 	// incident response as an ordinary transient failure.
@@ -244,6 +313,7 @@ const (
 	OpWSMove           = "ws.move"            // WSMoveReq -> Workspace (re-queued)
 	OpWSSleep          = "ws.sleep"           // WSSleepReq -> Timer
 	OpWSWake           = "ws.wake"            // WSGetReq -> Workspace
+	OpWSACL            = "ws.acl"             // WSACLReq -> Workspace (bumps authz_revision)
 	OpWSClaim          = "ws.claim"           // node: WSClaimReq -> WSClaimRes
 	OpWSRenew          = "ws.renew"           // node: WSRenewReq -> WSRenewRes
 	OpWSReleased       = "ws.released"        // node: WSReleasedReq -> {}
@@ -262,6 +332,13 @@ const (
 	OpFleetQuarantine  = "fleet.quarantine"   // FleetQuarantineReq -> FleetOperation
 	OpFleetGet         = "fleet.get"          // FleetGetReq -> FleetOperation
 	OpFleetList        = "fleet.list"         // -> FleetListRes
+	OpBaseCreate       = "base.create"        // BaseCreateReq -> Base (pins a snapshot under a tenant-scoped name)
+	OpBaseList         = "base.list"          // -> BaseListRes
+	OpBaseRemove       = "base.remove"        // BaseRemoveReq -> {}
+	OpQueueCreate      = "queue.create"       // QueueCreateReq -> Queue (durable task list for one workspace)
+	OpQueueGet         = "queue.get"          // QueueGetReq -> Queue
+	OpQueueList        = "queue.list"         // QueueListReq -> QueueListRes
+	OpQueueAdvance     = "queue.advance"      // QueueAdvanceReq -> Queue (records one task's outcome, moves the cursor)
 )
 
 type WSCreateReq struct {
@@ -294,6 +371,15 @@ type WSSleepReq struct {
 	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
 }
 
+// WSACLReq replaces a workspace's ACL. Principals present before and absent
+// after are revoked: their grants stop verifying and their live sessions are
+// closed within one renew interval.
+type WSACLReq struct {
+	ID             string       `cbor:"id" json:"id"`
+	ACL            WorkspaceACL `cbor:"acl" json:"acl"`
+	IdempotencyKey string       `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
 type WSClaimReq struct {
 	ID string `cbor:"id" json:"id"`
 }
@@ -311,6 +397,9 @@ type WSReadyReq struct {
 type WSRenewReq struct {
 	IDs []string          `cbor:"ids" json:"ids"`
 	Gen map[string]uint64 `cbor:"gen,omitempty" json:"gen,omitempty"`
+	// Authz is the authorization revision the node currently enforces for
+	// each workspace (authz-push). Control answers with what changed since.
+	Authz map[string]uint64 `cbor:"authz,omitempty" json:"authz,omitempty"`
 }
 
 // WSRenewResult is the control plane's affirmative ownership decision for
@@ -323,6 +412,14 @@ type WSRenewResult struct {
 	AuthoritativeGen uint64 `cbor:"authoritative_gen,omitempty" json:"authoritative_gen,omitempty"`
 	LeaseUntil       int64  `cbor:"lease_until,omitempty" json:"lease_until,omitempty"`
 	Action           string `cbor:"action" json:"action"` // continue | fence | destroy | reconcile
+	// AuthzRevision is the authoritative authorization revision (authz-push).
+	// Revoked lists principals that lost access after the revision the node
+	// reported in WSRenewReq.Authz. AuthzReset means the node's revision is
+	// older than the retained history: every session of the workspace must be
+	// closed because control cannot name the affected principals.
+	AuthzRevision uint64   `cbor:"authz_revision,omitempty" json:"authz_revision,omitempty"`
+	Revoked       []string `cbor:"revoked,omitempty" json:"revoked,omitempty"`
+	AuthzReset    bool     `cbor:"authz_reset,omitempty" json:"authz_reset,omitempty"`
 }
 
 type WSRenewRes struct {
@@ -334,6 +431,10 @@ type WSReleasedReq struct {
 	Gen      uint64 `cbor:"gen" json:"gen"`
 	Snapshot string `cbor:"snapshot,omitempty" json:"snapshot,omitempty"` // artifact id, if one was taken
 	Reason   string `cbor:"reason,omitempty" json:"reason,omitempty"`
+	// Failed marks a release caused by a materialization that could not
+	// complete (restore, clone, policy). Control holds the workspace out of
+	// placement with a growing delay instead of re-offering it immediately.
+	Failed bool `cbor:"failed,omitempty" json:"failed,omitempty"`
 	// Preparing is returned by a duplicate ws.release while the original
 	// checkpoint is still running. It lets control poll without accumulating
 	// blocked request handlers after a response timeout or reconnect.
@@ -435,6 +536,147 @@ type FleetListRes struct {
 	Operations []FleetOperation `cbor:"operations" json:"operations"`
 }
 
+// Base is a named, tenant-scoped snapshot that new workspaces can start from.
+// The artifact stays pinned against garbage collection until the base is
+// removed, which is what distinguishes it from a workspace's last snapshot.
+type Base struct {
+	Name      string `cbor:"name" json:"name"`
+	Tenant    string `cbor:"tenant" json:"tenant"`
+	Owner     string `cbor:"owner" json:"owner"`
+	Artifact  string `cbor:"artifact" json:"artifact"`
+	Workspace string `cbor:"workspace,omitempty" json:"workspace,omitempty"` // the workspace it was snapshotted from, when known
+	Bytes     int64  `cbor:"bytes,omitempty" json:"bytes,omitempty"`
+	CreatedAt int64  `cbor:"created_at" json:"created_at"`
+}
+
+// BaseCreateReq pins an uploaded artifact under a base name in the caller's
+// tenant. Names are unique per tenant; a second create with the same name is a
+// conflict unless it replays the same idempotency key.
+type BaseCreateReq struct {
+	Name           string `cbor:"name" json:"name"`
+	Artifact       string `cbor:"artifact" json:"artifact"`
+	Workspace      string `cbor:"workspace,omitempty" json:"workspace,omitempty"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// BaseListRes lists the bases visible to the caller, sorted by name.
+type BaseListRes struct {
+	Bases []Base `cbor:"bases" json:"bases"`
+}
+
+// Queue states.
+const (
+	QueueRunning = "running" // a task is running or is due to run next
+	QueueDone    = "done"    // every task finished with exit 0
+	QueueFailed  = "failed"  // Items[Cursor] exited non-zero; the cursor stays on it
+)
+
+// QueueItem is one task of a Queue with its outcome once it has run. Task text
+// is control-plane data, never written into the workspace; events about the
+// item carry only its index and exit.
+type QueueItem struct {
+	Task       string `cbor:"task" json:"task"`
+	Session    string `cbor:"session,omitempty" json:"session,omitempty"`
+	Exit       int    `cbor:"exit,omitempty" json:"exit,omitempty"`
+	Signal     string `cbor:"signal,omitempty" json:"signal,omitempty"`
+	Attempts   int    `cbor:"attempts,omitempty" json:"attempts,omitempty"`
+	FinishedAt int64  `cbor:"finished_at,omitempty" json:"finished_at,omitempty"`
+}
+
+// Queue is a durable, ordered list of harness tasks for one workspace
+// (ADR 0041). It survives moves of the workspace and restarts of the control
+// plane because it is a control-plane resource; a driver reads it back and
+// continues from Cursor.
+type Queue struct {
+	ID     string      `cbor:"id" json:"id"`
+	WS     string      `cbor:"ws" json:"ws"`
+	Tenant string      `cbor:"tenant" json:"tenant"`
+	Owner  string      `cbor:"owner" json:"owner"`
+	Recipe string      `cbor:"recipe,omitempty" json:"recipe,omitempty"`
+	Items  []QueueItem `cbor:"items" json:"items"`
+	Cursor int         `cbor:"cursor" json:"cursor"` // index of the next task to run; len(Items) when done
+	Status string      `cbor:"status" json:"status"`
+	// SleepAfterSec and SleepUntil record the pause between tasks the driver
+	// asked for, so a resumed driver honors the same rhythm.
+	SleepAfterSec int64  `cbor:"sleep_after_sec,omitempty" json:"sleep_after_sec,omitempty"`
+	SleepUntil    string `cbor:"sleep_until,omitempty" json:"sleep_until,omitempty"` // HH:MM, local to the driver
+	CreatedAt     int64  `cbor:"created_at" json:"created_at"`
+	UpdatedAt     int64  `cbor:"updated_at" json:"updated_at"`
+}
+
+// Queue bounds. A queue is control-plane state written by a driver that may
+// be a script, so the task list is sized like a request, not like a file.
+const (
+	MaxQueueItems    = 256
+	MaxQueueTaskSize = 16 << 10
+)
+
+// ValidateQueueTasks is the admission check for a queue's task list, shared
+// by the control plane and the CLI so a bad file is refused before anything
+// is created.
+func ValidateQueueTasks(tasks []string) error {
+	if len(tasks) == 0 {
+		return Err(CodeBadRequest, "queue needs at least one task")
+	}
+	if len(tasks) > MaxQueueItems {
+		return Err(CodeBadRequest, "queue has %d tasks; the limit is %d", len(tasks), MaxQueueItems)
+	}
+	for i, t := range tasks {
+		if strings.TrimSpace(t) == "" {
+			return Err(CodeBadRequest, "queue task %d is empty", i)
+		}
+		if len(t) > MaxQueueTaskSize {
+			return Err(CodeBadRequest, "queue task %d is %d bytes; the limit is %d", i, len(t), MaxQueueTaskSize)
+		}
+	}
+	return nil
+}
+
+// QueueCreateReq creates a queue for a workspace the caller may write. One
+// unfinished queue per workspace: a second create is a conflict.
+type QueueCreateReq struct {
+	WS             string   `cbor:"ws" json:"ws"`
+	Recipe         string   `cbor:"recipe,omitempty" json:"recipe,omitempty"`
+	Tasks          []string `cbor:"tasks" json:"tasks"`
+	SleepAfterSec  int64    `cbor:"sleep_after_sec,omitempty" json:"sleep_after_sec,omitempty"`
+	SleepUntil     string   `cbor:"sleep_until,omitempty" json:"sleep_until,omitempty"`
+	IdempotencyKey string   `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// QueueGetReq fetches one queue.
+type QueueGetReq struct {
+	ID string `cbor:"id" json:"id"`
+}
+
+// QueueListReq lists the caller's queues, optionally for one workspace.
+type QueueListReq struct {
+	WS string `cbor:"ws,omitempty" json:"ws,omitempty"`
+}
+
+// QueueListRes is the queues visible to the caller, oldest first.
+type QueueListRes struct {
+	Queues []Queue `cbor:"queues" json:"queues"`
+}
+
+// QueueAdvanceReq records the outcome of Items[Index], which must be the
+// cursor. Exit 0 moves the cursor on; anything else marks the queue failed
+// and leaves the cursor so a later driver can retry.
+type QueueAdvanceReq struct {
+	ID             string `cbor:"id" json:"id"`
+	Index          int    `cbor:"index" json:"index"`
+	Session        string `cbor:"session,omitempty" json:"session,omitempty"`
+	Exit           int    `cbor:"exit" json:"exit"`
+	Signal         string `cbor:"signal,omitempty" json:"signal,omitempty"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// BaseRemoveReq unpins a base. Workspaces already created from it keep their
+// own RestoreFrom reference, so their artifact is unaffected.
+type BaseRemoveReq struct {
+	Name           string `cbor:"name" json:"name"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
 type NodeStatus struct {
 	ID         string            `cbor:"id" json:"id"`
 	Labels     map[string]string `cbor:"labels,omitempty" json:"labels,omitempty"`
@@ -442,6 +684,7 @@ type NodeStatus struct {
 	Online     bool              `cbor:"online" json:"online"`
 	LastSeen   int64             `cbor:"last_seen" json:"last_seen"`
 	Workspaces []string          `cbor:"workspaces,omitempty" json:"workspaces,omitempty"`
+	Protocol   []string          `cbor:"protocol,omitempty" json:"protocol,omitempty"` // capabilities negotiated at the node's last hello
 }
 
 type EventsTailReq struct {
@@ -470,6 +713,7 @@ type Event struct {
 	Tenant      string `cbor:"tenant,omitempty" json:"tenant,omitempty"`
 	Workspace   string `cbor:"workspace,omitempty" json:"workspace,omitempty"`
 	Generation  uint64 `cbor:"generation,omitempty" json:"generation,omitempty"`
+	Session     string `cbor:"session,omitempty" json:"session,omitempty"` // session id for s.* events
 	OperationID string `cbor:"operation_id,omitempty" json:"operation_id,omitempty"`
 	ProducerSeq uint64 `cbor:"producer_seq,omitempty" json:"producer_seq,omitempty"`
 	Type        string `cbor:"type" json:"type"`
@@ -571,6 +815,10 @@ const (
 	OpFSRename = "fs.rename"
 	OpFSSearch = "fs.search"
 	OpFSEdit   = "fs.edit"
+	// OpFSApplyTar overlays an uploaded artifact onto the workspace tree:
+	// FSApplyTarReq -> FSApplyTarRes. Every file lands atomically by rename;
+	// nothing the archive does not name is removed.
+	OpFSApplyTar = "fs.apply_tar"
 
 	OpWSSnapshot         = "ws.snapshot"          // WSSnapshotReq -> WSSnapshotRes
 	OpWSRelease          = "ws.release"           // control -> node: WSReleaseReq -> WSReleasedReq
@@ -588,6 +836,11 @@ const (
 	SessionExec = "exec" // pipes: stdout/stderr separate
 	SessionPTY  = "pty"  // pseudo-terminal: single stream
 	SessionPort = "port" // TCP forward: bytes both ways
+	// SessionACP is a record-only transcript: the node's agent runner appends
+	// every ACP frame it exchanges with the harness (StreamACPIn from the
+	// harness, StreamACPOut to it) plus the harness's stderr. Clients cannot
+	// open one; they attach to the one an agent run created.
+	SessionACP = "acp"
 )
 
 // Chunk streams.
@@ -597,6 +850,8 @@ const (
 	StreamExit   = 3 // Data = CBOR ExitInfo
 	StreamInfo   = 4 // Data = CBOR SessionInfo (emitted once at open, replayable)
 	StreamGap    = 5 // Data = CBOR Gap: chunks before this were evicted
+	StreamACPIn  = 6 // Data = ACPFrameRecord: a JSON-RPC line the harness sent
+	StreamACPOut = 7 // Data = ACPFrameRecord: a JSON-RPC line Remount sent to the harness
 )
 
 // ChunkBody is the payload of a chunk frame.
@@ -609,7 +864,14 @@ type ExitInfo struct {
 	Code   int    `cbor:"code" json:"code"`
 	Signal string `cbor:"signal,omitempty" json:"signal,omitempty"`
 	Error  string `cbor:"error,omitempty" json:"error,omitempty"` // failed to start, etc.
+	// Reason names why the node ended the session when the process did not
+	// end on its own; empty for an ordinary exit.
+	Reason string `cbor:"reason,omitempty" json:"reason,omitempty"`
 }
+
+// ExitReasonRevoked marks a session the node closed because its principal
+// lost access to the workspace.
+const ExitReasonRevoked = "revoked"
 
 type SessionInfo struct {
 	ID       string   `cbor:"id" json:"id"`
@@ -618,6 +880,48 @@ type SessionInfo struct {
 	Program  []string `cbor:"program,omitempty" json:"program,omitempty"`
 	PID      int      `cbor:"pid,omitempty" json:"pid,omitempty"`
 	OpenedAt int64    `cbor:"opened_at" json:"opened_at"`
+	Run      *RunInfo `cbor:"run,omitempty" json:"run,omitempty"`
+}
+
+// RunInfo marks a session as a harness launch (`remount run`). The node
+// records it so run.started and run.finished are emitted by the peer that
+// observes the process, not by a client that may have detached.
+type RunInfo struct {
+	Recipe string `cbor:"recipe" json:"recipe"`
+	// TaskHash is a short digest of the task text; the text itself is never
+	// put in the event log.
+	TaskHash string `cbor:"task_hash,omitempty" json:"task_hash,omitempty"`
+	Sandbox  string `cbor:"sandbox,omitempty" json:"sandbox,omitempty"`
+	// Auth is RunAuthAPIKey or RunAuthWorkspaceResident.
+	Auth string `cbor:"auth,omitempty" json:"auth,omitempty"`
+}
+
+// RunInfo.Auth values.
+const (
+	// RunAuthAPIKey: the harness reads a brokered provider key placeholder
+	// from the environment.
+	RunAuthAPIKey = "api_key"
+	// RunAuthWorkspaceResident: the harness keeps its own login token in the
+	// workspace, outside the broker's view.
+	RunAuthWorkspaceResident = "workspace_resident"
+)
+
+// Validate rejects a RunInfo the node should not record.
+func (r *RunInfo) Validate() error {
+	if r == nil {
+		return nil
+	}
+	if r.Recipe == "" || len(r.Recipe) > 64 {
+		return Err(CodeBadRequest, "run.recipe is required and at most 64 bytes")
+	}
+	if len(r.TaskHash) > 64 || len(r.Sandbox) > 32 {
+		return Err(CodeBadRequest, "run.task_hash or run.sandbox too long")
+	}
+	switch r.Auth {
+	case "", RunAuthAPIKey, RunAuthWorkspaceResident:
+		return nil
+	}
+	return Err(CodeBadRequest, "run.auth must be %s or %s", RunAuthAPIKey, RunAuthWorkspaceResident)
 }
 
 type Gap struct {
@@ -641,6 +945,8 @@ type SOpenReq struct {
 	Grant *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 	// Subscribe: if true (default) chunks are streamed to this client from seq 0.
 	NoSubscribe bool `cbor:"no_sub,omitempty" json:"no_sub,omitempty"`
+	// Run marks a harness launch; see RunInfo.
+	Run *RunInfo `cbor:"run,omitempty" json:"run,omitempty"`
 }
 
 type SOpenRes struct {
@@ -839,6 +1145,23 @@ type FSEditRes struct {
 	Replacements int `cbor:"replacements" json:"replacements"`
 }
 
+// FSApplyTarReq names an artifact already present in the control plane's
+// store (uploaded with PUT /v1/artifacts/{id}) to overlay onto the workspace.
+type FSApplyTarReq struct {
+	WS             string `cbor:"ws" json:"ws"`
+	Artifact       string `cbor:"artifact" json:"artifact"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+}
+
+// FSApplyTarRes reports what the overlay wrote. Files counts regular files
+// and symlinks that were created or replaced.
+type FSApplyTarRes struct {
+	Files int   `cbor:"files" json:"files"`
+	Dirs  int   `cbor:"dirs" json:"dirs"`
+	Bytes int64 `cbor:"bytes" json:"bytes"`
+}
+
 // ---- workspace on node ----
 
 type WSSnapshotReq struct {
@@ -850,6 +1173,10 @@ type WSSnapshotReq struct {
 	Authoritative  bool   `cbor:"authoritative,omitempty" json:"authoritative,omitempty"`
 	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
 	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+	// Gen fences a control-plane-issued snapshot (agent fork) to the workspace
+	// generation the control plane believes the node holds. Clients leave it
+	// zero; their grant carries the generation.
+	Gen uint64 `cbor:"gen,omitempty" json:"gen,omitempty"`
 }
 
 type WSSnapshotRes struct {
@@ -1055,10 +1382,13 @@ const (
 	EvWSLeaseExpired = "ws.lease_expired"
 	EvWSFenced       = "ws.fenced"
 	EvWSStateChanged = "ws.state_changed"
+	EvWSACL          = "ws.acl"        // ACL replaced; payload names revoked principals and the new revision
+	EvAuthzRevoked   = "authz.revoked" // node closed a revoked principal's sessions
 	EvSOpened        = "s.opened"
 	EvSExited        = "s.exited"
 	EvSInput         = "s.input"
 	EvFSWrite        = "fs.write"
+	EvFSApplyTar     = "fs.apply_tar" // one overlay applied; payload carries artifact and counts, fs.write follows per path
 	EvFSMkdir        = "fs.mkdir"
 	EvFSEdit         = "fs.edit"
 	EvFSRemove       = "fs.remove"
@@ -1073,5 +1403,12 @@ const (
 	EvFleetRequested = "fleet.quarantine.requested"
 	EvFleetTarget    = "fleet.quarantine.target"
 	EvFleetCompleted = "fleet.quarantine.completed"
-	EvWSOffer        = "ws.offer" // control -> node (not logged; a hint to claim)
+	EvBaseCreated    = "base.created"
+	EvBaseRemoved    = "base.removed"
+	EvQueueCreated   = "queue.created"           // payload {queue, ws, items}
+	EvQueueAdvanced  = "queue.advanced"          // one queued task finished; payload {queue, index, exit, status}
+	EvRunStarted     = "run.started"             // a harness launch opened its session; payload {s, recipe, task_hash, sandbox, auth}
+	EvRunFinished    = "run.finished"            // that session exited; payload {s, recipe, exit, signal}
+	EvAuthWSResident = "auth.workspace_resident" // a launch relies on a login the harness keeps inside the workspace; payload {s, recipe}
+	EvWSOffer        = "ws.offer"                // control -> node (not logged; a hint to claim)
 )

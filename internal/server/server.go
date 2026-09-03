@@ -76,6 +76,27 @@ type Options struct {
 	MaxMutationRecords      int
 	MaxTimers               int
 	MaxTimersPerWorkspace   int
+	// PublicURL is the externally reachable base (https://host) that agent
+	// URLs are minted under; empty leaves Agent.URL empty.
+	PublicURL string
+	// AgentURLBase, when set, makes GET /a/{id} redirect to an operator UI:
+	// "{id}" in it is replaced, otherwise the id is appended. Empty serves
+	// the agent as JSON.
+	AgentURLBase string
+	// CORSOrigins lists browser origins allowed to call the API; "*" allows
+	// any origin without credentials. Empty disables CORS headers.
+	CORSOrigins []string
+	// MaxAPIClients bounds distinct credentials with an open in-process SDK
+	// client at once; APIClientIdle closes one unused that long. Defaults
+	// 256 and 10 minutes.
+	MaxAPIClients int
+	APIClientIdle time.Duration
+	// WebhookSecret lets POST /v1/events authenticate with an HMAC-SHA256 of
+	// the body (X-Remount-Signature or X-Hub-Signature-256: sha256=<hex>)
+	// instead of a bearer. WebhookToken is the credential a signed request's
+	// agent actions run as; empty leaves signed requests append-only.
+	WebhookSecret string
+	WebhookToken  string
 }
 
 const (
@@ -109,6 +130,11 @@ type Server struct {
 	gcCtx       context.Context
 	gcCancel    context.CancelFunc
 	gcWG        sync.WaitGroup
+	// lifetime ends at Close; in-process API clients and their relay sides
+	// live on it rather than on any one request.
+	lifetime       context.Context
+	lifetimeCancel context.CancelFunc
+	clients        *clientPool
 }
 
 // New builds a server. Call Serve or Handler.
@@ -207,7 +233,7 @@ func New(opts Options) (*Server, error) {
 		SecurityProfileFloor: floor, MaxWorkspacesPerTenant: opts.MaxWorkspacesPerTenant,
 		MaxWorkspacesPerSubject: opts.MaxWorkspacesPerSubject, MaxMutationRecords: opts.MaxMutationRecords,
 		MaxTimers: opts.MaxTimers, MaxTimersPerWorkspace: opts.MaxTimersPerWorkspace,
-		MaxConcurrentRequests: opts.MaxConcurrentRequests, MaxEvents: opts.MaxEvents})
+		MaxConcurrentRequests: opts.MaxConcurrentRequests, MaxEvents: opts.MaxEvents, PublicURL: opts.PublicURL})
 	if err != nil {
 		_ = log.Close()
 		if opts.DataDir == "" {
@@ -225,6 +251,17 @@ func New(opts Options) (*Server, error) {
 	if opts.DataDir == "" {
 		s.tempArtDir = artDir
 	}
+	s.lifetime, s.lifetimeCancel = context.WithCancel(context.Background())
+	if opts.MaxAPIClients <= 0 {
+		opts.MaxAPIClients = 256
+	}
+	if opts.APIClientIdle <= 0 {
+		opts.APIClientIdle = 10 * time.Minute
+	}
+	s.opts.MaxAPIClients, s.opts.APIClientIdle = opts.MaxAPIClients, opts.APIClientIdle
+	s.clients = newClientPool(s, opts.MaxAPIClients, opts.APIClientIdle)
+	s.gcWG.Add(1)
+	go s.clientSweepLoop(s.lifetime)
 	if opts.ArtifactGCInterval > 0 || opts.EventGCInterval > 0 || opts.RecordGCInterval > 0 {
 		gcCtx, gcCancel := context.WithCancel(context.Background())
 		s.gcCtx = gcCtx
@@ -243,6 +280,24 @@ func New(opts Options) (*Server, error) {
 		go s.recordGCLoop(s.gcCtx)
 	}
 	return s, nil
+}
+
+func (s *Server) clientSweepLoop(ctx context.Context) {
+	defer s.gcWG.Done()
+	interval := s.opts.APIClientIdle / 4
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			s.clients.sweep(now)
+		}
+	}
 }
 
 func (s *Server) artifactGCLoop(ctx context.Context) {
@@ -425,7 +480,8 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
-	return mux
+	s.apiRoutes(mux)
+	return s.cors(mux)
 }
 
 // Serve listens on addr until ctx ends.
@@ -524,8 +580,10 @@ func (s *Server) Close() error {
 		s.mu.Unlock()
 		if s.gcCancel != nil {
 			s.gcCancel()
-			s.gcWG.Wait()
 		}
+		s.lifetimeCancel()
+		s.clients.close()
+		s.gcWG.Wait()
 		var errs []error
 		if httpServer != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -639,42 +697,4 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
-}
-
-// handleEvents accepts a JSON event and appends it (webhook wake).
-func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var in struct {
-		Type    string          `json:"type"`
-		Stream  string          `json:"stream"`
-		Payload json.RawMessage `json:"payload"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&in); err != nil || in.Type == "" {
-		http.Error(w, "bad event", http.StatusBadRequest)
-		return
-	}
-	var payload any
-	if len(in.Payload) > 0 {
-		_ = json.Unmarshal(in.Payload, &payload)
-	}
-	e := proto.Event{Type: in.Type, Stream: in.Stream, Principal: "webhook"}
-	if payload != nil {
-		e.Payload = proto.MustMarshal(payload)
-	}
-	// Deliberately not r.Context(): the append, the timers it fires and the
-	// offers that follow outlive this HTTP response.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
-	defer cancel()
-	if err := s.Control.PostEvents(ctx, "webhook", []proto.Event{e}); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusAccepted)
 }

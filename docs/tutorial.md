@@ -19,7 +19,39 @@ go build -o remount ./cmd/remount
 remount dev
 ```
 
-## 2. Start standalone and run a command
+## 2. One command
+
+If you have a provider key in your environment, the whole thing is one
+command. `remount run` finds nothing at `http://127.0.0.1:7443`, starts
+`remount standalone` in the background with a data directory under
+`~/.local/share/remount` (or `$XDG_DATA_HOME/remount`, or `$REMOUNT_DATA`),
+writes a bindings file that references your keys by variable name — never by
+value — and picks the binding the recipe consumes.
+
+```sh
+export OPENAI_API_KEY=sk-...
+./remount run opencode --dir . -- 'Create GREETING.txt containing hello.'
+```
+
+```
+started remount standalone in the background (pid 168858, data /home/you/.local/share/remount, log .../standalone.log); stop it with: kill 168858
+provider bindings from the environment: b_openai ($OPENAI_API_KEY)
+using binding b_openai ($OPENAI_API_KEY) for opencode
+workspace ws_06g6d1z9g849pkqcxxfy7z99m4 created
+installing opencode
+session s_06g6d1za3qk2nvrsjq5y3jwn94 (Ctrl-C detaches; reattach with: remount attach ws_… s_…)
+```
+
+The next `remount run` or `remount resume` reuses that standalone. Everything
+in the rest of this tutorial works against it too; skip the `standalone` and
+`export` lines below if you went this way. `REMOUNT_AUTOSTART=0` disables the
+background start, and any explicit `--server` / `REMOUNT_SERVER` or token
+does as well: the CLI only ever starts a server at the default local address.
+The standalone inherits the environment of the `remount run` that started it,
+so after changing a key, stop it (the pid is in `standalone.pid` in the data
+directory) and let the next run start a fresh one.
+
+## 3. Start standalone by hand and run a command
 
 `remount standalone` runs the control plane, the relay and one node in a single
 process. It needs no token and no account. It is how you try things out.
@@ -62,7 +94,7 @@ hello from mac-mini.local
 The exit code of the command becomes the exit code of `remount exec`. Stdout and
 stderr come through on the same streams you would expect.
 
-## 3. An interactive shell
+## 4. An interactive shell
 
 `remount sh` opens a session of kind `pty`. A pty session has a real terminal
 behind it, so line editing, colours, `top` and resizing all work. The default
@@ -84,7 +116,7 @@ $ exit
 travel with it. Terminal resizes are forwarded, and the shell exits when you
 type `exit`.
 
-## 4. The filesystem
+## 5. The filesystem
 
 Every filesystem operation is served by the node and jailed to the workspace
 root. Paths are workspace-relative; `/src/a.go` and `src/a.go` name the same
@@ -126,7 +158,7 @@ or nothing is written and the command tells you why.
 remount: conflict: edit 0: old string not found
 ```
 
-## 5. Reconnect without losing output
+## 6. Reconnect without losing output
 
 Start a command that runs for a while, then kill the client half way through.
 
@@ -167,7 +199,7 @@ gap:
 [remount: output seq 0-311 elided]
 ```
 
-## 6. A second machine, and a move
+## 7. A second machine, and a move
 
 On another computer, enroll it as a node. Only outbound access to the server is
 needed; the node exposes no inbound listener. Labels are how you address groups
@@ -189,9 +221,9 @@ Back on the first machine, confirm both nodes are online:
 ```
 
 ```
-ID                              ONLINE  OS/ARCH       CPU  MEM_MiB  BACKENDS  LABELS                      WORKSPACES
-n_06g67csz3wmes8mengggemdaa4    true    linux/amd64   32   131072   process   map[owner:you zone:gpu]     0
-n_06g67jsx1an8pfy8r9exe5tgyw    true    darwin/arm64  10   32768    process   map[standalone:true]        1
+ID                              ONLINE  OS/ARCH       CPU  MEM_MiB  BACKENDS  PROTOCOL       LABELS                      WORKSPACES
+n_06g67csz3wmes8mengggemdaa4    true    linux/amd64   32   131072   process   v1,authz-push  map[owner:you zone:gpu]     0
+n_06g67jsx1an8pfy8r9exe5tgyw    true    darwin/arm64  10   32768    process   v1,authz-push  map[standalone:true]        1
 ```
 
 Now move the workspace. The current node snapshots the filesystem, the control
@@ -241,7 +273,60 @@ failover state. Request an authoritative checkpoint when recovery must use it.
 The authoritative path fences Remount-managed execution, uploads the blob, and
 commits the digest for the current generation before it reports success.
 
-## 7. Sleep and wake
+### Working from a local checkout
+
+A workspace can start as a copy of a directory on your machine, and changes
+can flow both ways. Packing honors `.gitignore` and `.remountignore`, skips
+`node_modules`, `.venv`, `target`, `dist` and `__pycache__`, and includes
+`.git` so the agent can commit (pass `--include-git=false` to leave it out).
+
+```sh
+WS=$(./remount ws create --dir ~/src/myapp --json | jq -r .id)
+
+# after editing locally: overlay the changed tree onto the workspace
+./remount push $WS --dir ~/src/myapp
+
+# after the agent has worked: bring its tree back, refusing to clobber
+# uncommitted local changes unless you say so
+./remount pull $WS --dir ~/src/myapp
+./remount pull $WS --dir ~/src/myapp --force
+```
+
+`push` never deletes files the archive does not name, and every file lands
+atomically; `pull` never deletes local files either and reports the ones it
+left in place.
+
+### Bases: a prepared workspace many runs start from
+
+Once a workspace has the toolchain installed and the repo cloned, pin its
+snapshot under a name. Every member of your tenant can start from it, and the
+artifact is exempt from garbage collection until the base is removed.
+
+```sh
+./remount ws snapshot $WS --as-base golden
+./remount base ls
+NEW=$(./remount ws create --base golden --json | jq -r .id)
+./remount base rm golden        # workspaces already created from it are unaffected
+```
+
+A base names an artifact, not a workspace: re-snapshotting `$WS` does not move
+`golden`. To update it, `base rm` and snapshot `--as-base` again.
+
+The third way to seed a workspace is a repository. The node clones it through
+the broker before the workspace becomes `claimed`, using a binding's
+placeholder for a private repository (a public one needs no binding), and
+emits `repo.cloned` with the commit it checked out:
+
+```sh
+NEW=$(./remount ws create --repo github.com/acme/app@main --repo-depth 1 --json | jq -r .id)
+./remount exec $NEW -- git log -1 --oneline
+./remount events --ws $NEW | grep repo.cloned
+```
+
+Inside the workspace `git fetch` and `git push` route through
+`$REMOUNT_GIT_CONNECTOR` and reach only that repository.
+
+## 8. Sleep and wake
 
 A sleeping workspace has no node. Its last snapshot is kept, its timers are
 durable, and it costs only storage.
@@ -295,7 +380,7 @@ The workspace wakes within a second of the post.
 ]
 ```
 
-## 8. Secrets the workspace never holds
+## 9. Secrets the workspace never holds
 
 Stop the standalone process and write a bindings file. A binding is a secret,
 the destinations it may be sent to, and the placeholder the workspace will hold
@@ -370,7 +455,110 @@ leaves the machine. An unlisted host with no credential is refused too.
 Nothing on the workspace's disk or in its environment ever contained the real
 key. The audit for all three requests is in the event log.
 
-## 9. Watch everything
+### Run a coding agent with one command
+
+`remount run` does the create, the harness install, the provider wiring and
+the launch in one step. `--binding b_openai` picks the `openai` preset by
+name, so the harness gets `OPENAI_API_KEY=ref:b_openai` and an
+`OPENAI_BASE_URL` that resolves to the broker at run time. Allow the hosts the
+recipe installs from when you start standalone:
+
+```sh
+./remount standalone --data ./data --bindings ./bindings.json \
+  --allow api.openai.com --allow registry.npmjs.org --allow models.dev &
+mkdir -p proj && echo hello > proj/README.md
+./remount run opencode --dir proj --binding b_openai --model openai/gpt-4o-mini \
+  -- 'Create a file named GREETING.txt containing exactly the word hello. Do nothing else.'
+```
+
+```
+workspace ws_06g6c49ka10ptnrcpzk8an8298 created
+installing opencode
+> build · gpt-4o-mini
+← Write GREETING.txt
+I have created a file named **GREETING.txt** containing the word "hello."
+```
+
+Ctrl-C detaches and leaves the agent running; `remount attach WS SID` picks the
+output back up from the start. `--detach` skips the attach and prints the two
+ids and the attach line. The run is in the log as `run.started` and
+`run.finished`, with a hash of the task rather than the task:
+
+```
+    37 06:59:58.574 run.started   ws_06g6c49ka10…  local-user  {"auth":"api_key","recipe":"opencode","s":"s_06g6c49k…","sandbox":"workspace-write","task_hash":"56d7ee2b45f68478"}
+    45 07:01:13.157 run.finished  ws_06g6c49ka10…  local-user  {"exit":0,"recipe":"opencode","s":"s_06g6c49k…","signal":""}
+```
+
+`remount run custom --binding b_openai -- python agent.py` runs anything that
+honors `OPENAI_API_KEY` and `OPENAI_BASE_URL`; `remount binding preset ls`
+lists the other providers. [harness-integration.md](harness-integration.md)
+has the full recipe table and the two kinds of auth.
+
+### Hand off a conversation, and a night's worth of tasks
+
+`remount handoff` moves the checkout you are in *and* the harness's
+conversation into a workspace and keeps it going. The recipe is detected from
+the state under your home directory; the tree lands at the same absolute path
+inside the workspace when the harness keys its history on it, which is why
+this one wants a `docker` node:
+
+```sh
+cd ~/proj
+remount handoff --binding b_anthropic --task "carry on with the failing test"
+```
+
+```
+uploaded 212 files (1840233 bytes) as art_sha256:…
+handed off /home/me/proj (212 files) with claude state .claude,.claude.json to ws_06g6cq… at /home/me/proj
+attach: remount attach ws_06g6cq… s_06g6cq…
+resume later: remount resume ws_06g6cq…
+bring it back: remount pull ws_06g6cq…
+```
+
+Later, from any machine, `remount resume ws_06g6cq…` attaches if the agent is
+still going, wakes the workspace if it went to sleep, and otherwise starts the
+harness's own resume command in the same conversation.
+
+A list of tasks runs the same way, one after another in one workspace, with
+the progress kept on the server so the run survives the workspace sleeping
+and moving:
+
+```sh
+cat > tonight.txt <<'TASKS'
+# one task per line; \ continues a line
+Fix the flaky TestReconnect and make the suite green.
+Update CHANGELOG.md for the 0.4 release.
+Open a PR titled "0.4" with a summary of the changes.
+TASKS
+remount run codex --dir proj --binding b_openai --queue tonight.txt --sleep-after 20m
+```
+
+Each task is a `run` session; between tasks the workspace checkpoints (or here
+sleeps for twenty minutes on a durable timer). A task that exits non-zero stops
+the queue with the cursor on it, and `remount run codex --queue-continue
+q_06g6cr…` retries from there. `remount events --ws WS` shows
+`queue.advanced{index, exit}` per task; the tasks themselves are never in the
+log.
+
+### Sharing a workspace, and taking it back
+
+A workspace's ACL names who else may use it. Only the owner (or an
+administrator) changes it, and every change advances the workspace's
+authorization revision so that every grant already handed out stops verifying.
+
+```sh
+./remount ws acl $WS --writer bob --reader carol
+./remount ws acl $WS --reader carol            # bob is out
+```
+
+Bob is refused a new grant immediately. The node learns the new revision on
+its next lease renew, at most a third of the lease later (10 s by default),
+and ends bob's live sessions with `exit{reason: "revoked"}`. Carol's shell
+keeps running; her client fetches a fresh grant the next time it needs one.
+In standalone mode every client is the same local administrator, so try this
+against `remount server` with an authenticator that tells principals apart.
+
+## 10. Watch everything
 
 Transactional resource rows are the source of lifecycle/recovery truth. The
 event log is the ordered audit and observation history. Follow it live:

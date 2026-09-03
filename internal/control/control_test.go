@@ -98,25 +98,45 @@ func signedNodeHello(t *testing.T, id, token string, info proto.NodeInfo) (proto
 	if err != nil {
 		t.Fatal(err)
 	}
+	return signedNodeHelloWithKey(t, id, token, info, key), key
+}
+
+// signedNodeHelloWithKey signs with a caller-held key so a node can come back
+// after a control-plane restart as itself: the pinned key is durable.
+func signedNodeHelloWithKey(t *testing.T, id, token string, info proto.NodeInfo, key ed25519.PrivateKey) proto.Hello {
+	t.Helper()
 	h := proto.Hello{
-		Peer: id, Role: proto.RoleNode, Token: token, Caps: []string{proto.CapabilityV1}, PubKey: key.Public().(ed25519.PublicKey),
+		Peer: id, Role: proto.RoleNode, Token: token, Caps: proto.PeerCapabilities(), PubKey: key.Public().(ed25519.PublicKey),
 		Node: &info, IssuedAt: time.Now().UnixMilli(), Nonce: make([]byte, 32),
 	}
 	if _, err := rand.Read(h.Nonce); err != nil {
 		t.Fatal(err)
 	}
 	h.Proof = ed25519.Sign(key, proto.HelloProofBytes(h))
-	return h, key
+	return h
 }
 
 func connectNode(t *testing.T, c *Control, id string, info proto.NodeInfo) {
 	t.Helper()
-	h, _ := signedNodeHello(t, id, "node-token", info)
+	connectNodeWithKey(t, c, id, info, nil)
+}
+
+// connectNodeWithKey connects id signing with key, or a fresh key when nil,
+// and returns the key used.
+func connectNodeWithKey(t *testing.T, c *Control, id string, info proto.NodeInfo, key ed25519.PrivateKey) ed25519.PrivateKey {
+	t.Helper()
+	var h proto.Hello
+	if key == nil {
+		h, key = signedNodeHello(t, id, "node-token", info)
+	} else {
+		h = signedNodeHelloWithKey(t, id, "node-token", info, key)
+	}
 	got, _, err := c.Authenticate(context.Background(), &h)
 	if err != nil || got != id {
 		t.Fatalf("Authenticate node = (%q, %v)", got, err)
 	}
 	c.PeerConnected(context.Background(), id, &h)
+	return key
 }
 
 func localSubject() Subject {
@@ -1178,5 +1198,48 @@ func TestFleetEmptySelectionIsDurablyAndObservablyComplete(t *testing.T) {
 	}
 	if requested != 1 || completed != 1 {
 		t.Fatalf("fleet events requested=%d completed=%d", requested, completed)
+	}
+}
+
+func TestMountPathNeedsANamespacedBackend(t *testing.T) {
+	f := newControlFixture(t, "", nil)
+	info := processNodeInfo(0)
+	info.Backends = append(info.Backends, "docker")
+	info.BackendDescriptors = append(info.BackendDescriptors, proto.BackendDescriptor{
+		Name: "docker", Security: proto.BackendSecurityCaps{
+			Isolation: "container", EgressMode: "cooperative_proxy", BrokerIdentity: "token",
+			FilesystemBoundary: "bind_mount", NetworkNamespace: true, DeviceIsolation: true,
+		}, Runtime: proto.RuntimeCaps{Snapshots: "fs", MountPath: true},
+	})
+	connectNode(t, f.c, "n_mixed", info)
+	connectNode(t, f.c, "n_process", processNodeInfo(0))
+
+	for _, bad := range []string{"relative/path", "/", "/etc/x", "/work/../x", "/proc/self", "/a//b"} {
+		if _, err := f.c.wsCreate(context.Background(), localSubject(), &proto.WSCreateReq{Spec: proto.WorkspaceSpec{MountPath: bad}}); err == nil {
+			t.Fatalf("mount_path %q accepted", bad)
+		}
+	}
+	ws := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{MountPath: "/home/me/proj"})
+	if _, err := f.c.wsClaim(context.Background(), "n_process", ws.ID); err == nil {
+		t.Fatal("process-only node claimed a workspace with a mount path it cannot honor")
+	}
+	claim, err := f.c.wsClaim(context.Background(), "n_mixed", ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Workspace.Spec.Requires.Backend != "docker" || claim.Workspace.Spec.MountPath != "/home/me/proj" {
+		t.Fatalf("claim = backend %q mount %q", claim.Workspace.Spec.Requires.Backend, claim.Workspace.Spec.MountPath)
+	}
+	forced := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{MountPath: "/home/me/proj", Requires: proto.Requires{Backend: "process"}})
+	if _, err := f.c.wsClaim(context.Background(), "n_mixed", forced.ID); err == nil {
+		t.Fatal("forced process backend accepted a mount path")
+	}
+	// The default is normalized away so an explicit /work behaves like "".
+	plain := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{MountPath: proto.DefaultMountPath})
+	if plain.Spec.MountPath != "" {
+		t.Fatalf("default mount path stored as %q", plain.Spec.MountPath)
+	}
+	if _, err := f.c.wsClaim(context.Background(), "n_process", plain.ID); err != nil {
+		t.Fatal(err)
 	}
 }

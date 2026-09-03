@@ -3,7 +3,7 @@ VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev
 LDFLAGS  := -s -w -X main.version=$(VERSION)
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 
-.PHONY: all build test race fuzz cover vet fmt lint clean dist install demo conformance public-api modal-binary modal-deploy modal-smoke
+.PHONY: all build test race fuzz cover vet fmt lint docs acpgen clean dist install demo conformance public-api modal-binary modal-deploy modal-smoke
 
 FUZZTIME ?= 5s
 
@@ -45,6 +45,16 @@ fmt:
 lint: vet
 	@gofmt -l . | grep -v '^$$' && { echo "gofmt needed on the files above"; exit 1; } || echo "gofmt clean"
 	@./scripts/lint-locks.sh .
+	@./scripts/gen-llms.sh >/dev/null && git diff --quiet -- llms.txt llms-full.txt || { echo "llms.txt is stale: run make docs and commit"; exit 1; }
+	@go run ./cmd/acpgen -check
+
+# Regenerate internal/acp/*_gen.go from the vendored ACP schema in spec/acp.
+acpgen:
+	@go run ./cmd/acpgen
+
+# Regenerate llms.txt and llms-full.txt from README.md and docs/.
+docs:
+	@./scripts/gen-llms.sh
 
 # Cross-compile a static binary for every supported platform. No CGO anywhere,
 # so these are plain files you can scp onto a box and run.

@@ -48,6 +48,15 @@ func newUpstream(t *testing.T) *upstream {
 			}
 			return
 		}
+		if r.URL.Path == "/teapot" {
+			w.WriteHeader(http.StatusTeapot)
+			return
+		}
+		if r.URL.Path == "/redirect-ftp" {
+			w.Header().Set("Location", "ftp://files.example/x")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
 		w.Header().Set("X-Upstream", "yes")
 		w.WriteHeader(200)
 		io.WriteString(w, "auth="+r.Header.Get("Authorization")+";key="+r.Header.Get("X-Api-Key"))
@@ -277,8 +286,10 @@ func TestSubstitutesBearerForBoundHost(t *testing.T) {
 	if up.paths[0] != "/repos/x?y=1" {
 		t.Fatal(up.paths)
 	}
+	// cred.used is the record of what the credential bought, so it carries
+	// the upstream status and is emitted once the response headers exist.
 	a, ok := rec.lastDecision(DecisionSubstituted)
-	if !ok || a.Binding != "b_gh" || a.Status != 0 || a.WS != "ws_t" || rec.last().Decision != DecisionAllowed {
+	if !ok || a.Binding != "b_gh" || a.Status != 200 || a.Error != "" || a.WS != "ws_t" || rec.last().Decision != DecisionAllowed {
 		t.Fatalf("%+v", a)
 	}
 	// Placeholder inside a Basic credential (git over HTTP).
@@ -294,6 +305,76 @@ func TestSubstitutesBearerForBoundHost(t *testing.T) {
 	_, body = get(t, DestURL(b.BaseURL(), up.host)+"/v1/messages", map[string]string{"X-Api-Key": Placeholder(lease2)})
 	if body != "auth=;key=sk-ant-api03-REALREAL" {
 		t.Fatalf("%q", body)
+	}
+}
+
+// A workspace on a non-loopback path to its broker (Docker's
+// host.docker.internal) must exempt that host from the forward proxy, or a
+// proxy-honoring client sends its capability URL through the proxy and the
+// broker sees a placeholder addressed to itself.
+func TestEnvExemptsAdvertisedBrokerHostFromProxy(t *testing.T) {
+	up := newUpstream(t)
+	rec := &recorder{}
+	lease := proto.BindingLease{ID: "b_gh", Secret: "ghp_REAL", Destinations: []string{up.host}}
+	b := New(Options{
+		WS: "ws_t", Principal: "a_test", Leases: []proto.BindingLease{lease},
+		AllowPrivate: []string{"127.0.0.1", "localhost"}, Audit: rec.add, RootCAs: up.pool(),
+		Listen: "127.0.0.1:0", AdvertiseHost: "host.docker.internal",
+	})
+	if _, err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	env := map[string]string{}
+	for _, kv := range b.EnvFor() {
+		k, v, _ := strings.Cut(kv, "=")
+		env[k] = v
+	}
+	for _, k := range []string{"NO_PROXY", "no_proxy"} {
+		got := strings.Split(env[k], ",")
+		want := map[string]bool{"127.0.0.1": false, "localhost": false, "host.docker.internal": false}
+		for _, h := range got {
+			if _, ok := want[h]; ok {
+				want[h] = true
+			}
+		}
+		for h, seen := range want {
+			if !seen {
+				t.Fatalf("%s=%q lacks %s", k, env[k], h)
+			}
+		}
+	}
+	if !strings.Contains(env["REMOUNT_BROKER"], "host.docker.internal") || !strings.Contains(env["HTTPS_PROXY"], "host.docker.internal") {
+		t.Fatalf("%+v", env)
+	}
+	if b.AdvertisedHost() != "host.docker.internal" {
+		t.Fatal(b.AdvertisedHost())
+	}
+	// Defence in depth: a client that ignores NO_PROXY and forwards the
+	// capability URL through the proxy is served directly, not recorded as a
+	// leak. Dial the listener but address the request to the advertised host.
+	_, port, _ := net.SplitHostPort(b.ln.Addr().String())
+	target := "http://" + net.JoinHostPort("host.docker.internal", port) + "/c/" + b.token + "/d/" + up.host + "/repos"
+	req, _ := http.NewRequest("GET", target, nil)
+	req.Header.Set("Authorization", "Bearer ref:b_gh")
+	proxyURL, _ := url.Parse(strings.Replace(b.ProxyURL(), "host.docker.internal", "127.0.0.1", 1))
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "auth=Bearer ghp_REAL;key=" {
+		t.Fatalf("%d %q", resp.StatusCode, body)
+	}
+	if rec.count(DecisionLeakBlocked) != 0 || rec.count(DecisionSubstituted) != 1 {
+		t.Fatalf("leak_blocked=%d substituted=%d", rec.count(DecisionLeakBlocked), rec.count(DecisionSubstituted))
+	}
+	// Loopback brokers do not repeat the loopback entries.
+	plain := start(t, up, nil, nil, &recorder{})
+	if plain.NoProxy() != "127.0.0.1,localhost" {
+		t.Fatal(plain.NoProxy())
 	}
 }
 
@@ -464,6 +545,18 @@ func TestHostMatchAndEnvResolution(t *testing.T) {
 	if !strings.Contains(strings.Join(b.EnvFor(), " "), "HTTPS_PROXY="+b.ProxyURL()) {
 		t.Fatal(b.EnvFor())
 	}
+	// Bun reads "http://tok@host" as host "tok@host"; the userinfo must carry
+	// an explicit empty password so Bun-compiled harnesses reach the broker.
+	pu, err := url.Parse(b.ProxyURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, set := pu.User.Password(); !set || pu.User.Username() != b.token || !strings.Contains(b.ProxyURL(), b.token+":@") {
+		t.Fatalf("proxy url %q must be http://TOKEN:@host:port", b.ProxyURL())
+	}
+	if !b.validProxyAuthorization("Basic " + base64.StdEncoding.EncodeToString([]byte(b.token+":"))) {
+		t.Fatal("token with empty password must authenticate")
+	}
 	if _, err := net.Dial("tcp", b.ln.Addr().String()); err != nil {
 		t.Fatal(err)
 	}
@@ -503,6 +596,61 @@ func TestCredentialAttemptAuditedWhenUpstreamFails(t *testing.T) {
 	}
 	if rec.count(DecisionSubstituted) != 1 || rec.count(DecisionDenied) == 0 {
 		t.Fatalf("missing attempt/failure audit: %+v", rec.ev)
+	}
+	// The credential left the broker but bought nothing: status 0 and the
+	// failure class, never the raw error text, which can embed the host.
+	a, _ := rec.lastDecision(DecisionSubstituted)
+	if a.Status != 0 || a.Error != ErrorClassDNS {
+		t.Fatalf("%+v", a)
+	}
+}
+
+// Every credential use is audited exactly once with the upstream outcome,
+// including non-2xx statuses and responses the broker itself rejects.
+func TestCredentialUseRecordsUpstreamOutcomeOnce(t *testing.T) {
+	up := newUpstream(t)
+	rec := &recorder{}
+	lease := proto.BindingLease{ID: "b_gh", Secret: "REAL", Destinations: []string{up.host}, ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}
+	b := start(t, up, []proto.BindingLease{lease}, nil, rec)
+	hdr := map[string]string{"Authorization": "Bearer ref:b_gh"}
+
+	resp, _ := get(t, DestURL(b.BaseURL(), up.host)+"/teapot", hdr)
+	if resp.StatusCode != http.StatusTeapot {
+		t.Fatal(resp.StatusCode)
+	}
+	a, _ := rec.lastDecision(DecisionSubstituted)
+	if rec.count(DecisionSubstituted) != 1 || a.Status != http.StatusTeapot || a.Error != "" {
+		t.Fatalf("count=%d %+v", rec.count(DecisionSubstituted), a)
+	}
+
+	// A redirect the broker refuses to relay still consumed the credential;
+	// the audit shows the upstream status and why the client saw 502.
+	resp, _ = get(t, DestURL(b.BaseURL(), up.host)+"/redirect-ftp", hdr)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatal(resp.StatusCode)
+	}
+	a, _ = rec.lastDecision(DecisionSubstituted)
+	if rec.count(DecisionSubstituted) != 2 || a.Status != http.StatusFound || a.Error != ErrorClassRedirect {
+		t.Fatalf("count=%d %+v", rec.count(DecisionSubstituted), a)
+	}
+
+	// Connection refused: the dial never produced headers.
+	dead := httptest.NewTLSServer(http.NotFoundHandler())
+	deadHost := strings.TrimPrefix(dead.URL, "https://")
+	dead.Close()
+	b.SetLeases([]proto.BindingLease{lease, {ID: "b_dead", Secret: "REAL2", Destinations: []string{deadHost}, ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}})
+	resp, _ = get(t, DestURL(b.BaseURL(), deadHost)+"/x", map[string]string{"Authorization": "Bearer ref:b_dead"})
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatal(resp.StatusCode)
+	}
+	a, _ = rec.lastDecision(DecisionSubstituted)
+	if rec.count(DecisionSubstituted) != 3 || a.Binding != "b_dead" || a.Status != 0 || a.Error != ErrorClassRefused {
+		t.Fatalf("count=%d %+v", rec.count(DecisionSubstituted), a)
+	}
+	for _, e := range rec.ev {
+		if strings.Contains(e.Reason, "REAL") || strings.Contains(e.Error, "REAL") {
+			t.Fatalf("secret in audit: %+v", e)
+		}
 	}
 }
 

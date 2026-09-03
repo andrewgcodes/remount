@@ -93,6 +93,49 @@ the control plane derives subject and tenant from the presented credential.
 with it. `lease_sec` tells a node how often it must renew claims. A node MUST
 renew at an interval no greater than one third of the lease.
 
+### 3.1 Named capabilities
+
+Within v1, a change an older peer could ignore without weakening any security
+property is an additive field. A change an older peer *ignoring it* would
+weaken is a **named capability**: an exact, case-sensitive identifier offered
+in `Hello.caps` and echoed in `HelloOK.caps` only when both sides implement
+it. The server never echoes an identifier it does not implement, and a peer
+MUST NOT rely on a capability that was not echoed. Capabilities are returned
+in the canonical order of the table below, `v1` first.
+
+| Capability | Introduced for | An old peer ignoring it would |
+|---|---|---|
+| `v1` | the semantic baseline | not be a peer at all |
+| `authz-push` | revocation epochs pushed on renew | keep honouring a revoked principal's grant until it expires |
+| `controller-epoch` | controller failover fencing | accept a superseded controller's decisions |
+| `session-cap` | principal-bound session capabilities | leave a revoked principal's session open |
+| `chunked-artifacts` | verified chunked artifact transfer | restore a truncated artifact as complete |
+| `approvals` | held operations awaiting a decision | proceed while an approval is pending |
+| `encrypted-artifacts` | artifacts encrypted at rest | write or read a plaintext snapshot |
+
+A security profile requires the capabilities whose absence would break the
+promise the profile makes. `local` requires none, so an older node keeps
+working there. `isolated` and `multi_tenant` require every named capability
+this release implements; a capability is added to that requirement in the
+same release that implements it on both sides. This release implements
+`authz-push`; the remaining identifiers are reserved and are neither offered
+nor required yet.
+
+| Deployment security floor | Peer offers `v1` only | Peer offers this release's set |
+|---|---|---|
+| `local` | accepted | accepted |
+| `isolated` | hello refused, `unsupported`, names the missing capabilities and the profile | accepted |
+| `multi_tenant` | hello refused, `unsupported`, names the missing capabilities and the profile | accepted |
+
+Without a deployment floor the same rule applies per workspace: a node that
+negotiated fewer capabilities than a workspace's `security.profile` requires is
+not eligible for it and the workspace stays `pending` until an eligible node
+exists. A node connected to a control plane that echoed fewer capabilities than
+a claimed workspace's profile requires MUST refuse to materialize it
+(`unsupported`, naming the missing capabilities) and release the claim rather
+than serve the workspace with the property missing. `NodeStatus.protocol`
+reports what each node negotiated at its last hello.
+
 ## 4. Grants
 
 A client may not talk to a node about a workspace without a grant. A grant is
@@ -113,6 +156,39 @@ authorization-revision checks make stale grants useless after a move or policy
 change.
 
 Clients obtain grants with `op: grant` against `control` and cache them.
+
+### 4.1 Revocation epochs (`authz-push`)
+
+A grant is verified offline, so on its own a revoked principal would keep
+access until the grant expired. With `authz-push` negotiated the workspace's
+`authz_revision` is a **revocation epoch**: control advances it on every ACL
+change (`ws.acl`, including one that re-states the current ACL) and on every
+generation change, and refuses at once to mint a grant for a principal the new
+ACL excludes. The ACL is how a principal's access to a workspace is revoked;
+a deployment whose external authorizer withdraws a principal re-states the ACL
+to force every grant to re-verify. Nodes learn the revision on renew: `WSRenewReq.authz[id]` carries
+the revision the node currently enforces and `WSRenewResult.authz_revision`
+carries the authoritative one. When they differ the node adopts the new
+revision, so every outstanding grant minted under the old one fails the
+`authz_revision` check in §4, and the result also names the principals revoked
+since the node's revision in `revoked`. The node MUST end every live session of
+a named principal with `exit{reason: "revoked"}`; other principals' sessions
+continue and their clients fetch fresh grants transparently.
+
+Control retains the last 64 revocations per workspace (`Workspace.revocations`)
+and records the newest pruned revision as `revocation_floor`. A node whose
+known revision is below the floor receives `authz_reset: true` instead of a
+list and MUST end every session of the workspace; still-authorized principals
+reopen with fresh grants. Fail closed is the rule throughout: a node that
+cannot tell who was revoked revokes everyone.
+
+The latency bound is one renew interval. A node renews at no more than a third
+of the lease (§5), so with the default 30 s lease a revoked principal loses
+access to the node within 10 s and is refused a new grant immediately. A node
+that has not renewed within the lease is fenced anyway, so no revoked grant
+outlives the lease. An old node that ignores these fields is exactly the
+failure the capability names, which is why `isolated` and `multi_tenant`
+require it (§3.1).
 
 ## 5. Workspaces and the claim queue
 
@@ -162,8 +238,12 @@ SecuritySpec { profile, min_isolation, require_sibling_isolation,
 NetworkPolicy { default: "deny"|"allow", rules: [EgressRule] }
 EgressRule { id, connector?, protocol, hosts, ports, methods, path_prefixes,
              max_requests, max_request_bytes, max_response_bytes,
-             shared_state }
+             shared_state, repos?, push? }
+RepoSpec    { url, ref?, depth? }
 ```
+
+`WorkspaceSpec.repo` names a repository the node clones into the tree before
+`ws.ready` (§10.2). It is mutually exclusive with `base` and `restore_from`.
 
 Profiles are `local`, `isolated`, and `multi_tenant`. `isolated` and
 `multi_tenant` require an enforced egress backend; `multi_tenant` additionally
@@ -207,6 +287,32 @@ operator-actionable `failed` or terminal `destroyed` state.
 claim, ready, move, sleep, wake, and destroy calls cannot silently revive it.
 Duplicate mutating operations are answered from the durable idempotency record.
 
+### 5.2 Stable paths and task queues
+
+`WorkspaceSpec.mount_path` is where the tree appears inside the workspace
+(default `/work`). It must be absolute, clean, at most 1024 bytes and outside
+the system directories (`/`, `/proc`, `/sys`, `/dev`, `/etc`, `/bin`, `/sbin`,
+`/lib`, `/usr`, `/var`, `/run`, `/boot`); `ws.create` rejects anything else
+with `bad_request` and stores the default as empty. A non-default path is a
+placement requirement: only a node whose backend descriptor advertises
+`runtime.mount_path` may claim the workspace, because the path is realised
+inside the workspace's own mount namespace and never as a host symlink. The
+path is part of the spec and survives snapshot, sleep, wake and move.
+
+A **queue** is a durable list of tasks for one workspace:
+`Queue{id, ws, tenant, owner, recipe?, items[{task, session?, exit, signal?,
+attempts, finished_at}], cursor, status, sleep_after_sec?, sleep_until?,
+created_at, updated_at}`. `status` is `running`, `done` or `failed`.
+`queue.create` refuses an empty list, more than 256 tasks or a task over
+16 KiB, and a workspace that already has an unfinished queue (`conflict`).
+`queue.advance{index, exit, signal}` records one task's outcome and requires
+`index == cursor`: a zero exit without a signal moves the cursor and marks the
+queue `done` when it passes the last item; anything else leaves the cursor on
+the task, increments its `attempts`, and marks the queue `failed` so a later
+driver retries the same task. Queue state is never stored in the workspace
+tree; a queue is deleted with its workspace. Both mutations carry `idem` and
+commit the resource, the mutation record and their events in one transaction.
+
 ## 6. Control-plane operations
 
 Sent to `control`. Client operations are marked C, node operations N.
@@ -220,6 +326,26 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `ws.move` | C | `WSMoveReq{id, requires?, placement?, idem}` → `Workspace` |
 | `ws.sleep` | C | `WSSleepReq{id, after_sec\|at\|on, idem}` → `Timer` |
 | `ws.wake` | C | `WSGetReq{id, idem}` → `Workspace` |
+| `ws.acl` | C | `WSACLReq{id, acl{readers, writers}, idem}` → `Workspace`; owner or admin only; replaces the ACL and advances `authz_revision` (§4.1) |
+| `base.create` | C | `BaseCreateReq{name, artifact, workspace?, idem}` → `Base`; pins an uploaded artifact under a tenant-unique name (§10.1) |
+| `base.list` | C | → `BaseListRes{bases}`; the caller's tenant only, unless admin |
+| `base.remove` | C | `BaseRemoveReq{name, idem}` → `{}`; owner or admin only |
+| `queue.create` | C | `QueueCreateReq{ws, recipe?, tasks, sleep_after_sec?\|sleep_until?, idem}` → `Queue`; one unfinished queue per workspace (§5.2) |
+| `queue.get` | C | `QueueGetReq{id}` → `Queue`; owner, workspace principals or admin |
+| `queue.list` | C | `QueueListReq{ws?}` → `QueueListRes{queues}`; the caller's tenant only, unless admin |
+| `queue.advance` | C | `QueueAdvanceReq{id, index, session?, exit, signal?, idem}` → `Queue`; `index` must equal `cursor` or the call fails with `conflict` |
+| `agent.create` | C | `AgentCreateReq{name?, ws?\|workspace?, spec, policy, parent?, acp_session_id?, idem}` → `Agent`; makes the workspace unless `ws` adopts one (§6.1) |
+| `agent.get` | C | `AgentGetReq{id}` → `Agent` |
+| `agent.list` | C | `AgentListReq{status?, ws?, parent?}` → `AgentListRes{agents}`; only agents the caller may read |
+| `agent.message` | C | `AgentMessageReq{id, text, kind?, idem}` → `AgentMessageRes{agent, message, degraded?, woken?}`; appends to the inbox, wakes a sleeping agent |
+| `agent.cancel` | C | `AgentGetReq{id, idem}` → `Agent`; drops the inbox and cancels the current turn; the run stays open for the next message |
+| `agent.sleep` | C | `AgentGetReq{id, idem}` → `Agent`; stops the run, checkpoints and pauses the workspace |
+| `agent.fork` | C | `AgentForkReq{id, name?, task?, policy?, idem}` → `Agent`; snapshots the workspace and starts a child from the copy with the same harness session |
+| `agent.destroy` | C | `AgentGetReq{id, idem}` → `{}`; destroys the workspace only if the agent created it |
+| `agent.transcript` | C | `AgentTranscriptReq{id, from?, limit?}` → `AgentTranscriptRes{records, next, gap?, done?}`; a page of the durable transcript mirror from cursor `from`, never touching the workspace (§6.2) |
+| `approval.list` | C | `ApprovalListReq{agent?, status?}` → `ApprovalListRes{approvals}`; pending only unless `status` is given |
+| `approval.get` | C | `ApprovalGetReq{id}` → `Approval` |
+| `approval.decide` | C | `ApprovalDecideReq{id, option?, denied?, content?, idem}` → `Approval`; the decision commits before it is handed to the run |
 | `grant` | C | `GrantReq{ws}` → `Grant` |
 | `node.list` | C | → `NodeListRes{nodes}` |
 | `timer.list` | C | → `TimerListRes{timers}` |
@@ -231,10 +357,11 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `events.post` | C N | `EventPost{events}` → `{}` |
 | `ws.claim` | N | `WSClaimReq{id}` → `WSClaimRes{workspace, lease_sec}` |
 | `ws.ready` | N | `WSReadyReq{id, gen}` → `{}` |
-| `ws.renew` | N | `WSRenewReq{ids, gen}` → `WSRenewRes{results}`; each result explicitly says continue/fence/destroy/reconcile |
-| `ws.released` | N | `WSReleasedReq{id, gen, snapshot, reason}` → `{}` |
+| `ws.renew` | N | `WSRenewReq{ids, gen, authz}` → `WSRenewRes{results}`; each result explicitly says continue/fence/destroy/reconcile and, for a continued lease, carries `authz_revision`, `revoked`, `authz_reset` (§4.1) |
+| `ws.released` | N | `WSReleasedReq{id, gen, snapshot, reason, failed?}` → `{}`; `failed:true` means materialization could not complete and control holds the workspace out of placement with a growing delay (1s doubling to 30s, reset by the next `ws.ready`) instead of re-offering it at once |
 | `ws.snapshot.commit` | N | `WSSnapshotCommitReq{id, gen, snapshot}` → `{}` |
 | `binding.lease` | N | `BindingLeaseReq{ws}` → `BindingLeaseRes{leases}` |
+| `agent.report` | N | `AgentReport{agent, run, ws, gen, seq, kind, ...}` → `{}`; one observation about a run, fenced to the node, generation and run, deduplicated by `seq` (§6.1); `kind: transcript` carries `chunks[]` for the mirror (§6.2) |
 | `diag` | C | `DiagReq{verify}` → control diagnostics |
 
 Every mutating request carries an `idem` key. Replaying a request with the same
@@ -245,13 +372,218 @@ The control plane sends nodes one event: `ws.offer`, a hint that a workspace is
 available to claim. It is a hint, not an instruction; a node that ignores it
 loses nothing but the work.
 
+### 6.1 Agents and approvals
+
+An `Agent` is a durable control-plane resource: a workspace plus a harness
+conversation plus a policy. The workspace holds the files and the harness
+process; the control plane holds the inbox, the run history, the ACP session
+id and the status. Nothing about the agent lives only in a process, so a node
+loss, a move or a sleep never loses the conversation.
+
+```
+Agent { id, tenant, owner, name, ws, owns_ws, spec, mode, acp_session_id,
+        capabilities, status, status_reason, inbox[], runs[], turns, parent,
+        forked_from, policy, transcript_session, transcript_node,
+        transcript_next, transcript_first, transcript_bytes,
+        pending_approvals, url, created_at, updated_at, wake_timer,
+        idle_since, failures, parent_notified }
+```
+
+`status` is derived, never stored as intent: `creating` until a node first
+holds the workspace; `scheduled` while `policy.start_at` (Unix ms) lies in the
+future and no run has started — the workspace is materialized, the inbox is
+held, nothing launches; `running` while a prompt is in flight or queued;
+`waiting_approval` while an approval is pending; `waiting_input` when the
+harness finished a turn and is still up; `idle` when no harness is running and
+nothing is queued; `sleeping` when the workspace is paused; `failed` after the
+harness exited nonzero or a protocol error twice in a row; `finished` when a
+policy (`max_turns`) ended it; `destroyed` forever. Transitions pass the
+central table in `control/state_machine.go`; a terminal agent is never
+resurrected.
+
+The control plane reconciles durable intent to node operations on every tick:
+a claimed workspace with a queued message and no live run gets `agent.run`
+(`AgentRunReq{agent, run, attempt, ws, gen, tenant, owner, spec, policy,
+mode, acp_session_id, messages}` → `AgentRunRes{transcript}`); a live run gets
+queued messages by `agent.deliver`; `agent.cancel`/`agent.sleep` send
+`agent.run.cancel`. A node answers with `agent.report` observations. A
+message stays in the inbox until the node reports `turn_finished` for it, so
+a harness that dies mid-turn is re-prompted with the same text on the retry.
+A run whose node is gone past its lease, or whose workspace moved, is closed
+with `stop_reason: node gone` and retried after a back-off; two consecutive
+failures fail the agent. `agent.report` is refused with `conflict` for a
+stale generation, `unauthorized` from a node that does not hold the run, and
+is idempotent per `(run, seq)`.
+
+Before it spawns the harness, the node runs the recipe's `install` script
+once per workspace generation (marker `.remount/launch/<recipe>.installed`
+holding the generation), the same step `remount run` performs from the
+client. A move lands on a fresh generation and installs again; a retry on the
+same node does not. The install runs as an exec session with the workspace's
+broker environment, is bounded to fifteen minutes, and its tail is written to
+the run's transcript on the stderr stream. A failed install finishes the run
+with `exit_code: -1` and an error naming the exit status; the marker is not
+written.
+
+`agent.message` kinds are `follow_up` (default) and `steer`. ACP has no
+mid-turn input, so a `steer` is queued as a follow-up and the response says
+`degraded: true`. The inbox is bounded (64) and rejects with
+`resource_exhausted`. A message to a `sleeping` agent wakes the workspace and
+returns `woken: true`; the run starts once a node claims it and loads the same
+ACP session.
+
+`agent.fork` needs a claimed workspace: the control plane asks the holding
+node for an uploaded snapshot on its own authority (`ws.snapshot{ws, gen,
+upload, idem}`, fenced to the generation it believes the node holds, no client
+grant), then creates a new agent whose workspace restores that snapshot and
+whose `acp_session_id` is the parent's. A child's policy may only be narrower
+than its parent's: `approve` may not widen and a bounded `max_turns` may not
+grow or become unbounded.
+
+`agent.create` with `parent` makes a child of a live agent the caller may
+execute (a fork is a child too). A child inherits what it does not name —
+`providers`, `primary`, `sandbox`, the workspace `bindings`, the security
+profile — and may never hold more than the parent: a provider or binding the
+parent lacks is `denied`, as is a wider policy. Trees are at most three deep.
+When a child reaches `failed`, `finished` or `destroyed`, the control plane
+appends one `kind: child` message to the parent's inbox whose text is a
+`ChildSummary{child, name, status, reason, turns, ws, url}` JSON document,
+emits `agent.child.finished` on the parent's stream, and marks the child
+`parent_notified`, all in one transaction. A parent that is terminal or gone
+is marked notified without a message; a parent whose inbox is full is retried
+on the next reconcile. The parent handles the summary like any follow-up: it
+wakes if asleep and runs a turn.
+
+`policy.start_at` schedules the first run: the agent is created and its
+workspace claimed at once, but the reconciler neither launches nor delivers
+before that instant, and `agent.message` before it is queued. A start more than
+366 days out is `bad_request`.
+
+`policy.approve` is `never`, `on-request` (default) or `auto`. `auto` is
+refused with `denied` for a local process workspace; it needs the docker
+backend or a security profile above `local`.
+
+An `Approval` is a question the harness asked that policy routed to a human:
+
+```
+Approval { id, tenant, owner, agent, ws, run, kind, title, tool_call,
+           tool_kind, locations[], options[], detail, status, decision,
+           delivered_at, created_at, updated_at }
+```
+
+`kind` is `tool_call` (an ACP `session/request_permission`), `elicitation`
+(an ACP elicitation) or `egress` (the broker asked). The node parks the
+harness request and reports it (`agent.report{kind: permission|elicitation,
+approval}`); the control plane owns the row and the decision; the node
+answers the harness when the decision reaches it (`agent.approval.decided`).
+The decision commits with its event before it is sent and is re-sent every
+ten seconds until the node acknowledges (`delivered_at`) or the run ends. An
+approval never outlives its run: ACP cannot re-ask, so a run ending expires
+what it parked (`delivered_at: -1` for an undelivered decision) and the
+harness asks again on its next turn. At most 64 approvals per agent may be
+pending. `detail` is the harness's raw request (bounded to 64 KiB) and
+appears in `approval.get`, never in an event payload.
+
+`approval.decide` validates against the kind. `tool_call`: `option` must be
+one the harness offered; an empty `option` without `denied` picks the first
+`allow_once`/`allow_always` option and is `bad_request` when there is none.
+`elicitation`: `content` must be a JSON object (the form fields) unless
+`denied`, which discards any content; `option` is refused. `egress`: `option`
+is `allow`, `deny` or absent (allow), `denied` also denies, and the recorded
+decision always carries `option: allow|deny`. A node may only park
+`tool_call` and `elicitation`; `egress` rows come from the broker. A second
+decision on any row is `conflict`; a replay with the same idempotency key
+returns the row as decided.
+
+### 6.2 Transcript mirror
+
+The node writes the harness conversation to a session log (`kind: acp`) in the
+workspace's node, where `s.attach` replays it. That log dies with the node and
+sleeps with the workspace, so the node also ships every record to the control
+plane as it is written: `agent.report{kind: transcript, chunks[]}` carries
+`TranscriptChunk{seq, stream, at, data}` for each session-log record on the
+`acp_in`, `acp_out` and `stderr` streams, after the same redaction and bound
+(`MaxACPTranscriptFrame`) the session log applied. The node batches records
+for at most 250 ms or 64 KiB and never lets a lifecycle report overtake a
+queued record: `turn_finished` for a message follows every chunk of that
+turn. One report carries at most `MaxTranscriptReportBytes` (256 KiB) and is
+refused with `bad_request` beyond it.
+
+The control plane appends the chunks to a per-agent log with a contiguous
+agent-wide index that spans runs, retries and moves, and records the bounds
+on the agent: `transcript_next` is the index the next record takes,
+`transcript_first` the oldest index still held, `transcript_bytes` the data
+held. A mirror is bounded (64 MiB per agent by default); past the bound the
+oldest records are evicted and `transcript_first` moves up. Rows and bounds
+commit in one transaction with the report's dedupe mark, so a replayed report
+never duplicates a record. A transcript report is data, not a state change,
+and emits no event.
+
+`agent.transcript{id, from, limit}` returns `records[]` (`TranscriptRecord{
+index, run, seq, stream, at, data}`) from `from` in index order, at most
+`limit` (default and cap 1000), and `next`, the cursor to continue from. A
+`from` below `transcript_first` returns `gap{from, to}` naming the evicted
+range and the page starts at `to`; a reader never sees a shorter log without
+being told. `done: true` is set when the agent is terminal and the page
+reached `next`: nothing more will ever arrive. Reading the mirror needs read
+authority on the agent and never wakes a sleeping workspace; the node-side
+session log remains the source for byte-exact replay of a live run.
+
+### 6.3 The agent HTTP API
+
+Next to the frame protocol the control plane serves a JSON HTTP API for
+agents, so a browser, an editor or a chat integration can drive one without
+speaking frames. It is normative only in that every route is a translation of
+one operation above: the request's bearer credential becomes a client, the
+body becomes the protocol request, the protocol error code becomes a status.
+Authorization, idempotency and events are the ones §6.1 and §6.2 define. The
+route table, streaming formats and bounds are in `docs/api.md`.
+
+```
+POST   /v1/session                      mint the browser cookie from a header credential
+DELETE /v1/session                      clear it
+POST   /v1/agents                       agent.create      201 + Location
+GET    /v1/agents                       agent.list
+GET    /v1/agents/{id}                  agent.get
+POST   /v1/agents/{id}/messages         agent.message
+POST   /v1/agents/{id}/cancel           agent.cancel
+POST   /v1/agents/{id}/sleep            agent.sleep
+POST   /v1/agents/{id}/wake             agent.wake
+POST   /v1/agents/{id}/destroy          agent.destroy     204
+POST   /v1/agents/{id}/fork             agent.fork        201 + Location
+GET    /v1/agents/{id}/transcript       agent.transcript (JSON page, SSE or WebSocket)
+GET    /v1/agents/{id}/approvals        approval.list
+GET    /v1/approvals/{id}               approval.get
+POST   /v1/approvals/{id}               approval.decide
+GET    /v1/agents/{id}/diff             git status + git diff in the workspace
+GET    /v1/agents/{id}/terminal         WebSocket pty (new or attach+replay)
+       /v1/agents/{id}/fs/{path}        GET/HEAD/PUT/DELETE, jailed by the node
+       /v1/agents/{id}/ports/{port}/... authenticated reverse proxy into the workspace
+GET    /a/{id}                          the stable agent URL
+```
+
+Three rules are protocol, not presentation. A credential arrives in
+`Authorization`, or as the WebSocket subprotocol `remount.bearer.<base64url>`,
+or as the `remount_session` cookie; the cookie is accepted only on the
+preview proxy and `GET /a/{id}`, and never from an untrusted `Origin`,
+because preview content is same-origin with the API and written by the
+untrusted workspace, so a cookie honoured on any route that reads a file,
+opens a terminal or wakes an agent would let one workspace act as the
+operator on every other. Reads never wake: the
+transcript reads the mirror, and the filesystem and terminal refuse a
+sleeping agent with `conflict` rather than waking it; `diff?wake=true` and
+the preview proxy wake deliberately and emit `agent.woken` with `by: diff`
+and `by: preview`. `/a/{id}` carries no capability: it redirects to the
+operator UI when one is configured and otherwise answers `agent.get`, both
+authenticating like every other route.
+
 ## 7. Node operations
 
 Sent to a node id, and every one carries a `Grant` on first use per connection.
 
 | op | Body → Response |
 |---|---|
-| `s.open` | `SOpenReq{ws, kind, program, cwd, env, rows, cols, stdin, timeout_sec, idem}` → `SOpenRes{s, next}` |
+| `s.open` | `SOpenReq{ws, kind, program, cwd, env, rows, cols, stdin, timeout_sec, idem, run?}` → `SOpenRes{s, next}` |
 | `s.attach` | `SAttachReq{s, from}` → `SOpenRes{s, next}` |
 | `s.input` | `SInputReq{s, iseq, d, eof}` → `{}` |
 | `s.resize` | `SResizeReq{s, rows, cols}` → `{}` |
@@ -269,6 +601,7 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `fs.rename` | `FSRenameReq{ws, old, new, idem}` → `{}` |
 | `fs.search` | `FSSearchReq{ws, path, pattern, glob, max}` → `FSSearchRes{matches, truncated}` |
 | `fs.edit` | `FSEditReq{ws, path, edits, idem}` → `FSEditRes{replacements}` |
+| `fs.apply_tar` | `FSApplyTarReq{ws, artifact, idem}` → `FSApplyTarRes{files, dirs, bytes}` |
 | `ws.snapshot` | `WSSnapshotReq{ws, upload, authoritative, idem}` → `WSSnapshotRes{artifact, bytes, consistency, authoritative}` |
 | `ws.info` | `WSGetReq{id}` → `WSInfoRes{ws, backend, root, sessions, broker}` |
 | `node.status` | → `NodeStatus` |
@@ -284,6 +617,15 @@ Session kinds are `exec`, `pty` and `port`.
 `fs.edit` is atomic across all edits in one request. Each edit's `old` must
 match exactly once unless `all` is set. If any edit fails to apply, the file is
 not written and the response is `conflict`.
+
+`fs.apply_tar` overlays an artifact (§10) onto the workspace tree. The node
+fetches and fully validates the archive under the same limits as a restore
+before it touches the tree; every regular file then lands by rename into its
+final path, so a reader never sees a partially written file. Paths the archive
+does not name are left in place, `.remount/` is refused, and an entry that
+would replace a directory with a file, or write through a symlinked parent,
+fails the whole request with `bad_request`. The response counts what was
+written; the node emits one `fs.apply_tar` event and one `fs.write` per path.
 
 Node mutations with an `idem` key are write-ahead journaled. The node persists
 and fsyncs a `pending` intent before applying the effect, then persists and
@@ -365,7 +707,7 @@ ChunkBody { st: uint8, d: bytes }
 
 st = 1 stdout        the process wrote this
      2 stderr
-     3 exit          d is CBOR ExitInfo{code, signal, error}
+     3 exit          d is CBOR ExitInfo{code, signal, error, reason?}; reason "revoked" means the node ended it (§4.1)
      4 info          d is CBOR SessionInfo; always seq 0
      5 gap           d is CBOR Gap{from, to}; these seqs are gone forever
 ```
@@ -390,6 +732,21 @@ chunk-count budget long before a byte budget.
 Input is idempotent. `s.input` carries `iseq`, a client-side counter. A node
 drops any `iseq` at or below the last one it applied. Without this, a keystroke
 retried after a dropped connection is typed twice.
+
+### 8.1 Harness runs
+
+`s.open` MAY carry `run: RunInfo{recipe, task_hash?, sandbox?, auth?}` to mark
+the session as a harness launch (`remount run`). `recipe` is the recipe name
+(`^[a-z0-9][a-z0-9_-]{0,63}$`); `task_hash` is a short digest of the task text,
+never the text; `sandbox` is `read-only`, `workspace-write` or `full`; `auth`
+is `api_key` (the harness reads a brokered placeholder from its environment)
+or `workspace_resident` (the harness keeps its own login token in the
+workspace, outside the broker's view). The node validates `run` fail-closed
+(`bad_request`), copies it into `SessionInfo.run`, and emits `run.started`
+once when the session is created — an idempotent replay of the open emits
+nothing — and `run.finished` from the session's exit path, so a client that
+detached still gets both records. When `auth` is `workspace_resident` the node
+also emits `auth.workspace_resident`.
 
 ## 9. Secret-blind execution
 
@@ -467,8 +824,29 @@ the header is stripped upstream. `X-Remount-Content-Digest` reports provenance
 without exposing a cache path or hit state. Audits additionally carry the
 connector and digest.
 
+`connector: "git"` is the smart-HTTP capability, reachable only as
+`$REMOUNT_GIT_CONNECTOR/<host>/<owner>/<repo>[.git]/{info/refs,git-upload-pack,git-receive-pack}`.
+A git rule requires HTTPS, scopes by `repos` (exact `owner/name` or
+`owner/*`) rather than `path_prefixes`, admits only `GET info/refs?service=`
+and `POST` to the two pack endpoints with no other query, and never follows a
+redirect. Dumb-HTTP object paths, the hosting service's API, raw-file and LFS
+endpoints are outside the grammar and are denied before any credential is
+substituted. `push:false` (the default) denies `git-receive-pack` at
+advertisement time so `git push` fails before a packfile is sent. A workspace
+whose `spec.repo` names a repository gets an implicit rule `repo` covering
+exactly that repository (fetch and push) when its policy declares no typed git
+rule; nothing else is opened. The push half is deliberate: an agent whose
+purpose is to open a pull request needs it, and the binding that carries the
+token is the operator's grant. An operator who wants a read-only checkout
+declares a typed git rule for the repository with `push:false`, which then
+governs alone. Audits carry `connector: git`, `op: fetch|push`
+and `repo: owner/name`. The `/d/<host>/` reverse proxy remains usable as a
+stopgap (`url.$REMOUNT_BROKER/d/github.com/.insteadOf`), but it is the generic
+substitution path and enforces none of the grammar above.
+
 The scheduler MUST require `package` in `NodeInfo.connectors` before assigning
-a workspace containing such a rule. Absence fails closed, including for older
+a workspace containing such a rule, and `git` for a workspace with a git rule
+or a `spec.repo`. Absence fails closed, including for older
 nodes that do not send the additive field. Production enrollment binds this
 list to operator-approved node information rather than trusting a node's
 self-report.
@@ -509,6 +887,61 @@ matches the id.
 `GET /v1/artifacts/{id}` retrieves it. A node fetching an artifact verifies the
 digest itself and refuses a mismatch.
 
+A client seeds a workspace from a local directory by producing the same
+deterministic archive (the reference implementation's `localfs.Pack` honors
+`.gitignore`, `.remountignore`, and a default exclude list, and never packs
+`.remount/`), uploading it with `PUT`, and passing the id as
+`WorkspaceSpec.restore_from`. Later local changes travel the same way and are
+applied with `fs.apply_tar` (§7); a pull is a `ws.snapshot` with `upload:true`
+followed by `GET`.
+
+### 10.1 Bases
+
+A **base** is a named, pinned artifact: `Base{name, tenant, owner, artifact,
+workspace?, bytes, created_at}`. `base.create` verifies the artifact's digest
+and records the pin; `WorkspaceSpec.base` then resolves to
+`restore_from = base.artifact` at `ws.create` time, so the workspace itself
+carries the artifact id and outlives the base. `base` and `restore_from` are
+mutually exclusive in one request.
+
+Names match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` and are unique per tenant;
+two tenants may each own a base called `golden`. Any member of the tenant may
+list a base or create a workspace from it; only its owner or an admin may
+remove it. An implementation bounds the number of pinned bases per tenant and
+refuses the excess with `resource_exhausted`.
+
+A pinned artifact is a GC root: artifact garbage collection must not unlink it
+while the base exists. `base.remove` drops the pin only; workspaces created
+from the base keep their own `restore_from` reference. A `ws.create` replay
+whose idempotency key was first used with `base: NAME` returns the original
+workspace even after that base is removed — the fingerprint covers the request
+as sent, not the resolved artifact.
+
+### 10.2 Repositories
+
+`WorkspaceSpec.repo{url, ref, depth}` seeds a fresh workspace from a git
+repository instead of an artifact. `url` is canonicalized to
+`https://<host>/<owner>/<name>` (userinfo, query, fragment and non-HTTPS
+schemes are refused); `ref` is a branch, tag or full commit SHA; `depth > 0`
+requests a shallow clone. The node clones **before** `ws.ready`, through its
+own broker with the workspace's binding placeholder, so the credential is
+substituted at the node edge and never enters the tree, `.remount/env`, the
+node log or an event payload. The tree's git configuration is delivered as
+`GIT_CONFIG_*` environment (routing `https://<host>/` through
+`$REMOUNT_GIT_CONNECTOR`, disabling credential helpers, terminal prompts and
+every protocol but HTTP(S)); it is regenerated on every materialization
+because the broker address changes on every move.
+
+A clone that fails does not produce a workspace: the node destroys the fresh
+tree, releases the claim with `failed:true`, and control backs the retry off.
+A node that adopts a tree whose clone never completed (it died mid-fetch)
+discards it rather than serving an empty checkout; the completion marker
+lives under `.remount/` and, like `.remount/env`, never travels in a snapshot.
+A restore (`restore_from`, a move, a wake) never re-clones: the snapshot
+already carries the checkout. Success emits `repo.cloned{repo, ref, commit,
+depth, backend}` where `commit` is `git rev-parse --verify HEAD` of the tree
+as served.
+
 ## 11. The event log
 
 Every consequential action is an event. Transactionally persisted resource
@@ -517,11 +950,16 @@ log is the canonical audit and subscription history.
 
 ```
 Event { event_id, seq, received_at, observed_at, origin, actor, tenant,
-        workspace, generation, operation_id, producer_seq,
+        workspace, generation, session, operation_id, producer_seq,
         stream, principal, node, type, payload, cause }
 ```
 
 `stream` is a workspace or node id, so a workspace's whole history is one filter.
+`session` is set by the node on every event attributed to one session
+(`s.opened`, `s.exited`, and any later `s.*` type) so one command's history is
+a second filter that needs no payload parsing. The control plane clears a
+client-supplied `session`; only the node that runs a session may attribute to
+it.
 
 `seq` is assigned by the control plane and is the only total order.
 `received_at`, authenticated `origin`/`actor`, tenant, workspace and generation
@@ -535,14 +973,88 @@ infer it from timestamps.
 Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `ws.claiming`, `ws.claimed`, `ws.released`, `ws.moved`, `ws.paused`,
 `ws.resumed`, `ws.snapshot`, `ws.restored`, `ws.destroyed`,
-`ws.lease_expired`, `s.opened`, `s.exited`, `fs.write`, `fs.edit`, `fs.remove`,
+`ws.lease_expired`, `ws.acl`, `authz.revoked`, `s.opened`, `s.exited`,
+`fs.write`, `fs.edit`, `fs.remove`, `fs.apply_tar`,
 `cred.used`, `egress.allowed`, `egress.denied`, `timer.set`, `timer.fired`,
 `peer.gone`, `ws.fenced`, `ws.state_changed`, `event.producer_gap`,
-`fleet.quarantine.requested`, `fleet.quarantine.target`, and
-`fleet.quarantine.completed`.
+`fleet.quarantine.requested`, `fleet.quarantine.target`,
+`fleet.quarantine.completed`, `base.created`, `base.removed`, `run.started`,
+`run.finished`, `auth.workspace_resident`, `queue.created`,
+`queue.advanced`, `repo.cloned`, `agent.created`, `agent.message`,
+`agent.run.started`, `agent.run.finished`, `agent.session`, `agent.turn`,
+`agent.tool_call`, `agent.waiting`, `agent.cancelled`, `agent.slept`,
+`agent.woken`, `agent.forked`, `agent.failed`, `agent.finished`,
+`agent.destroyed`, `agent.child.finished`, `approval.pending`,
+`approval.decided` and `approval.expired`.
+
+Agent events are on the workspace stream and every one carries `agent`.
+`agent.created` carries `ws`, `owns_ws`, `recipe`, `mode`, `task_hash`,
+`policy` and `parent`; `agent.message` carries `message`, `kind`,
+`text_hash` and `degraded`; `agent.run.started` carries `run`, `attempt`,
+`node` and `transcript`; `agent.run.finished` carries `run`, `stop_reason`,
+`error`, `cancelled` and `turns`; `agent.turn` carries `run`, `message`,
+`stop_reason` and `tokens`; `agent.cancelled` carries `run`, `dropped` (a
+count) and `by`; `agent.forked` carries `from` and `snapshot`;
+`agent.child.finished` is on the parent's stream and carries `child`,
+`status`, `reason`, `turns` and `message` (the inbox message id);
+`approval.pending` carries `run`, `title`, `tool_call`, `tool_kind` and
+`options` (a count); `approval.decided` carries `option`, `denied`, `by` and
+`run`. No agent or approval event carries a prompt's text, an elicitation's
+content, a permission request's detail or a provider key.
+
+`run.started` carries `s`, `recipe`, `task_hash`, `sandbox` and `auth`;
+`run.finished` carries `s`, `recipe`, `exit` and `signal`;
+`auth.workspace_resident` carries `s` and `recipe`. All three set `session`.
+None carries the task text, the harness argv or a provider key.
+
+`queue.created` carries `queue`, `ws` and `items` (a count); `queue.advanced`
+carries `queue`, `index`, `exit`, `signal`, `status` and `cursor`. Both are on
+the workspace stream and neither carries a task's text.
+
+`repo.cloned` carries `repo` (canonical URL), `ref`, `depth`, `commit` and
+`backend`; it never carries the binding, its placeholder or the broker URL.
+`egress.allowed`/`egress.denied` from the git connector add `connector: git`,
+`op: fetch|push` and `repo: owner/name`. A `ws.released` for a failed
+materialization carries `retry_after_ms`.
+
+`base.created` and `base.removed` are tenant-scoped rather than
+workspace-scoped: `stream` is the base name, `tenant` is set, `workspace` is
+empty, and the payload carries `name`, `artifact`, `workspace` (the snapshot's
+source, if any) and `bytes`.
+
+`fs.apply_tar` summarizes one overlay: `artifact`, `files`, `dirs`, `bytes`,
+and `complete:false` when a refusal partway through left some files written.
+Each written path also gets its own `fs.write` carrying `path` and `artifact`.
+
+`ws.acl` records an ACL change with the new lists, the principals it revoked
+and the resulting `authz_revision`. `authz.revoked` is the node's record of
+acting on a pushed revision: the revision, the principals (or `reset`), and the
+sessions it closed.
+
+`cred.used` is the record of what a released credential bought. The node
+emits it once per released binding after the upstream outcome is known: the
+payload's `status` is the upstream response status when headers arrived, or
+`0` with `error` set to a failure class (`dns`, `connection_refused`,
+`connection_reset`, `timeout`, `tls`, `canceled`, `eof`, `redirect_rejected`,
+`response_limit`, `non_public_address`, `connector`, `upstream`) when they did
+not. `error` is a class, never the transport's error text.
 
 `POST /v1/events` appends an event out of band. This is how a webhook wakes a
-sleeping workspace.
+sleeping workspace. The body is `{type, stream?, payload?, agent?}`; unknown
+fields are `400`. The caller authenticates with a bearer the control plane
+knows, or with an HMAC-SHA256 of the raw body under the configured webhook
+secret in `X-Remount-Signature` or `X-Hub-Signature-256` (`sha256=<hex>`).
+`agent` maps the event onto an Agent: `{wake, message}` sends `message` to an
+existing agent as a follow-up (waking it), where `wake` is an id or
+`name:<template>` naming exactly one live agent (none is `not_found`, several
+is `conflict`); `{create: AgentCreateReq}` creates one. `message`, `wake`,
+`create.spec.task`, `create.name`, `create.workspace.name` and
+`idempotency_key` are Go templates over the decoded payload with a missing key an error, so a payload
+that changed shape is refused rather than rendered into a half-empty prompt. A
+signed request acts as the configured webhook credential; without one it may
+only append. The response is `202 {accepted, agent?, ws?, status?}` and the
+event lands on the agent's workspace stream when `stream` is empty. Redelivery
+with the same rendered `idempotency_key` returns the same agent or message.
 
 Event history is finite. The reference control plane retains it by configured
 age and row budgets and records the oldest retained sequence as a durable
@@ -583,7 +1095,10 @@ wrong and that a conformance suite should check:
 `v` is the frame version. Peers negotiate exact, case-sensitive capability
 strings in `hello`; this release requires `v1`. New optional operations and
 fields are additive within v1, and a peer that does not know an `op` answers
-`unsupported`. A semantic change, removal, or incompatible field change
+`unsupported`. A change whose omission by an older peer would weaken a
+security property is a named capability (§3.1), not an additive field. A
+semantic change, removal, or incompatible field change to the baseline
 requires a new frame version and an explicit dual-version migration window.
-The repository keeps a deterministic v1 golden fixture under
-`internal/proto/testdata` to catch accidental wire drift.
+The repository keeps deterministic v1 golden fixtures under
+`internal/proto/testdata` (a request frame and a hello offering every named
+capability) to catch accidental wire drift.

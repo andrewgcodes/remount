@@ -39,9 +39,30 @@ handler does not interpret their bodies.
 
 ## Try it in 60 seconds
 
+One command runs a coding harness in a fresh workspace against a key it never
+sees. With nothing listening on the default local address, `remount run` starts
+`remount standalone` in the background for you, turns every provider key in
+your environment into a brokered binding, and picks the one the recipe uses.
+
 ```sh
 go build -o remount ./cmd/remount
+export OPENAI_API_KEY=sk-...
+./remount run opencode --dir . -- 'add a README'
+```
 
+```
+started remount standalone in the background (pid 4242, data ~/.local/share/remount, ...)
+using binding b_openai ($OPENAI_API_KEY) for opencode
+workspace ws_06g6d1z9g849pkqcxxfy7z99m4 created
+```
+
+The key stays in the standalone's process environment; the workspace gets a
+placeholder and `remount events WS` shows every `cred.used`. Set
+`REMOUNT_AUTOSTART=0` or `REMOUNT_SERVER` to opt out of the background start.
+
+The pieces underneath:
+
+```sh
 # Server + node in one process, no account, no token.
 ./remount standalone --data ./data &
 export REMOUNT_SERVER=http://127.0.0.1:7443
@@ -182,9 +203,21 @@ append-only event log is the durable audit and observation record.
 | `remount attach WS SESSION --from N` | reattach to a running session |
 | `remount fs read\|write\|ls\|stat\|rm\|mv\|mkdir\|search\|edit` | workspace filesystem |
 | `remount port WS PORT` | forward a port out of the workspace |
+| `remount run RECIPE [--dir . \| --repo URL[@REF]] [--binding b_openai] -- TASK` | seed a workspace, install a coding harness, run it against brokered keys |
+| `remount ws create --repo URL[@REF] [--repo-depth N]` | the node clones through the broker before the workspace is ready; the token never enters the tree |
+| `remount run RECIPE --queue FILE [--sleep-after D]` | run a file of tasks in order in one workspace; progress lives on the control plane |
+| `remount handoff` / `remount resume WS` | move this checkout and the harness's conversation into a workspace; pick it back up from anywhere |
 | `remount nodes` / `events` / `timers` | inspect the fleet |
 | `remount fleet quarantine ...` | durably fence, checkpoint, stop or destroy an incident scope |
 | `remount status` / `inspect` / `doctor` / `metrics` | inspect health and capacity |
+
+Sessions belong to the node, not to the terminal that started them. Ctrl-C in
+`exec`, `sh` or `attach` detaches and prints the `remount attach WS SID`
+command that picks the process back up; pass `--kill-on-interrupt` to send
+SIGINT to the remote process instead (a second Ctrl-C still detaches).
+`exec --timeout D` is enforced server-side by the node and has no client-side
+ceiling; `0` (the default) means no timeout. Long-running work is
+`exec ... ` + Ctrl-C (or a closed laptop) + `attach --from N`.
 
 ## Go SDK
 
@@ -228,7 +261,9 @@ verdict. See [docs/observability.md](docs/observability.md).
 - [docs/adr/](docs/adr/) — the decisions, and what each one costs.
 - [docs/tutorial.md](docs/tutorial.md) — a guided walkthrough from zero to a moved workspace.
 - [docs/harness-integration.md](docs/harness-integration.md) — running Claude Code, Codex, OpenCode and your own loop on Remount.
+- [docs/api.md](docs/api.md) — the agent HTTP API: agents, transcript streaming, approvals, diff, terminal, files, previews.
 - [docs/operations.md](docs/operations.md) — deploying, hardening and running it for real.
+- [docs/images.md](docs/images.md) — the default workspace image and what any substitute image must provide.
 - [docs/observability.md](docs/observability.md) — inspecting a deployment at three depths, and detecting damage.
 - [docs/engineering/hardening-lessons.md](docs/engineering/hardening-lessons.md) — the review method distilled from the audits, race failures and live cloud tests.
 - [docs/engineering/](docs/engineering/) — dated audits, implementation requests, dispositions and verification evidence.

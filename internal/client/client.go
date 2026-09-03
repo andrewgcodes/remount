@@ -10,12 +10,18 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
+	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/ids"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/transport"
@@ -33,6 +39,12 @@ type Options struct {
 	// MaxRunOutputBytes bounds stdout+stderr collected by Run. Streaming a
 	// Session through Chunks is unaffected. Default 64 MiB.
 	MaxRunOutputBytes int64
+	// ArtifactURL is the control plane's blob endpoint
+	// (http://host/v1/artifacts). Required by UploadArtifact and
+	// DownloadArtifact; the WebSocket link carries everything else.
+	ArtifactURL string
+	// HTTPClient performs artifact transfers. Default http.DefaultClient.
+	HTTPClient *http.Client
 }
 
 // OperationOption configures one logical mutating operation. Reuse the same
@@ -175,7 +187,7 @@ func (c *Client) Connect(ctx context.Context) (*transport.Peer, error) {
 	}
 	p := transport.NewPeer(conn, transport.HandlerFunc(c.handle))
 	hctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	ok, err := transport.Hello(hctx, p, proto.Hello{Peer: c.ID(), Role: proto.RoleClient, Token: c.opts.Token, Caps: []string{proto.CapabilityV1}, Principal: c.opts.Principal})
+	ok, err := transport.Hello(hctx, p, proto.Hello{Peer: c.ID(), Role: proto.RoleClient, Token: c.opts.Token, Caps: proto.PeerCapabilities(), Principal: c.opts.Principal})
 	cancel()
 	if err != nil {
 		p.Close()
@@ -386,6 +398,17 @@ func (c *Client) MoveWorkspace(ctx context.Context, id string, req *proto.Requir
 	return &ws, err
 }
 
+// SetWorkspaceACL replaces who else may use a workspace. Only its owner or an
+// administrator may call it. Principals removed by the change lose access
+// within one node renew interval; everyone else's grants refresh transparently.
+func (c *Client) SetWorkspaceACL(ctx context.Context, id string, acl proto.WorkspaceACL, options ...OperationOption) (*proto.Workspace, error) {
+	var ws proto.Workspace
+	idem, _ := operationKey(options)
+	err := c.call(ctx, proto.PeerControl, proto.OpWSACL, proto.WSACLReq{ID: id, ACL: acl, IdempotencyKey: idem}, &ws)
+	c.forgetGrant(id)
+	return &ws, err
+}
+
 // SleepWorkspace pauses a workspace until a timer or event.
 func (c *Client) SleepWorkspace(ctx context.Context, req proto.WSSleepReq, options ...OperationOption) (*proto.Timer, error) {
 	var t proto.Timer
@@ -426,6 +449,76 @@ func (c *Client) QuarantineFleet(ctx context.Context, req proto.FleetQuarantineR
 	var operation proto.FleetOperation
 	err := c.call(ctx, proto.PeerControl, proto.OpFleetQuarantine, req, &operation)
 	return &operation, err
+}
+
+// CreateBase pins an uploaded artifact under a tenant-scoped name so future
+// workspaces can start from it with WorkspaceSpec.Base. The artifact is
+// excluded from garbage collection until RemoveBase.
+func (c *Client) CreateBase(ctx context.Context, req proto.BaseCreateReq, options ...OperationOption) (*proto.Base, error) {
+	if key, set := operationKey(options); set {
+		req.IdempotencyKey = key
+	} else if req.IdempotencyKey == "" {
+		req.IdempotencyKey = ids.New("idem")
+	}
+	var base proto.Base
+	err := c.call(ctx, proto.PeerControl, proto.OpBaseCreate, req, &base)
+	return &base, err
+}
+
+// ListBases returns the bases visible to the caller, sorted by tenant and name.
+func (c *Client) ListBases(ctx context.Context) ([]proto.Base, error) {
+	var response proto.BaseListRes
+	err := c.call(ctx, proto.PeerControl, proto.OpBaseList, nil, &response)
+	return response.Bases, err
+}
+
+// RemoveBase unpins a base. Workspaces already created from it are unaffected.
+func (c *Client) RemoveBase(ctx context.Context, name string, options ...OperationOption) error {
+	idem, set := operationKey(options)
+	if !set {
+		idem = ids.New("idem")
+	}
+	return c.call(ctx, proto.PeerControl, proto.OpBaseRemove, proto.BaseRemoveReq{Name: name, IdempotencyKey: idem}, nil)
+}
+
+// CreateQueue records a durable task list for a workspace (ADR 0041). A
+// missing idempotency key is generated so a retry cannot create two queues.
+func (c *Client) CreateQueue(ctx context.Context, req proto.QueueCreateReq, options ...OperationOption) (*proto.Queue, error) {
+	if key, set := operationKey(options); set {
+		req.IdempotencyKey = key
+	} else if req.IdempotencyKey == "" {
+		req.IdempotencyKey = ids.New("idem")
+	}
+	var q proto.Queue
+	err := c.call(ctx, proto.PeerControl, proto.OpQueueCreate, req, &q)
+	return &q, err
+}
+
+// GetQueue returns one queue.
+func (c *Client) GetQueue(ctx context.Context, id string) (*proto.Queue, error) {
+	var q proto.Queue
+	err := c.call(ctx, proto.PeerControl, proto.OpQueueGet, proto.QueueGetReq{ID: id}, &q)
+	return &q, err
+}
+
+// ListQueues returns the caller's queues, optionally only those of one
+// workspace, oldest first.
+func (c *Client) ListQueues(ctx context.Context, wsID string) ([]proto.Queue, error) {
+	var res proto.QueueListRes
+	err := c.call(ctx, proto.PeerControl, proto.OpQueueList, proto.QueueListReq{WS: wsID}, &res)
+	return res.Queues, err
+}
+
+// AdvanceQueue records the outcome of the task at the queue's cursor.
+func (c *Client) AdvanceQueue(ctx context.Context, req proto.QueueAdvanceReq, options ...OperationOption) (*proto.Queue, error) {
+	if key, set := operationKey(options); set {
+		req.IdempotencyKey = key
+	} else if req.IdempotencyKey == "" {
+		req.IdempotencyKey = ids.New("idem")
+	}
+	var q proto.Queue
+	err := c.call(ctx, proto.PeerControl, proto.OpQueueAdvance, req, &q)
+	return &q, err
 }
 
 // GetFleetOperation returns one durable containment operation.
@@ -775,6 +868,121 @@ func (c *Client) Edit(ctx context.Context, wsID, path string, edits []proto.FSEd
 		return proto.FSEditReq{WS: wsID, Path: path, Edits: edits, IdempotencyKey: idem, Grant: g}
 	}, &res)
 	return res.Replacements, err
+}
+
+// ApplyTar overlays an artifact previously stored with UploadArtifact onto the
+// workspace tree. Files land one rename at a time; nothing else is removed.
+func (c *Client) ApplyTar(ctx context.Context, wsID, artifactID string, options ...OperationOption) (*proto.FSApplyTarRes, error) {
+	var res proto.FSApplyTarRes
+	idem, _ := operationKey(options)
+	err := c.nodeCall(ctx, wsID, proto.OpFSApplyTar, func(g *proto.Grant) any {
+		return proto.FSApplyTarReq{WS: wsID, Artifact: artifactID, IdempotencyKey: idem, Grant: g}
+	}, &res)
+	return &res, err
+}
+
+// ErrNoArtifactURL means Options.ArtifactURL was not configured.
+var ErrNoArtifactURL = errors.New("client: ArtifactURL not configured")
+
+// UploadArtifact stores r as a content-addressed artifact in the control
+// plane and returns its id. The stream is spooled to a temporary file so the
+// digest can be computed before the single PUT; the file is removed before
+// return.
+func (c *Client) UploadArtifact(ctx context.Context, r io.Reader) (string, int64, error) {
+	if c.opts.ArtifactURL == "" {
+		return "", 0, ErrNoArtifactURL
+	}
+	spool, err := os.CreateTemp("", "remount-upload-*")
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() {
+		spool.Close()
+		os.Remove(spool.Name())
+	}()
+	h := sha256.New()
+	size, err := io.Copy(io.MultiWriter(spool, h), r)
+	if err != nil {
+		return "", 0, err
+	}
+	if _, err := spool.Seek(0, io.SeekStart); err != nil {
+		return "", 0, err
+	}
+	id := artifact.ID(h.Sum(nil))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.artifactURL(id), spool)
+	if err != nil {
+		return "", 0, err
+	}
+	req.ContentLength = size
+	req.Header.Set("Authorization", "Bearer "+c.opts.Token)
+	req.Header.Set("Content-Type", "application/gzip")
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", 0, fmt.Errorf("client: upload artifact: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return id, size, nil
+}
+
+// DownloadArtifact streams an artifact from the control plane. The returned
+// reader fails with artifact.ErrDigestMismatch at EOF if the bytes do not
+// hash to id, so callers that consume the whole stream never act on a
+// corrupted or substituted archive without seeing an error.
+func (c *Client) DownloadArtifact(ctx context.Context, id string) (io.ReadCloser, error) {
+	if c.opts.ArtifactURL == "" {
+		return nil, ErrNoArtifactURL
+	}
+	if _, err := artifact.Digest(id); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.artifactURL(id), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.opts.Token)
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("client: download artifact %s: HTTP %d", id, resp.StatusCode)
+	}
+	return &verifyingReader{body: resp.Body, want: id, h: sha256.New()}, nil
+}
+
+type verifyingReader struct {
+	body io.ReadCloser
+	want string
+	h    hash.Hash
+}
+
+func (v *verifyingReader) Read(p []byte) (int, error) {
+	n, err := v.body.Read(p)
+	if n > 0 {
+		v.h.Write(p[:n])
+	}
+	if errors.Is(err, io.EOF) && artifact.ID(v.h.Sum(nil)) != v.want {
+		return n, artifact.ErrDigestMismatch
+	}
+	return n, err
+}
+
+func (v *verifyingReader) Close() error { return v.body.Close() }
+
+func (c *Client) artifactURL(id string) string {
+	return strings.TrimSuffix(c.opts.ArtifactURL, "/") + "/" + id
+}
+
+func (c *Client) httpClient() *http.Client {
+	if c.opts.HTTPClient != nil {
+		return c.opts.HTTPClient
+	}
+	return http.DefaultClient
 }
 
 // Snapshot takes a live, crash-inconsistent snapshot; upload pushes it to the

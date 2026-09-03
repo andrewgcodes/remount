@@ -570,3 +570,26 @@ func TestExcluded(t *testing.T) {
 		}
 	}
 }
+
+func TestStoreHeadMatchesOpenAndIsNotExistForUnknown(t *testing.T) {
+	var bs BlobStore
+	s, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs = s
+	id, size, err := bs.Put(strings.NewReader("hello blob"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := bs.Head(id)
+	if err != nil || n != size {
+		t.Fatalf("Head = %d, %v; want %d", n, err, size)
+	}
+	if _, err := bs.Head(digestFor("absent")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Head of unknown id = %v; want ErrNotExist", err)
+	}
+	if _, err := bs.Head("not-a-digest"); err == nil {
+		t.Fatal("Head must reject malformed ids")
+	}
+}
