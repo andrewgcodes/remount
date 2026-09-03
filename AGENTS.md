@@ -115,6 +115,7 @@ Check your own change against every line here before calling it done.
 | Artifact ids are plaintext digests, but encrypted physical objects are tenant/key-version scoped. Publication is atomic, decrypt verifies authentication and plaintext digest, and retired keys remain until verified migration. | `artifact/encrypted` (ADR 0065) |
 | Enforced-gateway networking is deny-first: the sandbox starts with its veth down, the broker-only rule commits before link activation, and any setup error or revoke synchronously deletes the veth before serviceability changes. | `netns`, `workspace/gvisor`, `node.materialize` (ADR 0061) |
 | Vendor drivers provision one whole node for one tenant per machine; vendor network controls never upgrade backend capabilities. | `provision` drivers + `pool.Spec` tenant boundary (ADR 0062) |
+| Pool scale-down destroys only provider inventory whose `remount.node` identity exactly matches an online, assignment-free control node; provider calls never hold the control mutex or lease loop. | `pool.Reconciler`, `control.reconcilePoolsAsync` (ADR 0064) |
 
 ## Where a change goes
 

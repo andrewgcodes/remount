@@ -321,6 +321,7 @@ func (d *Driver) createBody(request provision.Request, secretName string) (flyCr
 	env := map[string]string{
 		"REMOUNT_SERVER": request.Bootstrap.ServerURL, "REMOUNT_BINARY_URL": request.Bootstrap.BinaryURL,
 		"REMOUNT_BACKEND": request.Bootstrap.Backend, "REMOUNT_DATA_DIR": request.Bootstrap.DataDir,
+		"REMOUNT_NODE_ID": request.Bootstrap.NodeID,
 	}
 	return flyCreate{Name: request.Name, Region: request.Region, Config: flyConfig{
 		Image: d.image, Env: env, Metadata: metadata, Guest: guest, Restart: flyRestart{Policy: "always"},

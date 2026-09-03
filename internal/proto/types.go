@@ -724,7 +724,7 @@ func ValidatePoolSpec(spec PoolSpec) error {
 		if strings.TrimSpace(key) == "" || strings.ContainsAny(key, "=\x00\n\r") || strings.ContainsAny(value, "\x00\n\r") {
 			return Err(CodeBadRequest, "pool label %q is invalid", key)
 		}
-		if key == "remount.pool" {
+		if key == "remount.pool" || key == "remount.node" {
 			return Err(CodeBadRequest, "pool label %q is reserved", key)
 		}
 	}

@@ -41,7 +41,7 @@ type nodeResourceOptions struct {
 	snapshotMinInterval       time.Duration
 }
 
-func buildNode(data string, c common, labels map[string]string, backends, image string, allow, allowPrivate []string, resources nodeResourceOptions) (*node.Node, error) {
+func buildNode(data, nodeID string, c common, labels map[string]string, backends, image string, allow, allowPrivate []string, resources nodeResourceOptions) (*node.Node, error) {
 	if !filepath.IsAbs(data) {
 		return nil, fmt.Errorf("node data directory %q must be absolute", data)
 	}
@@ -83,7 +83,7 @@ func buildNode(data string, c common, labels map[string]string, backends, image 
 		return nil, errors.New("no backends")
 	}
 	return node.New(node.Options{
-		DataDir: data, Dialer: c.dialer(), Token: c.token, Labels: labels, Backends: workspace.NewRegistry(list...),
+		DataDir: data, ID: nodeID, Dialer: c.dialer(), Token: c.token, Labels: labels, Backends: workspace.NewRegistry(list...),
 		ArtifactURL: strings.TrimSuffix(c.server, "/") + "/v1/artifacts", Logger: slog.Default(),
 		MaxArtifactBytes: resources.artifactBytes, MaxArtifactStoreBytes: resources.artifactStoreBytes,
 		MaxArtifactObjects: resources.artifactObjects,

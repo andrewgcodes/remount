@@ -40,7 +40,8 @@ func (c *Control) Authenticate(ctx context.Context, h *proto.Hello) (string, *pr
 			}
 			h.Labels["tenant"] = identity.Tenant
 			if identity.Pool != "" {
-				h.Labels["pool"] = identity.Pool
+				h.Labels["pool"] = identity.Pool // compatibility with bindings issued before ADR 0064
+				h.Labels["remount.pool"] = identity.Pool
 			}
 			if err := c.validateDynamicNode(h); err != nil {
 				return "", nil, err

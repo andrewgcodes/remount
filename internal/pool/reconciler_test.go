@@ -29,6 +29,7 @@ type fakeDriver struct {
 	createErr   error
 	destroyErr  error
 	createBlock chan struct{}
+	inventory   []provision.Machine
 }
 
 func (f *fakeDriver) Name() string { return "fake" }
@@ -51,7 +52,9 @@ func (f *fakeDriver) Destroy(_ context.Context, id string) error {
 	return f.destroyErr
 }
 func (f *fakeDriver) List(context.Context, provision.ListOptions) ([]provision.Machine, error) {
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]provision.Machine(nil), f.inventory...), nil
 }
 
 func testSpec() Spec {
@@ -87,6 +90,9 @@ func TestDemandScalesFromZeroAndEnrollmentNeverEntersMachineState(t *testing.T) 
 	if req.Bootstrap.EnrollmentToken != "one-time-token" {
 		t.Fatal("driver did not receive the issued enrollment token")
 	}
+	if req.Bootstrap.NodeID == "" || req.Labels[provision.NodeLabel] != req.Bootstrap.NodeID {
+		t.Fatalf("provider/node identity contract = bootstrap %q labels %#v", req.Bootstrap.NodeID, req.Labels)
+	}
 }
 
 func TestConcurrentDemandCannotOvercommitOnePool(t *testing.T) {
@@ -116,6 +122,30 @@ func TestConcurrentDemandCannotOvercommitOnePool(t *testing.T) {
 	driver.mu.Unlock()
 	if creates != 1 {
 		t.Fatalf("creates = %d, want one pending capacity reservation", creates)
+	}
+}
+
+func TestVisibleBootingMachineSatisfiesRepeatedDemand(t *testing.T) {
+	driver, tokens := &fakeDriver{}, &fakeTokens{}
+	r, err := New([]provision.Driver{driver}, tokens, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), testSpec(), nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	driver.mu.Lock()
+	machine := provision.Machine{ID: driver.creates[0].Name, Name: driver.creates[0].Name, Provider: "fake", Tenant: "t", Labels: driver.creates[0].Labels}
+	driver.mu.Unlock()
+	actions, err := r.Reconcile(context.Background(), testSpec(), []Node{{Machine: machine, Workspaces: -1}}, 1)
+	if err != nil || len(actions) != 0 {
+		t.Fatalf("repeated demand over-scaled: actions=%#v err=%v", actions, err)
+	}
+	driver.mu.Lock()
+	creates := len(driver.creates)
+	driver.mu.Unlock()
+	if creates != 1 {
+		t.Fatalf("creates = %d, want 1", creates)
 	}
 }
 
@@ -154,5 +184,16 @@ func TestProviderFailureBacksOffObservably(t *testing.T) {
 }
 
 func ownedMachine(id string) provision.Machine {
-	return provision.Machine{ID: id, Provider: "fake", Tenant: "t", Labels: map[string]string{poolLabel: "p"}}
+	return provision.Machine{ID: id, Provider: "fake", Tenant: "t", Labels: map[string]string{provision.PoolLabel: "p", provision.NodeLabel: "n_" + id}}
+}
+
+func TestInventoryRejectsDriverScopeEscape(t *testing.T) {
+	driver := &fakeDriver{inventory: []provision.Machine{{ID: "foreign", Provider: "fake", Tenant: "other", Labels: map[string]string{provision.PoolLabel: "p"}}}}
+	r, err := New([]provision.Driver{driver}, &fakeTokens{}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Inventory(context.Background(), testSpec()); err == nil {
+		t.Fatal("cross-tenant provider inventory was accepted")
+	}
 }

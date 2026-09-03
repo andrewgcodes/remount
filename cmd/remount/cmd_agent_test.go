@@ -53,7 +53,7 @@ func standaloneForTest(t *testing.T) string {
 		t.Fatal(err)
 	}
 	c := common{server: "http://" + addr}
-	n, err := buildNode(filepath.Join(data, "node"), c, map[string]string{"standalone": "true"}, "process", workspace.DefaultImage(version), nil, []string{"127.0.0.1", "localhost"}, nodeResourceOptions{})
+	n, err := buildNode(filepath.Join(data, "node"), "", c, map[string]string{"standalone": "true"}, "process", workspace.DefaultImage(version), nil, []string{"127.0.0.1", "localhost"}, nodeResourceOptions{})
 	if err != nil {
 		cancel()
 		t.Fatal(err)

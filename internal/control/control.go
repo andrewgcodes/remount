@@ -214,6 +214,10 @@ type Options struct {
 	// PublicURL is the server's externally reachable base (https://host), used
 	// to mint stable agent URLs. Empty leaves Agent.URL empty.
 	PublicURL string
+	// PoolReconciler and PoolBootstrap enable provider-backed whole-node
+	// capacity. Nil leaves durable pool declarations inert.
+	PoolReconciler PoolReconciler
+	PoolBootstrap  PoolBootstrap
 }
 
 // ArtifactStore is the part of the blob store the control plane inspects.
@@ -251,6 +255,9 @@ type Control struct {
 	fleetLocks            map[string]*keyedMutex
 	bases                 map[string]*proto.Base // baseKey(tenant, name) -> pinned snapshot
 	pools                 map[string]*proto.Pool // poolKey(tenant, name) -> desired node capacity
+	poolBusy              map[string]bool
+	poolIdle              map[string]time.Time
+	poolWG                sync.WaitGroup
 	queues                map[string]*proto.Queue
 	agents                map[string]*proto.Agent
 	approvals             map[string]*proto.Approval
@@ -411,6 +418,8 @@ func New(opts Options) (*Control, error) {
 		fleetOps: map[string]*proto.FleetOperation{}, fleetLocks: map[string]*keyedMutex{}, fleetWake: make(chan struct{}, 1),
 		bases:                 map[string]*proto.Base{},
 		pools:                 map[string]*proto.Pool{},
+		poolBusy:              map[string]bool{},
+		poolIdle:              map[string]time.Time{},
 		queues:                map[string]*proto.Queue{},
 		agents:                map[string]*proto.Agent{},
 		approvals:             map[string]*proto.Approval{},
@@ -502,6 +511,7 @@ func (c *Control) Stop() {
 	})
 	c.requestWG.Wait()
 	c.wg.Wait()
+	c.poolWG.Wait()
 }
 
 // ---------------------------------------------------------------------------
@@ -4901,6 +4911,7 @@ func (c *Control) Tick(ctx context.Context) {
 		c.fireTimer(ctx, t)
 	}
 	c.offerPending(ctx)
+	c.reconcilePoolsAsync()
 	c.agentReconcileAsync(c.requestCtx)
 	c.expireStaleApprovals(ctx)
 }

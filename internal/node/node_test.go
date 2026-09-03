@@ -58,6 +58,21 @@ func TestCorruptIdentityIsNotSilentlyReplaced(t *testing.T) {
 	}
 }
 
+func TestProvisionedIdentityIsPinnedAndCannotBeReplaced(t *testing.T) {
+	dir := t.TempDir()
+	n, err := New(Options{DataDir: dir, ID: "n_planned"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.ID() != "n_planned" {
+		t.Fatalf("node id = %q", n.ID())
+	}
+	n.sessions.Close()
+	if _, err := New(Options{DataDir: dir, ID: "n_other"}); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("identity replacement error = %v", err)
+	}
+}
+
 func TestNewRejectsNegativeResourceLimits(t *testing.T) {
 	tests := map[string]func(*Options){
 		"sessions":                func(o *Options) { o.MaxSessions = -1 },

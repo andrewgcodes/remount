@@ -62,7 +62,7 @@ func (c *Control) Diag(ctx context.Context) *proto.ControlDiag {
 		}
 	}
 	// Collect findings while we hold the lock, emit them after.
-	type pending struct{ id, state, node string }
+	type pending struct{ id, state, node, pool string }
 	var stuck []pending
 	var expiring []pending
 	for _, ws := range c.workspaces {
@@ -76,11 +76,18 @@ func (c *Control) Diag(ctx context.Context) *proto.ControlDiag {
 				}
 			}
 			if eligible == 0 {
-				stuck = append(stuck, pending{ws.ID, ws.State, ""})
+				poolName := ""
+				for _, candidate := range c.pools {
+					if poolMatchesWorkspace(candidate, ws) {
+						poolName = candidate.Spec.Name
+						break
+					}
+				}
+				stuck = append(stuck, pending{id: ws.ID, state: ws.State, pool: poolName})
 			}
 		case held(ws.State) && ws.LeaseUntil > 0:
 			if remaining := ws.LeaseUntil - now.UnixMilli(); remaining < 0 {
-				expiring = append(expiring, pending{ws.ID, ws.State, ws.Node})
+				expiring = append(expiring, pending{id: ws.ID, state: ws.State, node: ws.Node})
 			}
 		}
 		// A workspace claimed by a node that is not connected is held but
@@ -99,10 +106,24 @@ func (c *Control) Diag(ctx context.Context) *proto.ControlDiag {
 	c.mu.Unlock()
 
 	for _, p := range stuck {
+		if p.pool != "" && c.opts.PoolReconciler != nil {
+			d.Findings = append(d.Findings, proto.Finding{
+				Severity: "warn", Check: "workspace.capacity_pending", Subject: p.id,
+				Detail: "pending while node pool " + p.pool + " reconciles provider capacity",
+				Hint:   "inspect pool.scaled and pool.provision_failed events",
+			})
+			continue
+		}
+		detail := "pending, and no online node satisfies its requires and placement"
+		hint := "compare `remount ws get " + p.id + "` with `remount nodes`"
+		if p.pool != "" {
+			detail = "pending with matching pool " + p.pool + ", but no provisioner reconciler is configured"
+			hint = "start the server with --provisioners and inspect its startup diagnostics"
+		}
 		d.Findings = append(d.Findings, proto.Finding{
 			Severity: "error", Check: "workspace.unplaceable", Subject: p.id,
-			Detail: "pending, and no online node satisfies its requires and placement",
-			Hint:   "compare `remount ws get " + p.id + "` with `remount nodes`",
+			Detail: detail,
+			Hint:   hint,
 		})
 	}
 	for _, p := range expiring {

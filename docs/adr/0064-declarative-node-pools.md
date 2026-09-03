@@ -20,11 +20,15 @@ reports unmet eligible demand to a separate `internal/pool.Reconciler`; normal
 workspace offers and claims remain the only placement authority.
 
 Provider actions serialize per `(tenant,pool)`. Before create, control durably
-mints a ten-minute, single-use enrollment token. A failed create or destroy is
-observable and enters exponential backoff. Scale-down considers only nodes with
-zero assigned workspaces and an explicit idle timestamp; it never infers idle
-from a missing observation. Deleting a pool removes reconciler bookkeeping only
-after its in-flight action has joined.
+mints a ten-minute, single-use enrollment token. The token authority contains
+the pool's trusted scheduler labels, and bootstrap pins a predetermined `n_`
+node id in both `--node-id` and the provider's `remount.node` inventory label.
+A failed create or destroy is observable and enters exponential backoff.
+Scale-down considers a machine only when that exact provider label resolves to
+an online control-plane node with zero assigned workspaces and an explicit idle
+timestamp; it never pairs inventories by ordering or infers idle from a missing
+observation. Deleting a pool removes reconciler bookkeeping only after its
+in-flight action has joined.
 
 The reconciler reserves a successful create until provider inventory exposes
 its machine or a bounded visibility timeout expires, so concurrent callers
@@ -36,6 +40,8 @@ in-memory visibility reservation.
 ## Consequences
 
 - Provider latency does not block control request or workspace lifecycle locks.
+- A provider machine can never inherit the assignment count of a different
+  node; missing or mismatched identity evidence makes it ineligible for destroy.
 - A claim that finds no eligible node requests capacity; it does not acquire
   authority over a future node.
 - Capacity, retries and partial provider outcomes are visible as pool events,
