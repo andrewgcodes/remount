@@ -216,3 +216,33 @@ func TestDefaultImageTracksRelease(t *testing.T) {
 		}
 	}
 }
+
+type fsOnlyCheckpointer struct{ Checkpointer }
+
+type memClaimer struct {
+	Checkpointer
+	kind CheckpointKind
+}
+
+func (m memClaimer) CheckpointKind() CheckpointKind { return m.kind }
+
+func TestKindOfTrustsOnlyKnownClaims(t *testing.T) {
+	if got := KindOf(fsOnlyCheckpointer{}); got != CheckpointFS {
+		t.Fatalf("plain handle = %q", got)
+	}
+	if got := KindOf(memClaimer{kind: CheckpointFSMem}); got != CheckpointFSMem {
+		t.Fatalf("memory claim = %q", got)
+	}
+	if got := KindOf(memClaimer{kind: "gpu+mem"}); got != CheckpointFS {
+		t.Fatalf("unknown claim must degrade to fs, got %q", got)
+	}
+	p, _ := NewProcess(t.TempDir())
+	h, err := p.Create(context.Background(), "ws_kind", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Destroy(context.Background())
+	if got := KindOf(h); string(got) != p.Caps().Snapshots {
+		t.Fatalf("process handle kind %q disagrees with advertised Caps.Snapshots %q", got, p.Caps().Snapshots)
+	}
+}
