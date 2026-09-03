@@ -9,12 +9,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,11 +31,24 @@ import (
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/node"
+	"remount.dev/remount/internal/notifier"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/server"
 	"remount.dev/remount/internal/transport"
 	"remount.dev/remount/internal/workspace"
 )
+
+type simResolverFunc func(context.Context, string, string) ([]netip.Addr, error)
+
+func (f simResolverFunc) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	return f(ctx, network, host)
+}
+
+type simRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f simRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
 
 // world is one simulated deployment.
 type world struct {
@@ -1071,6 +1086,52 @@ func TestApproveModeParksBeforeUpstreamAndResumesAfterDecision(t *testing.T) {
 	}
 	if hits.Load() != 0 {
 		t.Fatalf("undecided request reached upstream: hits=%d", hits.Load())
+	}
+	// E6 is a composed contract: the committed pending event must reach the
+	// configured Slack adapter while the upstream request is still parked.
+	cursors, err := w.srv.Control.ExportCursors("local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var slackDeliveries int
+	notifications, err := notifier.New(notifier.Options{
+		Source: w.srv.Log, Cursors: cursors, CursorName: "e6-slack",
+		Subscriptions: []notifier.Subscription{{
+			ID: "approvals", Tenant: "local", Events: []string{proto.EvEgressPending},
+			Destination: notifier.Destination{Kind: notifier.SlackWebhook, URL: "https://hooks.slack.com/services/T/B/test"},
+		}},
+		Resolver: simResolverFunc(func(context.Context, string, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+		}),
+		RoundTripper: simRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			slackDeliveries++
+			if hits.Load() != 0 {
+				t.Errorf("parked request reached upstream before notification: hits=%d", hits.Load())
+			}
+			var message struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&message); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(message.Text, proto.EvEgressPending) {
+				t.Errorf("Slack notification = %q", message.Text)
+			}
+			return &http.Response{
+				StatusCode: http.StatusNoContent,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("")),
+			}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := notifications.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if slackDeliveries != 1 || hits.Load() != 0 {
+		t.Fatalf("notifications=%d upstream hits=%d before decision", slackDeliveries, hits.Load())
 	}
 	if _, err := c.DecideApproval(ctx, proto.ApprovalDecideReq{ID: pending.ID, Remember: proto.ApprovalRememberNone}); err != nil {
 		t.Fatal(err)
