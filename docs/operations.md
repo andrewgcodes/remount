@@ -23,6 +23,16 @@ remount server --listen 0.0.0.0:7443 --data /var/lib/remount --token "$REMOUNT_T
 | `--insecure` | off | allow an empty token, for local experiments only |
 | `--bindings` | none | JSON file of secrets the nodes may lease |
 | `--lease` | `30` | claim lease in seconds |
+| `--mode` | `standalone` | `standalone`, `production-single-tenant`, or `production-multi-tenant` |
+| `--max-concurrent-requests` | `128` | active control request handlers; excess work fails with `resource_exhausted` |
+| `--max-tenant-workspaces` / `--max-subject-workspaces` | `1000` / `100` | non-destroyed workspace quotas |
+| `--max-mutation-records` | `100000` | retained control idempotency results |
+| `--max-timers` / `--max-workspace-timers` | `100000` / `128` | durable timer quotas |
+| `--artifact-object-bytes` | `8 GiB` | largest compressed artifact request |
+| `--artifact-store-bytes` / `--artifact-store-objects` | `64 GiB` / `100000` | retained blobs plus in-flight reservations |
+| `--artifact-grace` / `--artifact-gc-interval` | `24h` / `10m` | reference-aware artifact collection |
+| `--event-retention` / `--max-events` | `30d` / `1000000` | event age and row-count bounds |
+| `--control-record-retention` | `30d` | replay/tombstone/terminal-record visibility window |
 
 The server refuses to start without a token unless `--insecure` is set. The
 token authenticates every node hello, every client hello, every artifact
@@ -53,7 +63,8 @@ The proxy must pass WebSocket upgrades on `/v1/link` and must not buffer
 `/v1/artifacts/` bodies, which can be gigabytes. Nodes only ever dial out, so a
 public address on the server is the only inbound surface in the whole system.
 
-Health is at `/healthz` and returns the number of connected peers.
+Liveness is at `/healthz`; readiness is at `/readyz`. Both include serving and
+security-mode state. Use readiness for traffic and deployment checks.
 
 ## Nodes
 
@@ -74,6 +85,18 @@ remount up --server https://remount.example --token "$REMOUNT_TOKEN" \
 | `--image` | `ubuntu:24.04` | default image for docker workspaces |
 | `--allow` | none | hosts reachable without a credential, repeatable |
 | `--allow-private` | none | hosts allowed to resolve to private addresses, repeatable |
+| `--max-concurrent-requests` | `128` | active node request handlers |
+| `--max-sessions` / `--max-active-sessions` | `1024` / `256` | retained and live sessions per node |
+| `--max-workspace-sessions` / `--max-principal-sessions` | `64` / `128` | retained session quotas |
+| `--session-memory-bytes` / `--session-spill-bytes` | `2 MiB` / `128 MiB` | output retained per session in memory/on disk |
+| `--session-chunk-bytes` / `--session-memory-chunks` | `32 KiB` / `16384` | per-chunk and in-memory index bounds |
+| `--artifact-store-bytes` / `--artifact-store-objects` | `32 GiB` / `50000` | node snapshot cache capacity |
+| `--artifact-retention` / `--artifact-gc-interval` | `24h` / `10m` | unreferenced node-cache collection |
+| `--connector-cache-bytes` / `--connector-cache-objects` | `16 GiB` / `100000` | immutable managed-connector cache capacity |
+| `--connector-workspace-bytes` / `--connector-workspace-objects` | `2 GiB` / `4096` | per-workspace connector references |
+| `--connector-object-bytes` | `512 MiB` | maximum staged connector response |
+| `--max-mutation-records` / `--mutation-retention` | `10000` / `30d` | node replay journal capacity/window |
+| `--max-concurrent-snapshots` / `--snapshot-min-interval` | `4` / `1s` | snapshot concurrency and caller frequency |
 
 The node data directory holds `identity.json`, which is the node's id and
 ed25519 private key. Keep it; a node that loses it enrolls as a new node and the
@@ -104,6 +127,21 @@ credential boundary, not a firewall. MicroVM backends are not built yet.
 The docker backend checks the daemon lazily and reports `unsupported` if it is
 missing. Filesystem operations and snapshots use the host-side mount, so they
 are as fast as `process`.
+
+## Snapshot consistency
+
+`remount ws snapshot WS` is a live capture. It may observe concurrent process
+writes, reports `consistency=live`, and never updates `last_snapshot` even when
+uploaded. Use it for inspection/export where that tradeoff is acceptable.
+
+`remount ws snapshot WS --authoritative` is the failover operation. The node
+rejects new managed work, terminates and joins Remount-managed sessions for the
+process backend (or pauses a Docker container), exclusively locks filesystem
+mutations, uploads the artifact, and asks control to commit the digest for the
+same node and generation. A missing artifact store, upload failure, stale
+generation, or persistence failure returns an error and leaves the prior
+authoritative checkpoint unchanged. Host processes that escaped the local
+`process` backend remain outside its documented consistency boundary.
 
 ## Bindings
 
@@ -219,16 +257,21 @@ reports ready, all within the same generation.
 
 ## Backup and restore
 
-Back up `control.db` with a SQLite-aware tool, and `artifacts/` with anything
-that copies files. The two are independent: `control.db` names snapshots by
-digest, and `artifacts/` holds the bytes.
+Back up `control.db` with SQLite's online backup API (for example
+`sqlite3 control.db '.backup /backup/control.db'`) or stop the server before a
+filesystem copy. Do not copy a live database file by itself while WAL activity
+may be in progress. Copy `artifacts/` after the database backup; taking extra
+unreferenced blobs is safe, while omitting a blob referenced by the database is
+not. Retain both under one backup generation and record their checksums.
 
 A snapshot artifact is a gzip tar of the workspace filesystem with sorted
 entries, modes, mtimes and symlinks, minus the workspace's `exclude` globs.
 It contains no process state and no secrets. Identical trees produce identical
 ids, so repeated snapshots of an unchanged workspace cost nothing.
 
-To restore a server, put both back and start it. A recorded holder is preserved
+To restore a server, verify the database with `PRAGMA integrity_check`, verify
+the artifact tree with `remount doctor --deep`, put both back, and start exactly
+one controller. A recorded holder is preserved
 through a recovery grace period rather than immediately re-queued: the same
 node may re-adopt it at the same generation and prove readiness. A held
 workspace whose lease later expires returns to `pending` from its last durable
@@ -237,8 +280,17 @@ operator-visible; Remount does not guess that an ambiguous source is disposable.
 Durable fleet operations are loaded from the same database and continue their
 pending target reconciliation.
 
-To move a deployment, copy both, start the new server, and point nodes at it.
-Node identity is on the node, not the server, so nodes keep their ids.
+To move a deployment, fence traffic to the old writer, copy both, start the new
+server, verify `/readyz`, and only then point nodes at it. Never overlap two
+independent writers. Node identity is on the node, not the server, so nodes keep
+their ids.
+
+Rehearse this procedure with measured recovery point and recovery time
+objectives. A database-only restore can recover metadata but not referenced
+workspace bytes; an artifact-only restore cannot recover assignments, signing
+keys or policy. Node `identity.json`, workspace directories and
+`mutations.cbor` need their own host-level backup when retaining the latest
+uncheckpointed copy matters.
 
 ## Fleet containment
 
@@ -300,7 +352,8 @@ the node.
 
 ## Monitoring
 
-Everything is an event, and the event log is the monitoring surface.
+Lifecycle resource rows are transactional recovery truth; the ordered event
+log is the monitoring and audit surface.
 
 ```sh
 remount events --follow --json | jq -c 'select(.type|test("lease_expired|egress.denied|node.offline"))'
@@ -323,22 +376,39 @@ remount events --follow --json | jq -c 'select(.type|test("lease_expired|egress.
 `remount ws ls` shows state, node and generation for every workspace. A
 workspace in `pending` for more than a few seconds has no eligible node.
 
-## Capacity
+## Capacity, quotas, and retention
 
 | Resource | Per unit | Notes |
 |---|---|---|
-| session output in memory | 2 MiB per session | ring buffer; oldest chunks spill to disk |
-| session output on disk | 128 MiB per session | under the node's `spill/`; rotated when full |
+| workspaces | 1,000 per tenant; 100 per subject | counts every non-destroyed workspace; creation fails closed at the limit |
+| sessions | 1,024 retained; 256 active per node | additionally 64/workspace and 128/principal by default |
+| session output in memory | 2 MiB and 16,384 chunks per session | oldest chunks spill to disk; chunks are at most 32 KiB |
+| session output on disk | 128 MiB per session | under the node's `spill/`; oldest chunks are evicted with an explicit gap |
 | finished session retention | 24 hours | the exit record and log stay attachable |
 | broker client connections | 128 per workspace | listener stops accepting until a socket closes |
 | broker concurrent requests/tunnels | 64 per workspace | excess requests receive 429; streams and CONNECT hold a slot |
-| control-plane events | unbounded in SQLite | plan for the log's growth; it is the audit trail |
+| control/node requests | 128 active each | overload is rejected on a separately bounded response path |
+| snapshots | 4 active per node; 1 second between explicit snapshots/workspace | lifecycle checkpoints wait; user snapshots fail fast |
+| server artifacts | 64 GiB / 100,000 objects; 8 GiB each | in-flight reservations count; unreferenced blobs get a 24-hour grace period |
+| node artifact cache | 32 GiB / 50,000 objects | reference-aware collection preserves live and quarantined workspace snapshots |
+| connector cache | 16 GiB / 100,000 objects | 2 GiB / 4,096 refs per workspace and 512 MiB per response |
+| control-plane events | 30 days and 1,000,000 rows | pruning removes an oldest contiguous prefix; old cursors receive `evicted` with the new watermark |
+| control mutation records / timers | 100,000 each | 30-day replay/visibility window; timers additionally cap at 128/workspace |
 | node mutation records | 10,000 per node | new mutations fail closed with `resource_exhausted` at the cap |
 | fleet acknowledgement deadline | 5 minutes default, 24 hours maximum | pending unreachable targets remain visible and are retried |
 | grants | 1 hour | clients refresh them transparently |
 
 Session output that ages out of both tiers is reported to clients as an
 explicit gap, never silently dropped.
+
+Artifact, event and control-record collectors run in bounded batches every ten
+minutes by default. They preserve referenced workspace/fleet authority and
+producer high-water marks, update in-memory indexes only after database commit,
+and expose runs, errors, objects/bytes or row counts through metrics. Limits are
+also returned by `status`, `inspect`, `doctor` and the JSON diagnostic methods.
+The managed connector cache is capacity-bounded but currently has no automatic
+age-based eviction; size it for the deployment and treat exhaustion as an
+operator-visible fail-closed condition.
 
 ## Restarts and upgrades
 
@@ -353,8 +423,11 @@ A node can be restarted at any time. It re-adopts its local workspaces under
 the same generation if the lease has not expired, and under a new generation
 if it has. Files survive either way. Running processes do not.
 
-Upgrade one binary at a time. Unknown frame kinds and fields are ignored on
-both sides, and the hello negotiates capabilities, so mixed versions talk.
+Upgrade one binary at a time. Version 1 requires an exact frame version and the
+`v1` hello capability; a peer that cannot negotiate it is rejected
+before requests flow. Unknown additive operations return `unsupported`, and
+unknown fields remain forward-compatible. Do not assume different semantic
+frame versions can communicate merely because CBOR decoding succeeds.
 
 ## Troubleshooting
 
@@ -373,6 +446,22 @@ both sides, and the hello negotiates capabilities, so mixed versions talk.
 
 When in doubt, `remount events --ws WS` tells the whole story of a workspace
 in order, with a sequence number you can quote.
+
+---
+
+## Controller availability
+
+The reference implementation is a single SQLite writer. It does not implement
+leader election, shared transactional storage, or fencing between controllers.
+Putting two server instances behind a load balancer creates split authority
+even if they start from copies of the same database.
+
+For active/passive operation, keep the passive stopped, replicate a consistent
+database-plus-artifact backup, and use an external lease/fencing mechanism that
+proves the former writer is dead before starting the replacement. Then verify
+`/readyz`, `remount doctor --deep`, node re-adoption and one real workspace
+operation. Automated zero-downtime controller failover remains a published
+product gap; scale nodes horizontally, not controllers.
 
 ---
 
@@ -396,7 +485,7 @@ container lose their last snapshot.
 The working Modal deployment is in [deploy/modal_app.py](../deploy/modal_app.py):
 
 ```python
-volume = modal.Volume.from_name("remount-data", create_if_missing=True)
+volume = modal.Volume.from_name(APP_NAME + "-data", create_if_missing=True)
 
 @app.function(min_containers=1, max_containers=1, volumes={"/data": volume})
 @modal.concurrent(max_inputs=200)
@@ -411,6 +500,14 @@ claim queue and artifact store survive a restart.
 
 The same reasoning applies to any platform that scales on request volume. Run
 one control plane, give it persistent storage, and scale nodes instead.
+
+The checked-in deployment also requires a named Modal secret containing
+`REMOUNT_TOKEN`, pins Node 22 and Python 3.12, checks Node/npm/the Remount binary
+before advertising readiness, supervises both child processes, and provides
+`make modal-smoke`. The smoke uses `modal.Function.from_name` to resolve the
+deployed function explicitly; testing the ephemeral `modal run` copy would be
+a false positive. Modal Volumes commit periodically and at container shutdown,
+but the single-writer and backup rules above still apply.
 
 ### What this deployment proved
 

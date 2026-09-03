@@ -232,6 +232,27 @@ func TestExecSignalTERM(t *testing.T) {
 	}
 }
 
+func TestKillWorkspaceConfirmsAllSessionsStopped(t *testing.T) {
+	m := newMgr(t)
+	first, err := m.Open(Spec{WS: "ws_kill", Kind: proto.SessionExec, Program: []string{"sh", "-c", "sleep 60"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := m.Open(Spec{WS: "ws_kill", Kind: proto.SessionExec, Program: []string{"sh", "-c", "sleep 60"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.KillWorkspace("ws_kill"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Get(first.ID); ok {
+		t.Fatalf("first session %s remains", first.ID)
+	}
+	if _, ok := m.Get(second.ID); ok {
+		t.Fatalf("second session %s remains", second.ID)
+	}
+}
+
 func TestPTYEchoAndResize(t *testing.T) {
 	m := newMgr(t)
 	s, err := m.Open(Spec{WS: "ws_1", Kind: proto.SessionPTY, Program: []string{"sh", "-c", "stty size; read x; echo got:$x"}, Rows: 30, Cols: 100})

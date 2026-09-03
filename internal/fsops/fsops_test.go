@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"remount.dev/remount/internal/proto"
@@ -35,7 +36,8 @@ func TestJailBlocksEscapes(t *testing.T) {
 	for _, p := range []string{"../x", "/../x", "a/../../x", "..", "/.."} {
 		if _, err := f.Resolve(p); err == nil {
 			h, _ := f.Resolve(p)
-			if h == root || filepath.HasPrefix(h, root+string(filepath.Separator)) {
+			relative, relErr := filepath.Rel(root, h)
+			if relErr == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 				continue // Clean() collapsed it inside the root, which is fine
 			}
 			t.Fatalf("%q escaped to %q", p, h)

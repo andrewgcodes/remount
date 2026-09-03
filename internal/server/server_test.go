@@ -45,6 +45,12 @@ func newTestServer(t *testing.T, opts Options) *Server {
 	return s
 }
 
+func TestNewRejectsNegativeEventCapacity(t *testing.T) {
+	if _, err := New(Options{MaxEvents: -1}); err == nil || !strings.Contains(err.Error(), "must not be negative") {
+		t.Fatalf("New error = %v", err)
+	}
+}
+
 func TestArtifactPutMismatchCannotDeleteExistingBlob(t *testing.T) {
 	s := newTestServer(t, Options{MaxArtifactBytes: 1024})
 	body := "pre-existing valid body"
@@ -141,6 +147,27 @@ func TestEventRetentionPrunesPrefixAndExposesOldestSequence(t *testing.T) {
 	}
 	events, err := s.Log.Read(context.Background(), 0, "", 10)
 	if err != nil || len(events) != 1 || events[0].Seq != 3 {
+		t.Fatalf("retained events = %+v, %v", events, err)
+	}
+}
+
+func TestEventRetentionAlsoBoundsRecentRows(t *testing.T) {
+	s := newTestServer(t, Options{
+		EventRetention: 24 * time.Hour, MaxEvents: 2,
+		EventGCInterval: -1, ArtifactGCInterval: -1,
+	})
+	now := time.Now()
+	for index := 0; index < 5; index++ {
+		if err := s.Log.Append(context.Background(), &proto.Event{Type: "recent", At: now.UnixMilli()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed, err := s.PruneEvents(context.Background(), now)
+	if err != nil || removed != 3 {
+		t.Fatalf("PruneEvents = (%d, %v)", removed, err)
+	}
+	events, err := s.Log.Read(context.Background(), 0, "", 10)
+	if err != nil || len(events) != 2 || events[0].Seq != 4 || events[1].Seq != 5 {
 		t.Fatalf("retained events = %+v, %v", events, err)
 	}
 }

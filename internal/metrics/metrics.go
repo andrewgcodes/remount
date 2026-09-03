@@ -203,6 +203,7 @@ var (
 	ArtifactGCErrors      = Count("remount_artifact_gc_errors_total", "artifact garbage-collection passes that encountered an error")
 	ArtifactGCObjects     = Count("remount_artifact_gc_objects_total", "unreferenced artifacts removed by reference-aware garbage collection")
 	ArtifactGCBytes       = Count("remount_artifact_gc_bytes_total", "bytes reclaimed by reference-aware artifact garbage collection")
+	OrphanSpillsRemoved   = Count("remount_session_orphan_spills_removed_total", "orphaned session spill files removed during node startup")
 
 	CredUsed                = Count("remount_credentials_substituted_total", "credential substitutions at the egress broker")
 	EgressAllow             = Count("remount_egress_allowed_total", "requests allowed without a credential")
@@ -224,6 +225,9 @@ var (
 	MutationQuotaRejected = Count("remount_mutation_quota_rejections_total", "idempotent mutations rejected by durable control-record limits")
 	TimersPruned          = Count("remount_timers_pruned_total", "expired fired timers removed by control-record retention")
 	MutationsPruned       = Count("remount_mutations_pruned_total", "expired idempotency results removed by control-record retention")
+	WorkspacesPruned      = Count("remount_workspace_tombstones_pruned_total", "destroyed workspace records removed by control-record retention")
+	FleetOperationsPruned = Count("remount_fleet_operations_pruned_total", "terminal fleet operations removed by control-record retention")
+	AssignmentsPruned     = Count("remount_assignment_records_pruned_total", "historical assignment records removed by control-record retention")
 	RecordGCRuns          = Count("remount_control_record_gc_runs_total", "completed control-record retention passes")
 	RecordGCErrors        = Count("remount_control_record_gc_errors_total", "control-record retention passes that failed")
 )

@@ -842,16 +842,27 @@ type FSEditRes struct {
 // ---- workspace on node ----
 
 type WSSnapshotReq struct {
-	WS             string `cbor:"ws" json:"ws"`
-	Upload         bool   `cbor:"upload" json:"upload"` // push to the control plane's artifact store
+	WS     string `cbor:"ws" json:"ws"`
+	Upload bool   `cbor:"upload" json:"upload"` // push to the control plane's artifact store
+	// Authoritative requests a quiesced checkpoint. It requires Upload and
+	// terminates process-backend sessions; a live snapshot is never committed
+	// as failover state.
+	Authoritative  bool   `cbor:"authoritative,omitempty" json:"authoritative,omitempty"`
 	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
 	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type WSSnapshotRes struct {
-	Artifact string `cbor:"artifact" json:"artifact"` // art_sha256:<hex>
-	Bytes    int64  `cbor:"bytes" json:"bytes"`
+	Artifact      string `cbor:"artifact" json:"artifact"` // art_sha256:<hex>
+	Bytes         int64  `cbor:"bytes" json:"bytes"`
+	Consistency   string `cbor:"consistency" json:"consistency"`
+	Authoritative bool   `cbor:"authoritative" json:"authoritative"`
 }
+
+const (
+	SnapshotConsistencyLive     = "live"
+	SnapshotConsistencyQuiesced = "quiesced"
+)
 
 type WSReleaseReq struct {
 	WS       string `cbor:"ws" json:"ws"`
@@ -923,6 +934,8 @@ type ControlDiag struct {
 	MutationRecordsMax      int                `cbor:"mutation_records_max,omitempty" json:"mutation_records_max,omitempty"`
 	EventSeq                uint64             `cbor:"event_seq" json:"event_seq"`
 	EventOldest             uint64             `cbor:"event_oldest,omitempty" json:"event_oldest,omitempty"`
+	EventsMax               int                `cbor:"events_max,omitempty" json:"events_max,omitempty"`
+	RequestsActiveMax       int                `cbor:"requests_active_max,omitempty" json:"requests_active_max,omitempty"`
 	Bindings                []string           `cbor:"bindings,omitempty" json:"bindings,omitempty"`
 	ArtifactCount           int                `cbor:"artifact_count" json:"artifact_count"`
 	ArtifactBytes           int64              `cbor:"artifact_bytes" json:"artifact_bytes"`
@@ -966,34 +979,44 @@ type DiagReq struct {
 
 // NodeDiag is one machine's deep state.
 type NodeDiag struct {
-	Node                    string             `cbor:"node" json:"node"`
-	Info                    NodeInfo           `cbor:"info" json:"info"`
-	Now                     int64              `cbor:"now" json:"now"`
-	Uptime                  int64              `cbor:"uptime_sec" json:"uptime_sec"`
-	DataDir                 string             `cbor:"data_dir" json:"data_dir"`
-	DiskFree                int64              `cbor:"disk_free_bytes" json:"disk_free_bytes"`
-	DiskTotal               int64              `cbor:"disk_total_bytes" json:"disk_total_bytes"`
-	Goroutines              int                `cbor:"goroutines" json:"goroutines"`
-	HeapBytes               uint64             `cbor:"heap_bytes" json:"heap_bytes"`
-	Workspaces              []WSDiag           `cbor:"workspaces,omitempty" json:"workspaces,omitempty"`
-	Artifacts               int                `cbor:"artifacts" json:"artifacts"`
-	ArtifactBytes           int64              `cbor:"artifact_bytes,omitempty" json:"artifact_bytes,omitempty"`
-	ArtifactReservedBytes   int64              `cbor:"artifact_reserved_bytes,omitempty" json:"artifact_reserved_bytes,omitempty"`
-	ArtifactReservedObjects int                `cbor:"artifact_reserved_objects,omitempty" json:"artifact_reserved_objects,omitempty"`
-	ArtifactMaxBytes        int64              `cbor:"artifact_max_bytes,omitempty" json:"artifact_max_bytes,omitempty"`
-	ArtifactMaxObjects      int                `cbor:"artifact_max_objects,omitempty" json:"artifact_max_objects,omitempty"`
-	SessionsRetained        int                `cbor:"sessions_retained,omitempty" json:"sessions_retained,omitempty"`
-	SessionsActive          int                `cbor:"sessions_active,omitempty" json:"sessions_active,omitempty"`
-	SessionsMax             int                `cbor:"sessions_max,omitempty" json:"sessions_max,omitempty"`
-	SessionsActiveMax       int                `cbor:"sessions_active_max,omitempty" json:"sessions_active_max,omitempty"`
-	SessionsPerWorkspaceMax int                `cbor:"sessions_per_workspace_max,omitempty" json:"sessions_per_workspace_max,omitempty"`
-	SessionsPerPrincipalMax int                `cbor:"sessions_per_principal_max,omitempty" json:"sessions_per_principal_max,omitempty"`
-	MutationRecords         int                `cbor:"mutation_records,omitempty" json:"mutation_records,omitempty"`
-	MutationRecordsMax      int                `cbor:"mutation_records_max,omitempty" json:"mutation_records_max,omitempty"`
-	SnapshotsActive         int                `cbor:"snapshots_active,omitempty" json:"snapshots_active,omitempty"`
-	SnapshotsActiveMax      int                `cbor:"snapshots_active_max,omitempty" json:"snapshots_active_max,omitempty"`
-	Metrics                 map[string]float64 `cbor:"metrics,omitempty" json:"metrics,omitempty"`
-	Findings                []Finding          `cbor:"findings,omitempty" json:"findings,omitempty"`
+	Node                     string             `cbor:"node" json:"node"`
+	Info                     NodeInfo           `cbor:"info" json:"info"`
+	Now                      int64              `cbor:"now" json:"now"`
+	Uptime                   int64              `cbor:"uptime_sec" json:"uptime_sec"`
+	DataDir                  string             `cbor:"data_dir" json:"data_dir"`
+	DiskFree                 int64              `cbor:"disk_free_bytes" json:"disk_free_bytes"`
+	DiskTotal                int64              `cbor:"disk_total_bytes" json:"disk_total_bytes"`
+	Goroutines               int                `cbor:"goroutines" json:"goroutines"`
+	HeapBytes                uint64             `cbor:"heap_bytes" json:"heap_bytes"`
+	Workspaces               []WSDiag           `cbor:"workspaces,omitempty" json:"workspaces,omitempty"`
+	Artifacts                int                `cbor:"artifacts" json:"artifacts"`
+	ArtifactBytes            int64              `cbor:"artifact_bytes,omitempty" json:"artifact_bytes,omitempty"`
+	ArtifactReservedBytes    int64              `cbor:"artifact_reserved_bytes,omitempty" json:"artifact_reserved_bytes,omitempty"`
+	ArtifactReservedObjects  int                `cbor:"artifact_reserved_objects,omitempty" json:"artifact_reserved_objects,omitempty"`
+	ArtifactMaxBytes         int64              `cbor:"artifact_max_bytes,omitempty" json:"artifact_max_bytes,omitempty"`
+	ArtifactMaxObjects       int                `cbor:"artifact_max_objects,omitempty" json:"artifact_max_objects,omitempty"`
+	SessionsRetained         int                `cbor:"sessions_retained,omitempty" json:"sessions_retained,omitempty"`
+	SessionsActive           int                `cbor:"sessions_active,omitempty" json:"sessions_active,omitempty"`
+	SessionsMax              int                `cbor:"sessions_max,omitempty" json:"sessions_max,omitempty"`
+	SessionsActiveMax        int                `cbor:"sessions_active_max,omitempty" json:"sessions_active_max,omitempty"`
+	SessionsPerWorkspaceMax  int                `cbor:"sessions_per_workspace_max,omitempty" json:"sessions_per_workspace_max,omitempty"`
+	SessionsPerPrincipalMax  int                `cbor:"sessions_per_principal_max,omitempty" json:"sessions_per_principal_max,omitempty"`
+	SessionMemoryBytes       int                `cbor:"session_memory_bytes,omitempty" json:"session_memory_bytes,omitempty"`
+	SessionSpillBytes        int64              `cbor:"session_spill_bytes,omitempty" json:"session_spill_bytes,omitempty"`
+	SessionMemoryChunks      int                `cbor:"session_memory_chunks,omitempty" json:"session_memory_chunks,omitempty"`
+	SessionChunkBytes        int                `cbor:"session_chunk_bytes,omitempty" json:"session_chunk_bytes,omitempty"`
+	RequestsActiveMax        int                `cbor:"requests_active_max,omitempty" json:"requests_active_max,omitempty"`
+	ConnectorMaxBytes        int64              `cbor:"connector_max_bytes,omitempty" json:"connector_max_bytes,omitempty"`
+	ConnectorScopeMaxBytes   int64              `cbor:"connector_scope_max_bytes,omitempty" json:"connector_scope_max_bytes,omitempty"`
+	ConnectorObjectMaxBytes  int64              `cbor:"connector_object_max_bytes,omitempty" json:"connector_object_max_bytes,omitempty"`
+	ConnectorMaxObjects      int64              `cbor:"connector_max_objects,omitempty" json:"connector_max_objects,omitempty"`
+	ConnectorScopeMaxObjects int64              `cbor:"connector_scope_max_objects,omitempty" json:"connector_scope_max_objects,omitempty"`
+	MutationRecords          int                `cbor:"mutation_records,omitempty" json:"mutation_records,omitempty"`
+	MutationRecordsMax       int                `cbor:"mutation_records_max,omitempty" json:"mutation_records_max,omitempty"`
+	SnapshotsActive          int                `cbor:"snapshots_active,omitempty" json:"snapshots_active,omitempty"`
+	SnapshotsActiveMax       int                `cbor:"snapshots_active_max,omitempty" json:"snapshots_active_max,omitempty"`
+	Metrics                  map[string]float64 `cbor:"metrics,omitempty" json:"metrics,omitempty"`
+	Findings                 []Finding          `cbor:"findings,omitempty" json:"findings,omitempty"`
 }
 
 // WSDiag is one workspace as the node holding it sees it.
@@ -1031,6 +1054,7 @@ const (
 	EvWSDestroyed    = "ws.destroyed"
 	EvWSLeaseExpired = "ws.lease_expired"
 	EvWSFenced       = "ws.fenced"
+	EvWSStateChanged = "ws.state_changed"
 	EvSOpened        = "s.opened"
 	EvSExited        = "s.exited"
 	EvSInput         = "s.input"

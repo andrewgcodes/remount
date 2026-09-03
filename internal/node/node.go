@@ -58,12 +58,19 @@ type Options struct {
 	// cache, including concurrent staging. Zero selects 32 GiB / 50,000.
 	MaxArtifactStoreBytes int64
 	MaxArtifactObjects    int
+	// ArtifactRetention is the minimum age of an unreferenced cache entry;
+	// ArtifactGCInterval controls background reference-aware collection. Zero
+	// selects 24 hours and ten minutes.
+	ArtifactRetention  time.Duration
+	ArtifactGCInterval time.Duration
 	// Package connector cache limits. Zero values select conservative node,
 	// workspace, and object defaults in connector.NewStore.
-	MaxConnectorCacheBytes     int64
-	MaxConnectorWorkspaceBytes int64
-	MaxConnectorObjectBytes    int64
-	Logger                     *slog.Logger
+	MaxConnectorCacheBytes       int64
+	MaxConnectorWorkspaceBytes   int64
+	MaxConnectorObjectBytes      int64
+	MaxConnectorObjects          int64
+	MaxConnectorWorkspaceObjects int64
+	Logger                       *slog.Logger
 	// Allow lists hosts every workspace on this node may reach without a credential.
 	Allow []string
 	// AllowPrivate lists hosts that may resolve to private addresses (local models).
@@ -82,6 +89,12 @@ type Options struct {
 	MaxActiveSessions       int
 	MaxSessionsPerWorkspace int
 	MaxSessionsPerPrincipal int
+	// Session log limits are per retained session. Their product with
+	// MaxSessions is the node-wide worst-case retained-memory/spill bound.
+	SessionMemoryBytes     int
+	SessionSpillBytes      int64
+	SessionMaxChunkBytes   int
+	SessionMaxMemoryChunks int
 	// MutationRetention is the replay window for completed node-side
 	// idempotency results. Pending/ambiguous intents are never pruned. Zero
 	// selects 30 days; MaxMutationRecords defaults to 10,000.
@@ -153,6 +166,11 @@ type ws struct {
 	broker       *broker.Broker
 	leases       []proto.BindingLease
 	lastSnapshot time.Time
+	// treeMu serializes node filesystem mutations/session startup with archive
+	// construction. checkpointing is guarded by Node.mu and rejects newly
+	// authorized work while an authoritative checkpoint fences sessions.
+	treeMu        sync.RWMutex
+	checkpointing bool
 }
 
 // subscriber streams one session's log to one client.
@@ -221,10 +239,13 @@ func New(opts Options) (*Node, error) {
 		opts.HTTPClient = &http.Client{Timeout: 10 * time.Minute}
 	}
 	if opts.MaxArtifactBytes < 0 || opts.MaxArtifactStoreBytes < 0 || opts.MaxArtifactObjects < 0 ||
+		opts.MaxConnectorCacheBytes < 0 || opts.MaxConnectorWorkspaceBytes < 0 || opts.MaxConnectorObjectBytes < 0 ||
+		opts.MaxConnectorObjects < 0 || opts.MaxConnectorWorkspaceObjects < 0 ||
 		opts.MaxSessions < 0 || opts.MaxActiveSessions < 0 || opts.MaxSessionsPerWorkspace < 0 ||
-		opts.MaxSessionsPerPrincipal < 0 || opts.MaxConcurrentRequests < 0 ||
+		opts.MaxSessionsPerPrincipal < 0 || opts.SessionMemoryBytes < 0 || opts.SessionSpillBytes < 0 ||
+		opts.SessionMaxChunkBytes < 0 || opts.SessionMaxMemoryChunks < 0 || opts.MaxConcurrentRequests < 0 ||
 		opts.MutationRetention < 0 || opts.MaxMutationRecords < 0 || opts.MaxConcurrentSnapshots < 0 ||
-		opts.SnapshotMinInterval < 0 {
+		opts.SnapshotMinInterval < 0 || opts.ArtifactRetention < 0 || opts.ArtifactGCInterval < 0 {
 		return nil, errors.New("node: resource limits must not be negative")
 	}
 	if opts.MaxArtifactBytes == 0 {
@@ -236,8 +257,41 @@ func New(opts Options) (*Node, error) {
 	if opts.MaxArtifactObjects == 0 {
 		opts.MaxArtifactObjects = 50_000
 	}
+	if opts.ArtifactRetention == 0 {
+		opts.ArtifactRetention = 24 * time.Hour
+	}
+	if opts.ArtifactGCInterval == 0 {
+		opts.ArtifactGCInterval = 10 * time.Minute
+	}
+	if opts.MaxConnectorCacheBytes == 0 {
+		opts.MaxConnectorCacheBytes = 16 << 30
+	}
+	if opts.MaxConnectorWorkspaceBytes == 0 {
+		opts.MaxConnectorWorkspaceBytes = min(int64(2<<30), opts.MaxConnectorCacheBytes)
+	}
+	if opts.MaxConnectorObjectBytes == 0 {
+		opts.MaxConnectorObjectBytes = min(int64(512<<20), opts.MaxConnectorWorkspaceBytes)
+	}
+	if opts.MaxConnectorObjects == 0 {
+		opts.MaxConnectorObjects = 100_000
+	}
+	if opts.MaxConnectorWorkspaceObjects == 0 {
+		opts.MaxConnectorWorkspaceObjects = min(int64(4_096), opts.MaxConnectorObjects)
+	}
 	if opts.MaxConcurrentRequests <= 0 {
 		opts.MaxConcurrentRequests = 128
+	}
+	if opts.SessionMemoryBytes == 0 {
+		opts.SessionMemoryBytes = 2 << 20
+	}
+	if opts.SessionSpillBytes == 0 {
+		opts.SessionSpillBytes = 128 << 20
+	}
+	if opts.SessionMaxChunkBytes == 0 {
+		opts.SessionMaxChunkBytes = 32 << 10
+	}
+	if opts.SessionMaxMemoryChunks == 0 {
+		opts.SessionMaxMemoryChunks = 16_384
 	}
 	if opts.MutationRetention == 0 {
 		opts.MutationRetention = 30 * 24 * time.Hour
@@ -255,6 +309,9 @@ func New(opts Options) (*Node, error) {
 		if err := os.MkdirAll(filepath.Join(opts.DataDir, d), 0o700); err != nil {
 			return nil, err
 		}
+	}
+	if err := cleanupOrphanSpills(filepath.Join(opts.DataDir, "spill")); err != nil {
+		return nil, err
 	}
 	id, priv, err := loadIdentity(filepath.Join(opts.DataDir, "identity.json"))
 	if err != nil {
@@ -275,7 +332,8 @@ func New(opts Options) (*Node, error) {
 	}
 	connectorStore, err := connector.NewStore(filepath.Join(opts.DataDir, "connectors"), connector.StoreOptions{
 		MaxBytes: opts.MaxConnectorCacheBytes, MaxBytesPerScope: opts.MaxConnectorWorkspaceBytes,
-		MaxObjectBytes: opts.MaxConnectorObjectBytes,
+		MaxObjectBytes: opts.MaxConnectorObjectBytes, MaxObjects: opts.MaxConnectorObjects,
+		MaxObjectsPerScope: opts.MaxConnectorWorkspaceObjects,
 	})
 	if err != nil {
 		return nil, err
@@ -308,7 +366,8 @@ func New(opts Options) (*Node, error) {
 		started: time.Now(), stop: make(chan struct{}), online: make(chan struct{}),
 	}
 	n.sessions = session.NewManager(session.ManagerOptions{
-		SpillDir: filepath.Join(opts.DataDir, "spill"), MemBytes: 2 << 20, SpillBytes: 128 << 20,
+		SpillDir: filepath.Join(opts.DataDir, "spill"), MemBytes: opts.SessionMemoryBytes, SpillBytes: opts.SessionSpillBytes,
+		MaxChunk: opts.SessionMaxChunkBytes, MaxChunks: opts.SessionMaxMemoryChunks,
 		MaxSessions: opts.MaxSessions, MaxActive: opts.MaxActiveSessions, MaxSessionsPerWorkspace: opts.MaxSessionsPerWorkspace,
 		MaxSessionsPerPrincipal: opts.MaxSessionsPerPrincipal,
 		OnExit: func(s *session.Session, info proto.ExitInfo) {
@@ -316,6 +375,37 @@ func New(opts Options) (*Node, error) {
 		},
 	})
 	return n, nil
+}
+
+func cleanupOrphanSpills(directory string) error {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return fmt.Errorf("node: read spill directory: %w", err)
+	}
+	var cleanupErrors []error
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "s_") || !strings.HasSuffix(name, ".log") || entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			cleanupErrors = append(cleanupErrors, err)
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		if err := os.Remove(filepath.Join(directory, name)); err != nil {
+			cleanupErrors = append(cleanupErrors, err)
+			continue
+		}
+		metrics.OrphanSpillsRemoved.Inc()
+	}
+	if err := errors.Join(cleanupErrors...); err != nil {
+		return fmt.Errorf("node: remove orphan session spills: %w", err)
+	}
+	return nil
 }
 
 func loadMutations(path string) (map[string]*mutationEntry, error) {
@@ -415,8 +505,12 @@ func (n *Node) persistMutationsLocked() error {
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
-	if err := tmp.Chmod(0o600); err == nil {
-		_, err = tmp.Write(b)
+	if err = tmp.Chmod(0o600); err == nil {
+		var written int
+		written, err = tmp.Write(b)
+		if err == nil && written != len(b) {
+			err = io.ErrShortWrite
+		}
 	}
 	if err == nil {
 		err = tmp.Sync()
@@ -599,8 +693,12 @@ func loadIdentity(path string) (string, ed25519.PrivateKey, error) {
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
-	if err := tmp.Chmod(0o600); err == nil {
-		_, err = tmp.Write(b)
+	if err = tmp.Chmod(0o600); err == nil {
+		var written int
+		written, err = tmp.Write(b)
+		if err == nil && written != len(b) {
+			err = io.ErrShortWrite
+		}
 	}
 	if err == nil {
 		err = tmp.Sync()
@@ -640,10 +738,11 @@ func (n *Node) emit(typ, stream, principal string, payload any) {
 
 // Run connects (and reconnects) to the relay until ctx ends.
 func (n *Node) Run(ctx context.Context) error {
-	n.wg.Add(3)
+	n.wg.Add(4)
 	go n.renewLoop(ctx)
 	go n.fenceLoop(ctx)
 	go n.eventLoop(ctx)
+	go n.artifactGCLoop(ctx)
 	defer n.wg.Wait()
 	defer n.shutdown()
 	backoff := 100 * time.Millisecond
@@ -723,6 +822,59 @@ func (n *Node) eventLoop(ctx context.Context) {
 	}
 }
 
+func (n *Node) artifactGCLoop(ctx context.Context) {
+	defer n.wg.Done()
+	ticker := time.NewTicker(n.opts.ArtifactGCInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-n.stop:
+			return
+		case now := <-ticker.C:
+			if _, err := n.CollectArtifacts(now); err != nil {
+				metrics.ArtifactGCErrors.Inc()
+				n.logger.Error("collect node artifact cache", "err", err)
+			}
+		}
+	}
+}
+
+// CollectArtifacts removes old cache entries that are not referenced by a
+// current workspace or a prepared two-phase release. The control-plane store,
+// not this cache, remains the durability authority.
+func (n *Node) CollectArtifacts(now time.Time) (artifact.GCResult, error) {
+	n.mu.Lock()
+	references := make(map[string]struct{})
+	for _, workspace := range n.workspaces {
+		if workspace.LastSnapshot != "" {
+			references[workspace.LastSnapshot] = struct{}{}
+		}
+		if workspace.Spec.RestoreFrom != "" {
+			references[workspace.Spec.RestoreFrom] = struct{}{}
+		}
+	}
+	for _, prepared := range n.prepared {
+		if prepared.response.Snapshot != "" {
+			references[prepared.response.Snapshot] = struct{}{}
+		}
+	}
+	n.mu.Unlock()
+	ids := make([]string, 0, len(references))
+	for id := range references {
+		ids = append(ids, id)
+	}
+	result, err := n.store.Collect(ids, now.Add(-n.opts.ArtifactRetention))
+	if err != nil {
+		return result, err
+	}
+	metrics.ArtifactGCRuns.Inc()
+	metrics.ArtifactGCObjects.Add(uint64(result.Removed))
+	metrics.ArtifactGCBytes.Add(uint64(result.RemovedBytes))
+	return result, nil
+}
+
 func (n *Node) shutdown() {
 	n.requestMu.Lock()
 	n.acceptRequests = false
@@ -765,7 +917,7 @@ func (n *Node) connectOnce(ctx context.Context) error {
 	}
 	peer := transport.NewPeer(conn, transport.HandlerFunc(n.handle))
 	hello := proto.Hello{
-		Peer: n.id, Role: proto.RoleNode, Token: n.opts.Token, Caps: []string{"v1"},
+		Peer: n.id, Role: proto.RoleNode, Token: n.opts.Token, Caps: []string{proto.CapabilityV1},
 		PubKey: n.priv.Public().(ed25519.PublicKey), Labels: n.opts.Labels,
 	}
 	info := workspace.HostInfoForRegistry(n.opts.Backends)
@@ -789,6 +941,10 @@ func (n *Node) helloAndServe(ctx context.Context, peer *transport.Peer, hello pr
 	if err != nil {
 		peer.Close()
 		return err
+	}
+	if !proto.HasCapability(ok.Caps, proto.CapabilityV1) {
+		peer.Close()
+		return proto.Err(proto.CodeUnsupported, "server did not negotiate required capability %q", proto.CapabilityV1)
 	}
 	n.mu.Lock()
 	n.peer = peer
@@ -1104,6 +1260,16 @@ func appendWarning(existing, warning string) string {
 	return existing + "; " + warning
 }
 
+// stopWorkspaceSessions drains session creation that was already inside the
+// workspace tree boundary before ownership was removed, then terminates every
+// resulting session. Callers must remove the workspace from the serving map
+// first so queued starters fail their post-lock serviceability check.
+func (n *Node) stopWorkspaceSessions(w *ws) error {
+	w.treeMu.Lock()
+	defer w.treeMu.Unlock()
+	return n.sessions.KillWorkspace(w.ID)
+}
+
 // fenceWorkspace stops all execution and egress but preserves the filesystem.
 // Authority disagreement is not permission to delete the only current copy.
 func (n *Node) fenceWorkspace(ctx context.Context, id, reason string) {
@@ -1139,17 +1305,32 @@ func (n *Node) fenceWorkspace(ctx context.Context, id, reason string) {
 			n.logger.Error("revoke workspace network while fencing", "ws", id, "err", networkErr)
 		}
 	}
-	n.sessions.KillWorkspace(id)
+	var sessionErr error
+	if w != nil {
+		sessionErr = n.stopWorkspaceSessions(w)
+	} else {
+		sessionErr = n.sessions.KillWorkspace(id)
+	}
+	if sessionErr != nil {
+		n.logger.Error("stop workspace sessions while fencing", "ws", id, "err", sessionErr)
+	}
 	if w != nil {
 		if w.broker != nil {
 			_ = w.broker.Close()
 		}
+		// Wait for an operation already inside the tree critical section and
+		// prevent a pre-authorized waiter from racing the close. Such a waiter
+		// revalidates after it acquires treeMu and observes removal above.
+		w.treeMu.Lock()
 		_ = w.handle.FS().Close()
+		w.treeMu.Unlock()
 	}
 	n.logger.Warn("workspace execution fenced; local filesystem retained", "ws", id, "reason", reason,
-		"network_revoked", networkErr == nil, "network_error", errorString(networkErr))
+		"network_revoked", networkErr == nil, "network_error", errorString(networkErr),
+		"sessions_stopped", sessionErr == nil, "session_error", errorString(sessionErr))
 	n.emit(proto.EvWSFenced, id, "", map[string]any{
 		"reason": reason, "network_revoked": networkErr == nil, "network_error": errorString(networkErr),
+		"sessions_stopped": sessionErr == nil, "session_error": errorString(sessionErr),
 	})
 }
 
@@ -1271,15 +1452,19 @@ func (n *Node) quarantine(ctx context.Context, req *proto.WSQuarantineReq) (*pro
 		if w.broker != nil {
 			_ = w.broker.Close()
 		}
-		n.sessions.KillWorkspace(req.WS)
+		sessionErr := n.stopWorkspaceSessions(w)
 		res := proto.WSQuarantineRes{
 			Fenced: true, Generation: req.Gen, Action: req.Action, Backend: w.handle.Backend(),
+		}
+		if sessionErr != nil {
+			res.Fenced = false
+			res.Warning = appendWarning(res.Warning, "session fencing failed: "+sessionErr.Error())
 		}
 		if networkErr != nil {
 			res.Fenced = false
 			res.Warning = appendWarning(res.Warning, "network revocation failed: "+networkErr.Error())
 		}
-		if req.Action == proto.FleetActionCheckpoint || req.Action == proto.FleetActionDestroy {
+		if sessionErr == nil && (req.Action == proto.FleetActionCheckpoint || req.Action == proto.FleetActionDestroy) {
 			id, _, snapshotErr := n.snapshot(ctx, w, true)
 			if snapshotErr != nil {
 				res.Warning = appendWarning(res.Warning, snapshotErr.Error())
@@ -1287,7 +1472,9 @@ func (n *Node) quarantine(ctx context.Context, req *proto.WSQuarantineReq) (*pro
 				res.Snapshot = id
 			}
 		}
+		w.treeMu.Lock()
 		_ = w.handle.FS().Close()
+		w.treeMu.Unlock()
 		n.emit(proto.EvWSFenced, req.WS, w.Spec.Principal, map[string]any{
 			"operation": req.OperationID, "action": req.Action, "snapshot": res.Snapshot,
 			"warning": res.Warning, "network_revoked": res.Fenced,
@@ -1552,6 +1739,9 @@ func (n *Node) authorizeClaims(client, wsID string, g *proto.Grant) (*ws, proto.
 	if w == nil {
 		return nil, proto.GrantClaims{}, proto.Err(proto.CodeNotFound, "workspace %s is not on this node", wsID)
 	}
+	if w.checkpointing {
+		return nil, proto.GrantClaims{}, proto.Err(proto.CodeConflict, "workspace %s is checkpointing", wsID)
+	}
 	key := client + "|" + wsID
 	if g == nil {
 		g = n.grants[key]
@@ -1575,6 +1765,34 @@ func (n *Node) authorizeClaims(client, wsID string, g *proto.Grant) (*ws, proto.
 func (n *Node) authorize(client, wsID string, g *proto.Grant) (*ws, error) {
 	w, _, err := n.authorizeClaims(client, wsID, g)
 	return w, err
+}
+
+// lockWorkspaceTree closes the authorization-to-operation race. A lifecycle
+// transition can remove or checkpoint a workspace after authorize returns but
+// before an operation reaches treeMu. Revalidate only after acquiring the tree
+// lock so an operation queued behind release/quarantine/checkpoint cannot touch
+// a stale or already-archived handle.
+func (n *Node) lockWorkspaceTree(w *ws, exclusive bool) (func(), error) {
+	if exclusive {
+		w.treeMu.Lock()
+	} else {
+		w.treeMu.RLock()
+	}
+	unlock := func() {
+		if exclusive {
+			w.treeMu.Unlock()
+		} else {
+			w.treeMu.RUnlock()
+		}
+	}
+	n.mu.Lock()
+	serviceable := n.workspaces[w.ID] == w && !w.checkpointing
+	n.mu.Unlock()
+	if !serviceable {
+		unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace %s is no longer serviceable", w.ID)
+	}
+	return unlock, nil
 }
 
 // mutationKey scopes caller-selected keys to the authenticated subject,
@@ -1806,6 +2024,11 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
+		unlock, err := n.lockWorkspaceTree(w, false)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
 		return w.handle.FS().Read(req.Path, req.Offset, req.Limit)
 	case proto.OpFSWrite:
 		req, err := decode[proto.FSWriteReq](f)
@@ -1820,6 +2043,11 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		clean.Grant = nil
 		key := n.mutationKey(f.From, w.ID, proto.OpFSWrite, req.IdempotencyKey)
 		_, err = n.runMutation(ctx, key, clean, func() ([]byte, error) {
+			unlock, err := n.lockWorkspaceTree(w, true)
+			if err != nil {
+				return nil, err
+			}
+			defer unlock()
 			if err := w.handle.FS().Write(req.Path, req.Data, req.Mode, req.Append, req.MkdirP); err != nil {
 				return nil, err
 			}
@@ -1836,6 +2064,11 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
+		unlock, err := n.lockWorkspaceTree(w, false)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
 		ents, err := w.handle.FS().List(req.Path)
 		if err != nil {
 			return nil, err
@@ -1850,6 +2083,11 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
+		unlock, err := n.lockWorkspaceTree(w, false)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
 		e, err := w.handle.FS().Stat(req.Path)
 		if err != nil {
 			return nil, err
@@ -1868,6 +2106,11 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		clean.Grant = nil
 		key := n.mutationKey(f.From, w.ID, proto.OpFSMkdir, req.IdempotencyKey)
 		_, err = n.runMutation(ctx, key, clean, func() ([]byte, error) {
+			unlock, err := n.lockWorkspaceTree(w, true)
+			if err != nil {
+				return nil, err
+			}
+			defer unlock()
 			if err := w.handle.FS().Mkdir(req.Path); err != nil {
 				return nil, err
 			}
@@ -1888,6 +2131,11 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		clean.Grant = nil
 		key := n.mutationKey(f.From, w.ID, proto.OpFSRemove, req.IdempotencyKey)
 		_, err = n.runMutation(ctx, key, clean, func() ([]byte, error) {
+			unlock, err := n.lockWorkspaceTree(w, true)
+			if err != nil {
+				return nil, err
+			}
+			defer unlock()
 			if err := w.handle.FS().Remove(req.Path, req.Recursive); err != nil {
 				return nil, err
 			}
@@ -1908,6 +2156,11 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		clean.Grant = nil
 		key := n.mutationKey(f.From, w.ID, proto.OpFSRename, req.IdempotencyKey)
 		_, err = n.runMutation(ctx, key, clean, func() ([]byte, error) {
+			unlock, err := n.lockWorkspaceTree(w, true)
+			if err != nil {
+				return nil, err
+			}
+			defer unlock()
 			if err := w.handle.FS().Rename(req.From, req.To); err != nil {
 				return nil, err
 			}
@@ -1925,6 +2178,11 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
+		unlock, err := n.lockWorkspaceTree(w, false)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
 		return w.handle.FS().Search(req.Path, req.Pattern, req.Glob, req.MaxResults)
 	case proto.OpFSEdit:
 		req, err := decode[proto.FSEditReq](f)
@@ -1939,6 +2197,11 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		clean.Grant = nil
 		key := n.mutationKey(f.From, w.ID, proto.OpFSEdit, req.IdempotencyKey)
 		raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
+			unlock, err := n.lockWorkspaceTree(w, true)
+			if err != nil {
+				return nil, err
+			}
+			defer unlock()
 			nrep, err := w.handle.FS().Edit(req.Path, req.Edits)
 			if err != nil {
 				return nil, err
@@ -1967,19 +2230,16 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		clean.Grant = nil
 		key := n.mutationKey(f.From, w.ID, proto.OpWSSnapshot, req.IdempotencyKey)
 		raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
-			id, size, err := n.snapshotExplicit(ctx, w, req.Upload)
+			result, err := n.snapshotExplicit(ctx, w, req.Upload, req.Authoritative, func(id string) error {
+				cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+				return p.Call(cctx, proto.PeerControl, proto.OpWSSnapshotCommit,
+					proto.WSSnapshotCommitReq{ID: w.ID, Gen: w.Generation, Snapshot: id}, nil)
+			})
 			if err != nil {
 				return nil, err
 			}
-			if req.Upload {
-				cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				err = p.Call(cctx, proto.PeerControl, proto.OpWSSnapshotCommit, proto.WSSnapshotCommitReq{ID: w.ID, Gen: w.Generation, Snapshot: id}, nil)
-				cancel()
-				if err != nil {
-					return nil, fmt.Errorf("commit snapshot: %w", err)
-				}
-			}
-			return proto.Marshal(proto.WSSnapshotRes{Artifact: id, Bytes: size})
+			return proto.Marshal(result)
 		})
 		if err != nil {
 			return nil, err
@@ -2043,6 +2303,11 @@ func (n *Node) status() proto.NodeStatus {
 // ---------------------------------------------------------------------------
 
 func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, claims proto.GrantClaims, w *ws, req *proto.SOpenReq) (any, error) {
+	unlock, err := n.lockWorkspaceTree(w, false)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	env := map[string]string{}
 	for k, v := range w.Spec.Env {
 		env[k] = v
@@ -2086,6 +2351,11 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 }
 
 func (n *Node) portOpen(ctx context.Context, p *transport.Peer, client string, claims proto.GrantClaims, w *ws, req *proto.PortOpenReq) (any, error) {
+	unlock, err := n.lockWorkspaceTree(w, false)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	if req.Host != "" {
 		return nil, proto.Err(proto.CodeDenied, "port.open host is backend-controlled")
 	}
@@ -2451,16 +2721,84 @@ func (n *Node) snapshot(ctx context.Context, w *ws, upload bool) (string, int64,
 		return "", 0, err
 	}
 	defer release()
-	return n.snapshotRaw(ctx, w, upload)
+	w.treeMu.Lock()
+	defer w.treeMu.Unlock()
+	result, err := n.snapshotRaw(ctx, w, upload, proto.SnapshotConsistencyQuiesced)
+	return result.Artifact, result.Bytes, err
 }
 
-func (n *Node) snapshotExplicit(ctx context.Context, w *ws, upload bool) (string, int64, error) {
+func (n *Node) snapshotExplicit(ctx context.Context, w *ws, upload, authoritative bool, commit func(string) error) (proto.WSSnapshotRes, error) {
+	if authoritative && !upload {
+		return proto.WSSnapshotRes{}, proto.Err(proto.CodeBadRequest, "an authoritative checkpoint must be uploaded")
+	}
+	if authoritative && n.opts.ArtifactURL == "" {
+		return proto.WSSnapshotRes{}, proto.Err(proto.CodeUnsupported,
+			"authoritative checkpoints require a configured control-plane artifact store")
+	}
+	if authoritative && commit == nil {
+		return proto.WSSnapshotRes{}, proto.Err(proto.CodeInternal,
+			"authoritative checkpoints require a control-plane commit callback")
+	}
 	release, err := n.acquireSnapshot(ctx, w, true)
 	if err != nil {
-		return "", 0, err
+		return proto.WSSnapshotRes{}, err
 	}
 	defer release()
-	return n.snapshotRaw(ctx, w, upload)
+
+	if authoritative {
+		n.mu.Lock()
+		if n.workspaces[w.ID] != w || w.checkpointing {
+			n.mu.Unlock()
+			return proto.WSSnapshotRes{}, proto.Err(proto.CodeConflict, "workspace %s is not available for checkpoint", w.ID)
+		}
+		w.checkpointing = true
+		n.mu.Unlock()
+		defer func() {
+			n.mu.Lock()
+			w.checkpointing = false
+			n.mu.Unlock()
+		}()
+	}
+
+	// The exclusive tree lock drains any node-mediated filesystem mutation or
+	// session startup that authorized just before checkpointing was published.
+	w.treeMu.Lock()
+	defer w.treeMu.Unlock()
+	n.mu.Lock()
+	serviceable := n.workspaces[w.ID] == w
+	if !authoritative {
+		serviceable = serviceable && !w.checkpointing
+	}
+	n.mu.Unlock()
+	if !serviceable {
+		return proto.WSSnapshotRes{}, proto.Err(proto.CodeConflict,
+			"workspace %s is no longer serviceable", w.ID)
+	}
+	consistency := proto.SnapshotConsistencyLive
+	if authoritative {
+		// Process backends cannot suspend arbitrary escaped host processes, so
+		// their documented local-mode contract is limited to Remount-managed
+		// writers. KillWorkspace joins every such session before archiving.
+		if err := n.sessions.KillWorkspace(w.ID); err != nil {
+			return proto.WSSnapshotRes{}, proto.Err(proto.CodeTimeout, "quiesce workspace sessions: %v", err)
+		}
+		consistency = proto.SnapshotConsistencyQuiesced
+	}
+	result, err := n.snapshotRaw(ctx, w, upload, consistency)
+	if err != nil {
+		return result, err
+	}
+	// Keep checkpointing published and treeMu exclusive until control has
+	// durably accepted this exact generation/digest. An operation that passed
+	// authorization just before checkpointing may be waiting on treeMu; letting
+	// it mutate between archive completion and commit would acknowledge data not
+	// represented by the new authoritative checkpoint.
+	if authoritative {
+		if err := commit(result.Artifact); err != nil {
+			return result, fmt.Errorf("commit snapshot: %w", err)
+		}
+	}
+	return result, nil
 }
 
 func (n *Node) acquireSnapshot(ctx context.Context, w *ws, explicit bool) (func(), error) {
@@ -2495,25 +2833,51 @@ func (n *Node) acquireSnapshot(ctx context.Context, w *ws, explicit bool) (func(
 	return func() { <-n.snapshotSlots }, nil
 }
 
-func (n *Node) snapshotRaw(ctx context.Context, w *ws, upload bool) (string, int64, error) {
+// snapshotRaw requires w.treeMu to be held exclusively. Quiesced snapshots
+// call the backend's Checkpoint contract; live snapshots are explicitly
+// labeled and are never eligible to update control-plane failover state.
+func (n *Node) snapshotRaw(ctx context.Context, w *ws, upload bool, consistency string) (proto.WSSnapshotRes, error) {
 	// .remount is node-local truth and must never travel with the workspace.
 	excludes := append([]string{EnvFileDir}, w.Spec.Exclude...)
 	pr, pw := io.Pipe()
-	go func() { pw.CloseWithError(w.handle.Snapshot(ctx, excludes, pw)) }()
+	producerDone := make(chan error, 1)
+	go func() {
+		var err error
+		if consistency == proto.SnapshotConsistencyQuiesced {
+			err = w.handle.Checkpoint(ctx, excludes, pw)
+		} else {
+			err = w.handle.Snapshot(ctx, excludes, pw)
+		}
+		_ = pw.CloseWithError(err)
+		producerDone <- err
+	}()
 	id, size, err := n.store.PutLimit(pr, n.opts.MaxArtifactBytes)
 	if err != nil {
 		pr.CloseWithError(err)
-		return "", 0, err
+		// Do not release treeMu while the archive producer can still be walking
+		// the workspace. Closing the read end wakes a blocked writer; joining it
+		// also prevents one failed snapshot from leaking a goroutine.
+		<-producerDone
+		return proto.WSSnapshotRes{}, err
+	}
+	if producerErr := <-producerDone; producerErr != nil {
+		return proto.WSSnapshotRes{}, producerErr
 	}
 	if upload && n.opts.ArtifactURL != "" {
 		if err := n.upload(ctx, id); err != nil {
-			return id, size, fmt.Errorf("upload artifact %s: %w", id, err)
+			return proto.WSSnapshotRes{Artifact: id, Bytes: size, Consistency: consistency}, fmt.Errorf("upload artifact %s: %w", id, err)
 		}
 	}
 	metrics.SnapshotsTaken.Inc()
 	metrics.SnapshotBytes.Add(uint64(size))
-	n.emit(proto.EvWSSnapshot, w.ID, w.Spec.Principal, map[string]any{"artifact": id, "bytes": size, "uploaded": upload})
-	return id, size, nil
+	authoritative := consistency == proto.SnapshotConsistencyQuiesced && upload
+	n.emit(proto.EvWSSnapshot, w.ID, w.Spec.Principal, map[string]any{
+		"artifact": id, "bytes": size, "uploaded": upload,
+		"consistency": consistency, "authoritative": authoritative,
+	})
+	return proto.WSSnapshotRes{
+		Artifact: id, Bytes: size, Consistency: consistency, Authoritative: authoritative,
+	}, nil
 }
 
 func (n *Node) upload(ctx context.Context, id string) error {
@@ -2568,6 +2932,10 @@ func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error
 		n.mu.Unlock()
 		return nil, proto.Err(proto.CodeConflict, "generation mismatch")
 	}
+	if w.checkpointing {
+		n.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace %s is checkpointing", req.WS)
+	}
 	prepared := &preparedRelease{workspace: w, request: *req, done: make(chan struct{})}
 	n.prepared[req.WS] = prepared
 	delete(n.workspaces, req.WS)
@@ -2579,8 +2947,18 @@ func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error
 		}
 	}
 	n.mu.Unlock()
-	// Stop processes first so the snapshot is quiescent.
-	n.sessions.KillWorkspace(req.WS)
+	// Drain any session startup already inside the tree boundary, then stop all
+	// resulting processes so the snapshot (or destroy) is quiescent.
+	if err := n.stopWorkspaceSessions(w); err != nil {
+		prepared.err = fmt.Errorf("quiesce workspace sessions: %w", err)
+		n.mu.Lock()
+		n.workspaces[req.WS] = w
+		n.deadlines[req.WS] = time.Now().Add(n.localLeaseWindowLocked())
+		delete(n.prepared, req.WS)
+		close(prepared.done)
+		n.mu.Unlock()
+		return nil, prepared.err
+	}
 	out := proto.WSReleasedReq{ID: req.WS, Gen: req.Gen, Reason: req.Reason}
 	if req.Snapshot {
 		id, _, err := n.snapshot(ctx, w, true)
@@ -2588,6 +2966,7 @@ func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error
 			prepared.err = fmt.Errorf("checkpoint %s: %w", id, err)
 			n.mu.Lock()
 			n.workspaces[req.WS] = w
+			n.deadlines[req.WS] = time.Now().Add(n.localLeaseWindowLocked())
 			delete(n.prepared, req.WS)
 			close(prepared.done)
 			n.mu.Unlock()

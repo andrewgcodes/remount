@@ -1,8 +1,12 @@
 package proto
 
 import (
+	"bytes"
+	"encoding/hex"
 	"errors"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/fxamacker/cbor/v2"
@@ -30,6 +34,50 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 }
 
+func TestEncodeFrameDefaultsVersionWithoutMutatingCaller(t *testing.T) {
+	frame := &Frame{T: KindPing}
+	raw, err := EncodeFrame(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frame.V != 0 {
+		t.Fatalf("EncodeFrame mutated caller version to %d", frame.V)
+	}
+	decoded, err := DecodeFrame(raw)
+	if err != nil || decoded.V != Version {
+		t.Fatalf("decoded frame = %+v, err=%v", decoded, err)
+	}
+}
+
+func TestV1GoldenFixture(t *testing.T) {
+	rawHex, err := os.ReadFile("testdata/v1-request.hex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := hex.DecodeString(strings.TrimSpace(string(rawHex)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := DecodeFrame(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request WSGetReq
+	if err := frame.Decode(&request); err != nil {
+		t.Fatal(err)
+	}
+	if frame.V != Version || frame.T != KindReq || frame.ID != 7 || frame.To != PeerControl || frame.Op != OpWSGet || request.ID != "ws_fixture" {
+		t.Fatalf("fixture changed semantics: frame=%+v request=%+v", frame, request)
+	}
+	reencoded, err := EncodeFrame(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(reencoded, raw) {
+		t.Fatalf("v1 encoding changed:\n got %x\nwant %x", reencoded, raw)
+	}
+}
+
 func TestDeterministicEncoding(t *testing.T) {
 	a := MustMarshal(map[string]int{"b": 2, "a": 1})
 	b := MustMarshal(map[string]int{"a": 1, "b": 2})
@@ -38,7 +86,8 @@ func TestDeterministicEncoding(t *testing.T) {
 	}
 }
 
-// A newer peer may add fields; an older peer must ignore them.
+// A peer may add fields within the negotiated version; an older peer ignores
+// those fields without accepting a different semantic version.
 func TestUnknownFieldsIgnored(t *testing.T) {
 	type future struct {
 		V     uint8  `cbor:"v"`
@@ -47,12 +96,12 @@ func TestUnknownFieldsIgnored(t *testing.T) {
 		Extra string `cbor:"extra"`
 		Body  []byte `cbor:"body"`
 	}
-	b, _ := cbor.Marshal(future{V: 2, T: KindReq, Op: "x.new", Extra: "surprise", Body: MustMarshal(map[string]any{"k": 1, "z": []int{1}})})
+	b, _ := cbor.Marshal(future{V: Version, T: KindReq, Op: "x.new", Extra: "surprise", Body: MustMarshal(map[string]any{"k": 1, "z": []int{1}})})
 	f, err := DecodeFrame(b)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if f.Op != "x.new" || f.V != 2 {
+	if f.Op != "x.new" || f.V != Version {
 		t.Fatalf("%+v", f)
 	}
 	var body struct {
@@ -60,6 +109,28 @@ func TestUnknownFieldsIgnored(t *testing.T) {
 	}
 	if err := f.Decode(&body); err != nil || body.K != 1 {
 		t.Fatalf("body: %v %+v", err, body)
+	}
+}
+
+func TestDecodeRejectsUnsupportedVersion(t *testing.T) {
+	for _, version := range []uint8{0, Version + 1} {
+		b, err := cbor.Marshal(Frame{V: version, T: KindReq, Op: "test"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := DecodeFrame(b); err == nil {
+			t.Fatalf("version %d was accepted", version)
+		}
+	}
+}
+
+func TestNegotiateCapabilities(t *testing.T) {
+	got, err := NegotiateCapabilities([]string{"optional.future", CapabilityV1})
+	if err != nil || !reflect.DeepEqual(got, []string{CapabilityV1}) {
+		t.Fatalf("negotiated %v, %v", got, err)
+	}
+	if _, err := NegotiateCapabilities(nil); !errors.Is(err, &Error{Code: CodeUnsupported}) {
+		t.Fatalf("missing baseline capability: %v", err)
 	}
 }
 

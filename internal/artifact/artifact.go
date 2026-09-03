@@ -28,8 +28,14 @@ import (
 	"remount.dev/remount/internal/metrics"
 )
 
-// Prefix of every artifact id.
-const Prefix = "art_sha256:"
+const (
+	// Prefix of every artifact id.
+	Prefix = "art_sha256:"
+	// POSIX tar permits a NUL type flag for legacy regular-file entries.
+	// archive/tar's TypeRegA name is deprecated, but readers must still accept
+	// existing archives that use the wire value.
+	legacyRegularFile byte = 0
+)
 
 var (
 	// ErrDigestMismatch means a caller-supplied artifact id did not match the
@@ -966,7 +972,7 @@ func extract(root string, r io.Reader, limits RestoreLimits) error {
 				return err
 			}
 			dirs = append(dirs, deferredMode{osName, os.FileMode(hdr.Mode).Perm(), hdr.ModTime})
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg, legacyRegularFile:
 			if err := rr.MkdirAll(filepath.Dir(osName), 0o755); err != nil {
 				return err
 			}

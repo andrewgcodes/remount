@@ -53,6 +53,9 @@ type Options struct {
 	// Negative intervals disable the background collector.
 	EventRetention  time.Duration
 	EventGCInterval time.Duration
+	// MaxEvents bounds retained rows even during a high-volume interval that
+	// has not reached EventRetention age. Zero selects 1,000,000.
+	MaxEvents int
 	// RecordRetention is the replay window for completed idempotency results
 	// and the visibility window for fired timers. RecordGCInterval controls
 	// bounded pruning passes. Negative intervals disable background pruning.
@@ -64,6 +67,9 @@ type Options struct {
 	Authenticator control.Authenticator
 	Authorizer    control.Authorizer
 	ApprovedNodes map[string]control.NodeApproval
+	// MaxConcurrentRequests bounds control-plane request handlers. Zero
+	// selects 128.
+	MaxConcurrentRequests int
 	// Workspace quotas are enforced atomically by the control plane.
 	MaxWorkspacesPerTenant  int
 	MaxWorkspacesPerSubject int
@@ -110,10 +116,10 @@ func New(opts Options) (*Server, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	if opts.MaxArtifactBytes < 0 || opts.MaxArtifactStoreBytes < 0 || opts.MaxArtifactObjects < 0 {
-		return nil, errors.New("server: artifact limits must not be negative")
+	if opts.MaxArtifactBytes < 0 || opts.MaxArtifactStoreBytes < 0 || opts.MaxArtifactObjects < 0 || opts.MaxEvents < 0 {
+		return nil, errors.New("server: artifact and event limits must not be negative")
 	}
-	if opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 || opts.MaxMutationRecords < 0 ||
+	if opts.MaxConcurrentRequests < 0 || opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 || opts.MaxMutationRecords < 0 ||
 		opts.MaxTimers < 0 || opts.MaxTimersPerWorkspace < 0 {
 		return nil, errors.New("server: control-plane quotas must not be negative")
 	}
@@ -143,6 +149,9 @@ func New(opts Options) (*Server, error) {
 	}
 	if opts.EventGCInterval == 0 {
 		opts.EventGCInterval = 10 * time.Minute
+	}
+	if opts.MaxEvents == 0 {
+		opts.MaxEvents = 1_000_000
 	}
 	if opts.RecordRetention == 0 {
 		opts.RecordRetention = 30 * 24 * time.Hour
@@ -197,7 +206,8 @@ func New(opts Options) (*Server, error) {
 		Authenticator: opts.Authenticator, Authorizer: opts.Authorizer, ApprovedNodes: opts.ApprovedNodes,
 		SecurityProfileFloor: floor, MaxWorkspacesPerTenant: opts.MaxWorkspacesPerTenant,
 		MaxWorkspacesPerSubject: opts.MaxWorkspacesPerSubject, MaxMutationRecords: opts.MaxMutationRecords,
-		MaxTimers: opts.MaxTimers, MaxTimersPerWorkspace: opts.MaxTimersPerWorkspace})
+		MaxTimers: opts.MaxTimers, MaxTimersPerWorkspace: opts.MaxTimersPerWorkspace,
+		MaxConcurrentRequests: opts.MaxConcurrentRequests, MaxEvents: opts.MaxEvents})
 	if err != nil {
 		_ = log.Close()
 		if opts.DataDir == "" {
@@ -307,11 +317,26 @@ func (s *Server) CollectArtifacts(now time.Time) (artifact.GCResult, error) {
 func (s *Server) PruneEvents(ctx context.Context, now time.Time) (int64, error) {
 	const batch = 10_000
 	var total int64
+	// Age and count limits both delete only an oldest contiguous prefix. Run
+	// age first so a quiet deployment still honors its audit-window policy.
 	for {
 		if err := ctx.Err(); err != nil {
 			return total, err
 		}
 		n, err := s.Log.Prune(ctx, now.Add(-s.opts.EventRetention).UnixMilli(), batch)
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n < batch {
+			break
+		}
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		n, err := s.Log.PruneSize(ctx, s.opts.MaxEvents, batch)
 		total += n
 		if err != nil {
 			return total, err
@@ -335,10 +360,15 @@ func (s *Server) PruneControlRecords(ctx context.Context, now time.Time) (contro
 		result, err := s.Control.PruneRecords(ctx, now.Add(-s.opts.RecordRetention), batch)
 		total.Mutations += result.Mutations
 		total.Timers += result.Timers
+		total.Workspaces += result.Workspaces
+		total.FleetOperations += result.FleetOperations
+		total.Assignments += result.Assignments
+		total.LegacyIdem += result.LegacyIdem
 		if err != nil {
 			return total, err
 		}
-		if result.Mutations < batch && result.Timers < batch {
+		if result.Mutations < batch && result.Timers < batch && result.Workspaces < batch &&
+			result.FleetOperations < batch && result.Assignments < batch && result.LegacyIdem < batch {
 			metrics.RecordGCRuns.Inc()
 			return total, nil
 		}

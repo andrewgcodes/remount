@@ -99,7 +99,7 @@ func signedNodeHello(t *testing.T, id, token string, info proto.NodeInfo) (proto
 		t.Fatal(err)
 	}
 	h := proto.Hello{
-		Peer: id, Role: proto.RoleNode, Token: token, PubKey: key.Public().(ed25519.PublicKey),
+		Peer: id, Role: proto.RoleNode, Token: token, Caps: []string{proto.CapabilityV1}, PubKey: key.Public().(ed25519.PublicKey),
 		Node: &info, IssuedAt: time.Now().UnixMilli(), Nonce: make([]byte, 32),
 	}
 	if _, err := rand.Read(h.Nonce); err != nil {
@@ -140,6 +140,35 @@ func processNodeInfo(mem int) proto.NodeInfo {
 				Isolation: "none", EgressMode: "cooperative_proxy", BrokerIdentity: "token", FilesystemBoundary: "root_handle",
 			}, Runtime: proto.RuntimeCaps{Snapshots: "fs"},
 		}},
+	}
+}
+
+func TestSnapshotCommitLosesToLifecycleTransition(t *testing.T) {
+	f := newControlFixture(t, "", nil)
+	connectNode(t, f.c, "n_one", processNodeInfo(4096))
+	created := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{})
+	claim, err := f.c.wsClaim(context.Background(), "n_one", created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.c.wsReady(context.Background(), "n_one", &proto.WSReadyReq{
+		ID: created.ID, Gen: claim.Workspace.Generation,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	f.c.mu.Lock()
+	f.c.workspaces[created.ID].State = proto.WSQuiescing
+	f.c.mu.Unlock()
+	err = f.c.wsSnapshotCommit(context.Background(), "n_one", &proto.WSSnapshotCommitReq{
+		ID: created.ID, Gen: claim.Workspace.Generation,
+		Snapshot: "art_sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	})
+	if !errors.Is(err, &proto.Error{Code: proto.CodeConflict}) {
+		t.Fatalf("snapshot commit during lifecycle transition = %v, want conflict", err)
+	}
+	if got := f.c.snapshotWS(created.ID).LastSnapshot; got != "" {
+		t.Fatalf("rejected snapshot became authoritative: %q", got)
 	}
 }
 
@@ -274,6 +303,145 @@ func TestDurableRecordQuotasRetentionAndLockCleanup(t *testing.T) {
 	}
 }
 
+func TestKeyedLifecycleProducerAndFleetLocksAreReleased(t *testing.T) {
+	f := newControlFixture(t, "", nil)
+	for name, acquire := range map[string]func(string) func(){
+		"lifecycle": f.c.lockLifecycle,
+		"producer":  f.c.lockProducer,
+		"fleet":     f.c.lockFleet,
+	} {
+		t.Run(name, func(t *testing.T) {
+			release := acquire("untrusted-cardinality-key")
+			release()
+			f.c.mu.Lock()
+			counts := map[string]int{
+				"lifecycle": len(f.c.lifecycle), "producer": len(f.c.producerLocks), "fleet": len(f.c.fleetLocks),
+			}
+			f.c.mu.Unlock()
+			if counts[name] != 0 {
+				t.Fatalf("retained %d keyed locks", counts[name])
+			}
+		})
+	}
+}
+
+func TestRecordPruneCollectsTerminalMetadataButPreservesLiveAuthority(t *testing.T) {
+	now := time.Unix(2_100_000_000, 0)
+	f := newControlFixture(t, "", func(opts *Options) { opts.Now = func() time.Time { return now } })
+	deleted := &proto.Workspace{ID: "ws_deleted", State: proto.WSDestroyed, Generation: 1, UpdatedAt: now.UnixMilli()}
+	protected := &proto.Workspace{ID: "ws_protected", State: proto.WSDestroyed, Generation: 2, UpdatedAt: now.UnixMilli()}
+	active := &proto.Workspace{ID: "ws_active", State: proto.WSClaimed, Generation: 7, Node: "n_owner", UpdatedAt: now.UnixMilli()}
+	completed := &proto.FleetOperation{
+		ID: "fleet_completed", State: proto.FleetStateCompleted,
+		Results: []proto.FleetOperationResult{{Workspace: deleted.ID, Generation: 1}},
+	}
+	pending := &proto.FleetOperation{
+		ID: "fleet_pending", State: proto.FleetStateRunning,
+		Results: []proto.FleetOperationResult{{Workspace: protected.ID, State: proto.FleetTargetPending}},
+	}
+	f.c.mu.Lock()
+	for _, workspace := range []*proto.Workspace{deleted, protected, active} {
+		if err := f.c.persistWS(workspace); err != nil {
+			f.c.mu.Unlock()
+			t.Fatal(err)
+		}
+		f.c.workspaces[workspace.ID] = workspace
+	}
+	for _, operation := range []*proto.FleetOperation{completed, pending} {
+		if err := f.c.persistFleetOperation(operation); err != nil {
+			f.c.mu.Unlock()
+			t.Fatal(err)
+		}
+		f.c.fleetOps[operation.ID] = operation
+	}
+	for _, assignment := range []struct {
+		workspace  string
+		generation uint64
+		node       string
+	}{
+		{active.ID, 6, "n_old"}, {active.ID, 7, active.Node},
+	} {
+		if _, err := f.c.db.Exec(`INSERT INTO assignments(workspace,generation,node,tenant,created_at) VALUES(?,?,?,?,?)`,
+			assignment.workspace, assignment.generation, assignment.node, "local", now.UnixMilli()); err != nil {
+			f.c.mu.Unlock()
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.c.db.Exec(`INSERT INTO idem(key,ws) VALUES('legacy','ws_deleted')`); err != nil {
+		f.c.mu.Unlock()
+		t.Fatal(err)
+	}
+	f.c.mu.Unlock()
+
+	now = now.Add(2 * time.Hour)
+	result, err := f.c.PruneRecords(context.Background(), now.Add(-time.Hour), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Workspaces != 1 || result.FleetOperations != 1 || result.Assignments != 1 || result.LegacyIdem != 1 {
+		t.Fatalf("prune result = %+v", result)
+	}
+	f.c.mu.Lock()
+	_, deletedPresent := f.c.workspaces[deleted.ID]
+	_, protectedPresent := f.c.workspaces[protected.ID]
+	_, completedPresent := f.c.fleetOps[completed.ID]
+	_, pendingPresent := f.c.fleetOps[pending.ID]
+	f.c.mu.Unlock()
+	if deletedPresent || !protectedPresent || completedPresent || !pendingPresent {
+		t.Fatalf("retention maps: deleted=%t protected=%t completed=%t pending=%t",
+			deletedPresent, protectedPresent, completedPresent, pendingPresent)
+	}
+	var assignments int
+	if err := f.c.db.QueryRow(`SELECT COUNT(*) FROM assignments WHERE workspace=? AND generation=? AND node=?`,
+		active.ID, active.Generation, active.Node).Scan(&assignments); err != nil || assignments != 1 {
+		t.Fatalf("current assignment count = %d, err=%v", assignments, err)
+	}
+}
+
+func TestRecordPruneDoesNotStarveBehindProtectedAssignments(t *testing.T) {
+	now := time.Unix(2_200_000_000, 0)
+	f := newControlFixture(t, "", func(opts *Options) { opts.Now = func() time.Time { return now } })
+	f.c.mu.Lock()
+	for i := range 5 {
+		id := fmt.Sprintf("ws_live_%d", i)
+		node := fmt.Sprintf("n_live_%d", i)
+		workspace := &proto.Workspace{
+			ID: id, State: proto.WSClaimed, Generation: 1, Node: node,
+			Tenant: "local", UpdatedAt: now.UnixMilli(),
+		}
+		if err := f.c.persistWS(workspace); err != nil {
+			f.c.mu.Unlock()
+			t.Fatal(err)
+		}
+		f.c.workspaces[id] = workspace
+		if _, err := f.c.db.Exec(`INSERT INTO assignments(workspace,generation,node,tenant,created_at) VALUES(?,?,?,?,?)`,
+			id, 1, node, "local", now.UnixMilli()); err != nil {
+			f.c.mu.Unlock()
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.c.db.Exec(`INSERT INTO assignments(workspace,generation,node,tenant,created_at) VALUES(?,?,?,?,?)`,
+		"ws_stale", 1, "n_stale", "local", now.UnixMilli()); err != nil {
+		f.c.mu.Unlock()
+		t.Fatal(err)
+	}
+	f.c.mu.Unlock()
+
+	now = now.Add(2 * time.Hour)
+	result, err := f.c.PruneRecords(context.Background(), now.Add(-time.Hour), 1)
+	if err != nil || result.Assignments != 1 {
+		t.Fatalf("PruneRecords assignment result = (%+v, %v)", result, err)
+	}
+	var stale int
+	if err := f.c.db.QueryRow(`SELECT COUNT(*) FROM assignments WHERE workspace='ws_stale'`).Scan(&stale); err != nil || stale != 0 {
+		t.Fatalf("stale assignment count = %d, err=%v", stale, err)
+	}
+	var live int
+	if err := f.c.db.QueryRow(`SELECT COUNT(*) FROM assignments WHERE workspace LIKE 'ws_live_%'`).Scan(&live); err != nil || live != 5 {
+		t.Fatalf("live assignment count = %d, err=%v", live, err)
+	}
+}
+
 func TestNodeProofOfPossessionAndReplayProtection(t *testing.T) {
 	f := newControlFixture(t, "", nil)
 	missing, _ := signedNodeHello(t, "n_missing", "node-token", processNodeInfo(1024))
@@ -396,7 +564,7 @@ func TestServerAuthoritativeIdentityAndTenantACL(t *testing.T) {
 	}
 	f := newControlFixture(t, "", func(opts *Options) { opts.Authenticator = auth })
 	connectClient := func(token string) string {
-		h := proto.Hello{Role: proto.RoleClient, Token: token, Principal: "spoofed-admin"}
+		h := proto.Hello{Role: proto.RoleClient, Token: token, Caps: []string{proto.CapabilityV1}, Principal: "spoofed-admin"}
 		id, _, err := f.c.Authenticate(context.Background(), &h)
 		if err != nil {
 			t.Fatal(err)

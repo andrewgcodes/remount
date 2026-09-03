@@ -237,6 +237,36 @@ func TestSQLitePrunePersistsNodeProducerHighWatermark(t *testing.T) {
 	}
 }
 
+func TestPruneSizeBoundsRowsAndReportsWatermark(t *testing.T) {
+	for name, store := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			defer store.Close()
+			log := New(store)
+			for index := 0; index < 7; index++ {
+				if err := log.Append(context.Background(), &proto.Event{Type: "sized", At: int64(index + 1)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if removed, err := log.PruneSize(context.Background(), 3, 2); err != nil || removed != 2 {
+				t.Fatalf("first PruneSize = (%d, %v)", removed, err)
+			}
+			if removed, err := log.PruneSize(context.Background(), 3, 10); err != nil || removed != 2 {
+				t.Fatalf("second PruneSize = (%d, %v)", removed, err)
+			}
+			if first, err := log.First(context.Background()); err != nil || first != 5 {
+				t.Fatalf("first retained = (%d, %v), want 5", first, err)
+			}
+			events, err := log.Read(context.Background(), 0, "", 10)
+			if err != nil || len(events) != 3 || events[0].Seq != 5 || events[2].Seq != 7 {
+				t.Fatalf("retained = %+v, %v", events, err)
+			}
+			if _, err := log.Read(context.Background(), 4, "", 10); !errors.Is(err, &proto.Error{Code: proto.CodeEvicted}) {
+				t.Fatalf("read below size watermark = %v", err)
+			}
+		})
+	}
+}
+
 func TestSubscriptionCloseWakesBlockedNext(t *testing.T) {
 	l := New(NewMemory(0))
 	defer l.Close()

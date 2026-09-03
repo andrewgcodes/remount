@@ -19,7 +19,7 @@ func buildTarEntries(t *testing.T, entries ...testTarEntry) []byte {
 	tw := tar.NewWriter(gz)
 	for _, entry := range entries {
 		hdr := entry.header
-		if hdr.Typeflag == tar.TypeReg || hdr.Typeflag == tar.TypeRegA {
+		if hdr.Typeflag == tar.TypeReg || hdr.Typeflag == legacyRegularFile {
 			hdr.Size = int64(len(entry.body))
 		}
 		if err := tw.WriteHeader(&hdr); err != nil {

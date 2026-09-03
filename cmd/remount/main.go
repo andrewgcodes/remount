@@ -118,7 +118,7 @@ func usage() {
   remount standalone  server + node in one process (try it on a laptop)
 
 	  remount ws create [--name N] [--backend B] [--security PROFILE] [--egress-rule JSON] [--binding ID]
-  remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS
+	  remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS [--authoritative]
   remount exec WS -- cmd args...      run a command (stdout/stderr/exit streamed)
   remount sh WS [cmd]                 interactive shell (pty)
   remount attach WS SESSION [--from N]
@@ -318,6 +318,7 @@ func cmdServer(ctx context.Context, args []string) error {
 	artifactGrace := fs.Duration("artifact-grace", 24*time.Hour, "minimum age before unreferenced artifact collection")
 	eventRetention := fs.Duration("event-retention", 30*24*time.Hour, "retained canonical event history")
 	eventGCInterval := fs.Duration("event-gc-interval", 10*time.Minute, "event-retention pruning interval")
+	maxEvents := fs.Int("max-events", 1_000_000, "maximum retained canonical event rows")
 	recordRetention := fs.Duration("control-record-retention", 30*24*time.Hour, "idempotency result and fired-timer retention")
 	recordGCInterval := fs.Duration("control-record-gc-interval", 10*time.Minute, "control-record pruning interval")
 	maxTenantWorkspaces := fs.Int("max-tenant-workspaces", 1000, "maximum non-destroyed workspaces per tenant")
@@ -325,6 +326,7 @@ func cmdServer(ctx context.Context, args []string) error {
 	maxMutationRecords := fs.Int("max-mutation-records", 100_000, "maximum retained control-plane idempotency results")
 	maxTimers := fs.Int("max-timers", 100_000, "maximum retained durable timers")
 	maxWorkspaceTimers := fs.Int("max-workspace-timers", 128, "maximum retained durable timers per workspace")
+	maxConcurrentRequests := fs.Int("max-concurrent-requests", 128, "maximum concurrent control-plane requests")
 	mode := fs.String("mode", envOr("REMOUNT_SECURITY_MODE", server.ModeStandalone), "security mode: standalone, production-single-tenant, production-multi-tenant")
 	parse(fs, args)
 	if *token == "" && !*insecure {
@@ -341,10 +343,11 @@ func cmdServer(ctx context.Context, args []string) error {
 		DataDir: *data, Token: *token, Bindings: b, LeaseSec: *lease, Logger: slog.Default(), Mode: *mode,
 		MaxArtifactBytes: *artifactBytes, MaxArtifactStoreBytes: *artifactStoreBytes, MaxArtifactObjects: *artifactObjects,
 		ArtifactGCInterval: *artifactGCInterval, ArtifactGracePeriod: *artifactGrace,
-		EventRetention: *eventRetention, EventGCInterval: *eventGCInterval,
+		EventRetention: *eventRetention, EventGCInterval: *eventGCInterval, MaxEvents: *maxEvents,
 		RecordRetention: *recordRetention, RecordGCInterval: *recordGCInterval,
 		MaxWorkspacesPerTenant: *maxTenantWorkspaces, MaxWorkspacesPerSubject: *maxSubjectWorkspaces,
 		MaxMutationRecords: *maxMutationRecords, MaxTimers: *maxTimers, MaxTimersPerWorkspace: *maxWorkspaceTimers,
+		MaxConcurrentRequests: *maxConcurrentRequests,
 	})
 	if err != nil {
 		return err
@@ -366,10 +369,22 @@ func cmdUp(ctx context.Context, args []string) error {
 	artifactBytes := fs.Int64("artifact-object-bytes", 8<<30, "maximum compressed bytes per cached artifact")
 	artifactStoreBytes := fs.Int64("artifact-store-bytes", 32<<30, "maximum node artifact-cache bytes")
 	artifactObjects := fs.Int("artifact-store-objects", 50_000, "maximum node artifact-cache objects")
+	artifactRetention := fs.Duration("artifact-retention", 24*time.Hour, "minimum age of unreferenced node cache artifacts")
+	artifactGCInterval := fs.Duration("artifact-gc-interval", 10*time.Minute, "node artifact-cache collection interval")
+	connectorCacheBytes := fs.Int64("connector-cache-bytes", 16<<30, "maximum managed-connector cache bytes")
+	connectorWorkspaceBytes := fs.Int64("connector-workspace-bytes", 2<<30, "maximum connector bytes pinned per workspace")
+	connectorObjectBytes := fs.Int64("connector-object-bytes", 512<<20, "maximum bytes in one connector response")
+	connectorObjects := fs.Int64("connector-cache-objects", 100_000, "maximum connector cache objects")
+	connectorWorkspaceObjects := fs.Int64("connector-workspace-objects", 4_096, "maximum connector objects pinned per workspace")
 	maxSessions := fs.Int("max-sessions", 1024, "maximum retained sessions on this node")
 	maxActiveSessions := fs.Int("max-active-sessions", 256, "maximum live sessions on this node")
 	maxWorkspaceSessions := fs.Int("max-workspace-sessions", 64, "maximum retained sessions per workspace")
 	maxPrincipalSessions := fs.Int("max-principal-sessions", 128, "maximum retained sessions per principal")
+	sessionMemoryBytes := fs.Int("session-memory-bytes", 2<<20, "maximum in-memory log bytes per session")
+	sessionSpillBytes := fs.Int64("session-spill-bytes", 128<<20, "maximum spill bytes per session")
+	sessionMaxChunkBytes := fs.Int("session-chunk-bytes", 32<<10, "maximum bytes in one session chunk")
+	sessionMemoryChunks := fs.Int("session-memory-chunks", 16_384, "maximum in-memory chunks per session")
+	maxConcurrentRequests := fs.Int("max-concurrent-requests", 128, "maximum concurrent node requests")
 	mutationRetention := fs.Duration("mutation-retention", 30*24*time.Hour, "node idempotency-result replay window")
 	maxMutationRecords := fs.Int("max-mutation-records", 10_000, "maximum retained node idempotency records")
 	maxConcurrentSnapshots := fs.Int("max-concurrent-snapshots", 4, "maximum concurrent node snapshots")
@@ -380,9 +395,15 @@ func cmdUp(ctx context.Context, args []string) error {
 	parse(fs, args)
 	n, err := buildNode(*data, c, labels, *backends, *image, allow, allowPrivate, nodeResourceOptions{
 		artifactBytes: *artifactBytes, artifactStoreBytes: *artifactStoreBytes, artifactObjects: *artifactObjects,
-		maxSessions: *maxSessions, maxActiveSessions: *maxActiveSessions, maxWorkspaceSessions: *maxWorkspaceSessions,
-		maxPrincipalSessions: *maxPrincipalSessions,
-		mutationRetention:    *mutationRetention, maxMutationRecords: *maxMutationRecords,
+		artifactRetention: *artifactRetention, artifactGCInterval: *artifactGCInterval,
+		connectorCacheBytes: *connectorCacheBytes, connectorWorkspaceBytes: *connectorWorkspaceBytes,
+		connectorObjectBytes: *connectorObjectBytes, connectorObjects: *connectorObjects,
+		connectorWorkspaceObjects: *connectorWorkspaceObjects,
+		maxSessions:               *maxSessions, maxActiveSessions: *maxActiveSessions, maxWorkspaceSessions: *maxWorkspaceSessions,
+		maxPrincipalSessions: *maxPrincipalSessions, sessionMemoryBytes: *sessionMemoryBytes,
+		sessionSpillBytes: *sessionSpillBytes, sessionMaxChunkBytes: *sessionMaxChunkBytes,
+		sessionMemoryChunks: *sessionMemoryChunks, maxConcurrentRequests: *maxConcurrentRequests,
+		mutationRetention: *mutationRetention, maxMutationRecords: *maxMutationRecords,
 		maxConcurrentSnapshots: *maxConcurrentSnapshots, snapshotMinInterval: *snapshotMinInterval,
 	})
 	if err != nil {
@@ -400,17 +421,29 @@ func defaultNodeData() string {
 }
 
 type nodeResourceOptions struct {
-	artifactBytes          int64
-	artifactStoreBytes     int64
-	artifactObjects        int
-	maxSessions            int
-	maxActiveSessions      int
-	maxWorkspaceSessions   int
-	maxPrincipalSessions   int
-	mutationRetention      time.Duration
-	maxMutationRecords     int
-	maxConcurrentSnapshots int
-	snapshotMinInterval    time.Duration
+	artifactBytes             int64
+	artifactStoreBytes        int64
+	artifactObjects           int
+	artifactRetention         time.Duration
+	artifactGCInterval        time.Duration
+	connectorCacheBytes       int64
+	connectorWorkspaceBytes   int64
+	connectorObjectBytes      int64
+	connectorObjects          int64
+	connectorWorkspaceObjects int64
+	maxSessions               int
+	maxActiveSessions         int
+	maxWorkspaceSessions      int
+	maxPrincipalSessions      int
+	sessionMemoryBytes        int
+	sessionSpillBytes         int64
+	sessionMaxChunkBytes      int
+	sessionMemoryChunks       int
+	maxConcurrentRequests     int
+	mutationRetention         time.Duration
+	maxMutationRecords        int
+	maxConcurrentSnapshots    int
+	snapshotMinInterval       time.Duration
 }
 
 func buildNode(data string, c common, labels map[string]string, backends, image string, allow, allowPrivate []string, resources nodeResourceOptions) (*node.Node, error) {
@@ -442,10 +475,19 @@ func buildNode(data string, c common, labels map[string]string, backends, image 
 		ArtifactURL: strings.TrimSuffix(c.server, "/") + "/v1/artifacts", Logger: slog.Default(),
 		MaxArtifactBytes: resources.artifactBytes, MaxArtifactStoreBytes: resources.artifactStoreBytes,
 		MaxArtifactObjects: resources.artifactObjects,
-		MaxSessions:        resources.maxSessions, MaxActiveSessions: resources.maxActiveSessions,
+		ArtifactRetention:  resources.artifactRetention, ArtifactGCInterval: resources.artifactGCInterval,
+		MaxConnectorCacheBytes:       resources.connectorCacheBytes,
+		MaxConnectorWorkspaceBytes:   resources.connectorWorkspaceBytes,
+		MaxConnectorObjectBytes:      resources.connectorObjectBytes,
+		MaxConnectorObjects:          resources.connectorObjects,
+		MaxConnectorWorkspaceObjects: resources.connectorWorkspaceObjects,
+		MaxSessions:                  resources.maxSessions, MaxActiveSessions: resources.maxActiveSessions,
 		MaxSessionsPerWorkspace: resources.maxWorkspaceSessions,
 		MaxSessionsPerPrincipal: resources.maxPrincipalSessions,
-		MutationRetention:       resources.mutationRetention, MaxMutationRecords: resources.maxMutationRecords,
+		SessionMemoryBytes:      resources.sessionMemoryBytes, SessionSpillBytes: resources.sessionSpillBytes,
+		SessionMaxChunkBytes: resources.sessionMaxChunkBytes, SessionMaxMemoryChunks: resources.sessionMemoryChunks,
+		MaxConcurrentRequests: resources.maxConcurrentRequests,
+		MutationRetention:     resources.mutationRetention, MaxMutationRecords: resources.maxMutationRecords,
 		MaxConcurrentSnapshots: resources.maxConcurrentSnapshots, SnapshotMinInterval: resources.snapshotMinInterval,
 		Allow: allow, AllowPrivate: allowPrivate, Version: version,
 	})
@@ -705,18 +747,29 @@ func cmdWS(ctx context.Context, args []string) error {
 		}
 		fmt.Fprintf(os.Stderr, "awake: node=%s gen=%d\n", ws.Node, ws.Generation)
 	case "snapshot":
+		authoritative := fs.Bool("authoritative", false, "quiesce managed execution and commit as failover state")
+		upload := fs.Bool("upload", true, "upload the snapshot to the control-plane artifact store")
 		parse(fs, rest)
 		if fs.NArg() < 1 {
-			return errors.New("ws snapshot WS")
+			return errors.New("ws snapshot WS [--authoritative] [--upload=true]")
 		}
 		cl := c.client()
 		defer cl.Close()
-		res, err := cl.Snapshot(ctx, fs.Arg(0), true)
+		var res *proto.WSSnapshotRes
+		var err error
+		if *authoritative {
+			if !*upload {
+				return errors.New("--authoritative requires --upload=true")
+			}
+			res, err = cl.Checkpoint(ctx, fs.Arg(0))
+		} else {
+			res, err = cl.Snapshot(ctx, fs.Arg(0), *upload)
+		}
 		if err != nil {
 			return err
 		}
 		fmt.Println(res.Artifact)
-		fmt.Fprintf(os.Stderr, "%d bytes\n", res.Bytes)
+		fmt.Fprintf(os.Stderr, "%d bytes, consistency=%s, authoritative=%t\n", res.Bytes, res.Consistency, res.Authoritative)
 	default:
 		return fmt.Errorf("unknown ws subcommand %q", sub)
 	}

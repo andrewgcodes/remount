@@ -30,6 +30,9 @@ type Options struct {
 	Retries int
 	// MaxReadBytes bounds the allocation made by ReadFile. Default 64 MiB.
 	MaxReadBytes int64
+	// MaxRunOutputBytes bounds stdout+stderr collected by Run. Streaming a
+	// Session through Chunks is unaffected. Default 64 MiB.
+	MaxRunOutputBytes int64
 }
 
 // OperationOption configures one logical mutating operation. Reuse the same
@@ -89,6 +92,9 @@ func New(opts Options) *Client {
 	}
 	if opts.MaxReadBytes <= 0 {
 		opts.MaxReadBytes = 64 << 20
+	}
+	if opts.MaxRunOutputBytes <= 0 {
+		opts.MaxRunOutputBytes = 64 << 20
 	}
 	return &Client{
 		opts: opts, grants: map[string]*proto.Grant{}, sessions: map[string]*Session{},
@@ -169,11 +175,15 @@ func (c *Client) Connect(ctx context.Context) (*transport.Peer, error) {
 	}
 	p := transport.NewPeer(conn, transport.HandlerFunc(c.handle))
 	hctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	ok, err := transport.Hello(hctx, p, proto.Hello{Peer: c.ID(), Role: proto.RoleClient, Token: c.opts.Token, Caps: []string{"v1"}, Principal: c.opts.Principal})
+	ok, err := transport.Hello(hctx, p, proto.Hello{Peer: c.ID(), Role: proto.RoleClient, Token: c.opts.Token, Caps: []string{proto.CapabilityV1}, Principal: c.opts.Principal})
 	cancel()
 	if err != nil {
 		p.Close()
 		return nil, err
+	}
+	if !proto.HasCapability(ok.Caps, proto.CapabilityV1) {
+		p.Close()
+		return nil, proto.Err(proto.CodeUnsupported, "server did not negotiate required capability %q", proto.CapabilityV1)
 	}
 	c.mu.Lock()
 	if c.peer != nil {
@@ -767,12 +777,25 @@ func (c *Client) Edit(ctx context.Context, wsID, path string, edits []proto.FSEd
 	return res.Replacements, err
 }
 
-// Snapshot takes a snapshot; upload pushes it to the control plane store.
+// Snapshot takes a live, crash-inconsistent snapshot; upload pushes it to the
+// control-plane store but never makes it authoritative failover state.
 func (c *Client) Snapshot(ctx context.Context, wsID string, upload bool, options ...OperationOption) (*proto.WSSnapshotRes, error) {
 	var res proto.WSSnapshotRes
 	idem, _ := operationKey(options)
 	err := c.nodeCall(ctx, wsID, proto.OpWSSnapshot, func(g *proto.Grant) any {
 		return proto.WSSnapshotReq{WS: wsID, Upload: upload, IdempotencyKey: idem, Grant: g}
+	}, &res)
+	return &res, err
+}
+
+// Checkpoint fences managed execution, takes and uploads a quiesced snapshot,
+// and commits it as the workspace's authoritative failover state. On the
+// local process backend, fencing terminates all workspace sessions.
+func (c *Client) Checkpoint(ctx context.Context, wsID string, options ...OperationOption) (*proto.WSSnapshotRes, error) {
+	var res proto.WSSnapshotRes
+	idem, _ := operationKey(options)
+	err := c.nodeCall(ctx, wsID, proto.OpWSSnapshot, func(g *proto.Grant) any {
+		return proto.WSSnapshotReq{WS: wsID, Upload: true, Authoritative: true, IdempotencyKey: idem, Grant: g}
 	}, &res)
 	return &res, err
 }
@@ -1288,12 +1311,39 @@ loop:
 			}
 			switch ch.Stream {
 			case proto.StreamStdout:
-				stdout = append(stdout, ch.Data...)
+				if !appendWithinLimit(&stdout, ch.Data, int64(len(stdout)+len(stderr)), c.opts.MaxRunOutputBytes) {
+					killCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					_ = s.Close(killCtx, true)
+					cancel()
+					return stdout, stderr, nil, proto.Err(proto.CodeResourceExhausted,
+						"Run output exceeds %d bytes; use Session.Chunks for streaming", c.opts.MaxRunOutputBytes)
+				}
 			case proto.StreamStderr:
-				stderr = append(stderr, ch.Data...)
+				if !appendWithinLimit(&stderr, ch.Data, int64(len(stdout)+len(stderr)), c.opts.MaxRunOutputBytes) {
+					killCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					_ = s.Close(killCtx, true)
+					cancel()
+					return stdout, stderr, nil, proto.Err(proto.CodeResourceExhausted,
+						"Run output exceeds %d bytes; use Session.Chunks for streaming", c.opts.MaxRunOutputBytes)
+				}
+			case proto.StreamGap:
+				var gap proto.Gap
+				if decodeErr := proto.Unmarshal(ch.Data, &gap); decodeErr != nil || gap.To < gap.From {
+					killCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					_ = s.Close(killCtx, true)
+					cancel()
+					return stdout, stderr, nil, proto.Err(proto.CodeInternal, "Run received an invalid output gap")
+				}
+				killCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = s.Close(killCtx, true)
+				cancel()
+				return stdout, stderr, nil, proto.Err(proto.CodeEvicted,
+					"Run output sequence %d-%d is no longer available; use Session.Chunks for streaming", gap.From, gap.To)
 			}
 		case <-ctx.Done():
-			_ = s.Close(context.Background(), true)
+			killCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = s.Close(killCtx, true)
+			cancel()
 			return stdout, stderr, nil, ctx.Err()
 		}
 	}
@@ -1305,6 +1355,14 @@ loop:
 		return stdout, stderr, nil, fmt.Errorf("session ended without exit record")
 	}
 	return stdout, stderr, exit, nil
+}
+
+func appendWithinLimit(destination *[]byte, data []byte, current, limit int64) bool {
+	if current < 0 || limit < 0 || current > limit || int64(len(data)) > limit-current {
+		return false
+	}
+	*destination = append(*destination, data...)
+	return true
 }
 
 // Copy pumps a session's stdout/stderr into writers until exit.

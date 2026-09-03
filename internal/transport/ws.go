@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/coder/websocket"
 
@@ -74,12 +73,11 @@ func (w *wsConn) Recv(ctx context.Context) (*proto.Frame, error) {
 }
 
 func (w *wsConn) Close() error {
-	w.closeMu.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = w.c.Close(websocket.StatusNormalClosure, "bye")
-		_ = ctx
-	})
+	// CloseNow closes the network connection and wakes blocked readers and
+	// writers immediately. coder/websocket's graceful Close has its own fixed
+	// handshake wait and accepts no context; constructing a timeout here would
+	// therefore provide no bound at all.
+	w.closeMu.Do(func() { _ = w.c.CloseNow() })
 	return nil
 }
 

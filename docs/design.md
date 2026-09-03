@@ -38,7 +38,7 @@ Everything else in the system is a verb on one of these.
 ## 3. Shape
 
 ```
-  CONTROL PLANE                      one process, or three
+  CONTROL PLANE               one authoritative writer
   ┌──────────────────────────────────────────────────────────┐
   │  identity   claim queue   timers   bindings   event log   │
   │  policy     leases        grants   artifacts              │
@@ -64,7 +64,11 @@ Everything else in the system is a verb on one of these.
   └────────────────────────────┘
 ```
 
-Nothing listens. Nodes and clients dial out. ([ADR 12](adr/0012-outbound-only.md))
+The server listens; nodes and clients do not. They both dial the server over
+one outbound WebSocket path. The reference binary colocates relay, control,
+event log and artifact store, and supports exactly one SQLite-backed control
+writer. Do not place independent controllers behind a load balancer.
+([ADR 12](adr/0012-outbound-only.md))
 
 ## 4. The three things that make it work
 
@@ -98,9 +102,13 @@ not: the request is **blocked**, not forwarded, and recorded as `leak_blocked`.
 ### 4.3 The computer moves
 
 A snapshot is a deterministic tarball of the filesystem. Files, not memory,
-because files are portable across nodes, operating systems, architectures and
-vendors, and memory images are not. Processes restart; identity, files and
-policy travel. ([ADR 6](adr/0006-snapshots-are-files.md))
+because files can be portable across compatible nodes and backends, and memory
+images are not. Processes, installed host tools and architecture-specific
+binaries do not travel; identity, files and policy do. A user-requested live
+snapshot is labeled `live` and never silently becomes failover state. An
+authoritative checkpoint fences Remount-managed execution, archives under an
+exclusive tree lock, uploads the artifact, and commits its digest in control
+state before success. ([ADR 6](adr/0006-snapshots-are-files.md))
 
 ## 5. The workspace state machine
 
@@ -127,15 +135,26 @@ still has to restore a filesystem, and a node that has gone offline still holds
 its lease but is not answering. Both are "held but not serving", and clients
 must wait for `claimed`. ([ADR 11](adr/0011-ready-handshake.md))
 
+The drawing shows the common path only. `quiescing`, `checkpointing`,
+`released`, `destroying`, `destroyed` and `failed`, including actor and
+generation preconditions, are normative in the
+[protocol transition table](../spec/PROTOCOL.md#51-normative-lifecycle-transition-table).
+All mutations go through `internal/control/state_machine.go`; exhaustive,
+property and fuzz tests reject unspecified or stale transitions.
+
 ## 6. Placement is a race, not a decision
 
 The control plane offers a pending workspace to every eligible online node.
 Nodes race. The claim is a single compare-and-swap: the state was pending, now
 it is claiming, and the generation increments.
 
-Split brain is impossible by construction. A node acts only on its own
-generation, and a grant naming an old generation is refused, so a workspace that
-moved cannot be operated through a stale grant.
+Within the supported single-writer topology, generation-bound grants and node
+self-fencing prevent stale ownership from remaining serviceable. A node acts
+only on its own generation, renews affirmative authority, and stops sessions,
+broker access and filesystem service at its local lease deadline. A grant
+naming an old generation is refused, so a workspace that moved cannot be
+operated through a stale grant. Running independent control databases would
+break this premise and is explicitly unsupported.
 
 A claim carries a lease. The holder renews at no more than a third of the lease
 interval, including while it is still materializing, because a slow restore must
@@ -179,7 +198,7 @@ One recovery path. "Graceful shutdown" is a snapshot followed by a crash.
 | node uplink flaps | sessions keep running; workspaces demote to `claiming`, promote back on reconnect | nothing |
 | node dies | lease expires, workspace returns to pending with its last snapshot, another node claims | work since the last snapshot |
 | node restarts | it re-adopts its local copies at the same generation, so outstanding grants stay valid | nothing |
-| control plane restarts | held workspaces re-queue; nodes re-adopt local copies; sessions in flight are lost with the node process only if it also restarted | in-flight session output |
+| control plane restarts | recorded holders remain reserved for a recovery grace period; the same node re-adopts at the same generation; ambiguous transitional states become `failed` | no workspace bytes from control restart alone; control events since the last durable commit |
 | materialize fails | node releases the claim; another node tries | nothing |
 | workspace compromised | cannot read broker-held keys; broker requests are scoped and recorded | its files, granted destinations, and—on cooperative built-in backends—direct network access |
 | node compromised | leases are short; certs and secrets bounded by TTL | that node's workspaces |
@@ -210,6 +229,10 @@ not substitute for backend-specific hostile-workspace conformance tests.
 | Grants: ed25519, expiry, generation binding | built, tested |
 | Backends: process and docker | built, tested |
 | CLI: server, up, standalone, ws, exec, sh, attach, fs, port, nodes, events, timers | built, exercised live |
+| Public Go API and reconnecting client | built; compiled and tested from a separate module |
+| Live snapshots and authoritative checkpoints | built; consistency is explicit and control commit is required for authority |
+| Resource quotas and retention | built for workspaces, sessions, requests, snapshots, artifacts, connector cache, events, timers and mutation records; diagnostics and metrics expose limits and GC |
+| Release pipeline | pinned actions, cross-platform static binaries, SBOM, checksums, provenance attestation and keyless checksum signature |
 
 ### Verified end to end with a real agent
 
@@ -241,6 +264,9 @@ Named honestly, because a roadmap presented as a feature list is a lie.
 - **Web and phone UI.** The event log and attach are the only two things a UI
   needs, and both exist.
 - **Direct peer-to-peer.** Every session byte goes through the relay today.
+- **Automated controller high availability.** The supported topology is one
+  SQLite writer. Active/passive failover is an operator procedure, not a
+  leader-elected service.
 - **Subagent composition and RL fan-out.** Fork-from-snapshot is one call away
   given artifacts, but there is no API for it yet.
 
@@ -255,7 +281,7 @@ both sides in one process, so they bound the protocol overhead, not a WAN.
 | workspace create and claim | < 500 ms warm | ~1 ms, process backend |
 | snapshot, release, restore, re-claim on another node | < 2 s for a small tree | ~200 ms |
 | paused workspace cost | storage only | storage only |
-| session log memory | 2 MiB per session | 2 MiB, plus 128 MiB spill |
+| session log memory | 2 MiB per session | configurable 2 MiB memory plus 128 MiB spill by default |
 | binary size | < 30 MB | 13 MB, static, no CGO |
 
 ## 12. Principles, and what each one decided
@@ -266,7 +292,7 @@ both sides in one process, so they bound the protocol overhead, not a WAN.
 | Interfaces are the design | seven resources, one frame type, about thirty operations |
 | Minimal core, conservative growth | no plugin ABI, no framework, no prompt format |
 | Don't complect | identity, placement, policy and transport are separate; a session is not a connection |
-| The log is truth | state is a cache of the event log |
+| Durable truth is explicit | transactional resource rows recover authority; the ordered log records audit/observation history |
 | Crash-only | recovery is the normal path; graceful shutdown is snapshot then crash |
 | End-to-end argument | relays are dumb, the control plane never sees stdout |
 | Define errors out of existence | exec does not fail with "connection dropped"; idempotency keys everywhere |
@@ -277,6 +303,8 @@ both sides in one process, so they bound the protocol overhead, not a WAN.
 
 ```
 cmd/remount            the single binary: server, node, client
+api                    stable public resource types, constants and error taxonomy
+client                 supported reconnecting Go SDK
 internal/proto         frames, types, operation names, event names
 internal/transport     Conn, Peer, WebSocket, in-memory pipe with fault injection
 internal/session       the log, the cursor, exec/pty/port, the manager
@@ -288,7 +316,7 @@ internal/broker        the egress credential broker
 internal/relay         frame routing by destination
 internal/control       claim queue, leases, timers, bindings, grants
 internal/node          the supervisor
-internal/client        the Go SDK
+internal/client        SDK implementation and wire/reconnect machinery
 internal/server        HTTP surface: /v1/link, /v1/artifacts, /v1/events
 internal/sim           the whole system in one process, with fault injection
 spec/PROTOCOL.md       the wire protocol

@@ -148,6 +148,33 @@ Every counter is exported at `/metrics` in Prometheus text format, and through
 | `remount_connector_package_response_bytes_total` | registry bytes staged and hashed before release |
 | `remount_connector_package_failures_total` | connector execution, integrity, or policy failures |
 | `remount_connector_package_quota_rejections_total` | package staging rejected before disk limits could be exceeded |
+| `remount_workspace_quota_rejections_total` | workspace creation rejected at tenant/subject capacity |
+| `remount_session_quota_rejections_total` | session open rejected at node/workspace/principal capacity |
+| `remount_control_requests_rejected_total` / `remount_node_requests_rejected_total` | bounded request admission rejected overload |
+| `remount_snapshot_quota_rejections_total` | explicit snapshot rejected by concurrency/frequency admission |
+| `remount_artifact_quota_rejections_total` | blob staging rejected before byte/object limits could be exceeded |
+| `remount_mutation_quota_rejections_total` / `remount_timer_quota_rejections_total` | durable control records reached their fail-closed cap |
+| `remount_events_pruned_total` | canonical event rows removed from the oldest retained prefix |
+| `remount_artifact_gc_runs_total` / `remount_artifact_gc_errors_total` | reference-aware collector health |
+| `remount_artifact_gc_objects_total` / `remount_artifact_gc_bytes_total` | unreferenced snapshot cache reclaimed |
+| `remount_event_gc_runs_total` / `remount_event_gc_errors_total` | age/row event-retention health |
+| `remount_control_record_gc_runs_total` / `remount_control_record_gc_errors_total` | timer/idempotency/tombstone/fleet metadata retention health |
+| `remount_workspace_tombstones_pruned_total` | old destroyed resource rows removed |
+| `remount_fleet_operations_pruned_total` / `remount_assignment_records_pruned_total` | terminal incident metadata and superseded assignment history removed |
 
-The first three mean something was lost or attacked. The last three are normal
-in small numbers and mean something is wrong when they climb.
+The leak, gap and digest-mismatch counters mean something was attacked, lost or
+corrupted. Throughput counters are normal; rejection and GC-error counters
+require capacity or reliability investigation when they climb.
+
+Diagnostics expose the denominators as well as usage. Control reports event
+oldest/latest sequence, event row limit, workspace quotas, timers and mutation
+records, request concurrency, artifact objects/bytes and active reservations.
+Nodes report retained/active sessions and all session limits, request/snapshot
+admission, artifact capacity, connector byte/object limits, and durable mutation
+records. Alert on sustained usage near a maximum and on any GC error; a quota
+rejection is a controlled failure, not permission to silently evict authority.
+
+Event retention never punches a hole in the middle of history. A reader below
+the retained prefix receives the stable `evicted` error and current oldest
+sequence, and node producer high-water marks survive pruning so retries do not
+manufacture duplicate events or gaps.

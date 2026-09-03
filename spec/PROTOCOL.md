@@ -47,11 +47,14 @@ Error { code: string, msg: string, oldest: uint64 }
 
 Rules that make version skew survivable:
 
-1. Unknown fields are ignored. Unknown `t` values are ignored. Unknown `op`
-   values get a `res` with code `unsupported`.
-2. A peer never assumes a field it did not send will come back.
-3. `from` is authoritative and is stamped by the relay. A sender that sets it is
-   overwritten.
+1. A receiver MUST reject a frame whose `v` is not exactly a version it
+   negotiated. Version 1 peers advertise the mandatory `v1` capability in
+   hello; an empty capability list is not an implicit wildcard.
+2. Within a negotiated version, unknown fields are ignored. Unknown `t` values
+   are ignored. Unknown `op` values get a `res` with code `unsupported`.
+3. A peer never assumes a field it did not send will come back.
+4. `from` is authoritative and is stamped by the relay. A sender that sets it
+   is overwritten.
 
 Error codes are stable: `bad_request`, `not_found`, `unsupported`,
 `unauthorized`, `conflict`, `evicted`, `unreachable`, `internal`, `timeout`,
@@ -75,7 +78,9 @@ NodeInfo { backends, backend_descriptors, connectors, os, arch, cpu, mem_mib,
            caps, snapshots, version }
 ```
 
-A node MUST present a stable `n_` id and its ed25519 public key. `proof` is an
+A peer MUST offer `caps:["v1"]`; the server returns the actual ordered
+intersection and rejects a hello with no supported baseline. A node MUST
+present a stable `n_` id and its ed25519 public key. `proof` is an
 Ed25519 signature over deterministic CBOR of the Hello with `proof` omitted;
 `issued_at` must be fresh and `nonce` is single-use. Production enrollment
 binds the key, labels, and backend descriptors to an operator-approved node
@@ -174,6 +179,34 @@ holds, the control plane returns it at the *same* generation and moves it to
 `claiming`. Outstanding client grants stay valid, and the node re-announces
 readiness when it has re-opened the workspace.
 
+### 5.1 Normative lifecycle transition table
+
+The control plane applies every lifecycle change through one compare-and-
+transition function. It validates the named operation, actor class, current
+state, expected generation, and authoritative node before persistence. This
+table is exhaustive; any pair not listed returns `conflict`. `fleet.*` is the
+privileged containment path and may force any non-destroyed workspace to the
+operator-actionable `failed` or terminal `destroyed` state.
+
+| Operation | Actor | Legal transition(s) | Generation/node rule |
+|---|---|---|---|
+| startup recovery | recovery | `claimed→claiming`, `claiming→claiming`, `quiescing/checkpointing/destroying→failed`, `released→pending` | persisted assignment is retained |
+| node disconnect | control | `claimed→claiming` | same generation and node |
+| `ws.claim` | node | `pending→claiming`; same-node `claiming/claimed→claiming` re-adoption | a new claim increments generation; re-adoption does not |
+| `ws.ready` | node | `claiming→claimed`; `claimed→claimed` duplicate | exact generation and node |
+| release begin/commit | control | `claimed→quiescing→released` | exact generation and node throughout |
+| release abort | control | `quiescing/destroying→claimed` after an acknowledged abort, otherwise `→failed` | exact generation and node |
+| `ws.released` | node | `claiming/claimed→pending` | exact generation and node; it cannot override a control-owned transition |
+| move | control | `released/paused/pending→pending` | expected generation |
+| sleep/wake | control | `released/pending/paused→paused`; `paused→pending` | expected generation |
+| destroy | control | `claimed/claiming→destroying→destroyed`; `pending/released/paused→destroyed` | expected generation; held states also require the node |
+| lease expiry | control | `claiming/claimed→pending` | exact generation and node, then generation increments |
+| fleet quarantine | control | `claiming/claimed/failed→quiescing`, then any non-destroyed state `→failed/destroyed` | target list freezes node and generation |
+
+`destroyed` is absorbing. `failed` is durable and operator-actionable; ordinary
+claim, ready, move, sleep, wake, and destroy calls cannot silently revive it.
+Duplicate mutating operations are answered from the durable idempotency record.
+
 ## 6. Control-plane operations
 
 Sent to `control`. Client operations are marked C, node operations N.
@@ -236,7 +269,7 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `fs.rename` | `FSRenameReq{ws, old, new, idem}` → `{}` |
 | `fs.search` | `FSSearchReq{ws, path, pattern, glob, max}` → `FSSearchRes{matches, truncated}` |
 | `fs.edit` | `FSEditReq{ws, path, edits, idem}` → `FSEditRes{replacements}` |
-| `ws.snapshot` | `WSSnapshotReq{ws, upload}` → `WSSnapshotRes{artifact, bytes}` |
+| `ws.snapshot` | `WSSnapshotReq{ws, upload, authoritative, idem}` → `WSSnapshotRes{artifact, bytes, consistency, authoritative}` |
 | `ws.info` | `WSGetReq{id}` → `WSInfoRes{ws, backend, root, sessions, broker}` |
 | `node.status` | → `NodeStatus` |
 | `node.diag` | `NodeDiagReq{ws, verify}` → node diagnostics |
@@ -258,6 +291,17 @@ fsyncs the completed response before acknowledging it. An intent that is still
 `pending` after restart has an unknown outcome and MUST return `conflict`; it
 MUST NOT be applied automatically. Reusing a key with different arguments also
 returns `conflict`.
+
+An ordinary `ws.snapshot` is labeled `consistency:"live"`; it may observe a
+concurrently changing tree and is never committed as failover state, even when
+uploaded. `authoritative:true` requires `upload:true`, rejects new work, drains
+node-mediated filesystem mutations, terminates and joins Remount-managed
+process-backend sessions (or pauses a Docker container), and returns
+`consistency:"quiesced"`. Only after the uploaded digest is verified and
+`ws.snapshot.commit` succeeds does the operation succeed as authoritative.
+The process backend cannot fence host processes that escaped Remount, so it is
+only a local/unisolated profile; production profiles require a stronger
+backend boundary.
 
 ### 7.1 Fleet containment
 
@@ -493,12 +537,19 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `ws.resumed`, `ws.snapshot`, `ws.restored`, `ws.destroyed`,
 `ws.lease_expired`, `s.opened`, `s.exited`, `fs.write`, `fs.edit`, `fs.remove`,
 `cred.used`, `egress.allowed`, `egress.denied`, `timer.set`, `timer.fired`,
-`peer.gone`, `ws.fenced`, `event.producer_gap`,
+`peer.gone`, `ws.fenced`, `ws.state_changed`, `event.producer_gap`,
 `fleet.quarantine.requested`, `fleet.quarantine.target`, and
 `fleet.quarantine.completed`.
 
 `POST /v1/events` appends an event out of band. This is how a webhook wakes a
 sleeping workspace.
+
+Event history is finite. The reference control plane retains it by configured
+age and row budgets and records the oldest retained sequence as a durable
+watermark. A historical or tail request older than that watermark fails with
+`evicted` and `Error.oldest`; it never silently starts at a newer sequence.
+Pagination continues until the requested range is exhausted rather than
+silently stopping at an implementation page size.
 
 ## 12. What a minimal implementation must get right
 
@@ -522,10 +573,17 @@ wrong and that a conformance suite should check:
    journal proof.
 10. A fleet operation reports pending/unreachable targets by its deadline and
     resumes their reconciliation after control restart.
+11. Unsupported frame versions and hellos without the `v1` baseline fail
+    closed; a v1 golden frame re-encodes byte-for-byte.
+12. A live snapshot cannot replace authoritative recovery state, while a
+    successful quiesced checkpoint can.
 
 ## 13. Versioning
 
-`v` is the frame version. Peers negotiate capability strings in `hello`. New
-operations are additive; a peer that does not know an `op` answers
-`unsupported`, and the caller degrades. Removing or changing the meaning of an
-existing field requires a new `v`.
+`v` is the frame version. Peers negotiate exact, case-sensitive capability
+strings in `hello`; this release requires `v1`. New optional operations and
+fields are additive within v1, and a peer that does not know an `op` answers
+`unsupported`. A semantic change, removal, or incompatible field change
+requires a new frame version and an explicit dual-version migration window.
+The repository keeps a deterministic v1 golden fixture under
+`internal/proto/testdata` to catch accidental wire drift.

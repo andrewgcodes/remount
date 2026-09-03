@@ -2,9 +2,10 @@
 
 **Any agent, any machine, never holding the keys, never losing its place.**
 
-Remount is an open protocol and a single Go binary that turns any computer — your
-laptop, a Mac mini, a bare-metal GPU box, a cloud VM — into a place where an AI
-agent can run through one small exec / filesystem / session interface.
+Remount is an open protocol and a single Go binary that turns a supported
+machine — your laptop, a Mac mini, a bare-metal GPU box, a cloud VM — into a
+place where an AI agent can run through one small exec / filesystem / session
+interface.
 
 The agent's computer is a **workspace**, and Remount treats it as a movable value
 rather than a machine. Its files can be snapshotted, paused for days at
@@ -75,6 +76,19 @@ output replays from where you left off:
 The filesystem is snapshotted, the workspace is re-queued, a node in that zone
 claims it, and your files are there. Sessions are restarted by the harness from
 the event log; the workspace identity, its files and its policy travel with it.
+Files are portable between compatible backends; installed tools, running
+processes, permissions and architecture-specific binaries are not magically
+portable.
+
+An ordinary snapshot is a labeled live filesystem capture and is useful for
+inspection or export. Use `--authoritative` when the result must become the
+workspace's failover checkpoint; that path quiesces Remount-managed execution,
+uploads the artifact, and commits the reference before returning success.
+
+```sh
+./remount ws snapshot $WS                 # consistency=live, not failover state
+./remount ws snapshot $WS --authoritative # quiesced and durably committed
+```
 
 ## Sleep for days at storage-only cost
 
@@ -169,6 +183,31 @@ append-only event log is the durable audit and observation record.
 | `remount fs read\|write\|ls\|stat\|rm\|mv\|mkdir\|search\|edit` | workspace filesystem |
 | `remount port WS PORT` | forward a port out of the workspace |
 | `remount nodes` / `events` / `timers` | inspect the fleet |
+| `remount fleet quarantine ...` | durably fence, checkpoint, stop or destroy an incident scope |
+| `remount status` / `inspect` / `doctor` / `metrics` | inspect health and capacity |
+
+## Go SDK
+
+Applications import the supported public packages, not `internal/`:
+
+```go
+import (
+    "remount.dev/remount/api"
+    "remount.dev/remount/client"
+)
+
+c, err := client.New(client.Options{
+    Server: "https://remount.example",
+    Token:  os.Getenv("REMOUNT_TOKEN"),
+})
+ws, err := c.CreateWorkspace(ctx, api.WorkspaceSpec{Name: "agent"})
+ws, err = c.WaitClaimed(ctx, ws.ID)
+stdout, stderr, exit, err := c.Run(ctx, ws.ID, "sh", "-c", "make test")
+```
+
+Mutations accept `client.WithIdempotencyKey`; stable error codes live in
+`api`. CI compiles the SDK from a separate Go module so accidental dependencies
+on implementation-only packages fail the build.
 
 ## Seeing what is happening
 
@@ -211,9 +250,17 @@ references and metadata private to each workspace. See the
 [operations guide](docs/operations.md#network-policy) for the request format
 and its deliberate limitations.
 
+Long-lived state is bounded: workspace, session, request, snapshot, artifact,
+connector, event, timer and idempotency limits have fail-closed defaults.
+Reference-aware artifact collection and prefix-only event/control-record
+retention are observable in diagnostics and metrics. See the
+[operations guide](docs/operations.md#capacity-quotas-and-retention) before
+changing those limits.
+
 Not built yet, and honestly named as such: a production backend with enforced
-egress, microVM backends (Firecracker, Apple Virtualization), the display and
-browser session kinds, and the web UI.
+egress, automated multi-controller high availability, microVM backends
+(Firecracker, Apple Virtualization), the display and browser session kinds,
+and the web UI.
 See [docs/design.md](docs/design.md#not-built-yet).
 
 ## License
