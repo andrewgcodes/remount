@@ -7,6 +7,7 @@
 package eventlog
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -18,6 +19,41 @@ import (
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 )
+
+// RedactedPayloadKey marks an event whose content was removed by per-tenant
+// retention. The envelope survives so the canonical sequence stays contiguous
+// and a reader still learns that something happened at that sequence.
+const RedactedPayloadKey = "remount_redacted"
+
+// RedactionReasonRetention is the only reason the log itself redacts.
+const RedactionReasonRetention = "tenant_retention"
+
+// redactedPayload is byte-constant, with no timestamp, so a second retention
+// pass recognises an already-redacted row instead of rewriting it forever.
+var redactedPayload = proto.MustMarshal(map[string]any{RedactedPayloadKey: RedactionReasonRetention})
+
+// RedactedPayload returns the canonical replacement payload. It is a constant
+// so a repeated retention pass converges and an already-redacted row is not
+// rewritten.
+func RedactedPayload() []byte {
+	out := make([]byte, len(redactedPayload))
+	copy(out, redactedPayload)
+	return out
+}
+
+// redactionBound rejects every tenant selector that is not exactly one tenant
+// and applies the same default bound as Prune. An empty tenant would match
+// every untenanted control event and "*" reads as a wildcard, so either would
+// destroy history the caller never named.
+func redactionBound(tenant string, limit int) (int, error) {
+	if tenant == "" || tenant == "*" {
+		return 0, errors.New("eventlog: redaction requires an exact tenant")
+	}
+	if limit <= 0 {
+		limit = 10_000
+	}
+	return limit, nil
+}
 
 // Store persists events.
 type Store interface {
@@ -36,6 +72,12 @@ type Store interface {
 	// PruneSize removes an oldest contiguous prefix until at most max events
 	// remain. At most limit rows are removed in one resumable transaction.
 	PruneSize(ctx context.Context, max, limit int) (int64, error)
+	// RedactTenant replaces the payload of at most limit of one tenant's events
+	// older than beforeMillis with the constant redaction marker and returns how
+	// many rows changed. It never changes a sequence number, never touches
+	// another tenant's rows, and never removes a row, so the contiguous sequence
+	// the exporters depend on is preserved.
+	RedactTenant(ctx context.Context, tenant string, beforeMillis int64, limit int) (int64, error)
 	Close() error
 }
 
@@ -193,6 +235,20 @@ func (l *Log) PruneSize(ctx context.Context, max, limit int) (int64, error) {
 	n, err := l.store.PruneSize(ctx, max, limit)
 	if n > 0 {
 		metrics.EventsPruned.Add(uint64(n))
+	}
+	return n, err
+}
+
+// RedactTenant removes one tenant's event content in place. Callers use it
+// when a tenant's own retention has elapsed but the rows are still inside the
+// contiguous prefix that a longer-lived tenant requires. Delivery already made
+// to a live subscriber is not recalled; this is the durable history.
+func (l *Log) RedactTenant(ctx context.Context, tenant string, beforeMillis int64, limit int) (int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n, err := l.store.RedactTenant(ctx, tenant, beforeMillis, limit)
+	if n > 0 {
+		metrics.TenantEventsRedacted.Add(uint64(n))
 	}
 	return n, err
 }
@@ -415,6 +471,28 @@ func (m *Memory) PruneSize(_ context.Context, max, limit int) (int64, error) {
 	m.events = append([]proto.Event(nil), m.events[remove:]...)
 	m.first += uint64(remove)
 	return int64(remove), nil
+}
+
+func (m *Memory) RedactTenant(_ context.Context, tenant string, beforeMillis int64, limit int) (int64, error) {
+	limit, err := redactionBound(tenant, limit)
+	if err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var redacted int64
+	for index := range m.events {
+		if redacted >= int64(limit) {
+			break
+		}
+		e := &m.events[index]
+		if e.Tenant != tenant || e.At >= beforeMillis || len(e.Payload) == 0 || bytes.Equal(e.Payload, redactedPayload) {
+			continue
+		}
+		e.Payload = RedactedPayload()
+		redacted++
+	}
+	return redacted, nil
 }
 
 func (m *Memory) Close() error { return nil }
@@ -710,6 +788,45 @@ func (s *SQLite) PruneSize(ctx context.Context, max, limit int) (int64, error) {
 		return 0, err
 	}
 	return removed, nil
+}
+
+func (s *SQLite) RedactTenant(ctx context.Context, tenant string, beforeMillis int64, limit int) (int64, error) {
+	limit, err := redactionBound(tenant, limit)
+	if err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	// The subquery names exact sequences and the update rewrites only payload,
+	// so no row moves or disappears and the events_tenant index keeps the scan
+	// off another tenant's history.
+	res, err := tx.ExecContext(ctx, `UPDATE events SET payload=? WHERE seq IN (
+		SELECT seq FROM events
+		WHERE tenant=? AND at < ? AND payload IS NOT NULL AND length(payload) > 0 AND payload != ?
+		ORDER BY seq LIMIT ?
+	)`, redactedPayload, tenant, beforeMillis, redactedPayload, limit)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	committed = true
+	return n, nil
 }
 
 func (s *SQLite) Close() error { return s.db.Close() }

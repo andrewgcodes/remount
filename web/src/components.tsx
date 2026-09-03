@@ -12,9 +12,9 @@ export function StateBadge({ state }: { state: WorkspaceState | string }) {
 
 export function Empty({ children }: { children: ComponentChildren }) { return <div class="empty">{children}</div>; }
 
-export function ErrorNotice({ error }: { error?: Error }) {
+export function ErrorNotice({ error, title = 'Could not load data.' }: { error?: Error; title?: string }) {
   if (!error) return null;
-  return <div class="notice notice-error" role="alert"><strong>Could not load data.</strong> {error.message}</div>;
+  return <div class="notice notice-error" role="alert"><strong>{title}</strong> {error.message}</div>;
 }
 
 export function ConfirmButton({ label, confirm, onConfirm, danger = false, disabled = false }: {

@@ -1,6 +1,7 @@
 package eventlog
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"path/filepath"
@@ -357,6 +358,160 @@ func TestExportPagesRangesAndReportsEviction(t *testing.T) {
 			var pe *proto.Error
 			if !errors.As(err, &pe) || pe.Code != proto.CodeEvicted || pe.Oldest != 6 {
 				t.Fatalf("export below retention must be evicted with Oldest: %v", err)
+			}
+		})
+	}
+}
+
+func TestRedactTenantRemovesOnlyThatTenantsContent(t *testing.T) {
+	ctx := context.Background()
+	for name, store := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			defer store.Close()
+			log := New(store)
+			appended := map[uint64][]byte{}
+			tenants := map[uint64]string{}
+			for index := 0; index < 6; index++ {
+				tenant := "tenant-a"
+				if index%2 == 1 {
+					tenant = "tenant-b"
+				}
+				e := &proto.Event{Type: "t.x", Tenant: tenant, At: int64(index + 1), Payload: proto.MustMarshal(map[string]int{"i": index})}
+				if err := log.Append(ctx, e); err != nil {
+					t.Fatal(err)
+				}
+				appended[e.Seq] = append([]byte(nil), e.Payload...)
+				tenants[e.Seq] = tenant
+			}
+			// tenant-a holds seq 1, 3 and 5; only 1 and 3 are older than the cutoff.
+			const cutoff = 5
+			if n, err := log.RedactTenant(ctx, "tenant-a", cutoff, 0); err != nil || n != 2 {
+				t.Fatalf("RedactTenant = (%d, %v), want (2, nil)", n, err)
+			}
+			events, err := log.Read(ctx, 0, "", 100)
+			if err != nil || len(events) != 6 {
+				t.Fatalf("read after redaction = (%d events, %v)", len(events), err)
+			}
+			for _, e := range events {
+				want := appended[e.Seq]
+				if tenants[e.Seq] == "tenant-a" && e.At < cutoff {
+					want = RedactedPayload()
+				}
+				if !bytes.Equal(e.Payload, want) {
+					t.Fatalf("seq %d (tenant %s, at %d) payload = %x, want %x", e.Seq, e.Tenant, e.At, e.Payload, want)
+				}
+			}
+		})
+	}
+}
+
+func TestRedactTenantPreservesSequenceContiguity(t *testing.T) {
+	ctx := context.Background()
+	for name, store := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			defer store.Close()
+			log := New(store)
+			for index := 0; index < 8; index++ {
+				tenant := "tenant-a"
+				if index%3 == 0 {
+					tenant = "tenant-b"
+				}
+				if err := log.Append(ctx, &proto.Event{Type: "t.x", Tenant: tenant, At: int64(index + 1), Payload: proto.MustMarshal(map[string]int{"i": index})}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			firstBefore, err := log.First(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lastBefore, err := log.Last(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := log.Read(ctx, 0, "", 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Every tenant-a row is older than the cutoff: five of the eight.
+			if n, err := log.RedactTenant(ctx, "tenant-a", 9, 0); err != nil || n != 5 {
+				t.Fatalf("RedactTenant = (%d, %v), want (5, nil)", n, err)
+			}
+			if first, err := log.First(ctx); err != nil || first != firstBefore {
+				t.Fatalf("first = (%d, %v), want %d", first, err, firstBefore)
+			}
+			if last, err := log.Last(ctx); err != nil || last != lastBefore {
+				t.Fatalf("last = (%d, %v), want %d", last, err, lastBefore)
+			}
+			after, err := log.Read(ctx, 0, "", 100)
+			if err != nil || len(after) != len(before) {
+				t.Fatalf("read after redaction = (%d events, %v), want %d", len(after), err, len(before))
+			}
+			for index, e := range after {
+				if e.Seq != before[index].Seq || e.Seq != firstBefore+uint64(index) {
+					t.Fatalf("sequence moved at %d: %d, want %d", index, e.Seq, firstBefore+uint64(index))
+				}
+			}
+			var exported []uint64
+			last, err := log.Export(ctx, 0, 0, func(e proto.Event) error { exported = append(exported, e.Seq); return nil })
+			if err != nil || last != lastBefore || len(exported) != len(before) {
+				t.Fatalf("export = (%d, %d events, %v)", last, len(exported), err)
+			}
+			for index, seq := range exported {
+				if seq != firstBefore+uint64(index) {
+					t.Fatalf("export gap at %d: seq %d", index, seq)
+				}
+			}
+		})
+	}
+}
+
+func TestRedactTenantIsBoundedIdempotentAndRejectsWildcards(t *testing.T) {
+	ctx := context.Background()
+	for name, store := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			defer store.Close()
+			log := New(store)
+			appended := map[uint64][]byte{}
+			for index := 0; index < 4; index++ {
+				e := &proto.Event{Type: "t.x", Tenant: "tenant-a", At: int64(index + 1), Payload: proto.MustMarshal(map[string]int{"i": index})}
+				if err := log.Append(ctx, e); err != nil {
+					t.Fatal(err)
+				}
+				appended[e.Seq] = append([]byte(nil), e.Payload...)
+			}
+			// A selector that is not exactly one tenant is refused before it can
+			// reach a tenant the caller never named.
+			for _, tenant := range []string{"", "*"} {
+				if n, err := log.RedactTenant(ctx, tenant, 100, 0); err == nil || n != 0 {
+					t.Fatalf("RedactTenant(%q) = (%d, %v), want an error and no change", tenant, n, err)
+				}
+			}
+			events, err := log.Read(ctx, 0, "", 100)
+			if err != nil || len(events) != 4 {
+				t.Fatalf("read after refused redaction = (%d events, %v)", len(events), err)
+			}
+			for _, e := range events {
+				if !bytes.Equal(e.Payload, appended[e.Seq]) {
+					t.Fatalf("refused redaction changed seq %d", e.Seq)
+				}
+			}
+			if n, err := log.RedactTenant(ctx, "tenant-a", 100, 2); err != nil || n != 2 {
+				t.Fatalf("first bounded pass = (%d, %v), want (2, nil)", n, err)
+			}
+			if n, err := log.RedactTenant(ctx, "tenant-a", 100, 2); err != nil || n != 2 {
+				t.Fatalf("second bounded pass = (%d, %v), want (2, nil)", n, err)
+			}
+			if n, err := log.RedactTenant(ctx, "tenant-a", 100, 2); err != nil || n != 0 {
+				t.Fatalf("third pass = (%d, %v), want (0, nil): redaction must converge", n, err)
+			}
+			events, err = log.Read(ctx, 0, "", 100)
+			if err != nil || len(events) != 4 {
+				t.Fatalf("read after redaction = (%d events, %v)", len(events), err)
+			}
+			for _, e := range events {
+				if !bytes.Equal(e.Payload, RedactedPayload()) {
+					t.Fatalf("seq %d payload = %x, want the redaction marker", e.Seq, e.Payload)
+				}
 			}
 		})
 	}

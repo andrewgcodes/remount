@@ -15,6 +15,7 @@ import (
 
 	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/eventlog"
+	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/transport"
 )
@@ -1353,5 +1354,63 @@ func TestMountPathNeedsANamespacedBackend(t *testing.T) {
 	}
 	if _, err := f.c.wsClaim(context.Background(), "n_process", plain.ID); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestQuotaRejectionEmitsAnEventAndAMetric pins the paired-signal rule for the
+// in-process limits: a refusal that only advanced a counter left an operator
+// with a number and no way to learn whose request was refused or which limit
+// did it. The tenant-authority path emits the same type from inside its
+// admission transaction.
+func TestQuotaRejectionEmitsAnEventAndAMetric(t *testing.T) {
+	f := newControlFixture(t, "", func(opts *Options) {
+		opts.MaxWorkspacesPerTenant = 2
+		opts.MaxWorkspacesPerSubject = 1
+	})
+	alice := Subject{ID: "alice", Tenant: "tenant", Roles: []string{"admin"}}
+	createWorkspace(t, f.c, alice, proto.WorkspaceSpec{Name: "alice-1"})
+
+	before := metrics.WorkspaceQuotaRejected.Value()
+	if _, err := f.c.wsCreate(context.Background(), alice, &proto.WSCreateReq{Spec: proto.WorkspaceSpec{Name: "alice-2"}}); !errors.Is(err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+		t.Fatalf("subject quota error = %v", err)
+	}
+	createWorkspace(t, f.c, Subject{ID: "bob", Tenant: "tenant", Roles: []string{"admin"}}, proto.WorkspaceSpec{Name: "bob-1"})
+	if _, err := f.c.wsCreate(context.Background(), Subject{ID: "carol", Tenant: "tenant", Roles: []string{"admin"}}, &proto.WSCreateReq{Spec: proto.WorkspaceSpec{Name: "carol-1"}}); !errors.Is(err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+		t.Fatalf("tenant quota error = %v", err)
+	}
+	if delta := metrics.WorkspaceQuotaRejected.Value() - before; delta != 2 {
+		t.Fatalf("quota metric advanced by %d, want 2", delta)
+	}
+
+	events, err := f.log.Read(context.Background(), 0, "", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes := map[string]map[string]any{}
+	for _, event := range events {
+		if event.Type != proto.EvQuotaExceeded {
+			continue
+		}
+		if event.Tenant != "tenant" {
+			t.Fatalf("quota event tenant = %q, want tenant", event.Tenant)
+		}
+		var payload map[string]any
+		if err := proto.Unmarshal(event.Payload, &payload); err != nil {
+			t.Fatalf("decode quota payload: %v", err)
+		}
+		scope, _ := payload["scope"].(string)
+		scopes[scope] = payload
+	}
+	for _, scope := range []string{"subject", "tenant"} {
+		payload := scopes[scope]
+		if payload == nil {
+			t.Fatalf("a %s quota refusal advanced the metric without emitting an event", scope)
+		}
+		if payload["resource"] != "workspaces" {
+			t.Fatalf("%s quota event resource = %v", scope, payload["resource"])
+		}
+		if payload["limit"] == nil || payload["used"] == nil {
+			t.Fatalf("%s quota event does not name the limit it hit: %v", scope, payload)
+		}
 	}
 }

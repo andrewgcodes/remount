@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/artifact/chunked"
@@ -111,6 +112,53 @@ func (n *Node) snapshotChunked(ctx context.Context, w *ws, upload bool, excludes
 		return chunked.SnapshotResult{}, proto.Err(proto.CodeUnsupported, "backend %s has no host filesystem for chunked snapshot", w.handle.Backend())
 	}
 	return chunked.Snapshot(ctx, store, host.Root(), chunked.SnapshotOptions{Excludes: excludes})
+}
+
+// chunkedOverlayArchive reconstructs the interoperable tar stream for a
+// chunked manifest so an overlay can reuse the single validated apply path.
+// Every blob is fetched and digest-verified into the local store before the
+// stream is offered, matching the tar path where the whole download also
+// finishes before the caller takes the workspace tree boundary.
+func (n *Node) chunkedOverlayArchive(ctx context.Context, w *proto.Workspace, id string) (io.ReadCloser, error) {
+	job, err := chunked.StartPrefetch(ctx, &workspaceBlobStore{n: n, ctx: ctx, w: w}, n.store, id, chunked.Limits{})
+	if err != nil {
+		return nil, err
+	}
+	if err := job.Wait(); err != nil {
+		return nil, err
+	}
+	pr, pw := io.Pipe()
+	archive := &joinedArchive{PipeReader: pr, done: make(chan error, 1)}
+	go func() {
+		err := chunked.ExportTar(ctx, n.store, id, pw, chunked.Limits{})
+		_ = pw.CloseWithError(err)
+		archive.done <- err
+	}()
+	return archive, nil
+}
+
+// joinedArchive couples a reconstructed stream to its producer so that Close
+// is evidence the producer exited, not a request that it stop.
+type joinedArchive struct {
+	*io.PipeReader
+	once sync.Once
+	done chan error
+	err  error
+}
+
+func (a *joinedArchive) Close() error {
+	a.once.Do(func() {
+		_ = a.PipeReader.Close()
+		a.err = <-a.done
+		if errors.Is(a.err, io.ErrClosedPipe) {
+			// The overlay stops at the tar end-of-archive marker and never
+			// drains the gzip trailer, so a producer parked on that last
+			// write has finished its work. A genuine production failure
+			// reaches the reader through CloseWithError instead.
+			a.err = nil
+		}
+	})
+	return a.err
 }
 
 // chunkedTarReader reconstructs the interoperable tar stream directly from

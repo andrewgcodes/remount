@@ -760,3 +760,365 @@ multi-tenant production isolation. Before a broader production claim, run the
 conformance and chaos/load program against the chosen hardened backend, exercise
 the release workflow from a signed tag, select a controller failover design if
 required, and obtain the independent review called for by the original request.
+
+## 2026-09 build plan disposition
+
+This section dispositions every numbered Phase 2–6 item from
+`handoff-2026-09-03.md`, every acceptance scenario it defines, and the residual
+gaps carried by `handoff-2026-09-03-codex-wrap.md`. It is the current status
+entry for that build plan.
+
+Every row is exactly one of:
+
+- **implemented and verified** — the code exists and a named test or gate
+  proves it on the host recorded below;
+- **implemented, externally gated** — the code exists and its local proof
+  passes, but the product claim needs a resource this host cannot provide;
+- **deliberately fail-closed** — the behavior refuses or reports unavailable,
+  and that refusal is the correct answer;
+- **not performed, by decision** — an owner decided not to do it;
+- **open** — with a named owner and the exact next proof.
+
+A skipped secret-gated job is *unavailable*, never healthy. Absence of evidence
+is never recorded as a pass.
+
+### Host and candidate
+
+- Host: Darwin 25.3.0 arm64, Go 1.27, `CGO_ENABLED=0`.
+- Base commit: `b213017` (merge of `codex/handoff-2026-09-03`).
+- Docker: **available**, server 29.4.1 — the Docker backend lane runs here.
+- gVisor (`runsc`): **unavailable**, not registered with Docker. Docker Desktop
+  on macOS runs its daemon inside a VM, so `runsc` cannot be registered.
+- `/dev/kvm`: **absent**. macOS cannot provide it, so no Firecracker lane can
+  execute on this host.
+
+### Defects found and fixed during this pass
+
+Five defects were found while trying to *run* the evidence rather than while
+reading the code. Each is recorded because the acceptance claim it touches
+would otherwise have been false.
+
+1. **`ws.moved` asserted process continuity it could not know.**
+   `internal/control/control.go` set `processes="preserved"` from
+   `RestoreFormat == firecracker-full-v1` at the moment the move entered
+   `pending` — before a destination was chosen, before its Firecracker and CPU
+   compatibility were checked, and before any guest was restored. ADR 0063
+   permits that claim only for a checkpoint that actually restored. The event
+   is the audit record, so this made the log assert continuity for moves that
+   in fact cold-started. Now reports `restore_pending`; the positive claim is
+   reserved for a destination that restored. Regression:
+   `TestMoveNeverClaimsPreservedProcessesBeforeRestore` and
+   `TestMoveReportsRestartedForFilesystemOnlyCheckpoints`.
+
+2. **The E1 Docker acceptance test could never pass.** It scanned
+   `ws.info`'s `Root` as a host directory. `ws.info` reports `MountPathOf` —
+   the root the *workspace* sees, which under the docker backend is the
+   in-container mount `/work`. The scan died with `lstat /work: no such file or
+   directory`. This is precisely the confusion `HostFileSystem`'s own doc
+   comment warns against ("callers must never treat an in-guest tree as a local
+   directory"). The test now asserts that `ws.info` reports the in-container
+   mount path and reaches the host tree through the backend's layout. E1, E2
+   and E3 pass live as a result.
+
+3. **The MCP gateway dropped the artifact representation.** `internal/mcp`
+   decoded `FSApplyTarReq` and called `ApplyTar`, discarding `Format`, so a
+   chunked apply routed through MCP would be parsed as a tar. It failed closed
+   on the gzip header rather than corrupting a tree, but the operation was
+   unusable.
+
+4. **`fs.apply_tar` was advertised over MCP but permanently unreachable.** The
+   manifest builds a tool name by replacing dots with underscores
+   (`fs.apply_tar` → `op_fs_apply_tar`) and the gateway reversed it by
+   replacing underscores with dots, yielding `fs.apply.tar` — an operation that
+   does not exist. `fs.apply_tar` is the only protocol op whose name contains
+   an underscore, so it was the only tool silently broken. The reverse mapping
+   is now an exact lookup over the manifest. Regression for 3 and 4:
+   `TestMCPGatewayCarriesApplyArtifactFormat`, which also proves that applying
+   a chunked manifest *as tar* fails closed, i.e. the node honors the declared
+   format instead of guessing from the id.
+
+5. **Access tokens could be issued above the lifetime the verifier accepts.**
+   `IssueAccessToken` admitted any TTL up to 24 h, while `verify` rejects an
+   access token whose lifetime exceeds the configured `accessTTL` (default
+   1 h). A `--bootstrap-ttl 2h` therefore minted a bearer that was unusable the
+   instant it was written to the bootstrap file, and failed later as a bare
+   `unauthorized` with nothing in the log to explain it — the operator's first
+   contact with the product silently handing them a dead credential. Issuance
+   now refuses above the ceiling and names it, rather than shortening the
+   request silently. Regression:
+   `TestIssueAccessTokenRefusesATTLTheVerifierWouldReject`, which asserts the
+   issuer and the verifier agree at and above the boundary.
+
+### Repository gates
+
+| Gate | Result |
+|---|---|
+| `gofmt -l .` | clean |
+| `git diff --check` | clean |
+| `go build ./...` | ok |
+| `go vet ./...` | ok |
+| `go test -count=1 ./...` | ok |
+| `make race` | ok |
+| `make lint` (vet, gofmt, lock discipline, `llms.txt` freshness, acpgen) | ok |
+| `make public-api` | ok |
+| `make conformance` | ok |
+| `make fuzz FUZZTIME=10s`, all 8 targets | ok |
+| `staticcheck ./...` (pinned v0.8.1) | zero findings, including U1000 |
+| `go run ./cmd/protogen --check` | clean |
+| web `npm test`, `npm run build`, `npm run check:dist` | ok |
+
+### Acceptance scenarios
+
+| Scenario | Status | Evidence |
+|---|---|---|
+| E1 real key through the broker | implemented and verified, **live** | `TestRunOpenCodeDockerIntegration` passes in 46.9 s against a real `node:22` container, the real `opencode` harness and a real OpenAI key. The key appears in 0 workspace files and 0 log lines. Required fixing defect 2 above. |
+| E2 two turns, move across nodes, third turn recalls both | implemented and verified, **live** | `TestRunOpenCodeHandoffAcrossNodesDockerIntegration`, 152.1 s; key in 0 log lines |
+| E3 two-task queue with sleep between | implemented and verified, **live** | `TestRunOpenCodeQueueDockerIntegration`, 71.7 s; key in 0 log lines |
+| E4 gVisor enforced egress | implemented, externally gated | `runsc` is not registered on this host, so the seven-check denial suite cannot run. The backend advertises `enforced_gateway` only after that suite passes, so it is correctly unavailable rather than falsely green. |
+| E5 two untrusting tenants on one gVisor node | implemented, externally gated | same gate as E4 |
+| E6 approve-on-first-use | implemented and verified | committed `egress.pending` reaches the notifier while the upstream request stays parked, and a decision releases it (`8d5304e`) |
+| E7 budgets | implemented and verified | `internal/budget` suite |
+| E8 principal revocation | implemented and verified | `TestE8PrincipalRevocationComposes`, `TestE8OperatorRevocationClosesAmbientSession`, and `TestE8PrincipalRevocationCoreSurvivesRestart` in `integration/identity` |
+| E9 chunked snapshot dedupe | implemented and verified | `TestE9ChunkedSnapshotMoveDeduplicates500MBLogicalFixture`. Literal gap: the fixture is a 500 MiB *logical* tree and the under-3s move is measured on a local process backend, not across a network. |
+| E10 control-plane failover | implemented and verified | `integration/failover` passes |
+| E11 tiered session replay | implemented and verified | `TestE11TieredSessionReplayCrossesNodeAndNamesUnavailableBlob`, `TestE11TieredSessionRecordSurvivesNodeRestart`. Literal gap: the proof uses 8 MiB across more than 128 real 128 KiB segments, not a six-hour 2 GB PTY session. |
+| E12 published SDK packages | implemented, externally gated | both packages install and build from the local tree and their generated types are drift-checked, but neither is published to PyPI or npm. A local install is not publication. |
+| E13 two real MCP harnesses | deliberately fail-closed | no harness keys present; the lane skips explicitly rather than passing |
+| E14 real GitHub App | implemented, externally gated | exercised against a local Git HTTP/token fake; no GitHub App is registered |
+| E15 console operator flow | see Phase 5.2 | |
+| E16 exports | implemented and verified | `internal/control/exports` suite and durable cursor |
+| E17 pool scale up and down | implemented and verified against a fake provisioner | `TestE17PoolClaimScalesUpAndIdleScalesDown`. Real vendor scaling is externally gated — see `verification-2026-09.md`. |
+| E18 signed release | **not performed, by decision** | The user decided on 2026-09-03 not to release. No tag, image, formula or `go install` path was created or verified. No implementation depends on it. |
+| E19–E25 durable agent scenarios | implemented and verified | `internal/sim` agent suite |
+
+### Phase 2
+
+| Item | Status | Notes |
+|---|---|---|
+| 2.1 gVisor `enforced_gateway` backend | implemented, externally gated | code and unit tests exist; the denial-conformance suite requires `runsc`, which cannot be registered under Docker Desktop on macOS |
+| 2.2 vendors as node provisioners | implemented, externally gated | fake-API unit tests pass for e2b, fly, modal, ix and ssh. Live lanes skip with an explicit list of missing identifiers. E2B and Modal credentials were probed and are **valid**; the E2B account has **zero templates** and the Modal CLI helper is absent, so the gate is real and not a guessable variable. |
+| 2.3 Firecracker backend | implemented, externally gated — **deferred by decision** | format, compatibility, protocol and lifecycle logic are unit-tested; no `/dev/kvm` on this host. The user deferred this to a future Linux-VM session on 2026-09-03. `ws.moved.processes=preserved` is now fail-closed (defect 1). |
+| 2.4 node pools | implemented and verified | `TestE17PoolClaimScalesUpAndIdleScalesDown`; `pool.scaled` and `pool.provision_failed` are durable |
+| 2.5 secrets at rest | implemented and verified | encrypted tenant artifacts; snapshot fuzzing proves `.remount/env` and placeholder values never enter a snapshot |
+| **Gate 2** | **not met** | E4 and E5 cannot run without gVisor. This is unavailable, not passing. |
+
+### Phase 3
+
+| Item | Status | Notes |
+|---|---|---|
+| 3.1 approve-on-first-use | implemented and verified | E6 |
+| 3.2 budgets and rate limits | implemented and verified | E7; reserve-then-settle against the control-plane counter |
+| 3.3 response redaction | implemented and verified | `internal/broker` suite; `egress.redacted` |
+| 3.4 identity | implemented and verified | E8 in sim and integration |
+| 3.5 external secret sources | implemented and verified against fakes | `env://` and `file://` are real; Vault, AWS SM and GCP SM are verified only against fakes and must stay labelled as such |
+| 3.6 tenancy and metering | implemented and verified | per-tenant quotas, `quota.exceeded`, usage aggregation, tenant-scoped visibility |
+| 3.7 webhooks in, notifications out | implemented and verified against fixtures | real Slack signature and delivery remain externally gated |
+| **Gate 3** | met, with the noted fake-source limits | E6, E7, E8 pass; production modes start with zero shared tokens |
+
+### Phase 4
+
+| Item | Status | Notes |
+|---|---|---|
+| 4.1 chunked snapshots | implemented and verified | E9. `push --chunked` now exists, closing the wrap handoff's "push still emits the legacy tar representation" gap. |
+| 4.2 tiered session log | implemented and verified | E11, plus retention pruning now emits `session.log.deleted` per row |
+| 4.3 S3-compatible blob store | implemented and verified against MinIO | non-AWS conditional writes and multipart remain externally gated |
+| 4.4 control-plane durability and failover | implemented and verified | E10; controller epochs fence a stale writer; a lost RPO window is recorded as `control.recovered` |
+| 4.5 | n/a | reassigned to the already-delivered item 0.9 |
+| 4.6 shared data volumes | implemented and verified | `internal/volume` and sim lifecycle suites |
+| **Gate 4** | met | E9, E10, E11 pass; `doctor --deep` verifies chunked and encrypted artifacts |
+
+### Phase 6.4 scale evidence
+
+`TestHandoffScaleAndControlFailover` reproduced on this host in **37.9 s**: 200
+real protocol nodes and clients, 2,000 workspaces claimed, one exec and one
+move per node, the control plane restarted over the shared SQLite store, 400
+peers reconnected, and byte-exact session completion with no gap and no
+generation mismatch. Recorded p50/p99 for claim, exec round trip, move and
+reattach are in `bench/results/scale-process-local.json`.
+
+**Honest limit.** This is control/protocol scale evidence on the *process*
+backend. Item 6.4 asks for the same numbers on the docker and gVisor backends.
+The Docker backend is proven functional here (`TestDockerBackendReal`,
+`TestDockerWorkspaceIfAvailable`, and the live E1/E2/E3 runs), but the 200-node
+matrix has not been re-run under it, and gVisor cannot run on this host at all.
+Do not quote these numbers as isolation-backend performance.
+
+### Residual gaps carried forward
+
+| Gap | Owner | Exact next proof |
+|---|---|---|
+| gVisor E4/E5 denial conformance | isolation | register `runsc` on a Linux host and run the seven-check suite at connect time |
+| Firecracker KVM end to end | deferred to a Linux-VM session | boot through the real jailer and vsock bridge, checkpoint a running guest, move it, restore disk/state/memory, and prove the process continues exactly once; then and only then may a destination report `processes=preserved` |
+| Real vendor pool runs (E2B, Modal, Fly, ix, SSH) | external verification | a built node template, a publicly reachable control-plane URL, an enrollment token and a binary URL; record in `verification-2026-09.md` |
+| E12 publication | distribution | install from a published PyPI/npm artifact, not a local directory |
+| E13 two real MCP harnesses | distribution | run with two harness keys present; absence stays an explicit skip |
+| E14 real GitHub App | integrations | register an app and exercise clone plus push through `/d/github.com` |
+| Docker/gVisor scale matrix | performance | re-run the 200-node scenario under the docker backend on a named host |
+| E18 signed release | **withheld pending release authority** | not to be performed without an explicit instruction |
+| Independent architecture and security review | external | the closing self-review does not substitute for it |
+
+### Phase 5
+
+| Item | Status | Notes |
+|---|---|---|
+| 5.1 exports | implemented and verified | E16; OTLP, S3 hourly JSONL, stdout JSONL and SIEM, with a durable `export.cursor` |
+| 5.2 console | implemented and verified, **now browser-to-real-server** | see below |
+| 5.3 SDKs | implemented and verified locally; publication externally gated | both packages install and build from the tree and `cmd/protogen --check` enforces type drift. E12 asks for `pip install remount` / `npm i @remount/sdk` from a real index; a local install is not publication. |
+| 5.4 MCP | implemented and verified | `remount mcp serve` / `wrap`; two defects fixed this pass (see defects 3 and 4). E13's two real harnesses remain an explicit skip. |
+| 5.5 orchestrator adapters and examples | implemented and verified | Temporal, LangGraph, OpenHands and GitHub Action examples with smoke tests |
+| 5.6 docs, releases, benchmarks | partially met | `bench/` publishes `docs/benchmarks.md` with numbers and the measured commit. The signed release (E18) was **not performed, by decision**. |
+| **Gate 5** | **not met** | E15 and E16 pass; E12 publication, E13 two real harnesses and E18 remain open. The under-five-minute clean-machine README flow in a disposable VM was not performed. |
+
+#### 5.2 / E15 — the browser-to-server claim is now real
+
+The wrap handoff recorded that "the browser DOM/Playwright suite still uses
+mocked HTTP responses" and listed "the browser mock suite is not a
+browser-to-real-server proof" as a standing honesty constraint. That constraint
+is now discharged.
+
+`web/tests/mock-server.mjs` and the `page.routeWebSocket` version of the
+operator spec are **deleted**. Playwright drives the real `remount` binary
+through a fixture in `web/tests/e15/`, in two projects:
+
+- a `standalone` project with two real nodes, and
+- an `rbac` project in `production-single-tenant` mode with real
+  bootstrap-minted bearers.
+
+Seven tests pass in 7.4 s. What is genuinely real: browser-driven workspace
+create reaching `claimed`; a real PTY over
+`ws://…/v1/console/workspaces/{id}/terminal` carrying real chunk frames;
+server-side replay on re-dial with `since=`; file read/write with `If-Match`
+verified out of band; a real `art_sha256:` snapshot; a real cross-node move
+(the second node's log shows `gen=2 … restore=art_sha256:…`); RBAC for
+operator, viewer and a credential the server never issued; a real
+`leak_blocked`; and a real parked approve-mode egress released only after the
+browser commits the decision, confirmed against the upstream's own hit log.
+
+The leak scan has a positive control: a second synthetic string is planted in a
+file the browser *is* meant to read, and response bodies, base64-decoded
+WebSocket frames, DOM text and form-field values must each demonstrably contain
+it before the secret's absence counts for anything. That control was verified
+by mutation.
+
+One console defect was fixed in passing: `ErrorNotice error={state.error ??
+mutationError}` meant a denied *mutation* was invisible whenever the page's own
+load had also failed — precisely the viewer's situation, so the RBAC denial the
+test needed to observe was unobservable. The two notices now render separately.
+
+Remaining honest gaps in this lane:
+
+- successful credential substitution (`cred.used`) is **not** browser-driven.
+  The broker refuses credentials over plaintext HTTP and its upstream TLS trust
+  is in-process only, with no CLI flag to trust a locally generated CA. The
+  browser suite therefore proves the *blocked* path plus a real binding lease
+  and a placeholder-only workspace view; the substituted-and-allowed path stays
+  covered by `TestConsoleE15SimulatedOperatorFlow`;
+- the production-mode fixture runs no node, so RBAC covers the console surface
+  rather than PTY and lifecycle under a role;
+- Chromium only, plaintext `127.0.0.1` only, so `wss:` is unexercised.
+
+### Phase 6
+
+| Item | Status | Notes |
+|---|---|---|
+| 6.1 production-multi-tenant end to end | implemented and verified | cross-tenant negative tests for events, artifacts, attach, approvals and usage; per-tenant blob prefix and key |
+| 6.2 operator RBAC and SSO | implemented and verified; real WorkOS externally gated | roles enforced across CLI, console and API; OIDC discovery, RFC 8628 device flow, RS256/JWKS verification, group-to-role mapping, and an audit event for every role change. Simulated OIDC is not WorkOS evidence. |
+| 6.3 retention and residency | see the retention section | |
+| 6.4 load and chaos evidence | implemented and verified on the process backend | see the scale section above; docker and gVisor matrices remain open |
+| **Gate 6** | partially met | E17 and the cross-tenant negative suite pass; this residual-risk register is rewritten below |
+
+#### 6.3 — retention, residency and compliance export
+
+The wrap handoff recorded that `Retention.Events` and `Retention.Artifacts`
+were stored and validated but never read, that no doctor finding existed for
+retention or residency, and that `remount audit export` did not exist at all —
+`internal/compliance` was a complete, tested library with no CLI, no protocol
+operation and no server wiring.
+
+The design problem was real and is worth recording, because the obvious
+implementation would have been wrong. The canonical event log is one sequence,
+and retention deletes only a contiguous oldest prefix. `internal/compliance`
+depends on that: a hole punched into the middle of the sequence would make an
+export that skipped it look *complete* rather than gapped. Naive per-tenant
+deletion would therefore have silently converted a compliance gap into a
+clean bundle — the exact failure the export engine exists to prevent.
+
+The implemented answer is two mechanisms rather than one:
+
+1. The contiguous prefix is deleted at the **oldest** cutoff any tenant still
+   requires, never at a single tenant's own. A ninety-day tenant therefore
+   holds rows a seven-day tenant would rather have gone. No tenant's rows are
+   ever removed before that tenant's own policy allows, which is precisely the
+   property that stops one tenant's policy from destroying another's evidence.
+2. Between a tenant's own cutoff and that global floor, the tenant's event
+   **content** is removed in place. The envelope — sequence, time, type,
+   tenant — survives, so the sequence stays contiguous and a reader still
+   learns that something happened, while the payload becomes a constant
+   redaction marker. This is what makes `Retention.Events` delete on the
+   tenant's own schedule instead of the slowest tenant's schedule.
+
+Artifacts are the mirror image. `Retention.Artifacts` is a maximum age, so it
+may only *accelerate* collection relative to the shared grace window and never
+delay it, and it can never select a referenced object at any age: a live
+workspace, base, fleet or session-log closure outranks a retention policy, and
+an artifact still held by one is reported as a **violation** rather than
+deleted. Both passes are batched and bounded so a large backlog cannot starve
+other tenants or the prune that follows.
+
+Residency was already enforced at the claim boundary before this pass and was
+not redone. What was added is the diagnostic surface: retention and residency
+violations are now doctor findings, and a residency check that cannot run
+reports unavailable rather than healthy, following the existing
+`artifact.verify_unavailable` pattern.
+
+**Status: implemented and verified.** ADR 0080 records the design.
+
+Wire path, verified by hand against a real `production-single-tenant` server on
+this host rather than only in tests:
+
+| Command | Result |
+|---|---|
+| `remount audit key` | returns the key id, `ed25519`, and the public half only |
+| `audit export --tenant '*'` | refused — `*` is never a valid export subject |
+| `audit export --range 1..40` over 5 events | refused as `evicted`, "range is no longer complete", never a shorter bundle |
+| `audit export --tenant acme --range 1..3` | signed JSONL bundle with `payload_sha256` over exactly the event bytes |
+| `audit verify` with the published key | verified, offline, naming tenant, range and key id |
+| `audit verify` after editing `range_to` | refused, "manifest signature is invalid" |
+| `audit verify --tenant other` | refused, "manifest fields are invalid" |
+
+The refusal path emits `audit.export_denied`, so a denied export is itself in
+the log.
+
+Tests: `TestRetentionPlanFloorIsTheOldestTenantRequirement`,
+`TestRetentionPlanArtifactCutoffOnlyAccelerates`,
+`TestTenantRetentionNeverTouchesAnotherTenant`,
+`TestTenantRetentionEmitsAnEventAndAMetric`,
+`TestResidencyDriftEmitsAnEventAndAMetric`,
+`TestResidencyCheckThatCannotRunIsUnavailable`,
+`TestRetentionFindingsNameTheEnvelopeLimit`,
+`TestSessionLogRetentionNeverExpiresAnotherTenant`,
+`TestAuditSigningKeyIsDurableAndPrivate`,
+`TestAuditExportCannotCrossTenants`,
+`TestAuditExportIsDeterministicAndVerifies`,
+`TestAuditExportRefusesAnIncompleteRange`,
+`TestAuditExportRangeValidation`,
+`TestRedactTenantRemovesOnlyThatTenantsContent`,
+`TestRedactTenantPreservesSequenceContiguity`,
+`TestTenantRetentionCollectsOnlyItsOwnNamespace`,
+`TestTenantRetentionNeverCollectsAReferencedObject`, and the sim proofs
+`TestE63AuditExportIsolatesTenantsAndIsDeterministic`,
+`TestE63RetentionRemovesOneTenantsContentAndKeepsTheRangeHonest`,
+`TestE63ArtifactRetentionPreservesALiveClosure`.
+
+`doctor --deep` now labels canonical manifest validation and closure
+completeness separately from a digest rehash
+(`artifact.manifest_canonical`, `artifact.closure_complete`, and
+`artifact.closure_unavailable` when the walk cannot run), closing the
+last §2.3 residual.
+
+**Residual limit, deliberately visible:** redaction preserves envelopes, so a
+tenant whose retention has elapsed still leaves sequence, time, type and tenant
+rows behind until the global floor advances. `doctor` reports that as
+`tenant.retention_violation` naming the tenant holding the prefix. It is a
+consequence of one contiguous sequence, not an oversight, and it is reported
+rather than hidden.

@@ -1410,11 +1410,6 @@ func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int)
 			return RecordPruneResult{}, err
 		}
 	}
-	for _, id := range sessionLogCandidates {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM session_logs WHERE id=?`, id); err != nil {
-			return RecordPruneResult{}, err
-		}
-	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM mutations WHERE rowid IN (
 		SELECT rowid FROM mutations WHERE completed_at < ? ORDER BY completed_at, rowid LIMIT ?
 	)`, cutoff, limit)
@@ -1528,13 +1523,17 @@ func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int)
 	for _, id := range approvalCandidates {
 		delete(c.approvals, id)
 	}
-	for _, id := range sessionLogCandidates {
-		delete(c.sessionLogs, id)
-	}
+	// Expired session logs are pruned in their own transaction so each removed
+	// row and its deletion event commit together. A pruned record releases the
+	// GC roots its segments held, so a row that vanished without an audit
+	// record would make retained output disappear with no explanation. A
+	// failure here leaves the rows in place for the next pass rather than
+	// deleting them unwitnessed.
+	sessionLogsPruned := c.pruneSessionLogsLocked(sessionLogCandidates)
 	result := RecordPruneResult{
 		Mutations: mutations, Timers: int64(len(timerCandidates)),
 		Workspaces: int64(len(workspaceCandidates)), FleetOperations: int64(len(fleetCandidates)),
-		Assignments: int64(len(assignmentCandidates)), LegacyIdem: legacyIdem, SessionLogs: int64(len(sessionLogCandidates)),
+		Assignments: int64(len(assignmentCandidates)), LegacyIdem: legacyIdem, SessionLogs: int64(sessionLogsPruned),
 	}
 	if result.Mutations > 0 {
 		metrics.MutationsPruned.Add(uint64(result.Mutations))
@@ -1642,6 +1641,19 @@ func (c *Control) newEvent(typ, stream, principal, node string, payload any) *pr
 		e.Payload = proto.MustMarshal(payload)
 	}
 	return e
+}
+
+// appendAudit records an event that accompanies a refusal rather than a
+// durable row. There is nothing to roll back, so a delivery failure is logged
+// and the caller's refusal stands; losing the audit line must never turn a
+// rejection into an acceptance. Callers must not hold c.mu.
+func (c *Control) appendAudit(ctx context.Context, e *proto.Event) {
+	if e == nil || c.opts.Log == nil {
+		return
+	}
+	if err := c.opts.Log.Append(ctx, e); err != nil {
+		c.logger.Error("audit event append failed", "type", e.Type, "err", err)
+	}
 }
 
 // stampWS attributes e to the workspace whose row commits alongside it.
@@ -2749,6 +2761,25 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 		return c.grant(ctx, f.From, subject, req.WS)
 	case proto.OpTimerList:
 		return c.timerListAuthorized(ctx, f.From)
+	case proto.OpAuditExport:
+		req, err := decode[proto.AuditExportReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		// AuditExport resolves the exact tenant and authorizes the actor
+		// itself, so an extra check here would only be able to disagree with
+		// the one that governs the bundle's contents.
+		return c.AuditExport(ctx, subject, req)
+	case proto.OpAuditKey:
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.AuditPublicKey(ctx, subject)
 	case proto.OpDiag:
 		req, err := decode[proto.DiagReq](f)
 		if err != nil {
@@ -2985,14 +3016,29 @@ func (c *Control) wsCreateResolved(ctx context.Context, subject Subject, req *pr
 			subjectWorkspaces++
 		}
 	}
+	// A refusal writes no row, so its event is an audit record rather than
+	// part of a transaction. It is still emitted: a rejection that only moved
+	// a counter leaves an operator with a number and no way to learn whose
+	// request was refused or which limit did it. The tenant-authority path
+	// emits the same type from inside its admission transaction.
 	if c.opts.Tenants == nil && tenantWorkspaces >= c.opts.MaxWorkspacesPerTenant {
+		event := c.newEvent(proto.EvQuotaExceeded, subject.ID, subject.ID, "", map[string]any{
+			"resource": "workspaces", "scope": "tenant", "used": tenantWorkspaces, "limit": c.opts.MaxWorkspacesPerTenant,
+		})
+		event.Tenant = subject.Tenant
 		c.mu.Unlock()
 		metrics.WorkspaceQuotaRejected.Inc()
+		c.appendAudit(ctx, event)
 		return nil, proto.Err(proto.CodeResourceExhausted, "tenant workspace limit %d reached", c.opts.MaxWorkspacesPerTenant)
 	}
 	if subjectWorkspaces >= c.opts.MaxWorkspacesPerSubject {
+		event := c.newEvent(proto.EvQuotaExceeded, subject.ID, subject.ID, "", map[string]any{
+			"resource": "workspaces", "scope": "subject", "used": subjectWorkspaces, "limit": c.opts.MaxWorkspacesPerSubject,
+		})
+		event.Tenant = subject.Tenant
 		c.mu.Unlock()
 		metrics.WorkspaceQuotaRejected.Inc()
+		c.appendAudit(ctx, event)
 		return nil, proto.Err(proto.CodeResourceExhausted, "subject workspace limit %d reached", c.opts.MaxWorkspacesPerSubject)
 	}
 	now := c.now().UnixMilli()
@@ -3940,9 +3986,17 @@ func (c *Control) wsMove(ctx context.Context, principal string, req *proto.WSMov
 	next.Spec.RestoreObjects = append([]string(nil), ws.LastSnapshotObjects...)
 	next.Node = ""
 	next.LeaseUntil = 0
+	// This event is emitted when the move enters pending: no destination has
+	// been chosen, its Firecracker and CPU compatibility has not been checked,
+	// and the guest has not been restored. The artifact format therefore says
+	// only what was *intended*, never what happened. ADR 0063 permits
+	// `preserved` solely for a checkpoint that actually restored, so a full-VM
+	// move reports `restore_pending` here and the outcome is settled by the
+	// destination. Claiming `preserved` from the format alone would make the
+	// audit log assert process continuity for a move that in fact cold-started.
 	processes := "restarted"
 	if next.Spec.RestoreFormat == proto.ArtifactFormatFirecrackerFullV1 {
-		processes = "preserved"
+		processes = "restore_pending"
 	}
 	if err := c.persistWSAndMutation(&next, scope, req.IdempotencyKey, proto.OpWSMove, req, &next,
 		c.wsEvent(&next, proto.EvWSMoved, principal, "", map[string]any{"restore_from": snap, "processes": processes})); err != nil {

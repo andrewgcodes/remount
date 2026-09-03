@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"remount.dev/remount/internal/artifact"
+	"remount.dev/remount/internal/metrics"
 )
 
 // ReadinessCheck verifies the configured physical store can be used before a
@@ -34,7 +35,10 @@ type Resolver struct {
 	orphans  map[string]time.Time
 }
 
-var _ artifact.TenantResolver = (*Resolver)(nil)
+var (
+	_ artifact.TenantResolver           = (*Resolver)(nil)
+	_ artifact.TenantRetentionCollector = (*Resolver)(nil)
+)
 
 // NewResolver constructs the integration boundary used by the HTTP server,
 // chunked snapshots, and future node/control wiring.
@@ -142,6 +146,19 @@ func (r *Resolver) VerifyTenant(ctx context.Context, tenant string) ([]artifact.
 // is observed conservatively in memory: restart resets the grace window and
 // can delay reclamation, but can never accelerate deletion.
 func (r *Resolver) CollectTenants(ctx context.Context, referenced []artifact.TenantReference, now, cutoff time.Time) (artifact.GCResult, error) {
+	return r.collectTenants(ctx, referenced, now, cutoff, nil)
+}
+
+// CollectTenantRetention sweeps with a per-tenant maximum age layered over the
+// shared grace window. The cutoff is chosen by the namespace being swept, so
+// one tenant's retention policy can never select another tenant's object, and
+// a tenant absent from tenantCutoffs keeps the shared cutoff. Retention only
+// accelerates collection: a referenced object survives every cutoff.
+func (r *Resolver) CollectTenantRetention(ctx context.Context, referenced []artifact.TenantReference, now, cutoff time.Time, tenantCutoffs map[string]time.Time) (artifact.GCResult, error) {
+	return r.collectTenants(ctx, referenced, now, cutoff, tenantCutoffs)
+}
+
+func (r *Resolver) collectTenants(ctx context.Context, referenced []artifact.TenantReference, now, cutoff time.Time, tenantCutoffs map[string]time.Time) (artifact.GCResult, error) {
 	r.gc.Lock()
 	defer r.gc.Unlock()
 	keep := make(map[string]struct{}, len(referenced))
@@ -166,6 +183,12 @@ func (r *Resolver) CollectTenants(ctx context.Context, referenced []artifact.Ten
 		if err != nil {
 			return result, err
 		}
+		// Resolved from the namespace about to be swept, once, so a policy
+		// cannot follow an id into a tenant it does not own.
+		effective := cutoff
+		if specific, ok := tenantCutoffs[tenant]; ok {
+			effective = specific
+		}
 		for _, id := range ids {
 			result.Scanned++
 			key := tenant + "\x00" + id
@@ -180,7 +203,7 @@ func (r *Resolver) CollectTenants(ctx context.Context, referenced []artifact.Ten
 				result.GraceRetained++
 				continue
 			}
-			if cutoff.IsZero() || !first.Before(cutoff) {
+			if effective.IsZero() || !first.Before(effective) {
 				result.GraceRetained++
 				continue
 			}
@@ -194,6 +217,11 @@ func (r *Resolver) CollectTenants(ctx context.Context, referenced []artifact.Ten
 			result.Removed++
 			result.RemovedBytes += size
 			delete(r.orphans, key)
+			// Observable proof that a tenant policy reclaimed bytes the
+			// shared grace window would still be holding.
+			if !effective.Equal(cutoff) && !first.Before(cutoff) {
+				metrics.TenantArtifactsCollected.Inc()
+			}
 		}
 	}
 	return result, nil

@@ -464,9 +464,21 @@ func cmdDoctor(ctx context.Context, args []string) error {
 		}
 	}
 
-	// 5. Loss signals from the counters.
+	// 5. Tenant policy. The control plane already returned its own retention
+	// and residency findings above; naming the checks here is what tells an
+	// operator which properties were actually examined, so an unavailable
+	// finding is legible as "not checked" rather than as silence.
+	check("tenant.retention")
+	check("tenant.residency")
+
+	// 6. Loss signals from the counters. A deep pass answers three separate
+	// questions, so it registers three names: the blob still matches its
+	// content address, the chunk manifest still decodes canonically, and every
+	// object that manifest names is still present at its declared size.
 	if *deep {
 		check("artifact.deep_verify")
+		check("artifact.manifest_canonical")
+		check("artifact.closure_complete")
 	}
 	check("data.loss_signals")
 	if v := d.Metrics["remount_artifact_digest_mismatch_total"]; v > 0 {

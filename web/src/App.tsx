@@ -47,7 +47,8 @@ function Fleet({ api, refreshMs }: { api: APIClient; refreshMs: number }) {
   };
   return <>
     <PageHeader eyebrow="Control plane" title="Fleet" actions={<button class="button" type="button" onClick={() => setCreating(true)}>New workspace</button>} />
-    <ErrorNotice error={state.error ?? mutationError} />
+    <ErrorNotice error={state.error} />
+    <ErrorNotice error={mutationError} title="Could not complete that action." />
     {creating && <div class="modal-backdrop" role="presentation"><form class="modal" aria-labelledby="new-workspace-title" onSubmit={create}>
       <h2 id="new-workspace-title">New workspace</h2>
       <label>Name<input autoFocus required value={name} onInput={(e) => setName(e.currentTarget.value)} /></label>
@@ -104,7 +105,8 @@ function Workspace({ api, id, refreshMs }: { api: APIClient; id: string; refresh
   if (!detail) return <><PageHeader title="Workspace unavailable"/><ErrorNotice error={state.error}/></>;
   return <>
     <PageHeader eyebrow={<a href="#/fleet">Fleet</a>} title={detail.name || detail.id} actions={<><StateBadge state={detail.state}/><ConfirmButton label="Quarantine" confirm="Quarantine this workspace and terminate its serviceability?" onConfirm={() => mutate('quarantine')} danger/><ConfirmButton label="Destroy" confirm="Destroy this workspace after its durable lifecycle boundary? This cannot be undone." onConfirm={() => mutate('destroy')} danger/></>} />
-    <ErrorNotice error={state.error ?? mutationError}/>
+    <ErrorNotice error={state.error}/>
+    <ErrorNotice error={mutationError} title="Could not complete that action."/>
     <div class="tablist" role="tablist" aria-label="Workspace views">
       {(['overview','terminal','files'] as const).map((value) => <button key={value} role="tab" aria-selected={tab === value} onClick={() => setTab(value)}>{value}</button>)}
     </div>

@@ -1121,6 +1121,128 @@
       ],
       "additionalProperties": true
     },
+    "AuditExportReq": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "integer"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "to": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "additionalProperties": true
+    },
+    "AuditExportRes": {
+      "type": "object",
+      "properties": {
+        "bundle": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "manifest": {
+          "$ref": "#/$defs/AuditManifest"
+        },
+        "signature": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "bundle",
+        "manifest",
+        "signature"
+      ],
+      "additionalProperties": true
+    },
+    "AuditKeyReq": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "AuditKeyRes": {
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "type": "string"
+        },
+        "key_id": {
+          "type": "string"
+        },
+        "public_key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "algorithm",
+        "key_id",
+        "public_key"
+      ],
+      "additionalProperties": true
+    },
+    "AuditManifest": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer"
+        },
+        "event_count": {
+          "type": "integer"
+        },
+        "first_seq": {
+          "type": "integer"
+        },
+        "hash_algorithm": {
+          "type": "string"
+        },
+        "key_id": {
+          "type": "string"
+        },
+        "last_seq": {
+          "type": "integer"
+        },
+        "payload_bytes": {
+          "type": "integer"
+        },
+        "payload_sha256": {
+          "type": "string"
+        },
+        "range_from": {
+          "type": "integer"
+        },
+        "range_to": {
+          "type": "integer"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "signature_algorithm": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "event_count",
+        "hash_algorithm",
+        "key_id",
+        "payload_bytes",
+        "payload_sha256",
+        "range_from",
+        "range_to",
+        "schema",
+        "signature_algorithm",
+        "tenant"
+      ],
+      "additionalProperties": true
+    },
     "AuditPolicy": {
       "type": "object",
       "properties": {
@@ -2158,6 +2280,9 @@
       "type": "object",
       "properties": {
         "artifact": {
+          "type": "string"
+        },
+        "format": {
           "type": "string"
         },
         "grant": {
@@ -6528,6 +6653,18 @@
       "name": "artifact.proof",
       "request": "ArtifactProofReq",
       "response": "ArtifactProofRes"
+    },
+    {
+      "constant": "OpAuditExport",
+      "name": "audit.export",
+      "request": "AuditExportReq",
+      "response": "AuditExportRes"
+    },
+    {
+      "constant": "OpAuditKey",
+      "name": "audit.key",
+      "request": "AuditKeyReq",
+      "response": "AuditKeyRes"
     },
     {
       "constant": "OpBaseCreate",

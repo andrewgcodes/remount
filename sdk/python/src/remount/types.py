@@ -332,6 +332,43 @@ ArtifactProofRes = TypedDict("ArtifactProofRes", {
     "proof": Required[str],
 }, total=False)
 
+AuditExportReq = TypedDict("AuditExportReq", {
+    "tenant": NotRequired[str],
+    "from": Required[int],
+    "to": Required[int],
+}, total=False)
+
+AuditExportRes = TypedDict("AuditExportRes", {
+    "manifest": Required["AuditManifest"],
+    "signature": Required[str],
+    "bundle": Required[bytes],
+}, total=False)
+
+AuditKeyReq = TypedDict("AuditKeyReq", {
+}, total=False)
+
+AuditKeyRes = TypedDict("AuditKeyRes", {
+    "key_id": Required[str],
+    "algorithm": Required[str],
+    "public_key": Required[str],
+}, total=False)
+
+AuditManifest = TypedDict("AuditManifest", {
+    "schema": Required[str],
+    "tenant": Required[str],
+    "range_from": Required[int],
+    "range_to": Required[int],
+    "created_at": Required[int],
+    "event_count": Required[int],
+    "first_seq": NotRequired[int],
+    "last_seq": NotRequired[int],
+    "payload_bytes": Required[int],
+    "payload_sha256": Required[str],
+    "hash_algorithm": Required[str],
+    "signature_algorithm": Required[str],
+    "key_id": Required[str],
+}, total=False)
+
 AuditPolicy = TypedDict("AuditPolicy", {
     "required": NotRequired[bool],
 }, total=False)
@@ -644,6 +681,7 @@ ExitInfo = TypedDict("ExitInfo", {
 FSApplyTarReq = TypedDict("FSApplyTarReq", {
     "ws": Required[str],
     "artifact": Required[str],
+    "format": NotRequired[str],
     "idem": NotRequired[str],
     "grant": NotRequired[Optional["Grant"]],
 }, total=False)
@@ -1857,6 +1895,8 @@ OPERATIONS: dict[str, dict[str, object]] = {
     "approval.get": {"constant": "OpApprovalGet", "request": "ApprovalGetReq", "response": "Approval"},
     "approval.list": {"constant": "OpApprovalList", "request": "ApprovalListReq", "response": "ApprovalListRes"},
     "artifact.proof": {"constant": "OpArtifactProof", "request": "ArtifactProofReq", "response": "ArtifactProofRes"},
+    "audit.export": {"constant": "OpAuditExport", "request": "AuditExportReq", "response": "AuditExportRes"},
+    "audit.key": {"constant": "OpAuditKey", "request": "AuditKeyReq", "response": "AuditKeyRes"},
     "base.create": {"constant": "OpBaseCreate", "request": "BaseCreateReq", "response": "Base"},
     "base.list": {"constant": "OpBaseList", "request": "", "response": "BaseListRes"},
     "base.remove": {"constant": "OpBaseRemove", "request": "BaseRemoveReq", "response": ""},

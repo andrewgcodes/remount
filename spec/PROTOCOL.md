@@ -455,11 +455,16 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `session.cap.issue` | N | `SessionCapabilityIssueReq{client, ws, gen, authz_revision, principal, tenant, roles}` → `SessionCapabilityIssueRes{capability, expires_at}`; derives authority from the connected client and live signed grant |
 | `session.cap.renew` | N | `SessionCapabilityRenewReq{ws, gen, capability}` → `SessionCapabilityIssueRes{capability, expires_at}`; rotates an unexpired signed proof for the same principal while assignment and authorization remain live |
 | `session.cap.check` | N | `SessionCapabilityCheckReq{ws, gen, capability}` → `SessionCapabilityCheckRes{principal, tenant}`; performed for every broker request and revalidates principal revision, ACL and the live assignment |
+| `session.log.commit` | N | `SessionLogCommitReq{session, ws, gen, principal, kind, info, exit, max_chunk, segments, complete}` → `SessionLogRecord`; control derives `tenant` from the workspace and ignores any node-supplied tenant. A replacement must be a monotonic continuation: the stored segment list must be an exact prefix of the new one, and a record already marked `complete` is immutable. Every newly referenced segment is verified present and byte-exact in the tenant store before commit, and the assignment generation is revalidated after that verification |
+| `session.log.get` | N | `SessionLogGetReq{session, ws, gen}` → `SessionLogRecord`; only the current holder of that exact workspace generation, and only for a record whose tenant matches the workspace |
+| `session.log.delete` | N | `SessionLogGetReq{session, ws, gen}` → `{}`; current holder only. A live record — one not yet marked `complete` — cannot be deleted |
 | `controller.state` | control only | `ControllerNodeState{node, epoch, workspaces[], releases[]}`; authenticated node-authoritative state used only while a promoted controller is reconciling |
 | `binding.lease` | N | `BindingLeaseReq{ws, gen}` → `BindingLeaseRes{leases}` |
 | `egress.approval` | N | `EgressApprovalReq{ws, gen, principal, rule, host, method, path_hash, body_hash, fingerprint, wait_ms?}` → `EgressApprovalRes{id, status, allowed?, expires_at?}`; only the current generation holder may create the durable approval |
 | `agent.report` | N | `AgentReport{agent, run, ws, gen, seq, kind, ...}` → `{}`; one observation about a run, fenced to the node, generation and run, deduplicated by `seq` (§6.1); `kind: transcript` carries `chunks[]` for the mirror (§6.2) |
 | `diag` | C | `DiagReq{verify}` → control diagnostics |
+| `audit.export` | C | `AuditExportReq{tenant?, from, to}` → `AuditExportRes{manifest, signature, bundle}`; the range is INCLUSIVE of both endpoints and `from` must be at least 1. The tenant is resolved from the authenticated subject; a caller whose tenant is not `*` may not name another, `*` is never a valid export subject, and administrative authority is required. A range the log can no longer serve completely is `evicted` carrying the oldest retained sequence, never a shorter bundle. One bundle is bounded at 16 MiB and one range at 1,048,576 sequences (§11.1) |
+| `audit.key` | C | `AuditKeyReq{}` → `AuditKeyRes{key_id, algorithm, public_key}`; publishes only the verification half of the control plane's durable Ed25519 audit signing key, so a bundle can be verified without reaching the control plane |
 
 Every mutating request carries an `idem` key. Replaying a request with the same
 key is a no-op that returns the original result. This is what makes a retry
@@ -709,7 +714,7 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `fs.rename` | `FSRenameReq{ws, old, new, idem}` → `{}` |
 | `fs.search` | `FSSearchReq{ws, path, pattern, glob, max}` → `FSSearchRes{matches, truncated}` |
 | `fs.edit` | `FSEditReq{ws, path, edits, idem}` → `FSEditRes{replacements}` |
-| `fs.apply_tar` | `FSApplyTarReq{ws, artifact, idem}` → `FSApplyTarRes{files, dirs, bytes}` |
+| `fs.apply_tar` | `FSApplyTarReq{ws, artifact, format, idem}` → `FSApplyTarRes{files, dirs, bytes}`; `format` is the artifact's representation (§10) and an absent value means the legacy `tar` |
 | `ws.snapshot` | `WSSnapshotReq{ws, upload, authoritative, idem}` → `WSSnapshotRes{artifact, bytes, consistency, authoritative}` |
 | `volume.archive` | `VolumeArchiveReq{ws, path, upload, idem}` → `WSSnapshotRes`; creates a non-authoritative artifact for a jailed subdirectory |
 | `volume.publish` | `VolumePublishPathReq{ws, path, volume, expected_version, idem}` → `Volume`; holds the tree boundary through the control-plane CAS |
@@ -737,6 +742,15 @@ does not name are left in place, `.remount/` is refused, and an entry that
 would replace a directory with a file, or write through a symlinked parent,
 fails the whole request with `bad_request`. The response counts what was
 written; the node emits one `fs.apply_tar` event and one `fs.write` per path.
+
+The node reconstructs the archive from the `format` it is **told**; it never
+guesses one from the artifact id. A `chunked-v1` request is resolved by
+fetching and digest-verifying every referenced chunk before the tree boundary
+is taken, then streaming the canonical tar through the same validation and
+rename path as a legacy archive, so both representations share one overlay
+commit point. A node that does not support the named representation MUST fail
+with `unsupported` before touching the tree, and MUST NOT fall back to parsing
+the object as some other format.
 
 Node mutations with an `idem` key are write-ahead journaled. The node persists
 and fsyncs a `pending` intent before applying the effect, then persists and
@@ -870,6 +884,58 @@ once when the session is created — an idempotent replay of the open emits
 nothing — and `run.finished` from the session's exit path, so a client that
 detached still gets both records. When `auth` is `workspace_resident` the node
 also emits `auth.workspace_resident`.
+
+### 8.2 Tiered durable session logs (`tiered-session-logs`)
+
+The ring and spill of §8 are node-local, so they do not survive node loss. A
+node that offers the `tiered-session-logs` capability (§3.1) additionally
+seals completed sequence ranges into immutable, tenant-local artifacts and
+registers them with the control plane, so an exited session can still be
+replayed byte-exactly after a move or a node restart.
+
+A `SessionLogRecord` is the control-owned replay authority. It names the
+session, its workspace and tenant, the producing principal, the session kind,
+its `SessionInfo` and `ExitInfo`, the producer's `max_chunk` bound, and an
+ordered `segments` list. Each `SessionLogSegment{first, next, artifact, bytes}`
+covers the half-open chunk range `[first, next)` and names the artifact holding
+it. Segments MUST be contiguous: every segment's `first` equals the previous
+segment's `next`.
+
+The three operations are node-to-control (§6):
+
+- `session.log.commit` replaces the whole record. Control derives `tenant` from
+  the workspace; a node cannot select it. A commit is accepted only from the
+  node holding the exact workspace generation, and only as a **monotonic
+  continuation** — the stored segment list must be an exact prefix of the
+  replacement. A record marked `complete` is immutable, so a replayed identical
+  commit returns the stored record and anything else is a `conflict`. Newly
+  referenced segments are verified present and byte-exact in the tenant
+  artifact store before the record is committed, and the assignment generation
+  is revalidated afterwards, so a producer fenced during verification commits
+  nothing.
+- `session.log.get` returns the record to the current holder of that exact
+  workspace generation, so a node that has just claimed a moved workspace can
+  reconstruct a session it never ran.
+- `session.log.delete` releases an expired record and the GC roots its
+  segments held. A record that is not yet `complete` is live and cannot be
+  deleted.
+
+Retention is per tenant. While a record exists, every artifact it references is
+a GC root, so the transitive closure of a retained session log is never
+collected.
+
+Replay from a tiered log obeys the same honesty rule as §8's guarantee 4, and
+it is the rule that matters most here because the loss is now durable: if a
+segment is unavailable — the blob is gone, or a cold cache cannot reach it —
+the node MUST emit an explicit `gap` chunk naming the lost range, tagged with
+the tier that failed, before continuing from the oldest chunk it can serve.
+Unavailable archived output MUST NOT be reported as a complete replay. Control
+records that unavailability as `session.log.unavailable`.
+
+Events: `session.log.committed` carries the workspace, the segment count and
+whether the record is `complete`; `session.log.deleted` carries the workspace
+and the segment count that was released; `session.log.unavailable` records a
+replay that could not be served in full.
 
 ## 9. Secret-blind execution
 
@@ -1008,9 +1074,19 @@ produces the same id.
 `tar` and `chunked-v1` snapshots contain **files only**, never process memory.
 Their moves restart processes; the filesystem, identity and policy travel.
 `firecracker-full-v1` is accepted only by an exactly compatible Firecracker
-destination and preserves the paused guest process state. `ws.moved` always
-records `processes:"preserved"` for that format and `processes:"restarted"`
-for every other format.
+destination and carries the paused guest process state.
+
+`ws.moved` is emitted when the move enters `pending`, before a destination is
+chosen, so its `processes` field reports intent, not outcome. Every format
+other than `firecracker-full-v1` records `processes:"restarted"`, which is
+already final: those snapshots contain no process memory, so no destination can
+change the answer. A `firecracker-full-v1` move records
+`processes:"restore_pending"`, because whether the guest actually resumes
+depends on the destination's Firecracker and CPU compatibility and on the
+restore itself succeeding. `processes:"preserved"` MUST NOT be asserted from
+the artifact format alone; it is reserved for a checkpoint that demonstrably
+restored on the destination (ADR 0063). A reader that needs process continuity
+must treat `restore_pending` as unknown, never as preserved.
 
 `PUT /v1/artifacts/{id}` stores a blob in a private temporary file, enforces the
 configured compressed-size limit, and publishes it only after the digest
@@ -1139,8 +1215,10 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `budget.reserved`, `budget.settled`, `budget.expired`, `budget.unmetered`,
 `notifier.unavailable`, `notifier.dead_lettered`,
 `notifier.dead_letters_pruned`, `identity.principal_created`,
-`identity.roles_changed`, `identity.principal_revoked` and
-`export.cursor.advanced`.
+`identity.roles_changed`, `identity.principal_revoked`,
+`session.log.committed`, `session.log.deleted`, `session.log.unavailable`,
+`audit.exported`, `audit.export_denied`, `retention.enforced`,
+`retention.violation`, `residency.denied` and `export.cursor.advanced`.
 
 Principal role events are tenant-scoped and carry the actor, principal,
 revision and complete non-secret role set. Access, refresh, provider, device,
@@ -1263,6 +1341,30 @@ watermark. A historical or tail request older than that watermark fails with
 `evicted` and `Error.oldest`; it never silently starts at a newer sequence.
 Pagination continues until the requested range is exhausted rather than
 silently stopping at an implementation page size.
+
+### 11.1 Retention and compliance export
+
+Retention deletes only a contiguous oldest prefix of the sequence, so a range
+that is missing events is always reported as an explicit gap and never as a
+shorter answer. Per-tenant retention is therefore two mechanisms rather than
+one: the prefix is deleted at the oldest instant any tenant still requires,
+and between a tenant's own cutoff and that floor the tenant's event payload is
+replaced in place with the constant marker
+`{"remount_redacted": "tenant_retention"}`. Sequence, time, type and tenant are
+never changed, so contiguity holds; the redaction travels into an export as
+ordinary content, so a bundle covering a redacted range is explicit about it.
+
+Per-tenant artifact retention is a maximum age, so it may only accelerate
+collection relative to the shared grace window and never delay it. It never
+selects a referenced object at any age: a live workspace, base, fleet or
+session-log closure outranks a retention policy, and an artifact still held by
+one is reported as a violation rather than deleted.
+
+A compliance bundle is JSON Lines: one canonical event object per line, then
+one line holding `{"remount_audit_manifest": {...}, "signature": "..."}`. The
+manifest's `payload_sha256` covers exactly the event bytes preceding that line.
+Two exports of one range produce byte-identical event lines and the same hash;
+only `created_at` differs. See ADR 0080.
 
 ## 12. What a minimal implementation must get right
 

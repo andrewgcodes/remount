@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"remount.dev/remount/internal/artifact/chunked"
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/localfs"
 	"remount.dev/remount/internal/proto"
@@ -45,6 +46,29 @@ func uploadDir(ctx context.Context, cl *client.Client, dir string, opts localfs.
 	return id, result.m, nil
 }
 
+// uploadDirChunked publishes dir as a chunked manifest, transferring only the
+// content the control plane does not already hold. The file set comes from the
+// same selector Pack uses, so --chunked can never upload something the tar
+// path would have ignored.
+func uploadDirChunked(ctx context.Context, cl *client.Client, dir string, opts localfs.PackOptions) (chunked.SnapshotResult, error) {
+	if len(opts.Extra) > 0 {
+		return chunked.SnapshotResult{}, errors.New("a chunked upload carries no trees from outside the directory")
+	}
+	sel, err := localfs.Select(dir, opts)
+	if err != nil {
+		return chunked.SnapshotResult{}, err
+	}
+	defer sel.Close()
+	for _, w := range sel.Warnings {
+		fmt.Fprintln(os.Stderr, "warning:", w)
+	}
+	result, err := cl.UploadChunkedSnapshot(ctx, sel.Dir, chunked.SnapshotOptions{Skip: sel.Skip})
+	if err != nil {
+		return result, fmt.Errorf("chunked upload %s: %w", dir, err)
+	}
+	return result, nil
+}
+
 func cmdPush(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("push", flag.ExitOnError)
 	var c common
@@ -54,28 +78,57 @@ func cmdPush(ctx context.Context, args []string) error {
 	var exclude listFlag
 	fs.Var(&exclude, "exclude", "additional exclude glob (repeatable)")
 	noIgnore := fs.Bool("no-ignore", false, "ignore .gitignore/.remountignore and the default excludes")
+	useChunks := fs.Bool("chunked", false, "upload deduplicated chunks; only content the server does not already hold is transferred")
 	parse(fs, args)
-	if err := arity(fs, 1, 1, "push WS [--dir .] [--include-git=false] [--exclude GLOB]..."); err != nil {
+	if err := arity(fs, 1, 1, "push WS [--dir .] [--include-git=false] [--exclude GLOB]... [--chunked]"); err != nil {
 		return err
 	}
 	wsID := fs.Arg(0)
+	packOpts := localfs.PackOptions{
+		ExcludeGit: !*includeGit, Excludes: exclude, NoIgnoreFiles: *noIgnore, NoDefaultExcludes: *noIgnore,
+	}
 	cl := c.client()
 	defer cl.Close()
-	id, m, err := uploadDir(ctx, cl, *dir, localfs.PackOptions{
-		ExcludeGit: !*includeGit, Excludes: exclude, NoIgnoreFiles: *noIgnore, NoDefaultExcludes: *noIgnore,
-	})
-	if err != nil {
-		return err
+	var (
+		id     string
+		format = proto.ArtifactFormatTar
+		packed localfs.Manifest
+		dedup  *chunked.SnapshotResult
+	)
+	if *useChunks {
+		result, err := uploadDirChunked(ctx, cl, *dir, packOpts)
+		if err != nil {
+			return err
+		}
+		id, format, dedup = result.ManifestID, proto.ArtifactFormatChunkedV1, &result
+	} else {
+		uploaded, m, err := uploadDir(ctx, cl, *dir, packOpts)
+		if err != nil {
+			return err
+		}
+		id, packed = uploaded, m
 	}
-	res, err := cl.ApplyTar(ctx, wsID, id)
+	res, err := cl.ApplyArtifact(ctx, wsID, id, format)
 	if err != nil {
 		return err
 	}
 	if c.json {
-		printJSON(map[string]any{"ws": wsID, "artifact": id, "packed": m, "applied": res})
+		out := map[string]any{"ws": wsID, "artifact": id, "format": format, "applied": res}
+		// Deduplication is the only reason to choose --chunked, so what it
+		// saved is part of the result rather than a log line.
+		if dedup != nil {
+			out["chunked"] = dedup
+		} else {
+			out["packed"] = packed
+		}
+		printJSON(out)
 		return nil
 	}
 	fmt.Fprintf(os.Stderr, "pushed %d files (%d bytes) to %s\n", res.Files, res.Bytes, wsID)
+	if dedup != nil {
+		fmt.Fprintf(os.Stderr, "chunked: uploaded %d of %d chunks, %d bytes transferred of %d\n",
+			dedup.ChunksUploaded, dedup.Chunks, dedup.BytesUploaded, dedup.PlaintextBytes)
+	}
 	return nil
 }
 
@@ -110,7 +163,10 @@ func cmdPull(ctx context.Context, args []string) error {
 		return err
 	}
 	if c.json {
-		printJSON(map[string]any{"ws": wsID, "artifact": snap.Artifact, "result": res})
+		// The representation is reported because it decides how much moved:
+		// a chunked snapshot is reconstructed from chunks rather than fetched
+		// as one archive.
+		printJSON(map[string]any{"ws": wsID, "artifact": snap.Artifact, "format": snap.Format, "result": res})
 		return nil
 	}
 	fmt.Fprintf(os.Stderr, "pulled %s: %d written, %d unchanged", wsID, len(res.Written), res.Unchanged)

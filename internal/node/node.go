@@ -2784,7 +2784,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		clean.Grant = nil
 		key := n.mutationKey(f.From, w.ID, proto.OpFSApplyTar, req.IdempotencyKey)
 		raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
-			return n.applyTar(ctx, w, req.Artifact, f.From)
+			return n.applyTar(ctx, w, req.Artifact, req.Format, f.From)
 		})
 		if err != nil {
 			return nil, err
@@ -3784,13 +3784,31 @@ func (n *Node) authorizeArtifactRequest(ctx context.Context, w *proto.Workspace,
 // applyTar overlays an uploaded artifact onto a workspace tree. The fetch
 // happens before the tree lock so a slow download never blocks other file
 // operations; the overlay itself holds the lock because every rename must be
-// ordered against concurrent fs.* mutations.
-func (n *Node) applyTar(ctx context.Context, w *ws, id, client string) ([]byte, error) {
-	rc, err := n.fetchWorkspaceArtifact(ctx, &w.Workspace, id)
+// ordered against concurrent fs.* mutations. Every representation is turned
+// into the one interoperable archive and handed to the same ApplyOverlay, so
+// there is exactly one implementation of the containment, validate-before-
+// rename and atomic-landing rules.
+func (n *Node) applyTar(ctx context.Context, w *ws, id, format, client string) ([]byte, error) {
+	format, err := proto.NormalizeArtifactFormat(format)
+	if err != nil {
+		return nil, err
+	}
+	var rc io.ReadCloser
+	switch format {
+	case proto.ArtifactFormatTar:
+		rc, err = n.fetchWorkspaceArtifact(ctx, &w.Workspace, id)
+	case proto.ArtifactFormatChunkedV1:
+		rc, err = n.chunkedOverlayArchive(ctx, &w.Workspace, id)
+	default:
+		// Refused before the tree boundary is taken: a representation this
+		// node cannot reconstruct must not become a half-applied overlay, and
+		// must not be read as though it were some other representation.
+		return nil, proto.Err(proto.CodeUnsupported, "fs.apply_tar: artifact format %q cannot be overlaid", format)
+	}
 	if err != nil {
 		return nil, proto.Err(proto.CodeNotFound, "fs.apply_tar: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	unlock, err := n.lockWorkspaceTree(w, true)
 	if err != nil {
 		return nil, err
@@ -3802,6 +3820,11 @@ func (n *Node) applyTar(ctx context.Context, w *ws, id, client string) ([]byte, 
 		return nil, proto.Err(proto.CodeUnsupported, "backend %s has no host filesystem for archive apply", w.handle.Backend())
 	}
 	res, err := artifact.ApplyOverlay(host.Root(), rc, limits)
+	// Close joins the archive producer. A reconstruction goroutine that is
+	// merely asked to stop can still be running after this operation returns.
+	if closeErr := rc.Close(); err == nil {
+		err = closeErr
+	}
 	// Whatever landed before a mid-archive refusal is real state; record it
 	// before reporting the failure.
 	if len(res.Paths) > 0 || res.Dirs > 0 {

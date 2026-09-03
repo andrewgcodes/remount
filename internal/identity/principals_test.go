@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -88,5 +89,41 @@ func TestPrincipalCreationRejectsNodeAndInvalidTTL(t *testing.T) {
 	}
 	if _, _, err := manager.IssueAccessToken(context.Background(), "tenant-a", "missing", RoleAgent, 0); err == nil || errors.Is(err, ErrPrincipalNotFound) {
 		t.Fatalf("invalid ttl error=%v", err)
+	}
+}
+
+// TestIssueAccessTokenRefusesATTLTheVerifierWouldReject pins the agreement
+// between the issuer and the verifier. verify bounds an access token's lifetime
+// by accessTTL, so minting a longer one produced a bearer that was dead on
+// arrival: it authenticated as a bare unauthorized with nothing to explain it,
+// which is exactly how a --bootstrap-ttl above the ceiling used to fail.
+func TestIssueAccessTokenRefusesATTLTheVerifierWouldReject(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	// testManager configures AccessTTL: time.Minute.
+	manager, _ := testManager(t, &now)
+	ctx := context.Background()
+	if _, err := manager.CreatePrincipal(ctx, "tenant-a", "agent:alice", []string{RoleAgent}, "operator:bob"); err != nil {
+		t.Fatal(err)
+	}
+
+	// At the ceiling the token must both mint and authenticate.
+	token, _, err := manager.IssueAccessToken(ctx, "tenant-a", "agent:alice", RoleAgent, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Authenticate(ctx, control.Credential{Token: token}); err != nil {
+		t.Fatalf("a token issued at the ceiling did not authenticate: %v", err)
+	}
+
+	// Above it, issuance must refuse rather than hand back a dud.
+	over, _, err := manager.IssueAccessToken(ctx, "tenant-a", "agent:alice", RoleAgent, time.Hour)
+	if err == nil {
+		if _, authErr := manager.Authenticate(ctx, control.Credential{Token: over}); authErr != nil {
+			t.Fatalf("issued a bearer the verifier rejects (%v); issuance must refuse instead", authErr)
+		}
+		t.Fatal("issued an access token whose lifetime exceeds the configured maximum")
+	}
+	if !strings.Contains(err.Error(), "exceeds the configured maximum") {
+		t.Fatalf("refusal does not name the ceiling: %v", err)
 	}
 }

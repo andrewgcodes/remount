@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"strings"
@@ -1025,10 +1026,27 @@ func (c *Client) Edit(ctx context.Context, wsID, path string, edits []proto.FSEd
 // ApplyTar overlays an artifact previously stored with UploadArtifact onto the
 // workspace tree. Files land one rename at a time; nothing else is removed.
 func (c *Client) ApplyTar(ctx context.Context, wsID, artifactID string, options ...OperationOption) (*proto.FSApplyTarRes, error) {
+	return c.ApplyArtifact(ctx, wsID, artifactID, proto.ArtifactFormatTar, options...)
+}
+
+// ApplyArtifact is ApplyTar for an artifact in a named representation. The
+// node reconstructs the archive from the format it is told about; it never
+// guesses one from the id, and refuses a representation it cannot restore
+// without touching the tree.
+func (c *Client) ApplyArtifact(ctx context.Context, wsID, artifactID, format string, options ...OperationOption) (*proto.FSApplyTarRes, error) {
+	format, err := proto.NormalizeArtifactFormat(format)
+	if err != nil {
+		return nil, err
+	}
+	if format == proto.ArtifactFormatTar {
+		// The legacy representation stays off the wire so a request from this
+		// release is byte-identical to one from a release without formats.
+		format = ""
+	}
 	var res proto.FSApplyTarRes
 	idem, _ := operationKey(options)
-	err := c.nodeCall(ctx, wsID, proto.OpFSApplyTar, func(g *proto.Grant) any {
-		return proto.FSApplyTarReq{WS: wsID, Artifact: artifactID, IdempotencyKey: idem, Grant: g}
+	err = c.nodeCall(ctx, wsID, proto.OpFSApplyTar, func(g *proto.Grant) any {
+		return proto.FSApplyTarReq{WS: wsID, Artifact: artifactID, Format: format, IdempotencyKey: idem, Grant: g}
 	}, &res)
 	return &res, err
 }
@@ -1123,11 +1141,7 @@ func (s clientArtifactReadStore) Open(id string) (io.ReadCloser, int64, error) {
 }
 
 func (s clientArtifactReadStore) Head(id string) (int64, error) {
-	r, size, err := s.Open(id)
-	if r != nil {
-		_ = r.Close()
-	}
-	return size, err
+	return s.client.HeadArtifact(s.ctx, id)
 }
 
 func (clientArtifactReadStore) Delete(string) error {
@@ -1139,6 +1153,65 @@ func (clientArtifactReadStore) List() ([]string, error) {
 }
 
 var _ artifact.BlobStore = clientArtifactReadStore{}
+
+// clientArtifactStore adds publication to the read view. It is the store a
+// chunked push runs against: Head asks the control plane what it already
+// holds so an unchanged chunk is never sent, and Put publishes the ones it
+// does not.
+type clientArtifactStore struct {
+	clientArtifactReadStore
+}
+
+func (s clientArtifactStore) Put(r io.Reader) (string, int64, error) {
+	return s.client.UploadArtifact(s.ctx, r)
+}
+
+var _ artifact.BlobStore = clientArtifactStore{}
+
+// HeadArtifact reports an artifact's stored size without transferring it, and
+// returns an error satisfying errors.Is(err, fs.ErrNotExist) when the control
+// plane does not hold it. Deduplication depends on this being a real HEAD:
+// answering the same question with GET would download every chunk in order to
+// discover it was already there, which costs more than uploading everything.
+func (c *Client) HeadArtifact(ctx context.Context, id string) (int64, error) {
+	if c.opts.ArtifactURL == "" {
+		return 0, ErrNoArtifactURL
+	}
+	if _, err := artifact.Digest(id); err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.artifactURL(id), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.opts.Token)
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return 0, fmt.Errorf("client: artifact %s: %w", id, fs.ErrNotExist)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("client: head artifact %s: HTTP %d", id, resp.StatusCode)
+	}
+	if resp.ContentLength < 0 {
+		return 0, fmt.Errorf("client: head artifact %s: missing Content-Length", id)
+	}
+	return resp.ContentLength, nil
+}
+
+// UploadChunkedSnapshot publishes dir as a chunked manifest, transferring only
+// the chunks the control plane reports missing. The returned result names the
+// manifest id to pass to ApplyArtifact and reports the deduplication actually
+// achieved, which is the only reason to choose this representation over a tar.
+func (c *Client) UploadChunkedSnapshot(ctx context.Context, dir string, opts chunked.SnapshotOptions) (chunked.SnapshotResult, error) {
+	if c.opts.ArtifactURL == "" {
+		return chunked.SnapshotResult{}, ErrNoArtifactURL
+	}
+	return chunked.Snapshot(ctx, clientArtifactStore{clientArtifactReadStore{ctx: ctx, client: c}}, dir, opts)
+}
 
 // DownloadArtifactWithSize is DownloadArtifact plus the authenticated
 // plaintext Content-Length. Chunked snapshot exporters use the size to apply

@@ -77,7 +77,7 @@ func run(ctx context.Context, argv []string) error {
 	}
 	cmd, args := argv[0], argv[1:]
 	switch cmd {
-	case "ws", "fs", "fleet", "pool", "volume", "budget", "run", "agent", "mcp", "tenant", "principal", "token":
+	case "ws", "fs", "fleet", "pool", "volume", "budget", "run", "agent", "mcp", "tenant", "principal", "token", "audit":
 		if len(args) > 0 && !isFlag(args[0]) {
 			args = append(append([]string{args[0]}, globals...), args[1:]...)
 		} else {
@@ -149,6 +149,8 @@ func run(ctx context.Context, argv []string) error {
 		return cmdPrincipal(ctx, args)
 	case "token":
 		return cmdToken(ctx, args)
+	case "audit":
+		return cmdAudit(ctx, args)
 	case "invite":
 		return cmdInvite(ctx, args)
 	case "login":
@@ -255,6 +257,8 @@ func usage() {
   remount approve ID [--option X | --deny | --content JSON]              compatibility shorthand
   remount mcp serve | config HOST | wrap -- SERVER                      expose Remount and wrapped servers over MCP
   remount nodes | events [--follow] [--ws WS] | timers
+  remount audit export --tenant T --range FROM..TO [--out FILE]          a signed, tenant-scoped bundle of the event log; FROM..TO includes both ends
+  remount audit verify BUNDLE [--key BASE64] [--tenant T] | audit key    check a bundle, offline when given the key
 
 Inspection, at three depths. All take --json.
   remount status [--watch 5s]         the fleet in one screen

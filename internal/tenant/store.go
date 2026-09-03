@@ -14,6 +14,7 @@ import (
 
 	"remount.dev/remount/internal/eventlog"
 	"remount.dev/remount/internal/ids"
+	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 )
 
@@ -364,6 +365,10 @@ func (s *Store) Admit(ctx context.Context, admission Admission, commit func(*eve
 	now := s.now().UTC()
 	var fresh bool
 	var outcomeErr error
+	// quotaExceeded pairs the counter with the event exactly once: an
+	// idempotent replay of an already-refused admission emits no new event and
+	// must not move the counter either.
+	var quotaExceeded bool
 	err := s.log.Transact(ctx, s.db, func(tx *eventlog.Tx) error {
 		var storedFingerprint, outcome string
 		var raw []byte
@@ -418,6 +423,7 @@ func (s *Store) Admit(ctx context.Context, admission Admission, commit func(*eve
 		}
 		if reservationCount >= s.maxReservations {
 			outcomeErr = &Error{Code: CodeResourceExhausted}
+			quotaExceeded = true
 			if err := s.putOperation(ctx, tx, admission.Tenant, admission.OperationID, fingerprint, "resource_exhausted", outcomeErr, now); err != nil {
 				return err
 			}
@@ -432,6 +438,7 @@ func (s *Store) Admit(ctx context.Context, admission Admission, commit func(*eve
 		limit := current.Policy.Quotas.Limit(admission.Resource)
 		if limit > 0 && (admission.Amount > limit || used > limit-admission.Amount) {
 			outcomeErr = &Error{Code: CodeResourceExhausted, Resource: admission.Resource, Limit: limit, Used: used}
+			quotaExceeded = true
 			if err := s.putOperation(ctx, tx, admission.Tenant, admission.OperationID, fingerprint, "resource_exhausted", outcomeErr, now); err != nil {
 				return err
 			}
@@ -456,6 +463,11 @@ func (s *Store) Admit(ctx context.Context, admission Admission, commit func(*eve
 	})
 	if err = normalizeDrain(err); err != nil {
 		return false, err
+	}
+	// The counter moves only after the refusal is durable, so a metric can
+	// never claim a rejection the event log does not also record.
+	if quotaExceeded {
+		metrics.TenantQuotaExceeded.Inc()
 	}
 	return fresh, outcomeErr
 }
