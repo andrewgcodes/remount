@@ -1,0 +1,49 @@
+name: minio
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  s3-compatibility:
+    runs-on: ubuntu-latest
+    env:
+      MINIO_ROOT_USER: remount_ci_access
+      MINIO_ROOT_PASSWORD: remount_ci_secret_43
+      REMOUNT_S3_INTEGRATION_ENDPOINT: http://127.0.0.1:9000
+      REMOUNT_S3_INTEGRATION_REGION: us-east-1
+      REMOUNT_S3_INTEGRATION_BUCKET: remount-integration
+      REMOUNT_S3_INTEGRATION_ACCESS_KEY: remount_ci_access
+      REMOUNT_S3_INTEGRATION_SECRET_KEY: remount_ci_secret_43
+      REMOUNT_S3_INTEGRATION_CREATE_BUCKET: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+      - name: start pinned MinIO
+        run: >-
+          docker run -d --name remount-minio -p 127.0.0.1:9000:9000
+          -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD
+          quay.io/minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
+          server /data
+      - name: wait for MinIO
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs remount-minio
+          exit 1
+      - name: S3 REST and multipart compatibility
+        run: go test -race -count=1 -run '^TestMinIOIntegration$' -v -timeout 180s ./internal/artifact/s3
+      - name: remove MinIO
+        if: always()
+        run: docker rm -f remount-minio
