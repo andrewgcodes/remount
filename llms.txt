@@ -49,6 +49,7 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/re
 ## Agent HTTP API
 
 - [Base URL, authentication, errors](https://github.com/remount-dev/remount/blob/main/docs/api.md#base-url-authentication-errors): Every route is under the server's base URL (`--public-url` when set).
+- [Usage](https://github.com/remount-dev/remount/blob/main/docs/api.md#usage): `GET /v1/usage?tenant=&ws=&principal=&binding=&window=` translates to `usage.get` and returns `UsageRes{usage}`.
 - [Agents](https://github.com/remount-dev/remount/blob/main/docs/api.md#agents): `Agent`, `AgentCreateReq`, `AgentSpec` and `AgentPolicy` are the protocol types serialized as JSON with their `json` tags; the request to create an agent from a recipe is:
 - [Transcript](https://github.com/remount-dev/remount/blob/main/docs/api.md#transcript): `GET /v1/agents/{id}/transcript?from=N&limit=M` reads the durable mirror (§6.2) as a page:
 - [Approvals](https://github.com/remount-dev/remount/blob/main/docs/api.md#approvals): Decision validation is per kind (§6.1): a `tool_call` takes one of the offered `options`, an `elicitation` takes `content` (a JSON object) or `denied`, an `egress` takes `allow`/`deny`.

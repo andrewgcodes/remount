@@ -10,9 +10,43 @@ import (
 	"strings"
 	"time"
 
+	"remount.dev/remount/internal/artifact"
+	"remount.dev/remount/internal/artifact/chunked"
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/localfs"
+	"remount.dev/remount/internal/proto"
 )
+
+type clientArtifactReadStore struct {
+	ctx context.Context
+	cl  *client.Client
+}
+
+func (*clientArtifactReadStore) Put(io.Reader) (string, int64, error) {
+	return "", 0, errors.New("client artifact view is read-only")
+}
+
+func (s *clientArtifactReadStore) Open(id string) (io.ReadCloser, int64, error) {
+	return s.cl.DownloadArtifactWithSize(s.ctx, id)
+}
+
+func (s *clientArtifactReadStore) Head(id string) (int64, error) {
+	r, size, err := s.Open(id)
+	if r != nil {
+		_ = r.Close()
+	}
+	return size, err
+}
+
+func (*clientArtifactReadStore) Delete(string) error {
+	return errors.New("client artifact view is read-only")
+}
+
+func (*clientArtifactReadStore) List() ([]string, error) {
+	return nil, errors.New("client artifact enumeration is unavailable")
+}
+
+var _ artifact.BlobStore = (*clientArtifactReadStore)(nil)
 
 // uploadDir packs dir and streams it into the control plane's artifact store
 // in one pass. Warnings (a skipped oversized .git pack) go to stderr because
@@ -95,12 +129,35 @@ func cmdPull(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	rc, err := cl.DownloadArtifact(ctx, snap.Artifact)
+	var rc io.ReadCloser
+	var producer <-chan error
+	format, err := proto.NormalizeArtifactFormat(snap.Format)
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
+	if format == proto.ArtifactFormatChunkedV1 {
+		pr, pw := io.Pipe()
+		done := make(chan error, 1)
+		go func() {
+			err := chunked.ExportTar(ctx, &clientArtifactReadStore{ctx: ctx, cl: cl}, snap.Artifact, pw, chunked.Limits{})
+			_ = pw.CloseWithError(err)
+			done <- err
+		}()
+		rc = pr
+		producer = done
+	} else {
+		rc, err = cl.DownloadArtifact(ctx, snap.Artifact)
+		if err != nil {
+			return err
+		}
+	}
 	res, err := localfs.Unpack(*dir, rc, localfs.UnpackOptions{Force: *force})
+	closeErr := rc.Close()
+	var producerErr error
+	if producer != nil {
+		producerErr = <-producer
+	}
+	err = errors.Join(err, closeErr, producerErr)
 	if errors.Is(err, localfs.ErrDirty) {
 		return fmt.Errorf("%s has uncommitted changes; commit or stash them, or pass --force", *dir)
 	}
@@ -177,6 +234,180 @@ func cmdBase(ctx context.Context, args []string) error {
 		}
 	default:
 		return fmt.Errorf("unknown base subcommand %q", sub)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// volumes: immutable shared data mounted read-only into workspaces
+// ---------------------------------------------------------------------------
+
+func cmdVolume(ctx context.Context, args []string) error {
+	if len(args) == 0 || isHelp(args[0]) {
+		return errors.New("volume: create ID --dir PATH | ls | get ID | rm ID | attach ID WS PATH | detach WS PATH | publish WS PATH")
+	}
+	sub, rest := args[0], args[1:]
+	fs := flag.NewFlagSet("volume "+sub, flag.ExitOnError)
+	var c common
+	c.flags(fs)
+	idem := fs.String("idem", "", "stable idempotency key for retry after an ambiguous result")
+	operationOptions := func() []client.OperationOption {
+		if *idem == "" {
+			return nil
+		}
+		return []client.OperationOption{client.WithIdempotencyKey(*idem)}
+	}
+	switch sub {
+	case "create":
+		dir := fs.String("dir", "", "local directory to publish as version 1")
+		var exclude listFlag
+		fs.Var(&exclude, "exclude", "exclude glob (repeatable)")
+		parse(fs, rest)
+		if err := arity(fs, 1, 1, "volume create ID --dir PATH"); err != nil {
+			return err
+		}
+		if *dir == "" {
+			return errors.New("volume create requires --dir")
+		}
+		cl := c.client()
+		defer cl.Close()
+		artifactID, manifest, err := uploadDir(ctx, cl, *dir, localfs.PackOptions{ExcludeGit: true, Excludes: exclude})
+		if err != nil {
+			return err
+		}
+		volume, err := cl.CreateVolume(ctx, proto.VolumeCreateReq{ID: fs.Arg(0), Artifact: artifactID}, operationOptions()...)
+		if err != nil {
+			return err
+		}
+		if c.json {
+			printJSON(map[string]any{"volume": volume, "packed": manifest})
+		} else {
+			fmt.Printf("%s\tversion=%d\tartifact=%s\n", volume.ID, volume.Version, volume.Artifact)
+		}
+	case "ls":
+		parse(fs, rest)
+		if err := arity(fs, 0, 0, "volume ls"); err != nil {
+			return err
+		}
+		cl := c.client()
+		defer cl.Close()
+		volumes, err := cl.ListVolumes(ctx)
+		if err != nil {
+			return err
+		}
+		if c.json {
+			printJSON(volumes)
+			return nil
+		}
+		tw := tabWriter()
+		fmt.Fprintln(tw, "ID\tTENANT\tOWNER\tVERSION\tARTIFACT\tUPDATED")
+		for _, volume := range volumes {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\n", volume.ID, volume.Tenant, volume.Owner, volume.Version, short(volume.Artifact), time.UnixMilli(volume.UpdatedAt).UTC().Format(time.RFC3339))
+		}
+		tw.Flush()
+	case "get":
+		parse(fs, rest)
+		if err := arity(fs, 1, 1, "volume get ID"); err != nil {
+			return err
+		}
+		cl := c.client()
+		defer cl.Close()
+		volume, err := cl.GetVolume(ctx, fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		if c.json {
+			printJSON(volume)
+		} else {
+			fmt.Printf("%s\tversion=%d\tartifact=%s\n", volume.ID, volume.Version, volume.Artifact)
+		}
+	case "rm":
+		parse(fs, rest)
+		if err := arity(fs, 1, 1, "volume rm ID"); err != nil {
+			return err
+		}
+		cl := c.client()
+		defer cl.Close()
+		if err := cl.RemoveVolume(ctx, fs.Arg(0), operationOptions()...); err != nil {
+			return err
+		}
+		if c.json {
+			printJSON(map[string]string{"removed": fs.Arg(0)})
+		}
+	case "attach":
+		parse(fs, rest)
+		if err := arity(fs, 3, 3, "volume attach ID WS PATH"); err != nil {
+			return err
+		}
+		cl := c.client()
+		defer cl.Close()
+		ws, err := cl.GetWorkspace(ctx, fs.Arg(1))
+		if err != nil {
+			return err
+		}
+		ws, err = cl.AttachVolume(ctx, proto.VolumeAttachReq{ID: fs.Arg(0), Workspace: ws.ID, Generation: ws.Generation, Path: fs.Arg(2)}, operationOptions()...)
+		if err != nil {
+			return err
+		}
+		if c.json {
+			printJSON(ws)
+		}
+	case "detach":
+		parse(fs, rest)
+		if err := arity(fs, 2, 2, "volume detach WS PATH"); err != nil {
+			return err
+		}
+		cl := c.client()
+		defer cl.Close()
+		ws, err := cl.GetWorkspace(ctx, fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		ws, err = cl.DetachVolume(ctx, proto.VolumeDetachReq{Workspace: ws.ID, Generation: ws.Generation, Path: fs.Arg(1)}, operationOptions()...)
+		if err != nil {
+			return err
+		}
+		if c.json {
+			printJSON(ws)
+		}
+	case "publish":
+		volumeID := fs.String("volume", "", "volume ID (required when PATH is not its current mount path)")
+		parse(fs, rest)
+		if err := arity(fs, 2, 2, "volume publish WS PATH [--volume ID]"); err != nil {
+			return err
+		}
+		cl := c.client()
+		defer cl.Close()
+		ws, err := cl.GetWorkspace(ctx, fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		if *volumeID == "" {
+			for i := range ws.Spec.Volumes {
+				if ws.Spec.Volumes[i].Path == fs.Arg(1) {
+					*volumeID = ws.Spec.Volumes[i].ID
+					break
+				}
+			}
+			if *volumeID == "" {
+				return fmt.Errorf("PATH is not a mounted volume; select the target with --volume ID")
+			}
+		}
+		current, err := cl.GetVolume(ctx, *volumeID)
+		if err != nil {
+			return err
+		}
+		volume, err := cl.PublishVolumePath(ctx, ws.ID, fs.Arg(1), current.ID, current.Version, operationOptions()...)
+		if err != nil {
+			return err
+		}
+		if c.json {
+			printJSON(volume)
+		} else {
+			fmt.Printf("%s\tversion=%d\tartifact=%s\n", volume.ID, volume.Version, volume.Artifact)
+		}
+	default:
+		return fmt.Errorf("unknown volume subcommand %q", sub)
 	}
 	return nil
 }

@@ -301,6 +301,34 @@ export interface ApprovalOption {
   "kind"?: string;
 }
 
+export interface ArtifactProofClaims {
+  "id": string;
+  "node": string;
+  "tenant": string;
+  "ws": string;
+  "gen": number;
+  "method": string;
+  "artifact": string;
+  "issued_at": number;
+  "expires_at": number;
+}
+
+export interface ArtifactProofEnvelope {
+  "claims": ArtifactProofClaims;
+  "signature": Uint8Array;
+}
+
+export interface ArtifactProofReq {
+  "ws": string;
+  "gen": number;
+  "method": string;
+  "artifact": string;
+}
+
+export interface ArtifactProofRes {
+  "proof": string;
+}
+
 export interface AuditPolicy {
   "required"?: boolean;
 }
@@ -332,6 +360,8 @@ export interface Base {
   "tenant": string;
   "owner": string;
   "artifact": string;
+  "format"?: string;
+  "objects"?: Array<string>;
   "workspace"?: string;
   "bytes"?: number;
   "created_at": number;
@@ -340,6 +370,7 @@ export interface Base {
 export interface BaseCreateReq {
   "name": string;
   "artifact": string;
+  "format"?: string;
   "workspace"?: string;
   "idem"?: string;
 }
@@ -483,8 +514,34 @@ export interface ControlDiag {
   "workspaces_per_subject_max"?: number;
   "db_integrity"?: string;
   "lease_sec": number;
+  "controller_role"?: string;
+  "controller_epoch"?: number;
+  "controller_lease_age_ms"?: number;
+  "last_replicated_at"?: number;
+  "restored_event_seq"?: number;
+  "recovery_lost_window_ms"?: number;
+  "controller_reconciling"?: boolean;
   "metrics"?: Record<string, number>;
   "findings"?: Array<Finding>;
+}
+
+export interface ControllerNodeState {
+  "node": string;
+  "epoch": number;
+  "workspaces"?: Array<ControllerWorkspace>;
+  "releases"?: Array<ControllerReleaseState>;
+}
+
+export interface ControllerReleaseState {
+  "request": WSReleaseReq;
+  "response": WSReleasedReq;
+  "operation_id"?: string;
+  "state": string;
+}
+
+export interface ControllerWorkspace {
+  "workspace": Workspace;
+  "sessions"?: Array<string>;
 }
 
 export interface DiagReq {
@@ -549,6 +606,7 @@ export interface Event {
   "tenant"?: string;
   "workspace"?: string;
   "generation"?: number;
+  "controller_epoch"?: number;
   "session"?: string;
   "operation_id"?: string;
   "producer_seq"?: number;
@@ -740,6 +798,8 @@ export interface FleetOperationResult {
   "fenced"?: boolean;
   "acknowledged": boolean;
   "snapshot"?: string;
+  "snapshot_format"?: string;
+  "snapshot_objects"?: Array<string>;
   "error"?: string;
   "updated_at": number;
 }
@@ -755,6 +815,7 @@ export interface FleetQuarantineReq {
 export interface Frame {
   "v": number;
   "t": string;
+  "controller_epoch"?: number;
   "id"?: number;
   "seq"?: number;
   "s"?: string;
@@ -769,6 +830,7 @@ export interface Frame {
 export interface Gap {
   "from": number;
   "to": number;
+  "tier"?: string;
 }
 
 export interface Grant {
@@ -783,9 +845,11 @@ export interface GrantClaims {
   "node": string;
   "principal"?: string;
   "tenant"?: string;
+  "roles"?: Array<string>;
   "authz_revision"?: number;
   "exp": number;
   "gen": number;
+  "controller_epoch"?: number;
 }
 
 export interface GrantReq {
@@ -813,6 +877,7 @@ export interface HelloOK {
   "now": number;
   "pubkey"?: Uint8Array;
   "lease_sec"?: number;
+  "controller_epoch"?: number;
   "subject"?: string;
   "tenant"?: string;
   "node_token"?: string;
@@ -830,6 +895,7 @@ export interface NetworkPolicy {
 
 export interface NodeDiag {
   "node": string;
+  "controller_epoch"?: number;
   "info": NodeInfo;
   "now": number;
   "uptime_sec": number;
@@ -865,6 +931,13 @@ export interface NodeDiag {
   "mutation_records_max"?: number;
   "snapshots_active"?: number;
   "snapshots_active_max"?: number;
+  "volumes"?: number;
+  "volume_attachments"?: number;
+  "volume_source_bytes"?: number;
+  "volume_source_max_bytes"?: number;
+  "volume_source_entries"?: number;
+  "volume_source_max_entries"?: number;
+  "volume_quota_rejections"?: number;
   "metrics"?: Record<string, number>;
   "findings"?: Array<Finding>;
 }
@@ -953,6 +1026,60 @@ export interface PortOpenReq {
   "host"?: string;
   "idem"?: string;
   "grant"?: Grant | null;
+}
+
+export interface Principal {
+  "id": string;
+  "tenant": string;
+  "roles": Array<string>;
+  "revision": number;
+  "created_at": number;
+  "updated_at": number;
+}
+
+export interface PrincipalCreateReq {
+  "tenant"?: string;
+  "principal": string;
+  "roles": Array<string>;
+  "idem": string;
+}
+
+export interface PrincipalInviteReq {
+  "tenant": string;
+  "principal": string;
+  "ttl_ms": number;
+  "idem": string;
+}
+
+export interface PrincipalListReq {
+  "tenant"?: string;
+}
+
+export interface PrincipalListRes {
+  "principals": Array<Principal>;
+}
+
+export interface PrincipalRevokeReq {
+  "tenant"?: string;
+  "principal": string;
+  "idem": string;
+}
+
+export interface PrincipalRevokeRes {
+  "revision": number;
+}
+
+export interface PrincipalTokenIssueReq {
+  "tenant"?: string;
+  "principal": string;
+  "role": string;
+  "ttl_ms": number;
+  "idem": string;
+}
+
+export interface PrincipalTokenIssueRes {
+  "access_token": string;
+  "expires_at": number;
 }
 
 export interface Queue {
@@ -1129,6 +1256,38 @@ export interface SecuritySpec {
   "audit"?: AuditPolicy;
 }
 
+export interface SessionCapabilityCheckReq {
+  "ws": string;
+  "gen": number;
+  "capability": string;
+}
+
+export interface SessionCapabilityCheckRes {
+  "principal": string;
+  "tenant": string;
+}
+
+export interface SessionCapabilityIssueReq {
+  "client": string;
+  "ws": string;
+  "gen": number;
+  "authz_revision": number;
+  "principal": string;
+  "tenant": string;
+  "roles"?: Array<string>;
+}
+
+export interface SessionCapabilityIssueRes {
+  "capability": string;
+  "expires_at": number;
+}
+
+export interface SessionCapabilityRenewReq {
+  "ws": string;
+  "gen": number;
+  "capability": string;
+}
+
 export interface SessionInfo {
   "id": string;
   "ws": string;
@@ -1139,12 +1298,141 @@ export interface SessionInfo {
   "run"?: RunInfo | null;
 }
 
+export interface SessionLogCommitReq {
+  "session": string;
+  "workspace": string;
+  "gen": number;
+  "principal": string;
+  "kind": string;
+  "info"?: SessionInfo;
+  "exit"?: ExitInfo;
+  "max_chunk": number;
+  "segments"?: Array<SessionLogSegment>;
+  "complete"?: boolean;
+}
+
+export interface SessionLogGetReq {
+  "session": string;
+  "workspace": string;
+  "gen": number;
+}
+
+export interface SessionLogRecord {
+  "session": string;
+  "workspace": string;
+  "tenant": string;
+  "principal": string;
+  "kind": string;
+  "info": SessionInfo;
+  "exit": ExitInfo;
+  "max_chunk": number;
+  "segments"?: Array<SessionLogSegment>;
+  "complete"?: boolean;
+  "updated_at": number;
+  "expires_at"?: number;
+}
+
+export interface SessionLogSegment {
+  "first": number;
+  "next": number;
+  "artifact": string;
+  "bytes": number;
+}
+
 export interface SessionStatus {
   "info": SessionInfo;
   "exited": boolean;
   "exit"?: ExitInfo | null;
   "next": number;
   "oldest": number;
+  "blob_bytes"?: number;
+  "blob_segments"?: number;
+  "unavailable_tier"?: string;
+}
+
+export interface Tenant {
+  "id": string;
+  "state": string;
+  "revision": number;
+  "policy": TenantPolicy;
+  "created_at": number;
+  "updated_at": number;
+}
+
+export interface TenantCreateReq {
+  "id": string;
+  "policy": TenantPolicy;
+  "idem": string;
+}
+
+export interface TenantGetReq {
+  "id": string;
+}
+
+export interface TenantListRes {
+  "tenants": Array<Tenant>;
+}
+
+export interface TenantOIDC {
+  "issuer"?: string;
+  "client_id"?: string;
+  "audience"?: string;
+  "scopes"?: Array<string>;
+  "group_roles"?: Record<string, Array<string>>;
+  "tenant_claim"?: string;
+  "groups_claim"?: string;
+}
+
+export interface TenantPolicy {
+  "quotas": TenantQuotas;
+  "retention": TenantRetention;
+  "residency": TenantResidency;
+  "oidc": TenantOIDC;
+  "stripe_customer_id"?: string;
+}
+
+export interface TenantQuotas {
+  "max_workspaces": number;
+  "max_nodes": number;
+  "max_artifact_bytes": number;
+  "max_active_sessions": number;
+}
+
+export interface TenantResidency {
+  "allowed_regions"?: Array<string>;
+  "required_labels"?: Record<string, string>;
+}
+
+export interface TenantRetention {
+  "events_ms": number;
+  "session_logs_ms": number;
+  "artifacts_ms": number;
+  "meter_events_ms": number;
+}
+
+export interface TenantStateReq {
+  "id": string;
+  "state": string;
+  "expected_revision": number;
+  "idem": string;
+}
+
+export interface TenantUpdateReq {
+  "id": string;
+  "policy": TenantPolicy;
+  "expected_revision": number;
+  "idem": string;
+}
+
+export interface TenantUsage {
+  "workspaces": number;
+  "nodes": number;
+  "artifact_bytes": number;
+  "active_sessions": number;
+}
+
+export interface TenantUsageReq {
+  "tenant"?: string;
 }
 
 export interface Timer {
@@ -1152,6 +1440,7 @@ export interface Timer {
   "ws": string;
   "at"?: number;
   "on"?: string;
+  "match"?: Record<string, string>;
   "action": string;
   "fired": boolean;
   "fired_at"?: number;
@@ -1207,6 +1496,93 @@ export interface UsageRes {
   "usage": Array<Usage>;
 }
 
+export interface Volume {
+  "id": string;
+  "tenant": string;
+  "owner": string;
+  "artifact": string;
+  "version": number;
+  "versions": Array<VolumeVersion>;
+  "created_at": number;
+  "updated_at": number;
+}
+
+export interface VolumeArchiveReq {
+  "ws": string;
+  "path": string;
+  "upload": boolean;
+  "idem"?: string;
+  "grant"?: Grant | null;
+}
+
+export interface VolumeAttachReq {
+  "id": string;
+  "ws": string;
+  "generation": number;
+  "path": string;
+  "idem"?: string;
+}
+
+export interface VolumeCreateReq {
+  "id": string;
+  "artifact": string;
+  "idem"?: string;
+}
+
+export interface VolumeDetachReq {
+  "ws": string;
+  "generation": number;
+  "path": string;
+  "idem"?: string;
+}
+
+export interface VolumeGetReq {
+  "id": string;
+}
+
+export interface VolumeListRes {
+  "volumes": Array<Volume>;
+}
+
+export interface VolumeMount {
+  "id": string;
+  "path": string;
+  "version"?: number;
+  "artifact"?: string;
+}
+
+export interface VolumePublishPathReq {
+  "ws": string;
+  "path": string;
+  "volume": string;
+  "expected_version": number;
+  "idem"?: string;
+  "grant"?: Grant | null;
+}
+
+export interface VolumePublishReq {
+  "id": string;
+  "ws": string;
+  "generation": number;
+  "artifact": string;
+  "expected_version": number;
+  "idem"?: string;
+  "grant"?: Grant | null;
+}
+
+export interface VolumeRemoveReq {
+  "id": string;
+  "idem"?: string;
+}
+
+export interface VolumeVersion {
+  "number": number;
+  "artifact": string;
+  "published_by"?: string;
+  "generation"?: number;
+  "published_at": number;
+}
+
 export interface WSACLReq {
   "id": string;
   "acl": WorkspaceACL;
@@ -1232,6 +1608,7 @@ export interface WSDiag {
   "gen": number;
   "backend": string;
   "root": string;
+  "volumes"?: Array<VolumeMount>;
   "bytes": number;
   "files": number;
   "broker"?: string;
@@ -1271,6 +1648,7 @@ export interface WSQuarantineCommitReq {
   "gen": number;
   "backend": string;
   "snapshot": string;
+  "snapshot_format"?: string;
 }
 
 export interface WSQuarantineReq {
@@ -1281,6 +1659,8 @@ export interface WSQuarantineReq {
   "backend"?: string;
   "exclude"?: Array<string>;
   "security"?: SecuritySpec;
+  "tenant"?: string;
+  "volumes"?: Array<VolumeMount>;
 }
 
 export interface WSQuarantineRes {
@@ -1289,6 +1669,7 @@ export interface WSQuarantineRes {
   "action": string;
   "backend"?: string;
   "snapshot"?: string;
+  "snapshot_format"?: string;
   "warning"?: string;
 }
 
@@ -1300,20 +1681,28 @@ export interface WSReadyReq {
 export interface WSReleaseCommitReq {
   "id": string;
   "gen": number;
+  "operation"?: string;
   "snapshot"?: string;
+  "snapshot_format"?: string;
 }
 
 export interface WSReleaseReq {
   "ws": string;
   "gen": number;
+  "operation"?: string;
   "snapshot": boolean;
   "reason"?: string;
+  "tenant"?: string;
+  "backend"?: string;
+  "spec"?: WorkspaceSpec;
 }
 
 export interface WSReleasedReq {
   "id": string;
   "gen": number;
+  "operation"?: string;
   "snapshot"?: string;
+  "snapshot_format"?: string;
   "reason"?: string;
   "failed"?: boolean;
   "preparing"?: boolean;
@@ -1322,11 +1711,13 @@ export interface WSReleasedReq {
 export interface WSRenewReq {
   "ids": Array<string>;
   "gen"?: Record<string, number>;
+  "controller_epoch"?: number;
   "authz"?: Record<string, number>;
 }
 
 export interface WSRenewRes {
   "results": Array<WSRenewResult>;
+  "controller_epoch"?: number;
 }
 
 export interface WSRenewResult {
@@ -1336,6 +1727,7 @@ export interface WSRenewResult {
   "authoritative_gen"?: number;
   "lease_until"?: number;
   "action": string;
+  "controller_epoch"?: number;
   "authz_revision"?: number;
   "revoked"?: Array<string>;
   "authz_reset"?: boolean;
@@ -1346,6 +1738,7 @@ export interface WSSleepReq {
   "after_sec"?: number;
   "at"?: number;
   "on"?: string;
+  "match"?: Record<string, string>;
   "idem"?: string;
 }
 
@@ -1353,6 +1746,7 @@ export interface WSSnapshotCommitReq {
   "id": string;
   "gen": number;
   "snapshot": string;
+  "format"?: string;
 }
 
 export interface WSSnapshotReq {
@@ -1369,6 +1763,10 @@ export interface WSSnapshotRes {
   "bytes": number;
   "consistency": string;
   "authoritative": boolean;
+  "format"?: string;
+  "uploaded_bytes"?: number;
+  "chunks"?: number;
+  "uploaded_chunks"?: number;
 }
 
 export interface Workspace {
@@ -1378,6 +1776,8 @@ export interface Workspace {
   "node"?: string;
   "lease_until"?: number;
   "last_snapshot"?: string;
+  "last_snapshot_format"?: string;
+  "last_snapshot_objects"?: Array<string>;
   "created_at": number;
   "updated_at": number;
   "gen": number;
@@ -1386,6 +1786,7 @@ export interface Workspace {
   "authz_revision"?: number;
   "revocations"?: Array<AuthzRevocation>;
   "revocation_floor"?: number;
+  "release_operation"?: string;
   "quarantine_operation"?: string;
   "quarantined_at"?: number;
 }
@@ -1397,6 +1798,7 @@ export interface WorkspaceACL {
 
 export interface WorkspaceSelector {
   "all"?: boolean;
+  "workspace"?: string;
   "tenant"?: string;
   "principal"?: string;
   "run"?: string;
@@ -1415,6 +1817,8 @@ export interface WorkspaceSpec {
   "labels"?: Record<string, string>;
   "image"?: string;
   "restore_from"?: string;
+  "restore_format"?: string;
+  "restore_objects"?: Array<string>;
   "base"?: string;
   "requires": Requires;
   "placement": Placement;
@@ -1427,96 +1831,126 @@ export interface WorkspaceSpec {
   "acl"?: WorkspaceACL;
   "mount_path"?: string;
   "repo"?: RepoSpec;
+  "volumes"?: Array<VolumeMount>;
 }
 
 export const OPERATIONS = {
-  "agent.approval.decided": { constant: "OpAgentApprovalDecided", request: "AgentApprovalDecidedReq", response: "", mutating: false },
-  "agent.cancel": { constant: "OpAgentCancel", request: "AgentGetReq", response: "Agent", mutating: true },
-  "agent.create": { constant: "OpAgentCreate", request: "AgentCreateReq", response: "Agent", mutating: true },
-  "agent.deliver": { constant: "OpAgentDeliver", request: "AgentDeliverReq", response: "", mutating: false },
-  "agent.destroy": { constant: "OpAgentDestroy", request: "AgentGetReq", response: "", mutating: true },
-  "agent.fork": { constant: "OpAgentFork", request: "AgentForkReq", response: "Agent", mutating: true },
-  "agent.get": { constant: "OpAgentGet", request: "AgentGetReq", response: "Agent", mutating: false },
-  "agent.list": { constant: "OpAgentList", request: "AgentListReq", response: "AgentListRes", mutating: false },
-  "agent.message": { constant: "OpAgentMessage", request: "AgentMessageReq", response: "AgentMessageRes", mutating: true },
-  "agent.report": { constant: "OpAgentReport", request: "AgentReport", response: "", mutating: false },
-  "agent.run": { constant: "OpAgentRun", request: "AgentRunReq", response: "AgentRunRes", mutating: false },
-  "agent.run.cancel": { constant: "OpAgentRunCancel", request: "AgentRunCancelReq", response: "", mutating: false },
-  "agent.sleep": { constant: "OpAgentSleep", request: "AgentGetReq", response: "Agent", mutating: true },
-  "agent.transcript": { constant: "OpAgentTranscript", request: "AgentTranscriptReq", response: "AgentTranscriptRes", mutating: false },
-  "agent.wake": { constant: "OpAgentWake", request: "AgentWakeReq", response: "Agent", mutating: true },
-  "approval.decide": { constant: "OpApprovalDecide", request: "ApprovalDecideReq", response: "Approval", mutating: true },
-  "approval.get": { constant: "OpApprovalGet", request: "ApprovalGetReq", response: "Approval", mutating: false },
-  "approval.list": { constant: "OpApprovalList", request: "ApprovalListReq", response: "ApprovalListRes", mutating: false },
-  "base.create": { constant: "OpBaseCreate", request: "BaseCreateReq", response: "Base", mutating: true },
-  "base.list": { constant: "OpBaseList", request: "", response: "BaseListRes", mutating: false },
-  "base.remove": { constant: "OpBaseRemove", request: "BaseRemoveReq", response: "", mutating: true },
-  "binding.lease": { constant: "OpBindingLease", request: "BindingLeaseReq", response: "BindingLeaseRes", mutating: false },
-  "budget.create": { constant: "OpBudgetCreate", request: "BudgetCreateReq", response: "Budget", mutating: true },
-  "budget.list": { constant: "OpBudgetList", request: "BudgetListReq", response: "BudgetListRes", mutating: false },
-  "budget.remove": { constant: "OpBudgetRemove", request: "BudgetRemoveReq", response: "", mutating: true },
-  "budget.reserve": { constant: "OpBudgetReserve", request: "BudgetReserveReq", response: "BudgetReservation", mutating: false },
-  "budget.settle": { constant: "OpBudgetSettle", request: "BudgetSettleReq", response: "BudgetSettlement", mutating: false },
-  "diag": { constant: "OpDiag", request: "DiagReq", response: "", mutating: false },
-  "egress.approval": { constant: "OpEgressApproval", request: "EgressApprovalReq", response: "EgressApprovalRes", mutating: false },
-  "events.post": { constant: "OpEventsPost", request: "EventPost", response: "", mutating: false },
-  "events.stop": { constant: "OpEventsStop", request: "EventsStopReq", response: "", mutating: false },
-  "events.tail": { constant: "OpEventsTail", request: "EventsTailReq", response: "", mutating: false },
-  "fleet.get": { constant: "OpFleetGet", request: "FleetGetReq", response: "FleetOperation", mutating: false },
-  "fleet.list": { constant: "OpFleetList", request: "", response: "FleetListRes", mutating: false },
-  "fleet.quarantine": { constant: "OpFleetQuarantine", request: "FleetQuarantineReq", response: "FleetOperation", mutating: true },
-  "fs.apply_tar": { constant: "OpFSApplyTar", request: "FSApplyTarReq", response: "FSApplyTarRes", mutating: true },
-  "fs.edit": { constant: "OpFSEdit", request: "FSEditReq", response: "FSEditRes", mutating: true },
-  "fs.list": { constant: "OpFSList", request: "FSListReq", response: "FSListRes", mutating: false },
-  "fs.mkdir": { constant: "OpFSMkdir", request: "FSMkdirReq", response: "", mutating: true },
-  "fs.read": { constant: "OpFSRead", request: "FSReadReq", response: "FSReadRes", mutating: false },
-  "fs.remove": { constant: "OpFSRemove", request: "FSRemoveReq", response: "", mutating: true },
-  "fs.rename": { constant: "OpFSRename", request: "FSRenameReq", response: "", mutating: true },
-  "fs.search": { constant: "OpFSSearch", request: "FSSearchReq", response: "FSSearchRes", mutating: false },
-  "fs.stat": { constant: "OpFSStat", request: "", response: "FSStatRes", mutating: false },
-  "fs.write": { constant: "OpFSWrite", request: "FSWriteReq", response: "", mutating: true },
-  "grant": { constant: "OpGrant", request: "GrantReq", response: "Grant", mutating: false },
-  "node.diag": { constant: "OpNodeDiag", request: "NodeDiagReq", response: "", mutating: false },
-  "node.list": { constant: "OpNodeList", request: "", response: "NodeListRes", mutating: false },
-  "node.status": { constant: "OpNodeStatus", request: "", response: "", mutating: false },
-  "pool.create": { constant: "OpPoolCreate", request: "PoolCreateReq", response: "Pool", mutating: true },
-  "pool.get": { constant: "OpPoolGet", request: "PoolGetReq", response: "Pool", mutating: false },
-  "pool.list": { constant: "OpPoolList", request: "", response: "PoolListRes", mutating: false },
-  "pool.remove": { constant: "OpPoolRemove", request: "PoolRemoveReq", response: "", mutating: true },
-  "port.open": { constant: "OpPortOpen", request: "PortOpenReq", response: "SOpenRes", mutating: true },
-  "queue.advance": { constant: "OpQueueAdvance", request: "QueueAdvanceReq", response: "Queue", mutating: true },
-  "queue.create": { constant: "OpQueueCreate", request: "QueueCreateReq", response: "Queue", mutating: true },
-  "queue.get": { constant: "OpQueueGet", request: "QueueGetReq", response: "Queue", mutating: false },
-  "queue.list": { constant: "OpQueueList", request: "QueueListReq", response: "QueueListRes", mutating: false },
-  "s.ack": { constant: "OpSAck", request: "SAckReq", response: "", mutating: false },
-  "s.attach": { constant: "OpSAttach", request: "SAttachReq", response: "SOpenRes", mutating: false },
-  "s.close": { constant: "OpSClose", request: "SCloseReq", response: "", mutating: false },
-  "s.input": { constant: "OpSInput", request: "SInputReq", response: "", mutating: false },
-  "s.list": { constant: "OpSList", request: "SListReq", response: "SListRes", mutating: false },
-  "s.open": { constant: "OpSOpen", request: "SOpenReq", response: "SOpenRes", mutating: true },
-  "s.resize": { constant: "OpSResize", request: "SResizeReq", response: "", mutating: false },
-  "s.signal": { constant: "OpSSignal", request: "SSignalReq", response: "", mutating: false },
-  "s.wait": { constant: "OpSWait", request: "SWaitReq", response: "SWaitRes", mutating: false },
-  "timer.list": { constant: "OpTimerList", request: "", response: "TimerListRes", mutating: false },
-  "usage.get": { constant: "OpUsageGet", request: "UsageReq", response: "UsageRes", mutating: false },
-  "ws.acl": { constant: "OpWSACL", request: "WSACLReq", response: "Workspace", mutating: true },
-  "ws.claim": { constant: "OpWSClaim", request: "WSClaimReq", response: "WSClaimRes", mutating: false },
-  "ws.create": { constant: "OpWSCreate", request: "WSCreateReq", response: "Workspace", mutating: true },
-  "ws.destroy": { constant: "OpWSDestroy", request: "WSGetReq", response: "", mutating: true },
-  "ws.get": { constant: "OpWSGet", request: "WSGetReq", response: "Workspace", mutating: false },
-  "ws.info": { constant: "OpWSInfo", request: "WSGetReq", response: "WSInfoRes", mutating: false },
-  "ws.list": { constant: "OpWSList", request: "", response: "WSListRes", mutating: false },
-  "ws.move": { constant: "OpWSMove", request: "WSMoveReq", response: "Workspace", mutating: true },
-  "ws.quarantine": { constant: "OpWSQuarantine", request: "WSQuarantineReq", response: "WSQuarantineRes", mutating: false },
-  "ws.quarantine.commit": { constant: "OpWSQuarantineCommit", request: "WSQuarantineCommitReq", response: "", mutating: false },
-  "ws.ready": { constant: "OpWSReady", request: "WSReadyReq", response: "", mutating: false },
-  "ws.release": { constant: "OpWSRelease", request: "WSReleaseReq", response: "", mutating: false },
-  "ws.release.abort": { constant: "OpWSReleaseAbort", request: "", response: "", mutating: false },
-  "ws.release.commit": { constant: "OpWSReleaseCommit", request: "WSReleaseCommitReq", response: "", mutating: false },
-  "ws.released": { constant: "OpWSReleased", request: "WSReleasedReq", response: "", mutating: false },
-  "ws.renew": { constant: "OpWSRenew", request: "WSRenewReq", response: "WSRenewRes", mutating: false },
-  "ws.sleep": { constant: "OpWSSleep", request: "WSSleepReq", response: "Timer", mutating: true },
-  "ws.snapshot": { constant: "OpWSSnapshot", request: "WSSnapshotReq", response: "WSSnapshotRes", mutating: true },
-  "ws.snapshot.commit": { constant: "OpWSSnapshotCommit", request: "WSSnapshotCommitReq", response: "", mutating: false },
-  "ws.wake": { constant: "OpWSWake", request: "WSGetReq", response: "Workspace", mutating: true },
+  "agent.approval.decided": { constant: "OpAgentApprovalDecided", request: "AgentApprovalDecidedReq", response: "" },
+  "agent.cancel": { constant: "OpAgentCancel", request: "AgentGetReq", response: "Agent" },
+  "agent.create": { constant: "OpAgentCreate", request: "AgentCreateReq", response: "Agent" },
+  "agent.deliver": { constant: "OpAgentDeliver", request: "AgentDeliverReq", response: "" },
+  "agent.destroy": { constant: "OpAgentDestroy", request: "AgentGetReq", response: "" },
+  "agent.fork": { constant: "OpAgentFork", request: "AgentForkReq", response: "Agent" },
+  "agent.get": { constant: "OpAgentGet", request: "AgentGetReq", response: "Agent" },
+  "agent.list": { constant: "OpAgentList", request: "AgentListReq", response: "AgentListRes" },
+  "agent.message": { constant: "OpAgentMessage", request: "AgentMessageReq", response: "AgentMessageRes" },
+  "agent.report": { constant: "OpAgentReport", request: "AgentReport", response: "" },
+  "agent.run": { constant: "OpAgentRun", request: "AgentRunReq", response: "AgentRunRes" },
+  "agent.run.cancel": { constant: "OpAgentRunCancel", request: "AgentRunCancelReq", response: "" },
+  "agent.sleep": { constant: "OpAgentSleep", request: "AgentGetReq", response: "Agent" },
+  "agent.transcript": { constant: "OpAgentTranscript", request: "AgentTranscriptReq", response: "AgentTranscriptRes" },
+  "agent.wake": { constant: "OpAgentWake", request: "AgentWakeReq", response: "Agent" },
+  "approval.decide": { constant: "OpApprovalDecide", request: "ApprovalDecideReq", response: "Approval" },
+  "approval.get": { constant: "OpApprovalGet", request: "ApprovalGetReq", response: "Approval" },
+  "approval.list": { constant: "OpApprovalList", request: "ApprovalListReq", response: "ApprovalListRes" },
+  "artifact.proof": { constant: "OpArtifactProof", request: "ArtifactProofReq", response: "ArtifactProofRes" },
+  "base.create": { constant: "OpBaseCreate", request: "BaseCreateReq", response: "Base" },
+  "base.list": { constant: "OpBaseList", request: "", response: "BaseListRes" },
+  "base.remove": { constant: "OpBaseRemove", request: "BaseRemoveReq", response: "" },
+  "binding.lease": { constant: "OpBindingLease", request: "BindingLeaseReq", response: "BindingLeaseRes" },
+  "budget.create": { constant: "OpBudgetCreate", request: "BudgetCreateReq", response: "Budget" },
+  "budget.list": { constant: "OpBudgetList", request: "BudgetListReq", response: "BudgetListRes" },
+  "budget.remove": { constant: "OpBudgetRemove", request: "BudgetRemoveReq", response: "" },
+  "budget.reserve": { constant: "OpBudgetReserve", request: "BudgetReserveReq", response: "BudgetReservation" },
+  "budget.settle": { constant: "OpBudgetSettle", request: "BudgetSettleReq", response: "BudgetSettlement" },
+  "controller.state": { constant: "OpControllerState", request: "", response: "" },
+  "diag": { constant: "OpDiag", request: "DiagReq", response: "ControlDiag" },
+  "egress.approval": { constant: "OpEgressApproval", request: "EgressApprovalReq", response: "EgressApprovalRes" },
+  "events.post": { constant: "OpEventsPost", request: "EventPost", response: "" },
+  "events.stop": { constant: "OpEventsStop", request: "EventsStopReq", response: "" },
+  "events.tail": { constant: "OpEventsTail", request: "EventsTailReq", response: "" },
+  "fleet.get": { constant: "OpFleetGet", request: "FleetGetReq", response: "FleetOperation" },
+  "fleet.list": { constant: "OpFleetList", request: "", response: "FleetListRes" },
+  "fleet.quarantine": { constant: "OpFleetQuarantine", request: "FleetQuarantineReq", response: "FleetOperation" },
+  "fs.apply_tar": { constant: "OpFSApplyTar", request: "FSApplyTarReq", response: "FSApplyTarRes" },
+  "fs.edit": { constant: "OpFSEdit", request: "FSEditReq", response: "FSEditRes" },
+  "fs.list": { constant: "OpFSList", request: "FSListReq", response: "FSListRes" },
+  "fs.mkdir": { constant: "OpFSMkdir", request: "FSMkdirReq", response: "" },
+  "fs.read": { constant: "OpFSRead", request: "FSReadReq", response: "FSReadRes" },
+  "fs.remove": { constant: "OpFSRemove", request: "FSRemoveReq", response: "" },
+  "fs.rename": { constant: "OpFSRename", request: "FSRenameReq", response: "" },
+  "fs.search": { constant: "OpFSSearch", request: "FSSearchReq", response: "FSSearchRes" },
+  "fs.stat": { constant: "OpFSStat", request: "", response: "FSStatRes" },
+  "fs.write": { constant: "OpFSWrite", request: "FSWriteReq", response: "" },
+  "grant": { constant: "OpGrant", request: "GrantReq", response: "Grant" },
+  "node.diag": { constant: "OpNodeDiag", request: "NodeDiagReq", response: "NodeDiag" },
+  "node.list": { constant: "OpNodeList", request: "", response: "NodeListRes" },
+  "node.status": { constant: "OpNodeStatus", request: "", response: "NodeStatus" },
+  "pool.create": { constant: "OpPoolCreate", request: "PoolCreateReq", response: "Pool" },
+  "pool.get": { constant: "OpPoolGet", request: "PoolGetReq", response: "Pool" },
+  "pool.list": { constant: "OpPoolList", request: "", response: "PoolListRes" },
+  "pool.remove": { constant: "OpPoolRemove", request: "PoolRemoveReq", response: "" },
+  "port.open": { constant: "OpPortOpen", request: "PortOpenReq", response: "SOpenRes" },
+  "principal.create": { constant: "OpPrincipalCreate", request: "PrincipalCreateReq", response: "" },
+  "principal.invite": { constant: "OpPrincipalInvite", request: "PrincipalInviteReq", response: "" },
+  "principal.list": { constant: "OpPrincipalList", request: "PrincipalListReq", response: "PrincipalListRes" },
+  "principal.revoke": { constant: "OpPrincipalRevoke", request: "PrincipalRevokeReq", response: "PrincipalRevokeRes" },
+  "principal.token.issue": { constant: "OpPrincipalTokenIssue", request: "PrincipalTokenIssueReq", response: "PrincipalTokenIssueRes" },
+  "queue.advance": { constant: "OpQueueAdvance", request: "QueueAdvanceReq", response: "Queue" },
+  "queue.create": { constant: "OpQueueCreate", request: "QueueCreateReq", response: "Queue" },
+  "queue.get": { constant: "OpQueueGet", request: "QueueGetReq", response: "Queue" },
+  "queue.list": { constant: "OpQueueList", request: "QueueListReq", response: "QueueListRes" },
+  "s.ack": { constant: "OpSAck", request: "SAckReq", response: "" },
+  "s.attach": { constant: "OpSAttach", request: "SAttachReq", response: "SOpenRes" },
+  "s.close": { constant: "OpSClose", request: "SCloseReq", response: "" },
+  "s.input": { constant: "OpSInput", request: "SInputReq", response: "" },
+  "s.list": { constant: "OpSList", request: "SListReq", response: "SListRes" },
+  "s.open": { constant: "OpSOpen", request: "SOpenReq", response: "SOpenRes" },
+  "s.resize": { constant: "OpSResize", request: "SResizeReq", response: "" },
+  "s.signal": { constant: "OpSSignal", request: "SSignalReq", response: "" },
+  "s.wait": { constant: "OpSWait", request: "SWaitReq", response: "SWaitRes" },
+  "session.cap.check": { constant: "OpSessionCapabilityCheck", request: "SessionCapabilityCheckReq", response: "SessionCapabilityCheckRes" },
+  "session.cap.issue": { constant: "OpSessionCapabilityIssue", request: "SessionCapabilityIssueReq", response: "SessionCapabilityIssueRes" },
+  "session.cap.renew": { constant: "OpSessionCapabilityRenew", request: "SessionCapabilityRenewReq", response: "" },
+  "session.log.commit": { constant: "OpSessionLogCommit", request: "SessionLogCommitReq", response: "" },
+  "session.log.delete": { constant: "OpSessionLogDelete", request: "", response: "" },
+  "session.log.get": { constant: "OpSessionLogGet", request: "SessionLogGetReq", response: "" },
+  "tenant.create": { constant: "OpTenantCreate", request: "TenantCreateReq", response: "" },
+  "tenant.get": { constant: "OpTenantGet", request: "TenantGetReq", response: "" },
+  "tenant.list": { constant: "OpTenantList", request: "", response: "TenantListRes" },
+  "tenant.state": { constant: "OpTenantState", request: "TenantStateReq", response: "" },
+  "tenant.update": { constant: "OpTenantUpdate", request: "TenantUpdateReq", response: "" },
+  "tenant.usage": { constant: "OpTenantUsage", request: "TenantUsageReq", response: "" },
+  "timer.list": { constant: "OpTimerList", request: "", response: "TimerListRes" },
+  "usage.get": { constant: "OpUsageGet", request: "UsageReq", response: "UsageRes" },
+  "volume.archive": { constant: "OpVolumeArchive", request: "VolumeArchiveReq", response: "WSSnapshotRes" },
+  "volume.attach": { constant: "OpVolumeAttach", request: "VolumeAttachReq", response: "Workspace" },
+  "volume.create": { constant: "OpVolumeCreate", request: "VolumeCreateReq", response: "Volume" },
+  "volume.detach": { constant: "OpVolumeDetach", request: "VolumeDetachReq", response: "Workspace" },
+  "volume.get": { constant: "OpVolumeGet", request: "VolumeGetReq", response: "Volume" },
+  "volume.list": { constant: "OpVolumeList", request: "", response: "VolumeListRes" },
+  "volume.publish": { constant: "OpVolumePublish", request: "VolumePublishReq", response: "" },
+  "volume.publish.commit": { constant: "OpVolumePublishCommit", request: "", response: "" },
+  "volume.remove": { constant: "OpVolumeRemove", request: "VolumeRemoveReq", response: "" },
+  "ws.acl": { constant: "OpWSACL", request: "WSACLReq", response: "Workspace" },
+  "ws.claim": { constant: "OpWSClaim", request: "WSClaimReq", response: "WSClaimRes" },
+  "ws.create": { constant: "OpWSCreate", request: "WSCreateReq", response: "Workspace" },
+  "ws.destroy": { constant: "OpWSDestroy", request: "WSGetReq", response: "" },
+  "ws.get": { constant: "OpWSGet", request: "WSGetReq", response: "Workspace" },
+  "ws.info": { constant: "OpWSInfo", request: "WSGetReq", response: "WSInfoRes" },
+  "ws.list": { constant: "OpWSList", request: "", response: "WSListRes" },
+  "ws.move": { constant: "OpWSMove", request: "WSMoveReq", response: "Workspace" },
+  "ws.quarantine": { constant: "OpWSQuarantine", request: "WSQuarantineReq", response: "WSQuarantineRes" },
+  "ws.quarantine.commit": { constant: "OpWSQuarantineCommit", request: "WSQuarantineCommitReq", response: "" },
+  "ws.ready": { constant: "OpWSReady", request: "WSReadyReq", response: "" },
+  "ws.release": { constant: "OpWSRelease", request: "WSReleaseReq", response: "" },
+  "ws.release.abort": { constant: "OpWSReleaseAbort", request: "", response: "" },
+  "ws.release.abort.commit": { constant: "OpWSReleaseAbortCommit", request: "", response: "" },
+  "ws.release.commit": { constant: "OpWSReleaseCommit", request: "WSReleaseCommitReq", response: "" },
+  "ws.released": { constant: "OpWSReleased", request: "WSReleasedReq", response: "" },
+  "ws.renew": { constant: "OpWSRenew", request: "WSRenewReq", response: "WSRenewRes" },
+  "ws.sleep": { constant: "OpWSSleep", request: "WSSleepReq", response: "Timer" },
+  "ws.snapshot": { constant: "OpWSSnapshot", request: "WSSnapshotReq", response: "WSSnapshotRes" },
+  "ws.snapshot.commit": { constant: "OpWSSnapshotCommit", request: "WSSnapshotCommitReq", response: "" },
+  "ws.wake": { constant: "OpWSWake", request: "WSGetReq", response: "Workspace" },
 } as const;

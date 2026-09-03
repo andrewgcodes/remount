@@ -78,13 +78,14 @@ var composites = []Operation{
 // invoked through a client-role MCP server.
 var protocolOperations = []string{
 	"agent.approval.decided", "agent.cancel", "agent.create", "agent.deliver", "agent.destroy", "agent.fork", "agent.get", "agent.list", "agent.message", "agent.report", "agent.run", "agent.run.cancel", "agent.sleep", "agent.transcript", "agent.wake",
-	"approval.decide", "approval.get", "approval.list", "base.create", "base.list", "base.remove", "binding.lease",
-	"budget.create", "budget.list", "budget.remove", "budget.reserve", "budget.settle", "diag", "egress.approval",
+	"approval.decide", "approval.get", "approval.list", "artifact.proof", "base.create", "base.list", "base.remove", "binding.lease",
+	"budget.create", "budget.list", "budget.remove", "budget.reserve", "budget.settle", "controller.state", "diag", "egress.approval",
 	"events.post", "events.stop", "events.tail", "fleet.get", "fleet.list", "fleet.quarantine",
 	"fs.apply_tar", "fs.edit", "fs.list", "fs.mkdir", "fs.read", "fs.remove", "fs.rename", "fs.search", "fs.stat", "fs.write", "grant",
-	"node.diag", "node.list", "node.status", "pool.create", "pool.get", "pool.list", "pool.remove", "port.open",
+	"node.diag", "node.list", "node.status", "pool.create", "pool.get", "pool.list", "pool.remove", "port.open", "principal.create", "principal.invite", "principal.list", "principal.revoke", "principal.token.issue",
 	"queue.advance", "queue.create", "queue.get", "queue.list", "s.ack", "s.attach", "s.close", "s.input", "s.list", "s.open", "s.resize", "s.signal", "s.wait",
-	"timer.list", "usage.get", "ws.acl", "ws.claim", "ws.create", "ws.destroy", "ws.get", "ws.info", "ws.list", "ws.move", "ws.quarantine", "ws.quarantine.commit", "ws.ready", "ws.release", "ws.release.abort", "ws.release.commit", "ws.released", "ws.renew", "ws.sleep", "ws.snapshot", "ws.snapshot.commit", "ws.wake",
+	"session.cap.check", "session.cap.issue", "session.cap.renew", "session.log.commit", "session.log.delete", "session.log.get", "tenant.create", "tenant.get", "tenant.list", "tenant.state", "tenant.update", "tenant.usage",
+	"timer.list", "usage.get", "volume.archive", "volume.attach", "volume.create", "volume.detach", "volume.get", "volume.list", "volume.publish", "volume.publish.commit", "volume.remove", "ws.acl", "ws.claim", "ws.create", "ws.destroy", "ws.get", "ws.info", "ws.list", "ws.move", "ws.quarantine", "ws.quarantine.commit", "ws.ready", "ws.release", "ws.release.abort", "ws.release.abort.commit", "ws.release.commit", "ws.released", "ws.renew", "ws.sleep", "ws.snapshot", "ws.snapshot.commit", "ws.wake",
 }
 
 // Manifest returns a stable copy of every composite and protocol operation.

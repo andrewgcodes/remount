@@ -265,36 +265,34 @@ func (r *CachedResolver) Probe(ctx context.Context, source string) error {
 	if err := ValidateSource(source); err != nil {
 		return err
 	}
-	for {
-		r.mu.Lock()
-		if call := r.inflight[source]; call != nil {
-			done := call.done
-			r.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-done:
-				return call.err
-			}
-		}
-
-		call := &resolveCall{done: make(chan struct{})}
-		if len(r.inflight) >= r.cfg.MaxEntries {
-			r.mu.Unlock()
-			return errors.New("secretsource: too many source probes in progress")
-		}
-		r.inflight[source] = call
+	r.mu.Lock()
+	if call := r.inflight[source]; call != nil {
+		done := call.done
 		r.mu.Unlock()
-
-		value, _, err := r.resolveUncached(ctx, source)
-		zero(value)
-		r.mu.Lock()
-		delete(r.inflight, source)
-		call.err = err
-		close(call.done)
-		r.mu.Unlock()
-		return err
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-done:
+			return call.err
+		}
 	}
+
+	call := &resolveCall{done: make(chan struct{})}
+	if len(r.inflight) >= r.cfg.MaxEntries {
+		r.mu.Unlock()
+		return errors.New("secretsource: too many source probes in progress")
+	}
+	r.inflight[source] = call
+	r.mu.Unlock()
+
+	value, _, err := r.resolveUncached(ctx, source)
+	zero(value)
+	r.mu.Lock()
+	delete(r.inflight, source)
+	call.err = err
+	close(call.done)
+	r.mu.Unlock()
+	return err
 }
 
 // Stats reports cache capacity without exposing source names or values.

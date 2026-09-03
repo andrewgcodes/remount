@@ -3,6 +3,7 @@
 package session
 
 import (
+	"errors"
 	"os/exec"
 	"syscall"
 
@@ -11,6 +12,10 @@ import (
 
 func configureProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+}
+
+func isPTYEOF(err error) bool {
+	return errors.Is(err, syscall.EIO)
 }
 
 func signalProcess(cmd *exec.Cmd, name string) error {

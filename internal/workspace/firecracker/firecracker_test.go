@@ -3,6 +3,7 @@ package firecracker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/netip"
 	"os"
@@ -20,6 +21,7 @@ import (
 var _ workspace.Backend = (*Backend)(nil)
 var _ workspace.NetworkController = (*handle)(nil)
 var _ workspace.MemoryCheckpointer = (*handle)(nil)
+var _ workspace.FencedCheckpointer = (*handle)(nil)
 
 type logbook struct {
 	sync.Mutex
@@ -29,7 +31,10 @@ type logbook struct {
 func (l *logbook) add(v string)   { l.Lock(); l.calls = append(l.calls, v); l.Unlock() }
 func (l *logbook) joined() string { l.Lock(); defer l.Unlock(); return strings.Join(l.calls, ",") }
 
-type fakeMachine struct{ log *logbook }
+type fakeMachine struct {
+	log     *logbook
+	killErr error
+}
 
 func (m *fakeMachine) Configure(context.Context, MachineConfig) error {
 	m.log.add("configure")
@@ -37,16 +42,20 @@ func (m *fakeMachine) Configure(context.Context, MachineConfig) error {
 }
 func (m *fakeMachine) Start(context.Context) error { m.log.add("start"); return nil }
 func (m *fakeMachine) Pause(context.Context) error { m.log.add("pause"); return nil }
-func (m *fakeMachine) CreateSnapshot(context.Context, SnapshotFiles) error {
+func (m *fakeMachine) CreateSnapshot(context.Context) (SnapshotFiles, error) {
 	m.log.add("snapshot")
-	return nil
+	return SnapshotFiles{State: "vm.state", Memory: "vm.mem"}, nil
 }
-func (m *fakeMachine) LoadSnapshot(context.Context, SnapshotFiles) error {
+func (m *fakeMachine) LoadSnapshot(context.Context, SnapshotFiles, string) error {
 	m.log.add("load")
 	return nil
 }
 func (m *fakeMachine) Resume(context.Context) error { m.log.add("resume"); return nil }
-func (m *fakeMachine) Kill(context.Context) error   { m.log.add("kill"); return nil }
+func (*fakeMachine) GuestSocket() string            { return "/jail/run/guest.vsock" }
+func (m *fakeMachine) Kill(context.Context) error {
+	m.log.add("kill")
+	return m.killErr
+}
 
 type fakeMachines struct {
 	log     *logbook
@@ -55,7 +64,7 @@ type fakeMachines struct {
 
 func (f *fakeMachines) Probe(context.Context) error { f.log.add("probe-machine"); return nil }
 func (*fakeMachines) Jailed() bool                  { return true }
-func (f *fakeMachines) New(context.Context, string) (Machine, error) {
+func (f *fakeMachines) New(context.Context, string, MachineLaunch) (Machine, error) {
 	f.log.add("new-machine")
 	return f.machine, nil
 }
@@ -63,10 +72,12 @@ func (f *fakeMachines) New(context.Context, string) (Machine, error) {
 type fakeNetwork struct {
 	log         *logbook
 	host, guest netip.Addr
+	revokeErr   error
 }
 
 func (n *fakeNetwork) HostAddress() netip.Addr  { return n.host }
 func (n *fakeNetwork) GuestAddress() netip.Addr { return n.guest }
+func (*fakeNetwork) NamespacePath() string      { return "/var/run/netns/fake" }
 func (n *fakeNetwork) Prepare(context.Context, uint64) (string, error) {
 	n.log.add("net-prepare")
 	return "tap0", nil
@@ -75,7 +86,10 @@ func (n *fakeNetwork) Activate(context.Context, netip.AddrPort) error {
 	n.log.add("net-activate")
 	return nil
 }
-func (n *fakeNetwork) Revoke(context.Context) error { n.log.add("net-revoke"); return nil }
+func (n *fakeNetwork) Revoke(context.Context) error {
+	n.log.add("net-revoke")
+	return n.revokeErr
+}
 
 type fakeNetworks struct {
 	log   *logbook
@@ -92,18 +106,20 @@ type fakeVolume struct {
 	log              *logbook
 	fs               *fsops.FS
 	memory           bool
+	destroyErr       error
 	entered, release chan struct{}
 }
 
-func (v *fakeVolume) FS() *fsops.FS              { return v.fs }
-func (*fakeVolume) ImagePath() string            { return "/jail/rootfs.ext4" }
-func (*fakeVolume) SnapshotFiles() SnapshotFiles { return SnapshotFiles{"vm.state", "vm.mem"} }
-func (v *fakeVolume) HasMemorySnapshot() bool    { return v.memory }
+func (v *fakeVolume) FS() workspace.FileSystem { return v.fs }
+func (*fakeVolume) ImagePath() string          { return "/jail/rootfs.ext4" }
+func (v *fakeVolume) MemorySnapshot() (SnapshotFiles, uint64, bool) {
+	return SnapshotFiles{State: "vm.state", Memory: "vm.mem"}, 6, v.memory
+}
 func (v *fakeVolume) Snapshot(context.Context, []string, io.Writer) error {
 	v.log.add("fs-snapshot")
 	return nil
 }
-func (v *fakeVolume) Checkpoint(_ context.Context, _ []string, _ SnapshotFiles, _ io.Writer) error {
+func (v *fakeVolume) Checkpoint(_ context.Context, _ []string, _ SnapshotFiles, _ uint64, _ io.Writer) error {
 	v.log.add("archive")
 	if v.entered != nil {
 		close(v.entered)
@@ -111,7 +127,10 @@ func (v *fakeVolume) Checkpoint(_ context.Context, _ []string, _ SnapshotFiles, 
 	}
 	return nil
 }
-func (v *fakeVolume) Destroy(context.Context) error { v.log.add("volume-destroy"); return nil }
+func (v *fakeVolume) Destroy(context.Context) error {
+	v.log.add("volume-destroy")
+	return v.destroyErr
+}
 
 type fakeVolumes struct {
 	log    *logbook
@@ -128,9 +147,15 @@ func (v *fakeVolumes) Adopt(context.Context, string) (Volume, error) {
 	return v.volume, nil
 }
 
-type fakeGuest struct{ log *logbook }
+type fakeGuest struct {
+	log *logbook
+	fs  workspace.FileSystem
+}
 
 func (g *fakeGuest) Probe(context.Context) error { g.log.add("probe-guest"); return nil }
+func (g *fakeGuest) FileSystem(func() (GuestEndpoint, error)) workspace.FileSystem {
+	return g.fs
+}
 func (g *fakeGuest) Prepare(s *session.Spec, _ GuestEndpoint) error {
 	g.log.add("guest-prepare")
 	s.Program = []string{"guest-agent"}
@@ -157,9 +182,9 @@ func fixture(t *testing.T, memory bool) (*Backend, *logbook) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	machine := &fakeMachine{log}
+	machine := &fakeMachine{log: log}
 	network := &fakeNetwork{log: log, host: netip.MustParseAddr("169.254.9.1"), guest: netip.MustParseAddr("169.254.9.2")}
-	opts := Options{Dir: filepath.Join(dir, "data"), KernelImage: kernel, BaseRootFS: base, Machines: &fakeMachines{log, machine}, Networks: &fakeNetworks{log, network}, Volumes: &fakeVolumes{log, &fakeVolume{log: log, fs: fs, memory: memory}}, Guest: &fakeGuest{log}}
+	opts := Options{Dir: filepath.Join(dir, "data"), KernelImage: kernel, BaseRootFS: base, Machines: &fakeMachines{log, machine}, Networks: &fakeNetworks{log, network}, Volumes: &fakeVolumes{log, &fakeVolume{log: log, fs: fs, memory: memory}}, Guest: &fakeGuest{log: log, fs: fs}}
 	b, err := New(context.Background(), opts)
 	if err != nil {
 		t.Fatal(err)
@@ -241,6 +266,54 @@ func TestCheckpointJoinsArchiveBeforeResume(t *testing.T) {
 	}
 }
 
+func TestLifecycleCheckpointStaysPausedUntilIdempotentAbortResume(t *testing.T) {
+	b, log := fixture(t, false)
+	raw, err := b.Create(context.Background(), "ws_one", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := raw.(*handle)
+	if err := h.ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, endpoint()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.CheckpointFenced(context.Background(), nil, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got := log.joined(); !strings.HasSuffix(got, "pause,snapshot,archive") || strings.HasSuffix(got, "resume") {
+		t.Fatalf("lifecycle prepare did not retain pause: %s", got)
+	}
+	if err := h.ResumeFenced(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ResumeFenced(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(log.joined(), "resume"); got != 1 {
+		t.Fatalf("abort replay resumed %d times: %s", got, log.joined())
+	}
+}
+
+func TestFencedCheckpointCanBeDestroyedWithoutSourceResume(t *testing.T) {
+	b, log := fixture(t, false)
+	raw, err := b.Create(context.Background(), "ws_one", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := raw.(*handle)
+	if err := h.ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, endpoint()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.CheckpointFenced(context.Background(), nil, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Destroy(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(log.joined(), "archive,resume") {
+		t.Fatalf("committed lifecycle resumed source before destroy: %s", log.joined())
+	}
+}
+
 func TestCapsOnlyExistAfterAllProbes(t *testing.T) {
 	b, _ := fixture(t, false)
 	caps := b.Caps()
@@ -250,5 +323,129 @@ func TestCapsOnlyExistAfterAllProbes(t *testing.T) {
 	unverified := (&Backend{}).Caps()
 	if unverified.Isolation != "none" || unverified.EgressMode != "open" || unverified.Snapshots != "fs" {
 		t.Fatalf("unverified backend overclaimed caps: %+v", unverified)
+	}
+}
+
+func TestRevokedNetworkIsTerminalAndCannotLaunchSecondMachine(t *testing.T) {
+	b, log := fixture(t, false)
+	raw, err := b.Create(context.Background(), "ws_one", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := raw.(*handle)
+	if err := h.ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, endpoint()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.RevokeNetwork(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, endpoint()); !errors.Is(err, proto.Err(proto.CodeClosed, "")) {
+		t.Fatalf("reapply after revoke err=%v", err)
+	}
+	if got := strings.Count(log.joined(), "new-machine"); got != 1 {
+		t.Fatalf("launched %d machines after terminal revoke: %s", got, log.joined())
+	}
+}
+
+func TestActiveGenerationReplayRejectsChangedBrokerIdentity(t *testing.T) {
+	b, _ := fixture(t, false)
+	raw, err := b.Create(context.Background(), "ws_one", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := raw.(*handle)
+	if err := h.ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, endpoint()); err != nil {
+		t.Fatal(err)
+	}
+	changed := endpoint()
+	changed.ReverseProxyURL = "http://169.254.9.1:8443/r"
+	changed.ForwardProxyURL = "http://169.254.9.1:8443"
+	if err := h.ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, changed); !errors.Is(err, proto.Err(proto.CodeDenied, "")) {
+		t.Fatalf("changed same-generation broker err=%v", err)
+	}
+}
+
+func TestRestoreRejectsGenerationOlderThanCheckpointBeforeMachineLaunch(t *testing.T) {
+	b, log := fixture(t, true)
+	raw, err := b.Adopt(context.Background(), "ws_one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := endpoint()
+	stale.Generation = 5
+	if err := raw.(*handle).ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, stale); !errors.Is(err, proto.Err(proto.CodeDenied, "")) {
+		t.Fatalf("stale restore err=%v", err)
+	}
+	if strings.Contains(log.joined(), "new-machine") {
+		t.Fatalf("stale restore launched VMM: %s", log.joined())
+	}
+}
+
+func TestBackendCapacityIsAtomicAndReleasedOnlyAfterDestroy(t *testing.T) {
+	b, _ := fixture(t, false)
+	b.opts.MaxWorkspaces = 1
+	first, err := b.Create(context.Background(), "ws_one", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Create(context.Background(), "ws_two", proto.WorkspaceSpec{}, nil); !errors.Is(err, proto.Err(proto.CodeResourceExhausted, "")) {
+		t.Fatalf("over-capacity err=%v", err)
+	}
+	if err := first.Destroy(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Create(context.Background(), "ws_two", proto.WorkspaceSpec{}, nil); err != nil {
+		t.Fatalf("capacity was not released after destroy: %v", err)
+	}
+}
+
+func TestDestroyRetainsLaterResourcesUntilEachPriorBoundarySucceeds(t *testing.T) {
+	b, log := fixture(t, false)
+	raw, err := b.Create(context.Background(), "ws_one", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := raw.(*handle)
+	if err := h.ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, endpoint()); err != nil {
+		t.Fatal(err)
+	}
+	network := h.network.(*fakeNetwork)
+	machine := h.machine.(*fakeMachine)
+	volume := h.volume.(*fakeVolume)
+	network.revokeErr = errors.New("network still live")
+	if err := h.Destroy(context.Background()); err == nil {
+		t.Fatal("destroy succeeded while network revoke failed")
+	}
+	if strings.Contains(log.joined(), "volume-destroy") || strings.Contains(log.joined(), "kill") {
+		t.Fatalf("later resources destroyed before network postcondition: %s", log.joined())
+	}
+	network.revokeErr = nil
+	machine.killErr = errors.New("VMM not joined")
+	if err := h.Destroy(context.Background()); err == nil {
+		t.Fatal("destroy succeeded while VMM join failed")
+	}
+	if strings.Contains(log.joined(), "volume-destroy") {
+		t.Fatalf("volume destroyed before VMM join: %s", log.joined())
+	}
+	machine.killErr = nil
+	volume.destroyErr = errors.New("disk busy")
+	if err := h.Destroy(context.Background()); err == nil {
+		t.Fatal("destroy succeeded while volume removal failed")
+	}
+	b.mu.Lock()
+	_, retained := b.handles["ws_one"]
+	b.mu.Unlock()
+	if !retained {
+		t.Fatal("failed destruction released backend admission")
+	}
+	volume.destroyErr = nil
+	if err := h.Destroy(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	_, retained = b.handles["ws_one"]
+	b.mu.Unlock()
+	if retained {
+		t.Fatal("completed destruction retained backend admission")
 	}
 }

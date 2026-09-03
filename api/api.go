@@ -49,17 +49,23 @@ func DecodeEventPayload(event Event, out any) error {
 }
 
 type (
-	Requires          = proto.Requires
-	Placement         = proto.Placement
-	WorkspaceSpec     = proto.WorkspaceSpec
-	SecuritySpec      = proto.SecuritySpec
-	NetworkPolicy     = proto.NetworkPolicy
-	EgressRule        = proto.EgressRule
-	AuditPolicy       = proto.AuditPolicy
-	WorkspaceACL      = proto.WorkspaceACL
-	Idle              = proto.Idle
-	Workspace         = proto.Workspace
-	WorkspaceSelector = proto.WorkspaceSelector
+	Requires            = proto.Requires
+	Placement           = proto.Placement
+	WorkspaceSpec       = proto.WorkspaceSpec
+	SecuritySpec        = proto.SecuritySpec
+	NetworkPolicy       = proto.NetworkPolicy
+	EgressRule          = proto.EgressRule
+	AuditPolicy         = proto.AuditPolicy
+	WorkspaceACL        = proto.WorkspaceACL
+	Idle                = proto.Idle
+	Workspace           = proto.Workspace
+	WorkspaceSelector   = proto.WorkspaceSelector
+	VolumeMount         = proto.VolumeMount
+	Volume              = proto.Volume
+	VolumeVersion       = proto.VolumeVersion
+	VolumeCreateRequest = proto.VolumeCreateReq
+	VolumeAttachRequest = proto.VolumeAttachReq
+	VolumeDetachRequest = proto.VolumeDetachReq
 
 	FleetOperation         = proto.FleetOperation
 	FleetOperationResult   = proto.FleetOperationResult

@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -197,14 +196,8 @@ func TestArtifactReferencesAreStableAndRestoreMustExist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	restore, _, err := store.Put(strings.NewReader("restore"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	checkpoint, _, err := store.Put(strings.NewReader("checkpoint"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	restore := putTestSnapshot(t, store, "restore")
+	checkpoint := putTestSnapshot(t, store, "checkpoint")
 	f := newControlFixture(t, "", func(opts *Options) { opts.Artifacts = store })
 	ws := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{RestoreFrom: restore})
 	f.c.mu.Lock()
@@ -607,8 +600,77 @@ func TestRestartPreservesHolderAndReleasedRecovery(t *testing.T) {
 
 	f3 := newControlFixture(t, path, nil)
 	recovered = f3.c.snapshotWS(ws.ID)
-	if recovered.State != proto.WSPending || recovered.Node != "" || recovered.Spec.RestoreFrom != recovered.LastSnapshot {
+	if recovered.State != proto.WSReleased || recovered.Node != "n_one" || recovered.LastSnapshot == "" {
 		t.Fatalf("released recovery = %#v", recovered)
+	}
+}
+
+func TestRestartReconcilesDurableReleaseAbortBeforeClaimed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "release-abort-restart.db")
+	f1 := newControlFixture(t, path, nil)
+	f1.c.Attach(&fakeSender{online: map[string]bool{"n_one": true}})
+	key := connectNodeWithKey(t, f1.c, "n_one", processNodeInfo(4096), nil)
+	ws := createWorkspace(t, f1.c, localSubject(), proto.WorkspaceSpec{})
+	claim, err := f1.c.wsClaim(context.Background(), "n_one", ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f1.c.wsReady(context.Background(), "n_one", &proto.WSReadyReq{ID: ws.ID, Gen: claim.Workspace.Generation}); err != nil {
+		t.Fatal(err)
+	}
+	f1.c.mu.Lock()
+	current := f1.c.workspaces[ws.ID]
+	next, err := transitionWorkspace(current, lifecycleTransition{
+		operation: transitionReleaseBegin, actor: actorControl, to: proto.WSQuiescing,
+		expectGeneration: true, generation: current.Generation, expectNode: true, node: current.Node,
+	})
+	if err != nil {
+		f1.c.mu.Unlock()
+		t.Fatal(err)
+	}
+	next.ReleaseOperation = "rel_restart_proof"
+	if err := f1.c.persistWS(&next, f1.c.transitionEvent(current.State, &next, lifecycleTransition{
+		operation: transitionReleaseBegin, actor: actorControl, to: proto.WSQuiescing,
+		expectGeneration: true, generation: current.Generation, expectNode: true, node: current.Node,
+	})); err != nil {
+		f1.c.mu.Unlock()
+		t.Fatal(err)
+	}
+	*current = next
+	f1.c.mu.Unlock()
+	if err := f1.log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	f2 := newControlFixture(t, path, nil)
+	recovered := f2.c.snapshotWS(ws.ID)
+	if recovered.State != proto.WSQuiescing || recovered.ReleaseOperation != next.ReleaseOperation {
+		t.Fatalf("restart discarded release abort authority: %+v", recovered)
+	}
+	var aborts, commits int
+	f2.c.Attach(&fakeSender{online: map[string]bool{"n_one": true}, request: func(_ context.Context, _ string, op string, body, _ any) error {
+		req := body.(proto.WSReleaseCommitReq)
+		if req.OperationID != next.ReleaseOperation {
+			t.Fatalf("recovery operation=%q want %q", req.OperationID, next.ReleaseOperation)
+		}
+		switch op {
+		case proto.OpWSReleaseAbort:
+			aborts++
+		case proto.OpWSReleaseAbortCommit:
+			commits++
+			state := f2.c.snapshotWS(ws.ID)
+			if state.State != proto.WSClaiming {
+				t.Fatalf("abort commit sent before durable claiming: %+v", state)
+			}
+		default:
+			t.Fatalf("unexpected recovery op %q", op)
+		}
+		return nil
+	}})
+	connectNodeWithKey(t, f2.c, "n_one", processNodeInfo(4096), key)
+	recovered = f2.c.snapshotWS(ws.ID)
+	if recovered.State != proto.WSClaimed || recovered.ReleaseOperation != "" || aborts < 2 || commits != 1 {
+		t.Fatalf("release abort recovery did not converge: workspace=%+v aborts=%d commits=%d", recovered, aborts, commits)
 	}
 }
 
@@ -742,13 +804,27 @@ func TestGlobalWriteEgressRuleRequiresAdministrator(t *testing.T) {
 func TestReleaseFailureRetainsAuthoritativeSource(t *testing.T) {
 	f := newControlFixture(t, "", nil)
 	sender := &fakeSender{online: map[string]bool{"n_one": true}}
-	var aborted bool
-	sender.request = func(_ context.Context, _ string, op string, _, _ any) error {
+	var aborted, published bool
+	var operationID string
+	sender.request = func(_ context.Context, _ string, op string, body, _ any) error {
 		switch op {
 		case proto.OpWSRelease:
 			return proto.Err(proto.CodeInternal, "checkpoint failed")
 		case proto.OpWSReleaseAbort:
+			req := body.(proto.WSReleaseCommitReq)
+			if req.OperationID == "" {
+				t.Fatal("release abort omitted operation epoch")
+			}
+			operationID = req.OperationID
 			aborted = true
+			return nil
+		case proto.OpWSReleaseAbortCommit:
+			req := body.(proto.WSReleaseCommitReq)
+			current := f.c.snapshotWS(req.ID)
+			if req.OperationID != operationID || current == nil || current.State != proto.WSClaiming || current.ReleaseOperation != operationID {
+				t.Fatalf("abort publication crossed control commit: request=%+v workspace=%+v", req, current)
+			}
+			published = true
 			return nil
 		}
 		return nil
@@ -770,7 +846,7 @@ func TestReleaseFailureRetainsAuthoritativeSource(t *testing.T) {
 	if after.State != proto.WSClaimed || after.Node != "n_one" || after.Generation != claim.Workspace.Generation {
 		t.Fatalf("release failure discarded source authority: %#v", after)
 	}
-	if !aborted {
+	if !aborted || !published || after.ReleaseOperation != "" {
 		t.Fatal("release failure restored claimed state without an acknowledged node abort")
 	}
 }
@@ -788,7 +864,7 @@ func TestReleaseRetriesLostResponse(t *testing.T) {
 				return transport.ErrClosed
 			}
 			req := body.(proto.WSReleaseReq)
-			*out.(*proto.WSReleasedReq) = proto.WSReleasedReq{ID: req.WS, Gen: req.Gen, Snapshot: snapshot, Reason: req.Reason}
+			*out.(*proto.WSReleasedReq) = proto.WSReleasedReq{ID: req.WS, Gen: req.Gen, OperationID: req.OperationID, Snapshot: snapshot, Reason: req.Reason}
 		}
 		return nil
 	}

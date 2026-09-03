@@ -113,6 +113,8 @@ in the canonical order of the table below, `v1` first.
 | `controller-epoch` | controller failover fencing | accept a superseded controller's decisions |
 | `session-cap` | principal-bound session capabilities | leave a revoked principal's session open |
 | `chunked-artifacts` | verified chunked artifact transfer | restore a truncated artifact as complete |
+| `tiered-session-logs` | durable sealed session ranges | lose completed output after node loss |
+| `identity-admin` | production tenant/principal onboarding operations | assume an unavailable management API exists |
 | `approvals` | held operations awaiting a decision | proceed while an approval is pending |
 | `encrypted-artifacts` | artifacts encrypted at rest | write or read a plaintext snapshot |
 
@@ -121,8 +123,8 @@ promise the profile makes. `local` requires none, so an older node keeps
 working there. `isolated` and `multi_tenant` require every named capability
 this release implements; a capability is added to that requirement in the
 same release that implements it on both sides. This release implements
-`authz-push`; the remaining identifiers are reserved and are neither offered
-nor required yet.
+`authz-push`, `controller-epoch`, and `session-cap`; the remaining identifiers are reserved and
+are neither offered nor required yet.
 
 | Deployment security floor | Peer offers `v1` only | Peer offers this release's set |
 |---|---|---|
@@ -139,6 +141,23 @@ a claimed workspace's profile requires MUST refuse to materialize it
 than serve the workspace with the property missing. `NodeStatus.protocol`
 reports what each node negotiated at its last hello.
 
+### 3.2 Controller epochs (`controller-epoch`)
+
+`HelloOK.controller_epoch` is the nonzero epoch of the conditionally leased
+controller writer. After hello, every frame in either direction carries that
+epoch. Events also persist it as `Event.controller_epoch`, and grants bind it
+in `GrantClaims.controller_epoch`. A peer MUST reject a lower epoch before
+touching workspace state. Nodes durably persist the greatest accepted epoch
+before accepting a higher-epoch frame; equal epochs permit idempotent replay.
+An old controller that loses its object-store lease refuses authentication and
+every later decision even if its process and peer connections remain alive.
+
+A promoted controller answers health as reconciling and refuses mutations
+until it queries every restored assignment holder with the internal
+`controller.state` operation. Repairs pass through the lifecycle transition
+table. Completion persists `control.reconciled` per repair and one
+`control.recovered` with the restored event sequence and lost-window estimate.
+
 ## 4. Grants
 
 A client may not talk to a node about a workspace without a grant. A grant is
@@ -147,7 +166,7 @@ connection to the control plane to authorize a request.
 
 ```
 GrantClaims { client, ws, node, principal, tenant, authz_revision,
-              exp: int64, gen: uint64 }
+              controller_epoch, exp: int64, gen: uint64 }
 Grant       { claims: GrantClaims, sig: bytes, node: string }
 ```
 
@@ -335,6 +354,32 @@ latter binds provider inventory to the predetermined node id accepted during
 one-time enrollment; it is never trusted from an unauthenticated hello. Removing a pool with
 non-zero inventory returns `conflict`; it never destroys machines implicitly.
 
+### 5.4 Immutable shared-data volumes
+
+A `Volume{id, tenant, owner, artifact, version, versions[], created_at,
+updated_at}` names a bounded history of immutable artifacts. A workspace stores
+resolved `WorkspaceSpec.volumes[] = VolumeMount{id, path, version, artifact}`;
+clients supply only `id` and `path` at create/attach time and control pins the
+current version. Paths are clean, absolute, outside system and `.remount`
+trees, unique within a workspace, and at most 64 mounts are retained.
+
+Nodes advertise `readonly-volumes` only for the process backend and only after
+an actual read-only bind-mount probe succeeds. Docker, gVisor and Firecracker
+must each gain an end-to-end visibility/read-only proof before advertising the
+capability. Nodes fetch and verify each pinned artifact, attach it before
+`ws.ready`, and synchronously detach it after the source checkpoint and control
+commit during move or destroy. Workspace snapshots exclude mount paths, so a
+later publish cannot change restored bytes. Existing mounts remain pinned;
+new attaches see the new version. No live shared writes are provided.
+
+`volume.publish` is two-hop: the client sends `VolumePublishPathReq` to the
+holding node; the node archives the jailed path and holds the workspace tree
+boundary while sending `VolumePublishReq` to control. Control verifies the
+artifact, exact workspace generation and expected volume version before the
+volume row and event commit atomically. At the 128-version bound an unpinned
+old version may be pruned; if every old version is pinned the call fails with
+`resource_exhausted`.
+
 ## 6. Control-plane operations
 
 Sent to `control`. Client operations are marked C, node operations N.
@@ -352,6 +397,13 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `base.create` | C | `BaseCreateReq{name, artifact, workspace?, idem}` → `Base`; pins an uploaded artifact under a tenant-unique name (§10.1) |
 | `base.list` | C | → `BaseListRes{bases}`; the caller's tenant only, unless admin |
 | `base.remove` | C | `BaseRemoveReq{name, idem}` → `{}`; owner or admin only |
+| `volume.create` | C | `VolumeCreateReq{id, artifact, idem}` → `Volume`; artifact is verified and becomes version 1 |
+| `volume.get` | C | `VolumeGetReq{id}` → `Volume`; tenant scoped |
+| `volume.list` | C | → `VolumeListRes{volumes}`; caller's tenant only unless admin |
+| `volume.remove` | C | `VolumeRemoveReq{id, idem}` → `{}`; owner/admin only and refused while attached |
+| `volume.attach` | C | `VolumeAttachReq{id, ws, generation, path, idem}` → `Workspace`; pins the current immutable version in a non-running workspace |
+| `volume.detach` | C | `VolumeDetachReq{ws, generation, path, idem}` → `Workspace`; removes a pinned declaration from a non-running workspace |
+| `volume.publish.commit` | N | `VolumePublishReq{id, ws, generation, artifact, expected_version, idem, grant}` → `Volume`; control re-verifies the forwarded signed grant and its live client identity before applying the generation/version CAS |
 | `queue.create` | C | `QueueCreateReq{ws, recipe?, tasks, sleep_after_sec?\|sleep_until?, idem}` → `Queue`; one unfinished queue per workspace (§5.2) |
 | `queue.get` | C | `QueueGetReq{id}` → `Queue`; owner, workspace principals or admin |
 | `queue.list` | C | `QueueListReq{ws?}` → `QueueListRes{queues}`; the caller's tenant only, unless admin |
@@ -378,6 +430,13 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `budget.reserve` | N | `BudgetReserveReq{key, ws, gen, principal, bindings, provider, model, input_tokens, max_output_tokens, metered}` → `BudgetReservation`; current generation holder only, before secret substitution or upstream I/O |
 | `budget.settle` | N | `BudgetSettleReq{reservation, mode, input_tokens?, output_tokens?}` → `BudgetSettlement`; owning node only, exact replay is a no-op |
 | `usage.get` | C | `UsageReq{tenant?, ws?, principal?, binding?, window?}` → `UsageRes{usage}` |
+| `tenant.create` | C | `TenantCreateReq{id, policy{quotas, retention, residency, oidc}, idem}` → `Tenant`; global operator only |
+| `tenant.get` / `tenant.list` / `tenant.update` / `tenant.state` / `tenant.usage` | C | tenant-scoped administrative reads and expected-revision mutations |
+| `principal.create` | C | `PrincipalCreateReq{tenant?, principal, roles, idem}` → `Principal`; tenant operator only; node is never assignable here |
+| `principal.list` | C | `PrincipalListReq{tenant?}` → `PrincipalListRes{principals}`; exact tenant only |
+| `principal.revoke` | C | `PrincipalRevokeReq{tenant?, principal, idem}` → `PrincipalRevokeRes{revision}`; advances the durable revision |
+| `principal.token.issue` | C | `PrincipalTokenIssueReq{tenant?, principal, role, ttl_ms, idem}` → `PrincipalTokenIssueRes{access_token, expires_at}`; access-only, assigned role, 24h maximum |
+| `principal.invite` | C | `PrincipalInviteReq{tenant, principal, ttl_ms, idem}` → `PrincipalTokenIssueRes`; creates a tenant-bound operator and returns its initial short-lived access bearer |
 | `grant` | C | `GrantReq{ws}` → `Grant` |
 | `node.list` | C | → `NodeListRes{nodes}` |
 | `timer.list` | C | → `TimerListRes{timers}` |
@@ -389,9 +448,14 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `events.post` | C N | `EventPost{events}` → `{}` |
 | `ws.claim` | N | `WSClaimReq{id}` → `WSClaimRes{workspace, lease_sec}` |
 | `ws.ready` | N | `WSReadyReq{id, gen}` → `{}` |
-| `ws.renew` | N | `WSRenewReq{ids, gen, authz}` → `WSRenewRes{results}`; each result explicitly says continue/fence/destroy/reconcile and, for a continued lease, carries `authz_revision`, `revoked`, `authz_reset` (§4.1) |
+| `ws.renew` | N | `WSRenewReq{ids, gen, authz, controller_epoch}` → `WSRenewRes{results, controller_epoch}`; each result repeats the epoch and explicitly says continue/fence/destroy/reconcile and, for a continued lease, carries `authz_revision`, `revoked`, `authz_reset` (§3.2, §4.1) |
 | `ws.released` | N | `WSReleasedReq{id, gen, snapshot, reason, failed?}` → `{}`; `failed:true` means materialization could not complete and control holds the workspace out of placement with a growing delay (1s doubling to 30s, reset by the next `ws.ready`) instead of re-offering it at once |
 | `ws.snapshot.commit` | N | `WSSnapshotCommitReq{id, gen, snapshot}` → `{}` |
+| `artifact.proof` | N | `ArtifactProofReq{ws, gen, method, artifact}` → `ArtifactProofRes{proof}`; issues a one-use, short-lived control signature only to the live assignment holder |
+| `session.cap.issue` | N | `SessionCapabilityIssueReq{client, ws, gen, authz_revision, principal, tenant, roles}` → `SessionCapabilityIssueRes{capability, expires_at}`; derives authority from the connected client and live signed grant |
+| `session.cap.renew` | N | `SessionCapabilityRenewReq{ws, gen, capability}` → `SessionCapabilityIssueRes{capability, expires_at}`; rotates an unexpired signed proof for the same principal while assignment and authorization remain live |
+| `session.cap.check` | N | `SessionCapabilityCheckReq{ws, gen, capability}` → `SessionCapabilityCheckRes{principal, tenant}`; performed for every broker request and revalidates principal revision, ACL and the live assignment |
+| `controller.state` | control only | `ControllerNodeState{node, epoch, workspaces[], releases[]}`; authenticated node-authoritative state used only while a promoted controller is reconciling |
 | `binding.lease` | N | `BindingLeaseReq{ws, gen}` → `BindingLeaseRes{leases}` |
 | `egress.approval` | N | `EgressApprovalReq{ws, gen, principal, rule, host, method, path_hash, body_hash, fingerprint, wait_ms?}` → `EgressApprovalRes{id, status, allowed?, expires_at?}`; only the current generation holder may create the durable approval |
 | `agent.report` | N | `AgentReport{agent, run, ws, gen, seq, kind, ...}` → `{}`; one observation about a run, fenced to the node, generation and run, deduplicated by `seq` (§6.1); `kind: transcript` carries `chunks[]` for the mirror (§6.2) |
@@ -601,6 +665,9 @@ GET    /v1/agents/{id}/terminal         WebSocket pty (new or attach+replay)
        /v1/agents/{id}/fs/{path}        GET/HEAD/PUT/DELETE, jailed by the node
        /v1/agents/{id}/ports/{port}/... authenticated reverse proxy into the workspace
 GET    /a/{id}                          the stable agent URL
+GET    /v1/identity/oidc?tenant=T       public non-secret device-flow configuration
+POST   /v1/identity/oidc/exchange       verified ID token to Remount access/refresh pair
+POST   /v1/identity/refresh             atomically rotate a single-use refresh bearer
 ```
 
 Three rules are protocol, not presentation. A credential arrives in
@@ -644,13 +711,16 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `fs.edit` | `FSEditReq{ws, path, edits, idem}` → `FSEditRes{replacements}` |
 | `fs.apply_tar` | `FSApplyTarReq{ws, artifact, idem}` → `FSApplyTarRes{files, dirs, bytes}` |
 | `ws.snapshot` | `WSSnapshotReq{ws, upload, authoritative, idem}` → `WSSnapshotRes{artifact, bytes, consistency, authoritative}` |
+| `volume.archive` | `VolumeArchiveReq{ws, path, upload, idem}` → `WSSnapshotRes`; creates a non-authoritative artifact for a jailed subdirectory |
+| `volume.publish` | `VolumePublishPathReq{ws, path, volume, expected_version, idem}` → `Volume`; holds the tree boundary through the control-plane CAS |
 | `ws.info` | `WSGetReq{id}` → `WSInfoRes{ws, backend, root, sessions, broker}` |
 | `node.status` | → `NodeStatus` |
 | `node.diag` | `NodeDiagReq{ws, verify}` → node diagnostics |
-| `ws.release` | control only: `WSReleaseReq{ws, gen, snapshot, reason}` → `WSReleasedReq`; `preparing:true` means poll with the identical request |
-| `ws.release.commit` | control only: `WSReleaseCommitReq{id, gen, snapshot}` → `{}` and authorizes source deletion |
-| `ws.release.abort` | control only: `WSReleaseCommitReq{id, gen}` → `{}` and resumes the retained source |
-| `ws.quarantine` | control only: `WSQuarantineReq{operation, ws, gen, action, backend, exclude, security}` → `WSQuarantineRes{fenced, gen, action, backend, snapshot?, warning?}` |
+| `ws.release` | control only: `WSReleaseReq{ws, gen, operation, snapshot, reason, tenant, backend, spec}` → `WSReleasedReq`; `operation` is a control-generated lifecycle epoch, the recovery fields are control-derived and include exact pinned volumes, and `preparing:true` means poll with the identical request |
+| `ws.release.commit` | control only: `WSReleaseCommitReq{id, gen, operation, snapshot}` → `{}` and authorizes source deletion only for the exact prepared lifecycle epoch |
+| `ws.release.abort` | control only: `WSReleaseCommitReq{id, gen, operation}` → `{}`; restores the retained source and exact volume pins but keeps it inert |
+| `ws.release.abort.commit` | control only: `WSReleaseCommitReq{id, gen, operation}` → `{}`; after control durably commits `claiming`, authorizes publication of that exact restored source. Control publishes `claimed` only after this acknowledgement |
+| `ws.quarantine` | control only: `WSQuarantineReq{operation, ws, gen, action, backend, exclude, security, tenant, volumes}` → `WSQuarantineRes{fenced, gen, action, backend, snapshot?, warning?}`; recovery declarations identify exact pins to detach before phase-one acknowledgement |
 | `ws.quarantine.commit` | control only: `WSQuarantineCommitReq{operation, ws, gen, backend, snapshot}` → `{}` and authorizes deletion only after an exact durable phase-one proof |
 
 Session kinds are `exec`, `pty` and `port`.
@@ -704,12 +774,24 @@ FleetOperationResult { workspace, node, backend, generation, state,
 The allowed actions are `freeze`, `revoke_egress`, `checkpoint`, `stop`, and
 `destroy`. Every action is containment: the node first removes the target from
 its serving map, revokes broker access, invalidates grants/subscriptions and
-stops sessions. `checkpoint` and `destroy` additionally require a verified
+stops sessions. After any required checkpoint has joined, the node synchronously
+detaches and verifies absence of every exact control-declared volume pin before
+closing the tree or returning its durable phase-one proof. `checkpoint` and `destroy` additionally require a verified
 snapshot. `destroy` is two phase: control first durably commits the advanced
 generation, terminal workspace state, and snapshot reference; only then may it
 send `ws.quarantine.commit`. A node MUST match that commit against the exact,
 durably journaled phase-one generation, action, backend and snapshot before it
-deletes the retained source.
+deletes the retained source. Control retains the physical node and pinned volume
+references until the node's durable phase-two tombstone is acknowledged; their
+removal and pinned `volume.detached` events commit atomically.
+
+The node records quarantine progress in a typed durable journal before the
+first fence. `preparing` is deliberately ambiguous after restart; later
+`quiesced`, `checkpointed`, `detached`, `prepared`, and `destroy-authorized`
+states contain enough exact request and result data to resume idempotently.
+Only `committed` or `superseded` records are retention-prunable. A prepared
+destroy operation cannot be superseded, so an older same-generation commit can
+never delete a source retained by a later fleet cycle.
 
 An empty selector is invalid; callers must supply at least one constraint or
 set `all:true`. The matching workspace ids and their physical holder
@@ -914,20 +996,43 @@ placeholder before it ever reaches the broker.
 
 ## 10. Artifacts and snapshots
 
-An artifact id is `art_sha256:<64 hex>`. A snapshot is a deterministic tar.gz of
-the workspace filesystem: entries sorted by path, uid and gid zeroed, PAX
-format. The same tree always produces the same id.
+An artifact id is `art_sha256:<64 hex>`. Snapshot responses and durable
+workspace state carry an explicit `format`. Empty format is the legacy `tar`
+format; `chunked-v1` is a manifest plus its referenced tenant-local chunks;
+`firecracker-full-v1` is one opaque, content-addressed full-VM bundle containing
+the root disk, VMM state, guest memory, and exact restore-compatibility fence.
+A `tar` snapshot is a deterministic tar.gz of the workspace filesystem:
+entries sorted by path, uid and gid zeroed, PAX format. The same tree always
+produces the same id.
 
-Snapshots contain **files only**, never process memory. That is what makes them
-portable across nodes, operating systems, architectures and vendors. A move
-across machines restarts processes; the filesystem, the identity and the policy
-travel.
+`tar` and `chunked-v1` snapshots contain **files only**, never process memory.
+Their moves restart processes; the filesystem, identity and policy travel.
+`firecracker-full-v1` is accepted only by an exactly compatible Firecracker
+destination and preserves the paused guest process state. `ws.moved` always
+records `processes:"preserved"` for that format and `processes:"restarted"`
+for every other format.
 
 `PUT /v1/artifacts/{id}` stores a blob in a private temporary file, enforces the
 configured compressed-size limit, and publishes it only after the digest
-matches the id.
-`GET /v1/artifacts/{id}` retrieves it. A node fetching an artifact verifies the
-digest itself and refuses a mismatch.
+matches the id. `GET` retrieves it and `HEAD` reports its plaintext size. The
+authenticated subject's tenant selects the logical store; a tenant header is
+never accepted. A known digest in another tenant is indistinguishable from an
+unknown digest.
+
+A dynamically enrolled node sends its short-lived node credential plus
+`X-Remount-Workspace`, `X-Remount-Generation`, and
+`X-Remount-Artifact-Proof`. Immediately before each request it obtains the
+proof with `artifact.proof`. The signed claims bind a unique, single-use id,
+authenticated node and tenant, workspace, current generation, exact HTTP
+method and artifact id, issue time, and expiry. The artifact server verifies
+the signature and exact request binding, then asks the control plane to
+recheck the live assignment before touching storage. `claiming` permits
+downloads needed for materialization; lifecycle checkpoint states permit
+uploads needed to commit a release. A released, moved, expired, replayed, or
+otherwise stale proof is refused as not found and never exposes whether the
+tenant has the digest. A node fetching an artifact verifies the digest itself
+and refuses a mismatch; a production node also authorizes a shared local-cache
+hit with a tenant-bound `HEAD` before reusing it.
 
 A client seeds a workspace from a local directory by producing the same
 deterministic archive (the reference implementation's `localfs.Pack` honors
@@ -993,7 +1098,7 @@ log is the canonical audit and subscription history.
 ```
 Event { event_id, seq, received_at, observed_at, origin, actor, tenant,
         workspace, generation, session, operation_id, producer_seq,
-        stream, principal, node, type, payload, cause }
+        stream, principal, node, type, payload, cause, controller_epoch }
 ```
 
 `stream` is a workspace or node id, so a workspace's whole history is one filter.
@@ -1020,7 +1125,8 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `cred.used`, `egress.allowed`, `egress.denied`, `egress.redacted`, `timer.set`, `timer.fired`,
 `peer.gone`, `ws.fenced`, `ws.state_changed`, `event.producer_gap`,
 `fleet.quarantine.requested`, `fleet.quarantine.target`,
-`fleet.quarantine.completed`, `base.created`, `base.removed`, `run.started`,
+`fleet.quarantine.completed`, `base.created`, `base.removed`, `volume.created`,
+`volume.published`, `volume.attached`, `volume.detached`, `volume.removed`, `run.started`,
 `run.finished`, `auth.workspace_resident`, `queue.created`,
 `queue.advanced`, `pool.created`, `pool.removed`, `pool.scaled`,
 `pool.provision_failed`, `repo.cloned`, `agent.created`, `agent.message`,
@@ -1032,7 +1138,13 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `egress.denied`, `policy.updated`, `budget.created`, `budget.removed`,
 `budget.reserved`, `budget.settled`, `budget.expired`, `budget.unmetered`,
 `notifier.unavailable`, `notifier.dead_lettered`,
-`notifier.dead_letters_pruned` and `export.cursor.advanced`.
+`notifier.dead_letters_pruned`, `identity.principal_created`,
+`identity.roles_changed`, `identity.principal_revoked` and
+`export.cursor.advanced`.
+
+Principal role events are tenant-scoped and carry the actor, principal,
+revision and complete non-secret role set. Access, refresh, provider, device,
+enrollment and bootstrap bearers never enter an event or durable role row.
 
 Agent events are on the workspace stream and every one carries `agent`.
 `agent.created` carries `ws`, `owns_ws`, `recipe`, `mode`, `task_hash`,

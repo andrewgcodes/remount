@@ -84,6 +84,8 @@ func TestNewRejectsNegativeResourceLimits(t *testing.T) {
 		"snapshot min interval":   func(o *Options) { o.SnapshotMinInterval = -1 },
 		"artifact retention":      func(o *Options) { o.ArtifactRetention = -1 },
 		"artifact gc interval":    func(o *Options) { o.ArtifactGCInterval = -1 },
+		"volume source bytes":     func(o *Options) { o.MaxVolumeSourceBytes = -1 },
+		"volume source entries":   func(o *Options) { o.MaxVolumeSourceEntries = -1 },
 		"connector total bytes":   func(o *Options) { o.MaxConnectorCacheBytes = -1 },
 		"connector scope bytes":   func(o *Options) { o.MaxConnectorWorkspaceBytes = -1 },
 		"connector object bytes":  func(o *Options) { o.MaxConnectorObjectBytes = -1 },
@@ -150,6 +152,17 @@ func TestNodeArtifactGCIsReferenceAware(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	for _, item := range []struct {
+		id, body string
+	}{{referenced, "referenced"}, {orphan, "orphan"}} {
+		dir := filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", item.id)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "data"), []byte(item.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	n.workspaces["ws_ref"] = &ws{Workspace: proto.Workspace{ID: "ws_ref", LastSnapshot: referenced}}
 	result, err := n.CollectArtifacts(time.Now())
 	if err != nil {
@@ -158,10 +171,19 @@ func TestNodeArtifactGCIsReferenceAware(t *testing.T) {
 	if !n.store.Has(referenced) || n.store.Has(orphan) || result.Removed != 1 {
 		t.Fatalf("collection = %+v, referenced=%t orphan=%t", result, n.store.Has(referenced), n.store.Has(orphan))
 	}
+	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", referenced)); err != nil {
+		t.Fatalf("referenced volume source removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", orphan)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan volume source remains: %v", err)
+	}
 	delete(n.workspaces, "ws_ref")
 	result, err = n.CollectArtifacts(time.Now())
 	if err != nil || n.store.Has(referenced) || result.Removed != 1 {
 		t.Fatalf("post-release collection = %+v, retained=%t, err=%v", result, n.store.Has(referenced), err)
+	}
+	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", referenced)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("released volume source remains: %v", err)
 	}
 }
 
@@ -189,6 +211,262 @@ func TestFetchArtifactMismatchCannotDeleteExistingBlob(t *testing.T) {
 	}
 	if n.store.Has(wanted) {
 		t.Fatal("mismatched fetch published requested id")
+	}
+}
+
+func TestFetchArtifactRejectsCorruptCachedBlob(t *testing.T) {
+	n := newTestNode(t, nil)
+	id, _, err := n.store.Put(strings.NewReader("valid cached body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := strings.TrimPrefix(id, artifact.Prefix)
+	path := filepath.Join(n.opts.DataDir, "artifacts", digest[:2], digest)
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("corrupt cached body"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.fetchArtifact(context.Background(), id); !errors.Is(err, artifact.ErrDigestMismatch) {
+		t.Fatalf("fetch corrupt cached artifact = %v, want digest mismatch", err)
+	}
+}
+
+func TestProductionCachedArtifactRequiresTenantProof(t *testing.T) {
+	body := "tenant-b cached bytes"
+	id := nodeDigest(body)
+	var artifactRequests atomic.Int64
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		artifactRequests.Add(1)
+		if r.Method != http.MethodHead || r.Header.Get("Authorization") != "Bearer dynamic-node-token" ||
+			r.Header.Get(proto.ArtifactWorkspaceHeader) != "ws_a" || r.Header.Get(proto.ArtifactGenerationHeader) != "4" ||
+			r.Header.Get(proto.ArtifactProofHeader) != "opaque-proof" {
+			t.Errorf("artifact authorization headers = method=%s auth=%q ws=%q gen=%q proof=%q", r.Method,
+				r.Header.Get("Authorization"), r.Header.Get(proto.ArtifactWorkspaceHeader),
+				r.Header.Get(proto.ArtifactGenerationHeader), r.Header.Get(proto.ArtifactProofHeader))
+		}
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer httpServer.Close()
+	n := newTestNode(t, func(opts *Options) {
+		opts.ArtifactURL = httpServer.URL
+		opts.HTTPClient = httpServer.Client()
+	})
+	if stored, _, err := n.store.Put(strings.NewReader(body)); err != nil || stored != id {
+		t.Fatalf("seed local cache = %q, %v", stored, err)
+	}
+	attachArtifactProofPeer(t, n, func(req proto.ArtifactProofReq) proto.ArtifactProofRes {
+		if req.Workspace != "ws_a" || req.Generation != 4 || req.Method != http.MethodHead || req.Artifact != id {
+			t.Errorf("artifact proof request = %+v", req)
+		}
+		return proto.ArtifactProofRes{Proof: "opaque-proof"}
+	})
+
+	w := &proto.Workspace{ID: "ws_a", Tenant: "tenant-a", Generation: 4, State: proto.WSClaimed}
+	if _, err := n.fetchWorkspaceArtifact(context.Background(), w, id); err == nil {
+		t.Fatal("cross-tenant cache hit bypassed tenant authority")
+	}
+	if artifactRequests.Load() != 1 {
+		t.Fatalf("artifact HTTP requests = %d, want one authorization HEAD", artifactRequests.Load())
+	}
+}
+
+func TestProductionArtifactDownloadCarriesExactProofBinding(t *testing.T) {
+	body := "tenant-a remote bytes"
+	id := nodeDigest(body)
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer dynamic-node-token" ||
+			r.Header.Get(proto.ArtifactWorkspaceHeader) != "ws_a" || r.Header.Get(proto.ArtifactGenerationHeader) != "4" ||
+			r.Header.Get(proto.ArtifactProofHeader) != "opaque-proof" {
+			http.Error(w, "missing proof", http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, body)
+	}))
+	defer httpServer.Close()
+	n := newTestNode(t, func(opts *Options) {
+		opts.ArtifactURL = httpServer.URL
+		opts.HTTPClient = httpServer.Client()
+	})
+	attachArtifactProofPeer(t, n, func(req proto.ArtifactProofReq) proto.ArtifactProofRes {
+		if req.Workspace != "ws_a" || req.Generation != 4 || req.Method != http.MethodGet || req.Artifact != id {
+			t.Errorf("artifact proof request = %+v", req)
+		}
+		return proto.ArtifactProofRes{Proof: "opaque-proof"}
+	})
+
+	w := &proto.Workspace{ID: "ws_a", Tenant: "tenant-a", Generation: 4, State: proto.WSClaiming}
+	r, err := n.fetchWorkspaceArtifact(context.Background(), w, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, readErr := io.ReadAll(r)
+	closeErr := r.Close()
+	if readErr != nil || closeErr != nil || string(got) != body {
+		t.Fatalf("download = %q, read=%v close=%v", got, readErr, closeErr)
+	}
+}
+
+func attachArtifactProofPeer(t *testing.T, n *Node, issue func(proto.ArtifactProofReq) proto.ArtifactProofRes) {
+	t.Helper()
+	nodeConn, controlConn := transport.Pipe(8)
+	nodePeer := transport.NewPeer(nodeConn, nil)
+	controlPeer := transport.NewPeer(controlConn, transport.HandlerFunc(func(ctx context.Context, p *transport.Peer, frame *proto.Frame) {
+		if frame.Op != proto.OpArtifactProof {
+			t.Errorf("control operation = %q, want %q", frame.Op, proto.OpArtifactProof)
+			_ = p.RespondErr(ctx, frame, proto.Err(proto.CodeBadRequest, "unexpected operation"))
+			return
+		}
+		var req proto.ArtifactProofReq
+		if err := frame.Decode(&req); err != nil {
+			t.Errorf("decode proof request: %v", err)
+			_ = p.RespondErr(ctx, frame, proto.Err(proto.CodeBadRequest, "invalid request"))
+			return
+		}
+		_ = p.Respond(ctx, frame, issue(req))
+	}))
+	t.Cleanup(func() {
+		_ = nodePeer.Close()
+		_ = controlPeer.Close()
+	})
+	n.mu.Lock()
+	n.peer = nodePeer
+	n.httpToken = "dynamic-node-token"
+	n.mu.Unlock()
+}
+
+func TestSessionCapabilityHandleRotatesProofBeforeExpiry(t *testing.T) {
+	n := newTestNode(t, nil)
+	nodeConn, controlConn := transport.Pipe(8)
+	nodePeer := transport.NewPeer(nodeConn, nil)
+	var renewals atomic.Int64
+	controlPeer := transport.NewPeer(controlConn, transport.HandlerFunc(func(ctx context.Context, p *transport.Peer, frame *proto.Frame) {
+		switch frame.Op {
+		case proto.OpSessionCapabilityRenew:
+			var request proto.SessionCapabilityRenewReq
+			if err := frame.Decode(&request); err != nil || request.Capability != "signed-proof-1" {
+				t.Errorf("renew request=%+v err=%v", request, err)
+				_ = p.RespondErr(ctx, frame, proto.Err(proto.CodeBadRequest, "bad renew request"))
+				return
+			}
+			renewals.Add(1)
+			_ = p.Respond(ctx, frame, proto.SessionCapabilityIssueRes{Capability: "signed-proof-2", ExpiresAt: time.Now().Add(2 * time.Second).UnixMilli()})
+		case proto.OpSessionCapabilityCheck:
+			var request proto.SessionCapabilityCheckReq
+			if err := frame.Decode(&request); err != nil || request.Capability != "signed-proof-2" {
+				t.Errorf("check request=%+v err=%v", request, err)
+				_ = p.RespondErr(ctx, frame, proto.Err(proto.CodeDenied, "stale proof"))
+				return
+			}
+			_ = p.Respond(ctx, frame, proto.SessionCapabilityCheckRes{Principal: "agent:alice", Tenant: "tenant-a"})
+		default:
+			_ = p.RespondErr(ctx, frame, proto.Err(proto.CodeUnsupported, "unexpected operation"))
+		}
+	}))
+	t.Cleanup(func() {
+		_ = nodePeer.Close()
+		_ = controlPeer.Close()
+	})
+	n.mu.Lock()
+	n.peer = nodePeer
+	n.mu.Unlock()
+	w := &ws{Workspace: proto.Workspace{ID: "ws_session_cap", Tenant: "tenant-a", Generation: 3}}
+	claims := proto.GrantClaims{WS: w.ID, Gen: w.Generation, Principal: "agent:alice", Tenant: w.Tenant}
+	handle := "sc_stable_test_handle"
+	originalExpiry := time.Now().Add(300 * time.Millisecond)
+	if err := n.installSessionCapability(handle, "signed-proof-1", originalExpiry, claims, w); err != nil {
+		t.Fatal(err)
+	}
+	s, err := n.sessions.Open(session.Spec{WS: w.ID, Kind: proto.SessionACP, Principal: claims.Principal, Tenant: claims.Tenant})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.bindSessionCapability(handle, s)
+	deadline := time.Now().Add(time.Second)
+	for renewals.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if renewals.Load() == 0 {
+		t.Fatal("short-lived proof was not renewed")
+	}
+	if remaining := time.Until(originalExpiry); remaining > 0 {
+		time.Sleep(remaining + 25*time.Millisecond)
+	}
+	principal, err := n.verifyLocalSessionCapability(context.Background(), w, handle)
+	if err != nil || principal != claims.Principal {
+		t.Fatalf("stable handle after original expiry principal=%q err=%v", principal, err)
+	}
+	s.End(proto.ExitInfo{})
+}
+
+func TestPrepareVolumeArtifactRebuildsIncompleteSource(t *testing.T) {
+	n := newTestNode(t, nil)
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "dataset.txt"), []byte("verified bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var archive strings.Builder
+	if err := artifact.Snapshot(source, nil, &archive); err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := n.store.Put(strings.NewReader(archive.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant-a", id)
+	if err := os.MkdirAll(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(destination, "dataset.txt"), []byte("partial bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.prepareVolumeArtifact(context.Background(), "tenant-a", id); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(destination, "dataset.txt"))
+	if err != nil || string(got) != "verified bytes" {
+		t.Fatalf("rebuilt source = %q, %v", got, err)
+	}
+	markerPath := filepath.Join(filepath.Dir(destination), ".complete-"+id)
+	marker, err := os.ReadFile(markerPath)
+	markerLines := strings.Split(strings.TrimSpace(string(marker)), "\n")
+	if err != nil || len(markerLines) != 2 || markerLines[0] != id || markerLines[1] == "" {
+		t.Fatalf("completion marker = %q, %v", marker, err)
+	}
+	if err := os.WriteFile(filepath.Join(destination, "dataset.txt"), []byte("corrupt after completion"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.prepareVolumeArtifact(context.Background(), "tenant-a", id); err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(filepath.Join(destination, "dataset.txt"))
+	if err != nil || string(got) != "verified bytes" {
+		t.Fatalf("corrupt completed source was not rebuilt = %q, %v", got, err)
+	}
+}
+
+func TestPrepareVolumeArtifactEnforcesExpandedEntryLimit(t *testing.T) {
+	n := newTestNode(t, func(options *Options) { options.MaxVolumeSourceEntries = 2 })
+	source := t.TempDir()
+	for _, name := range []string{"one", "two", "three"} {
+		if err := os.WriteFile(filepath.Join(source, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var archive strings.Builder
+	if err := artifact.Snapshot(source, nil, &archive); err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := n.store.Put(strings.NewReader(archive.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.prepareVolumeArtifact(context.Background(), "tenant-a", id); err == nil {
+		t.Fatal("expanded volume source exceeded entry limit without rejection")
+	}
+	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant-a", id)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("over-limit source was published: %v", err)
 	}
 }
 
@@ -250,17 +528,36 @@ type failingHandle struct {
 	fs          *fsops.FS
 	snapshotErr error
 	destroyed   atomic.Int32
+	fenced      atomic.Int32
+	resumed     atomic.Int32
+}
+
+func mustHostFS(t *testing.T, handle workspace.Handle) workspace.HostFileSystem {
+	t.Helper()
+	host, ok := workspace.HostFileSystemOf(handle)
+	if !ok {
+		t.Fatalf("backend %s has no host filesystem", handle.Backend())
+	}
+	return host
 }
 
 func (h *failingHandle) ID() string                  { return h.id }
 func (h *failingHandle) Backend() string             { return "test" }
-func (h *failingHandle) FS() *fsops.FS               { return h.fs }
+func (h *failingHandle) FS() workspace.FileSystem    { return h.fs }
 func (h *failingHandle) Prepare(*session.Spec) error { return nil }
 func (h *failingHandle) Snapshot(context.Context, []string, io.Writer) error {
 	return h.snapshotErr
 }
 func (h *failingHandle) Checkpoint(context.Context, []string, io.Writer) error {
 	return h.snapshotErr
+}
+func (h *failingHandle) CheckpointFenced(context.Context, []string, io.Writer) error {
+	h.fenced.Add(1)
+	return h.snapshotErr
+}
+func (h *failingHandle) ResumeFenced(context.Context) error {
+	h.resumed.Add(1)
+	return nil
 }
 func (h *failingHandle) Destroy(context.Context) error {
 	h.destroyed.Add(1)
@@ -314,7 +611,7 @@ func TestReleaseSnapshotFailureRestoresSourceWithoutDestroy(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := &failingHandle{id: "ws_one", fs: fs, snapshotErr: errors.New("disk full")}
-	w := &ws{Workspace: proto.Workspace{ID: h.id, Generation: 7, State: proto.WSClaimed}, handle: h}
+	w := &ws{Workspace: proto.Workspace{ID: h.id, Tenant: "local", Generation: 7, State: proto.WSClaimed}, handle: h}
 	n.mu.Lock()
 	n.workspaces[w.ID] = w
 	n.deadlines[w.ID] = n.started.AddDate(1, 0, 0)
@@ -325,11 +622,26 @@ func TestReleaseSnapshotFailureRestoresSourceWithoutDestroy(t *testing.T) {
 	n.mu.Lock()
 	restored := n.workspaces[w.ID]
 	_, prepared := n.prepared[w.ID]
-	deadline, deadlinePresent := n.deadlines[w.ID]
+	_, quarantined := n.quarantined[w.ID]
 	n.mu.Unlock()
-	if restored != w || prepared || !deadlinePresent || !deadline.After(time.Now()) || h.destroyed.Load() != 0 {
-		t.Fatalf("source was not restored: workspace=%p prepared=%v deadline=%v present=%t destroyed=%d",
-			restored, prepared, deadline, deadlinePresent, h.destroyed.Load())
+	if restored != nil || !prepared || !quarantined || h.destroyed.Load() != 0 {
+		t.Fatalf("source was not retained inert: workspace=%p prepared=%v quarantined=%v destroyed=%d",
+			restored, prepared, quarantined, h.destroyed.Load())
+	}
+	record, ok := n.releaseRecord(w.ID)
+	if !ok || record.State != releaseRestored {
+		t.Fatalf("release rollback state=%+v present=%v", record, ok)
+	}
+	if err := n.releaseAbortCommit(context.Background(), &proto.WSReleaseCommitReq{
+		ID: w.ID, Gen: w.Generation, OperationID: record.OperationID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n.mu.Lock()
+	restored = n.workspaces[w.ID]
+	n.mu.Unlock()
+	if restored != w {
+		t.Fatal("abort commit did not publish restored source")
 	}
 }
 
@@ -788,7 +1100,7 @@ func TestRejectedRenewalFencesAndRetainsFilesystem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := handle.FS().Root()
+	root := mustHostFS(t, handle).Root()
 	if err := handle.FS().Write("keep", []byte("current bytes"), 0o600, false, false); err != nil {
 		t.Fatal(err)
 	}
@@ -1031,7 +1343,7 @@ func TestQuarantineFencesAndDestroyCommitIsIdempotent(t *testing.T) {
 	if serving || !retained {
 		t.Fatalf("serving=%v retained=%v", serving, retained)
 	}
-	if got, err := os.ReadFile(filepath.Join(handle.FS().Root(), "keep")); err != nil || string(got) != "evidence" {
+	if got, err := os.ReadFile(filepath.Join(mustHostFS(t, handle).Root(), "keep")); err != nil || string(got) != "evidence" {
 		t.Fatalf("evidence before commit=%q err=%v", got, err)
 	}
 	replayed, err := n.quarantine(context.Background(), req)
@@ -1048,7 +1360,7 @@ func TestQuarantineFencesAndDestroyCommitIsIdempotent(t *testing.T) {
 	if err := n.quarantineCommit(context.Background(), &mismatched); err == nil {
 		t.Fatal("destroy commit with a mismatched checkpoint was accepted")
 	}
-	if _, err := os.Stat(handle.FS().Root()); err != nil {
+	if _, err := os.Stat(mustHostFS(t, handle).Root()); err != nil {
 		t.Fatalf("mismatched destroy commit changed source: %v", err)
 	}
 
@@ -1067,7 +1379,7 @@ func TestQuarantineFencesAndDestroyCommitIsIdempotent(t *testing.T) {
 	if err := restarted.quarantineCommit(context.Background(), commit); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(handle.FS().Root()); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(mustHostFS(t, handle).Root()); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("workspace still exists after commit: %v", err)
 	}
 	if err := restarted.quarantineCommit(context.Background(), commit); err != nil {
@@ -1097,7 +1409,7 @@ func TestQuarantineSnapshotsRetainedWorkspaceBeforeDestroy(t *testing.T) {
 	if err := handle.FS().Write(EnvFilePath, []byte("node-local"), 0o600, false, false); err != nil {
 		t.Fatal(err)
 	}
-	root := handle.FS().Root()
+	root := mustHostFS(t, handle).Root()
 	_ = handle.FS().Close()
 	n.mu.Lock()
 	n.quarantined["ws_retained"] = struct{}{}
@@ -1155,7 +1467,7 @@ func TestQuarantineCommitWithoutPhaseOneProofCannotDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := handle.FS().Root()
+	root := mustHostFS(t, handle).Root()
 	_ = handle.FS().Close()
 	n.mu.Lock()
 	n.quarantined["ws_unproven"] = struct{}{}

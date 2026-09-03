@@ -108,6 +108,7 @@ Check your own change against every line here before calling it done.
 | Session output loss is an explicit `gap` and public helpers return `evicted`; incomplete output is never reported complete. | `session.Log`, `client.Copy`, `client.Run` |
 | A session-log range moves from disk to blob only after its immutable artifact and contiguous reference commit; retention dereferences before releasing capacity, and replay is byte-identical or an explicit tier-named gap. | `session.Log` tier transitions (ADR 0073) |
 | Every retained collection and staging path has admission, accounting, cleanup and an observable rejection or degradation signal. | resource options, GC loops, diagnostics and quota metrics |
+| Shared volumes are immutable artifact versions: mounts are probed read-only, pinned by workspace generation, excluded from workspace snapshots, and materialized before `ws.ready`. | `control/volumes.go`, `node.attachWorkspaceVolumes`, `volume.LocalBackend` |
 | `Session.Wait` is the active-capacity handoff: accounting is committed before exit becomes observable. | `session.finish`, `session.Manager.markInactive` |
 | A check that cannot run is unavailable, never healthy. | `doctor`, `node.diag_unavailable`, `scripts/explain.py` |
 | Notification delivery is at least once: the tenant cursor advances only after destination acceptance or a durable sanitized dead letter plus signal. | `notifier.Runner`, `server.configureNotifiers` |

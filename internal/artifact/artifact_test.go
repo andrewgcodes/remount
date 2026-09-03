@@ -563,6 +563,10 @@ func TestExcluded(t *testing.T) {
 		{".venv/lib", []string{".venv", "*.pyc"}, true},
 		{"a/b.pyc", []string{".venv", "*.pyc"}, true},
 		{"a/b.py", []string{".venv", "*.pyc"}, false},
+		{"shared/data", []string{"/shared"}, true},
+		{"src/shared/data", []string{"/shared"}, false},
+		{"data[1]/file", []string{"/data[1]"}, true},
+		{"data1/file", []string{"/data[1]"}, false},
 	}
 	for _, c := range cases {
 		if got := Excluded(c.rel, c.pats); got != c.want {

@@ -213,19 +213,28 @@ func ObjectKey(tenant, keyVersion, id string) (string, error) {
 
 // Put stores plaintext for tenant and returns its plaintext content id.
 func (s *Store) Put(ctx context.Context, tenant string, r io.Reader) (string, int64, error) {
-	return s.put(ctx, tenant, "", r)
+	return s.put(ctx, tenant, "", r, 0)
 }
 
 // PutExpected stores plaintext only when it hashes to expected.
 func (s *Store) PutExpected(ctx context.Context, tenant, expected string, r io.Reader) (int64, error) {
+	return s.PutExpectedLimit(ctx, tenant, expected, r, 0)
+}
+
+// PutExpectedLimit is PutExpected with an additional request-specific
+// plaintext bound. A positive limit smaller than the store-wide limit wins.
+func (s *Store) PutExpectedLimit(ctx context.Context, tenant, expected string, r io.Reader, maxBytes int64) (int64, error) {
 	if _, err := artifact.Digest(expected); err != nil {
 		return 0, err
 	}
-	_, n, err := s.put(ctx, tenant, expected, r)
+	if maxBytes < 0 {
+		return 0, errors.New("encrypted artifact: request limit must not be negative")
+	}
+	_, n, err := s.put(ctx, tenant, expected, r, maxBytes)
 	return n, err
 }
 
-func (s *Store) put(ctx context.Context, tenant, expected string, r io.Reader) (string, int64, error) {
+func (s *Store) put(ctx context.Context, tenant, expected string, r io.Reader, requestMax int64) (string, int64, error) {
 	if err := validateSegment("tenant", tenant); err != nil {
 		return "", 0, err
 	}
@@ -243,7 +252,11 @@ func (s *Store) put(ctx context.Context, tenant, expected string, r io.Reader) (
 	defer os.Remove(tmpName)
 	h := sha256.New()
 	w := io.MultiWriter(tmp, h)
-	n, err := copyPlaintext(ctx, w, r, reservation, s.opts.MaxPlaintextBytes)
+	maxPlaintext := s.opts.MaxPlaintextBytes
+	if requestMax > 0 && requestMax < maxPlaintext {
+		maxPlaintext = requestMax
+	}
+	n, err := copyPlaintext(ctx, w, r, reservation, maxPlaintext)
 	if err != nil {
 		_ = tmp.Close()
 		return "", n, err
@@ -543,6 +556,22 @@ func (s *Store) List(ctx context.Context, tenant string) ([]string, error) {
 	return out, nil
 }
 
+// Tenants returns every tenant present in the physical object namespace.
+// Malformed keys fail the inventory instead of being silently orphaned.
+func (s *Store) Tenants(ctx context.Context) ([]string, error) {
+	if inventory, ok := s.objects.(interface {
+		Tenants(context.Context) ([]string, error)
+	}); ok {
+		return inventory.Tenants(ctx)
+	}
+	if inventory, ok := s.keys.(interface {
+		Tenants(context.Context) ([]string, error)
+	}); ok {
+		return inventory.Tenants(ctx)
+	}
+	return nil, errors.New("encrypted artifact: tenant inventory unavailable")
+}
+
 // Delete removes every physical version of one tenant's logical artifact.
 func (s *Store) Delete(ctx context.Context, tenant, id string) error {
 	if err := validateSegment("tenant", tenant); err != nil {
@@ -709,6 +738,15 @@ func (s *Store) locate(ctx context.Context, tenant, id string) (string, string, 
 	}
 	versions, err := s.keys.Versions(ctx, tenant)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			objects, listErr := s.objects.List(ctx, "tenants/"+tenant+"/")
+			if listErr != nil {
+				return "", "", listErr
+			}
+			if len(objects) == 0 {
+				return "", "", fs.ErrNotExist
+			}
+		}
 		return "", "", fmt.Errorf("%w", ErrKeyUnavailable)
 	}
 	for _, version := range versions {
@@ -865,8 +903,8 @@ func (s *TenantStore) List() ([]string, error) {
 }
 
 // PutExpected stores a body under its asserted plaintext id.
-func (s *TenantStore) PutExpected(expected string, r io.Reader) (int64, error) {
-	return s.store.PutExpected(context.Background(), s.tenant, expected, r)
+func (s *TenantStore) PutExpected(expected string, r io.Reader, maxBytes int64) (int64, error) {
+	return s.store.PutExpectedLimit(context.Background(), s.tenant, expected, r, maxBytes)
 }
 
 // Verify decrypts and hashes one complete artifact.

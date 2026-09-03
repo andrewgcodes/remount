@@ -197,6 +197,13 @@ func (c *Client) Connect(ctx context.Context) (*transport.Peer, error) {
 		p.Close()
 		return nil, proto.Err(proto.CodeUnsupported, "server did not negotiate required capability %q", proto.CapabilityV1)
 	}
+	if proto.HasCapability(ok.Caps, proto.CapabilityControllerEpoch) {
+		if ok.ControllerEpoch == 0 {
+			p.Close()
+			return nil, proto.Err(proto.CodeConflict, "server negotiated controller-epoch without an epoch")
+		}
+		p.SetControllerEpoch(ok.ControllerEpoch)
+	}
 	c.mu.Lock()
 	if c.peer != nil {
 		c.peer.Close()
@@ -256,6 +263,9 @@ func (c *Client) supervise(p *transport.Peer) {
 }
 
 func (c *Client) handle(ctx context.Context, p *transport.Peer, f *proto.Frame) {
+	if epoch := p.ControllerEpoch(); epoch != 0 && f.ControllerEpoch < epoch {
+		return
+	}
 	switch f.T {
 	case proto.KindChunk:
 		c.mu.Lock()
@@ -479,6 +489,103 @@ func (c *Client) RemoveBase(ctx context.Context, name string, options ...Operati
 		idem = ids.New("idem")
 	}
 	return c.call(ctx, proto.PeerControl, proto.OpBaseRemove, proto.BaseRemoveReq{Name: name, IdempotencyKey: idem}, nil)
+}
+
+// CreateVolume creates a tenant-scoped immutable shared-data volume from an
+// already uploaded artifact.
+func (c *Client) CreateVolume(ctx context.Context, req proto.VolumeCreateReq, options ...OperationOption) (*proto.Volume, error) {
+	if key, set := operationKey(options); set {
+		req.IdempotencyKey = key
+	} else if req.IdempotencyKey == "" {
+		req.IdempotencyKey = ids.New("idem")
+	}
+	var volume proto.Volume
+	err := c.call(ctx, proto.PeerControl, proto.OpVolumeCreate, req, &volume)
+	return &volume, err
+}
+
+// GetVolume returns one tenant-scoped shared-data volume.
+func (c *Client) GetVolume(ctx context.Context, id string) (*proto.Volume, error) {
+	var volume proto.Volume
+	err := c.call(ctx, proto.PeerControl, proto.OpVolumeGet, proto.VolumeGetReq{ID: id}, &volume)
+	return &volume, err
+}
+
+// ListVolumes returns shared-data volumes visible to the caller.
+func (c *Client) ListVolumes(ctx context.Context) ([]proto.Volume, error) {
+	var response proto.VolumeListRes
+	err := c.call(ctx, proto.PeerControl, proto.OpVolumeList, nil, &response)
+	return response.Volumes, err
+}
+
+// RemoveVolume removes an unattached volume and releases its artifact pins.
+func (c *Client) RemoveVolume(ctx context.Context, id string, options ...OperationOption) error {
+	idem, set := operationKey(options)
+	if !set {
+		idem = ids.New("idem")
+	}
+	return c.call(ctx, proto.PeerControl, proto.OpVolumeRemove, proto.VolumeRemoveReq{ID: id, IdempotencyKey: idem}, nil)
+}
+
+// AttachVolume pins the current volume version in a workspace declaration.
+// A running workspace must first be paused so the next materialization can
+// enforce the read-only mount.
+func (c *Client) AttachVolume(ctx context.Context, req proto.VolumeAttachReq, options ...OperationOption) (*proto.Workspace, error) {
+	if key, set := operationKey(options); set {
+		req.IdempotencyKey = key
+	} else if req.IdempotencyKey == "" {
+		req.IdempotencyKey = ids.New("idem")
+	}
+	var ws proto.Workspace
+	err := c.call(ctx, proto.PeerControl, proto.OpVolumeAttach, req, &ws)
+	return &ws, err
+}
+
+// DetachVolume removes a pinned mount declaration from a non-running
+// workspace generation.
+func (c *Client) DetachVolume(ctx context.Context, req proto.VolumeDetachReq, options ...OperationOption) (*proto.Workspace, error) {
+	if key, set := operationKey(options); set {
+		req.IdempotencyKey = key
+	} else if req.IdempotencyKey == "" {
+		req.IdempotencyKey = ids.New("idem")
+	}
+	var ws proto.Workspace
+	err := c.call(ctx, proto.PeerControl, proto.OpVolumeDetach, req, &ws)
+	return &ws, err
+}
+
+// ArchiveVolume snapshots one jailed workspace directory and uploads the
+// immutable artifact without changing the workspace's authoritative snapshot.
+func (c *Client) ArchiveVolume(ctx context.Context, wsID, path string, options ...OperationOption) (*proto.WSSnapshotRes, error) {
+	return c.ArchiveVolumeWithUpload(ctx, wsID, path, true, options...)
+}
+
+// ArchiveVolumeWithUpload controls whether the node also publishes the
+// resulting blob to the configured control-plane artifact service.
+func (c *Client) ArchiveVolumeWithUpload(ctx context.Context, wsID, path string, upload bool, options ...OperationOption) (*proto.WSSnapshotRes, error) {
+	idem, set := operationKey(options)
+	if !set {
+		idem = ids.New("idem")
+	}
+	var result proto.WSSnapshotRes
+	err := c.nodeCall(ctx, wsID, proto.OpVolumeArchive, func(g *proto.Grant) any {
+		return proto.VolumeArchiveReq{WS: wsID, Path: path, Upload: upload, IdempotencyKey: idem, Grant: g}
+	}, &result)
+	return &result, err
+}
+
+// PublishVolumePath snapshots one workspace directory and keeps the node tree
+// boundary held until the control plane commits the generation/version CAS.
+func (c *Client) PublishVolumePath(ctx context.Context, wsID, path, volumeID string, expectedVersion uint64, options ...OperationOption) (*proto.Volume, error) {
+	idem, set := operationKey(options)
+	if !set {
+		idem = ids.New("idem")
+	}
+	var result proto.Volume
+	err := c.nodeCall(ctx, wsID, proto.OpVolumePublish, func(g *proto.Grant) any {
+		return proto.VolumePublishPathReq{WS: wsID, Path: path, Volume: volumeID, ExpectedVersion: expectedVersion, IdempotencyKey: idem, Grant: g}
+	}, &result)
+	return &result, err
 }
 
 // CreatePool records tenant-scoped desired node capacity. Provider
@@ -977,26 +1084,38 @@ func (c *Client) UploadArtifact(ctx context.Context, r io.Reader) (string, int64
 // hash to id, so callers that consume the whole stream never act on a
 // corrupted or substituted archive without seeing an error.
 func (c *Client) DownloadArtifact(ctx context.Context, id string) (io.ReadCloser, error) {
+	r, _, err := c.DownloadArtifactWithSize(ctx, id)
+	return r, err
+}
+
+// DownloadArtifactWithSize is DownloadArtifact plus the authenticated
+// plaintext Content-Length. Chunked snapshot exporters use the size to apply
+// manifest and segment bounds before consuming a remote object.
+func (c *Client) DownloadArtifactWithSize(ctx context.Context, id string) (io.ReadCloser, int64, error) {
 	if c.opts.ArtifactURL == "" {
-		return nil, ErrNoArtifactURL
+		return nil, 0, ErrNoArtifactURL
 	}
 	if _, err := artifact.Digest(id); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.artifactURL(id), nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.opts.Token)
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, fmt.Errorf("client: download artifact %s: HTTP %d", id, resp.StatusCode)
+		return nil, 0, fmt.Errorf("client: download artifact %s: HTTP %d", id, resp.StatusCode)
 	}
-	return &verifyingReader{body: resp.Body, want: id, h: sha256.New()}, nil
+	if resp.ContentLength < 0 {
+		resp.Body.Close()
+		return nil, 0, fmt.Errorf("client: download artifact %s: missing Content-Length", id)
+	}
+	return &verifyingReader{body: resp.Body, want: id, h: sha256.New()}, resp.ContentLength, nil
 }
 
 type verifyingReader struct {

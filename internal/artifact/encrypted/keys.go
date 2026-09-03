@@ -159,9 +159,7 @@ func decodeMasterKey(value string) ([]byte, error) {
 		clear(decoded)
 		return nil, errors.New("invalid key")
 	}
-	if strings.HasPrefix(value, "base64:") {
-		value = strings.TrimPrefix(value, "base64:")
-	}
+	value = strings.TrimPrefix(value, "base64:")
 	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.RawURLEncoding} {
 		decoded, err := encoding.DecodeString(value)
 		if err == nil && len(decoded) == 32 {
@@ -517,6 +515,11 @@ func (p *DirectoryKeyProvider) listTenants() ([]string, error) {
 	}
 	sort.Strings(tenants)
 	return tenants, nil
+}
+
+// Tenants returns every tenant with durable wrapped-key metadata.
+func (p *DirectoryKeyProvider) Tenants(_ context.Context) ([]string, error) {
+	return p.listTenants()
 }
 
 func (p *DirectoryKeyProvider) readCurrent(tenant string) (string, error) {

@@ -1495,6 +1495,20 @@ any origin without credentials. Preflights are answered with the methods and
 headers the API uses (`Authorization`, `Content-Type`, `Idempotency-Key`,
 `Last-Event-ID`) and `Location`/`Idempotency-Key` are exposed.
 
+## Usage
+
+`GET /v1/usage?tenant=&ws=&principal=&binding=&window=` translates to
+`usage.get` and returns `UsageRes{usage}`. `window`, when present, is `1h`,
+`1d`, or `30d`. Each row names its budget and reports requests, tokens,
+estimated cost in micro-dollars, active reservations, unmetered requests and
+incomplete requests. The authenticated subject may read only its tenant unless
+it is a wildcard operator; an unavailable or unsupported meter is explicit and
+is never represented as zero-cost healthy usage.
+
+Budget definitions themselves are managed through the frame API and
+`remount budget`; this HTTP route is read-only so dashboards cannot turn a
+read credential into governance mutation authority.
+
 ## Agents
 
 | Route | Body → result |
@@ -1672,6 +1686,14 @@ Actions workflow that posts both. A signed request acts as
 response is `202 {"accepted": true, "agent": "ag_…", "ws": "ws_…", "status":
 "…"}`. Redelivering the same webhook (same rendered `idempotency_key`)
 returns the same agent.
+
+With `remount server --notifications FILE`, provider-native GitHub, Slack and
+Linear bodies are verified using their own signature formats and translated
+to `webhook.<provider>.*` events; `X-Remount-Provider: generic` selects the
+separate configured bearer. The same file configures tenant-scoped Slack or
+allow-listed generic outbound subscriptions for `egress.pending`,
+`run.finished`, `ws.fenced`, and `pool.*`. See `docs/operations.md` for the
+environment-reference-only configuration and durable dead-letter behavior.
 
 ## Scheduling and children
 

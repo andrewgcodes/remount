@@ -19,13 +19,14 @@ remount server --listen 0.0.0.0:7443 --data /var/lib/remount --token "$REMOUNT_T
 |---|---|---|
 | `--listen` | `127.0.0.1:7443` | bind address; also `REMOUNT_LISTEN` |
 | `--data` | `./remount-data` | state directory; also `REMOUNT_DATA` |
-| `--token` | `$REMOUNT_TOKEN` | shared bearer token, required |
+| `--token` | `$REMOUNT_TOKEN` | shared bearer token, standalone mode only |
 | `--insecure` | off | allow an empty token, for local experiments only |
 | `--bindings` | none | JSON file of secrets the nodes may lease |
 | `--provisioners` | none | provider registry JSON; credentials are named environment references |
 | `--notifications` | none | provider-webhook and outbound-notification JSON; credentials are named environment references |
 | `--lease` | `30` | claim lease in seconds |
 | `--mode` | `standalone` | `standalone`, `production-single-tenant`, or `production-multi-tenant` |
+| `--bootstrap-principal` / `--bootstrap-token-file` | none | first global operator and exclusive mode-0600 initial access file; production only |
 | `--max-concurrent-requests` | `128` | active control request handlers; excess work fails with `resource_exhausted` |
 | `--max-tenant-workspaces` / `--max-subject-workspaces` | `1000` / `100` | non-destroyed workspace quotas |
 | `--max-mutation-records` | `100000` | retained control idempotency results |
@@ -36,9 +37,35 @@ remount server --listen 0.0.0.0:7443 --data /var/lib/remount --token "$REMOUNT_T
 | `--event-retention` / `--max-events` | `30d` / `1000000` | event age and row-count bounds |
 | `--control-record-retention` | `30d` | replay/tombstone/terminal-record visibility window |
 
-The server refuses to start without a token unless `--insecure` is set. The
-token authenticates every node hello, every client hello, every artifact
-upload and every webhook.
+Standalone refuses to start without a token unless `--insecure` is set.
+Production modes refuse that shared token entirely and use signed principal
+identity plus one-time node enrollment.
+
+### Production onboarding and OIDC
+
+Bootstrap exactly one short-lived global operator on the first production
+start. The path must not exist; Remount creates it mode 0600 and never writes
+the bearer to a log or event.
+
+```sh
+remount server --mode production-multi-tenant --data /var/lib/remount \
+  --bootstrap-principal root@example.com \
+  --bootstrap-token-file /run/remount/bootstrap.token
+export REMOUNT_TOKEN="$(tr -d '\n' </run/remount/bootstrap.token)"
+remount tenant create acme --oidc /etc/remount/acme-oidc.json
+remount invite admin@acme.example --tenant acme
+remount principal create buildbot --tenant acme --roles agent,service
+remount token issue buildbot --tenant acme --role agent --ttl 1h
+```
+
+The OIDC JSON contains only public-client configuration: `issuer`,
+`client_id`, optional `audience`, `scopes`, claim names, and exact
+`group_roles` mappings. Issuers must be HTTPS. `remount login --tenant acme`
+performs discovery and RFC 8628 device flow, verifies RS256 from the discovered
+JWKS through the server, and stores the access/refresh pair in
+`~/.remount/credentials.json` (or `REMOUNT_CREDENTIAL_FILE`) mode 0600. Refresh
+rotation is single-use. Provider, refresh, device, enrollment and bootstrap
+bearers never appear in canonical events.
 
 The data directory contains two things:
 
@@ -453,17 +480,36 @@ in order, with a sequence number you can quote.
 
 ## Controller availability
 
-The reference implementation is a single SQLite writer. It does not implement
-leader election, shared transactional storage, or fencing between controllers.
-Putting two server instances behind a load balancer creates split authority
-even if they start from copies of the same database.
+The reference implementation is one fenced SQLite writer with optional warm
+standby. It is not Raft and does not promise zero RPO. Never start two ordinary
+servers from copies of a database; use the controller lease and epoch path.
 
-For active/passive operation, keep the passive stopped, replicate a consistent
-database-plus-artifact backup, and use an external lease/fencing mechanism that
-proves the former writer is dead before starting the replacement. Then verify
-`/readyz`, `remount doctor --deep`, node re-adoption and one real workspace
-operation. Automated zero-downtime controller failover remains a published
-product gap; scale nodes horizontally, not controllers.
+Both active and standby need the same strongly consistent S3-compatible
+`--blob` configuration. Start the active with:
+
+```
+remount server --control-replication --blob s3://BUCKET/PREFIX --data /srv/remount
+```
+
+Start the passive with the same durable configuration and `--standby`. It
+polls the conditional lease, restores only the published manifest after lease
+expiry, advances the controller epoch, and remains unready while nodes report
+their retained workspace and release state. `/readyz` becomes healthy only
+after reconciliation and a full publication of the repaired database.
+
+The defaults are a 1 s ship interval, 3 s lease, and five-minute full snapshot.
+The event `control.recovered` records the measured capture-to-promotion lost
+window and restored event sequence; this is an estimate, not a promise that
+all writes in that interval were lost. `control.reconciled` records every
+workspace repair. `remount status`, `remount doctor --deep`, and metrics expose
+role, epoch, lease age, replication lag/failures, and reconciliation state.
+
+For a failover drill, stop the active without graceful coordination, observe
+the standby remain unready until its lease acquisition and node pass complete,
+then require an epoch increase, exactly one assignment per generation, and the
+two recovery event types. A node that sees the old epoch rejects it before
+touching a workspace. If the object store cannot prove conditional writes,
+startup fails; do not bypass that check.
 
 ---
 

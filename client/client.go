@@ -160,6 +160,49 @@ func (c *Client) ListNodes(ctx context.Context) ([]api.NodeStatus, error) {
 	return c.inner.ListNodes(ctx)
 }
 
+// CreateVolume creates a tenant-scoped immutable shared-data volume from an
+// uploaded artifact.
+func (c *Client) CreateVolume(ctx context.Context, request api.VolumeCreateRequest, options ...OperationOption) (*api.Volume, error) {
+	return c.inner.CreateVolume(ctx, request, options...)
+}
+
+// GetVolume returns one tenant-scoped shared-data volume.
+func (c *Client) GetVolume(ctx context.Context, id string) (*api.Volume, error) {
+	return c.inner.GetVolume(ctx, id)
+}
+
+// ListVolumes returns shared-data volumes visible to the caller.
+func (c *Client) ListVolumes(ctx context.Context) ([]api.Volume, error) {
+	return c.inner.ListVolumes(ctx)
+}
+
+// RemoveVolume removes an unattached volume and releases its artifact pins.
+func (c *Client) RemoveVolume(ctx context.Context, id string, options ...OperationOption) error {
+	return c.inner.RemoveVolume(ctx, id, options...)
+}
+
+// AttachVolume pins the current volume version in a non-running workspace.
+func (c *Client) AttachVolume(ctx context.Context, request api.VolumeAttachRequest, options ...OperationOption) (*api.Workspace, error) {
+	return c.inner.AttachVolume(ctx, request, options...)
+}
+
+// DetachVolume removes a pinned volume mount from a non-running workspace.
+func (c *Client) DetachVolume(ctx context.Context, request api.VolumeDetachRequest, options ...OperationOption) (*api.Workspace, error) {
+	return c.inner.DetachVolume(ctx, request, options...)
+}
+
+// ArchiveVolume snapshots one jailed workspace directory and uploads it as a
+// standalone immutable artifact without changing the workspace snapshot.
+func (c *Client) ArchiveVolume(ctx context.Context, workspace, path string, options ...OperationOption) (*api.SnapshotResult, error) {
+	return c.inner.ArchiveVolume(ctx, workspace, path, options...)
+}
+
+// PublishVolumePath snapshots one workspace directory and atomically advances
+// its mounted volume while the node keeps the tree boundary held.
+func (c *Client) PublishVolumePath(ctx context.Context, workspace, path, volumeID string, expectedVersion uint64, options ...OperationOption) (*api.Volume, error) {
+	return c.inner.PublishVolumePath(ctx, workspace, path, volumeID, expectedVersion, options...)
+}
+
 func (c *Client) QuarantineFleet(ctx context.Context, request api.FleetQuarantineRequest) (*api.FleetOperation, error) {
 	return c.inner.QuarantineFleet(ctx, request)
 }

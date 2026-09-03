@@ -31,6 +31,10 @@ type Controller interface {
 	PeerGone(ctx context.Context, id string)
 }
 
+type controllerEpochProvider interface {
+	ControllerEpoch() uint64
+}
+
 // Sender is what the relay offers the controller.
 type Sender interface {
 	// Send routes f by f.To (From is forced to "control").
@@ -248,6 +252,12 @@ func (r *Relay) removeLocked(ctx context.Context, id string, peer *transport.Pee
 
 // route delivers a frame from an authenticated peer.
 func (r *Relay) route(ctx context.Context, f *proto.Frame) {
+	// Epoch is conferred by the authenticated relay path, never accepted from
+	// the peer. This prevents an untrusted client from inventing a higher epoch
+	// that a node would otherwise persist as a fence.
+	if epochs, ok := r.ctrl.(controllerEpochProvider); ok {
+		f.ControllerEpoch = epochs.ControllerEpoch()
+	}
 	if f.To == "" || f.To == proto.PeerControl {
 		if f.T == proto.KindRes {
 			r.pendMu.Lock()
@@ -296,9 +306,14 @@ func (r *Relay) route(ctx context.Context, f *proto.Frame) {
 
 // Send routes a frame originating from the control plane.
 func (r *Relay) Send(ctx context.Context, f *proto.Frame) error {
+	copyFrame := *f
+	f = &copyFrame
 	f.From = proto.PeerControl
 	if f.V == 0 {
 		f.V = proto.Version
+	}
+	if epochs, ok := r.ctrl.(controllerEpochProvider); ok {
+		f.ControllerEpoch = epochs.ControllerEpoch()
 	}
 	r.mu.RLock()
 	closed := r.closed

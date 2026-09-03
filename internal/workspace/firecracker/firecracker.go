@@ -16,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"remount.dev/remount/internal/fsops"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/session"
 	"remount.dev/remount/internal/workspace"
@@ -24,13 +23,18 @@ import (
 
 // SnapshotFiles are the VMM state and guest memory files created while a VM
 // is paused. Paths are interpreted inside the jail by Machine.
-type SnapshotFiles struct{ State, Memory string }
+type SnapshotFiles struct {
+	State, Memory string
+	Compatibility Compatibility
+}
 
 // MachineConfig is the complete pre-boot Firecracker configuration.
 type MachineConfig struct {
 	KernelImage string
 	RootDrive   string
 	TapName     string
+	GuestIP     netip.Addr
+	GatewayIP   netip.Addr
 	VCPU        int
 	MemMiB      int
 	TrackDirty  bool
@@ -41,10 +45,20 @@ type Machine interface {
 	Configure(context.Context, MachineConfig) error
 	Start(context.Context) error
 	Pause(context.Context) error
-	CreateSnapshot(context.Context, SnapshotFiles) error
-	LoadSnapshot(context.Context, SnapshotFiles) error
+	CreateSnapshot(context.Context) (SnapshotFiles, error)
+	LoadSnapshot(context.Context, SnapshotFiles, string) error
 	Resume(context.Context) error
+	// GuestSocket is the exact host UDS backing this VM's virtio-vsock device.
+	GuestSocket() string
+	// Kill terminates and joins the jailer and VMM. Returning nil means no
+	// process from this machine remains alive.
 	Kill(context.Context) error
+}
+
+// MachineLaunch contains host boundaries which must be selected before the
+// jailer starts. The namespace is node-owned; the factory must only join it.
+type MachineLaunch struct {
+	NetworkNamespace string
 }
 
 // MachineFactory creates jailer-owned Firecracker processes. Jailed must be
@@ -52,7 +66,7 @@ type Machine interface {
 type MachineFactory interface {
 	Probe(context.Context) error
 	Jailed() bool
-	New(context.Context, string) (Machine, error)
+	New(context.Context, string, MachineLaunch) (Machine, error)
 }
 
 // NetworkProvider reserves a host address before the broker binds and returns
@@ -68,6 +82,7 @@ type NetworkProvider interface {
 type NetworkLease interface {
 	HostAddress() netip.Addr
 	GuestAddress() netip.Addr
+	NamespacePath() string
 	Prepare(context.Context, uint64) (tapName string, err error)
 	Activate(context.Context, netip.AddrPort) error
 	Revoke(context.Context) error
@@ -83,26 +98,26 @@ type VolumeProvider interface {
 
 // Volume is a CoW workspace disk plus the node's jailed filesystem view.
 type Volume interface {
-	FS() *fsops.FS
 	ImagePath() string
-	SnapshotFiles() SnapshotFiles
-	HasMemorySnapshot() bool
-	Snapshot(context.Context, []string, io.Writer) error
-	Checkpoint(context.Context, []string, SnapshotFiles, io.Writer) error
+	MemorySnapshot() (files SnapshotFiles, sourceGeneration uint64, ok bool)
+	Checkpoint(context.Context, []string, SnapshotFiles, uint64, io.Writer) error
 	Destroy(context.Context) error
 }
 
 // GuestExecutor rewrites a portable session into the guest-agent transport.
 type GuestExecutor interface {
 	Probe(context.Context) error
+	FileSystem(func() (GuestEndpoint, error)) workspace.FileSystem
 	Prepare(*session.Spec, GuestEndpoint) error
 }
 
 // GuestEndpoint identifies a running VM without carrying a credential into
 // the workspace disk.
 type GuestEndpoint struct {
-	Workspace string
-	Address   netip.Addr
+	Workspace  string
+	Generation uint64
+	Address    netip.Addr
+	Socket     string
 }
 
 // Options are deliberately explicit: a kernel, base disk, jailed VMM,
@@ -113,6 +128,9 @@ type Options struct {
 	Networks                     NetworkProvider
 	Volumes                      VolumeProvider
 	Guest                        GuestExecutor
+	// MaxWorkspaces bounds live handles. Providers must independently bound
+	// their durable disks, namespaces and process state.
+	MaxWorkspaces int
 }
 
 // Backend is a production-capable Firecracker backend only after New has
@@ -120,6 +138,8 @@ type Options struct {
 type Backend struct {
 	opts     Options
 	verified bool
+	mu       sync.Mutex
+	handles  map[string]*handle
 }
 
 // New verifies all capability-bearing prerequisites. An unavailable check is
@@ -135,6 +155,9 @@ func New(ctx context.Context, opts Options) (*Backend, error) {
 	}
 	if opts.Machines == nil || opts.Networks == nil || opts.Volumes == nil || opts.Guest == nil {
 		return nil, errors.New("firecracker: jailed VMM, network, CoW volume and guest executor are required")
+	}
+	if opts.MaxWorkspaces <= 0 {
+		opts.MaxWorkspaces = 128
 	}
 	if !opts.Machines.Jailed() {
 		return nil, errors.New("firecracker: unjailed machine factory refused")
@@ -161,7 +184,7 @@ func New(ctx context.Context, opts Options) (*Backend, error) {
 		return nil, err
 	}
 	opts.Dir = abs
-	return &Backend{opts: opts, verified: true}, nil
+	return &Backend{opts: opts, verified: true, handles: make(map[string]*handle)}, nil
 }
 
 func (b *Backend) Name() string { return "firecracker" }
@@ -173,51 +196,140 @@ func (b *Backend) Caps() workspace.Caps {
 }
 
 func (b *Backend) Create(ctx context.Context, id string, spec proto.WorkspaceSpec, restore io.Reader) (workspace.Handle, error) {
+	if err := validateWorkspaceID(id); err != nil {
+		return nil, err
+	}
 	if err := proto.ValidateMountPath(spec.MountPath); err != nil {
 		return nil, err
 	}
+	if err := b.reserve(id); err != nil {
+		return nil, err
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			b.release(id, nil)
+		}
+	}()
 	volume, err := b.opts.Volumes.Create(ctx, id, b.opts.BaseRootFS, restore)
 	if err != nil {
 		return nil, err
 	}
-	return b.newHandle(ctx, id, spec, volume)
+	h, err := b.newHandle(ctx, id, spec, volume, true)
+	if err != nil {
+		return nil, err
+	}
+	b.install(id, h)
+	reserved = false
+	return h, nil
 }
 
 func (b *Backend) Adopt(ctx context.Context, id string) (workspace.Handle, error) {
+	if err := validateWorkspaceID(id); err != nil {
+		return nil, err
+	}
+	if err := b.reserve(id); err != nil {
+		return nil, err
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			b.release(id, nil)
+		}
+	}()
 	volume, err := b.opts.Volumes.Adopt(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	return b.newHandle(ctx, id, proto.WorkspaceSpec{}, volume)
-}
-
-func (b *Backend) newHandle(ctx context.Context, id string, spec proto.WorkspaceSpec, volume Volume) (*handle, error) {
-	network, err := b.opts.Networks.Reserve(ctx, id)
+	h, err := b.newHandle(ctx, id, proto.WorkspaceSpec{}, volume, false)
 	if err != nil {
-		cleanupCtx, cancel := cleanupContext()
-		defer cancel()
-		_ = volume.Destroy(cleanupCtx)
 		return nil, err
 	}
-	return &handle{id: id, spec: spec, kernel: b.opts.KernelImage, volume: volume, network: network, machines: b.opts.Machines, guest: b.opts.Guest, restored: volume.HasMemorySnapshot()}, nil
+	b.install(id, h)
+	reserved = false
+	return h, nil
+}
+
+func (b *Backend) newHandle(ctx context.Context, id string, spec proto.WorkspaceSpec, volume Volume, destroyOnFailure bool) (*handle, error) {
+	network, err := b.opts.Networks.Reserve(ctx, id)
+	if err != nil {
+		if destroyOnFailure {
+			cleanupCtx, cancel := cleanupContext()
+			defer cancel()
+			err = errors.Join(err, volume.Destroy(cleanupCtx))
+		}
+		return nil, err
+	}
+	files, sourceGeneration, restored := volume.MemorySnapshot()
+	if restored && (sourceGeneration == 0 || files.State == "" || files.Memory == "") {
+		cleanupCtx, cancel := cleanupContext()
+		defer cancel()
+		cleanupErr := network.Revoke(cleanupCtx)
+		if destroyOnFailure {
+			cleanupErr = errors.Join(cleanupErr, volume.Destroy(cleanupCtx))
+		}
+		return nil, errors.Join(errors.New("firecracker: incomplete retained memory snapshot"), cleanupErr)
+	}
+	h := &handle{id: id, spec: spec, kernel: b.opts.KernelImage, volume: volume, network: network, machines: b.opts.Machines, guest: b.opts.Guest, restored: restored, snapshotFiles: files, sourceGeneration: sourceGeneration, release: b.release}
+	h.filesystem = b.opts.Guest.FileSystem(h.guestEndpoint)
+	if h.filesystem == nil {
+		return nil, errors.New("firecracker: guest executor returned no filesystem")
+	}
+	return h, nil
+}
+
+func (b *Backend) reserve(id string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, exists := b.handles[id]; exists {
+		return proto.Err(proto.CodeConflict, "firecracker workspace %s is already active", id)
+	}
+	if len(b.handles) >= b.opts.MaxWorkspaces {
+		return proto.Err(proto.CodeResourceExhausted, "firecracker workspace capacity %d exhausted", b.opts.MaxWorkspaces)
+	}
+	b.handles[id] = nil
+	return nil
+}
+
+func (b *Backend) install(id string, h *handle) {
+	b.mu.Lock()
+	b.handles[id] = h
+	b.mu.Unlock()
+}
+
+func (b *Backend) release(id string, expected *handle) {
+	b.mu.Lock()
+	if current, exists := b.handles[id]; exists && (expected == nil || current == expected) {
+		delete(b.handles, id)
+	}
+	b.mu.Unlock()
 }
 
 type handle struct {
-	id, kernel        string
-	spec              proto.WorkspaceSpec
-	volume            Volume
-	network           NetworkLease
-	machines          MachineFactory
-	guest             GuestExecutor
-	mu                sync.Mutex
-	machine           Machine
-	generation        uint64
-	started, restored bool
+	id, kernel         string
+	spec               proto.WorkspaceSpec
+	volume             Volume
+	network            NetworkLease
+	machines           MachineFactory
+	guest              GuestExecutor
+	filesystem         workspace.FileSystem
+	mu                 sync.Mutex
+	machine            Machine
+	generation         uint64
+	broker             netip.AddrPort
+	sourceGeneration   uint64
+	snapshotFiles      SnapshotFiles
+	started, restored  bool
+	snapshotFenced     bool
+	fencedEnv          []byte
+	fencedEnvPending   bool
+	revoked, destroyed bool
+	release            func(string, *handle)
 }
 
-func (h *handle) ID() string      { return h.id }
-func (h *handle) Backend() string { return "firecracker" }
-func (h *handle) FS() *fsops.FS   { return h.volume.FS() }
+func (h *handle) ID() string               { return h.id }
+func (h *handle) Backend() string          { return "firecracker" }
+func (h *handle) FS() workspace.FileSystem { return h.filesystem }
 func (h *handle) MountPath() string {
 	if h.spec.MountPath != "" {
 		return h.spec.MountPath
@@ -228,14 +340,20 @@ func (h *handle) CheckpointKind() workspace.CheckpointKind { return workspace.Ch
 func (h *handle) BrokerAdvertiseHost() string              { return h.network.HostAddress().String() }
 
 func (h *handle) Prepare(spec *session.Spec) error {
-	h.mu.Lock()
-	started := h.started
-	endpoint := GuestEndpoint{Workspace: h.id, Address: h.network.GuestAddress()}
-	h.mu.Unlock()
-	if !started {
-		return proto.Err(proto.CodeClosed, "firecracker VM %s is not ready", h.id)
+	endpoint, err := h.guestEndpoint()
+	if err != nil {
+		return err
 	}
 	return h.guest.Prepare(spec, endpoint)
+}
+
+func (h *handle) guestEndpoint() (GuestEndpoint, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.started || h.machine == nil {
+		return GuestEndpoint{}, proto.Err(proto.CodeClosed, "firecracker VM %s is not ready", h.id)
+	}
+	return GuestEndpoint{Workspace: h.id, Generation: h.generation, Address: h.network.GuestAddress(), Socket: h.machine.GuestSocket()}, nil
 }
 
 func (h *handle) ApplyNetworkPolicy(ctx context.Context, _ proto.NetworkPolicy, endpoint workspace.NetworkEndpoint) (err error) {
@@ -244,15 +362,18 @@ func (h *handle) ApplyNetworkPolicy(ctx context.Context, _ proto.NetworkPolicy, 
 	if endpoint.Workspace != h.id || endpoint.Generation == 0 {
 		return proto.Err(proto.CodeDenied, "network endpoint does not identify this workspace generation")
 	}
-	if h.started {
-		if h.generation == endpoint.Generation {
-			return nil
-		}
-		return proto.Err(proto.CodeDenied, "active Firecracker generation is %d, not %d", h.generation, endpoint.Generation)
+	if h.destroyed || h.revoked {
+		return proto.Err(proto.CodeClosed, "firecracker workspace %s is fenced", h.id)
 	}
 	broker, err := brokerAddress(endpoint)
 	if err != nil {
 		return err
+	}
+	if h.started {
+		if h.generation == endpoint.Generation && h.broker == broker {
+			return nil
+		}
+		return proto.Err(proto.CodeDenied, "active Firecracker network identity differs from replay")
 	}
 	if broker.Addr() != h.network.HostAddress() {
 		return fmt.Errorf("broker must bind %s, got %s", h.network.HostAddress(), broker.Addr())
@@ -261,7 +382,10 @@ func (h *handle) ApplyNetworkPolicy(ctx context.Context, _ proto.NetworkPolicy, 
 	if err != nil {
 		return err
 	}
-	machine, err := h.machines.New(ctx, h.id)
+	if h.restored && endpoint.Generation < h.sourceGeneration {
+		return proto.Err(proto.CodeDenied, "restore generation %d predates checkpoint generation %d", endpoint.Generation, h.sourceGeneration)
+	}
+	machine, err := h.machines.New(ctx, h.id, MachineLaunch{NetworkNamespace: h.network.NamespacePath()})
 	if err != nil {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
@@ -278,14 +402,15 @@ func (h *handle) ApplyNetworkPolicy(ctx context.Context, _ proto.NetworkPolicy, 
 		}
 	}()
 	if h.restored {
-		if err = machine.LoadSnapshot(ctx, h.volume.SnapshotFiles()); err != nil {
+		if err = machine.LoadSnapshot(ctx, h.snapshotFiles, h.volume.ImagePath()); err != nil {
 			return err
 		}
 		if err = machine.Resume(ctx); err != nil {
 			return err
 		}
 	} else {
-		cfg := MachineConfig{KernelImage: h.kernel, RootDrive: h.volume.ImagePath(), TapName: tap, VCPU: max(1, h.spec.Requires.CPU), MemMiB: max(128, h.spec.Requires.MemMiB), TrackDirty: true}
+		guestIP := h.network.GuestAddress()
+		cfg := MachineConfig{KernelImage: h.kernel, RootDrive: h.volume.ImagePath(), TapName: tap, GuestIP: guestIP, GatewayIP: guestIP.Prev(), VCPU: max(1, h.spec.Requires.CPU), MemMiB: max(128, h.spec.Requires.MemMiB), TrackDirty: true}
 		if err = machine.Configure(ctx, cfg); err != nil {
 			return err
 		}
@@ -296,7 +421,7 @@ func (h *handle) ApplyNetworkPolicy(ctx context.Context, _ proto.NetworkPolicy, 
 	if err = h.network.Activate(ctx, broker); err != nil {
 		return err
 	}
-	h.generation, h.started = endpoint.Generation, true
+	h.generation, h.broker, h.started = endpoint.Generation, broker, true
 	return nil
 }
 
@@ -306,35 +431,117 @@ func (h *handle) RevokeNetwork(ctx context.Context) error {
 	if err := h.network.Revoke(ctx); err != nil {
 		return err
 	}
-	h.started = false
+	h.revoked = true
 	return nil
 }
 func (h *handle) Snapshot(ctx context.Context, excludes []string, w io.Writer) error {
-	return h.volume.Snapshot(ctx, excludes, w)
+	return h.checkpoint(ctx, excludes, w, false)
 }
 func (h *handle) Checkpoint(ctx context.Context, excludes []string, w io.Writer) (err error) {
+	return h.checkpoint(ctx, excludes, w, false)
+}
+
+// CheckpointFenced snapshots the full VM and deliberately leaves it paused.
+// This is the source-side prepare boundary for a destructive lifecycle.
+func (h *handle) CheckpointFenced(ctx context.Context, excludes []string, w io.Writer) (err error) {
+	return h.checkpoint(ctx, excludes, w, true)
+}
+
+// ResumeFenced resumes an in-memory source only after abort authorization is
+// durable. A replay is a no-op, so the resume boundary is exactly once.
+func (h *handle) ResumeFenced(ctx context.Context) error {
+	h.mu.Lock()
+	if h.snapshotFenced && (h.destroyed || h.machine == nil) {
+		h.mu.Unlock()
+		return proto.Err(proto.CodeClosed, "firecracker VM %s cannot resume", h.id)
+	}
+	if h.snapshotFenced {
+		if err := h.machine.Resume(ctx); err != nil {
+			h.mu.Unlock()
+			return err
+		}
+		h.snapshotFenced = false
+	}
+	env := append([]byte(nil), h.fencedEnv...)
+	envPending := h.fencedEnvPending
+	h.mu.Unlock()
+	if envPending {
+		if err := h.filesystem.Write(".remount/env", env, 0o644, false, true); err != nil {
+			return err
+		}
+		h.mu.Lock()
+		h.fencedEnv = nil
+		h.fencedEnvPending = false
+		h.mu.Unlock()
+	}
+	return nil
+}
+
+func (h *handle) checkpoint(ctx context.Context, excludes []string, w io.Writer, retainFence bool) (err error) {
+	// The broker URL is a node-local capability. Remove it while the guest is
+	// live, then restore it only on the retained source after the disk bytes
+	// have been captured. A destination rewrites its own value at materialize.
+	var env []byte
+	var envPresent bool
+	if read, readErr := h.filesystem.Read(".remount/env", 0, 1<<20); readErr == nil {
+		envPresent = true
+		env = append([]byte(nil), read.Data...)
+		if err := h.filesystem.Remove(".remount/env", false); err != nil {
+			return err
+		}
+	} else {
+		var protocol *proto.Error
+		if !errors.As(readErr, &protocol) || protocol.Code != proto.CodeNotFound {
+			return readErr
+		}
+	}
+	defer func() {
+		if envPresent && (!retainFence || err != nil) {
+			restoreErr := h.filesystem.Write(".remount/env", env, 0o644, false, true)
+			err = errors.Join(err, restoreErr)
+		}
+	}()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if !h.started || h.machine == nil {
 		return proto.Err(proto.CodeClosed, "firecracker VM %s is not running", h.id)
 	}
+	if h.snapshotFenced {
+		return proto.Err(proto.CodeConflict, "firecracker VM %s is already checkpoint-fenced", h.id)
+	}
 	if err = h.machine.Pause(ctx); err != nil {
 		return err
 	}
 	defer func() {
-		resumeCtx, cancel := cleanupContext()
-		defer cancel()
-		err = errors.Join(err, h.machine.Resume(resumeCtx))
+		if !retainFence || err != nil {
+			resumeCtx, cancel := cleanupContext()
+			defer cancel()
+			err = errors.Join(err, h.machine.Resume(resumeCtx))
+		}
 	}()
-	files := h.volume.SnapshotFiles()
-	if err = h.machine.CreateSnapshot(ctx, files); err != nil {
+	files, err := h.machine.CreateSnapshot(ctx)
+	if err != nil {
 		return err
 	}
-	return h.volume.Checkpoint(ctx, excludes, files, w)
+	if err = h.volume.Checkpoint(ctx, excludes, files, h.generation, w); err != nil {
+		return err
+	}
+	h.snapshotFiles = files
+	h.sourceGeneration = h.generation
+	h.restored = true
+	h.snapshotFenced = retainFence
+	if retainFence {
+		h.fencedEnv = env
+		h.fencedEnvPending = envPresent
+	}
+	return nil
 }
 func (h *handle) Destroy(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.destroyed {
+		return nil
+	}
 	if err := h.network.Revoke(ctx); err != nil {
 		return err
 	}
@@ -344,7 +551,28 @@ func (h *handle) Destroy(ctx context.Context) error {
 		}
 		h.machine = nil
 	}
-	return h.volume.Destroy(ctx)
+	if err := h.volume.Destroy(ctx); err != nil {
+		return err
+	}
+	h.destroyed = true
+	h.started = false
+	if h.release != nil {
+		h.release(h.id, h)
+	}
+	return nil
+}
+
+func validateWorkspaceID(id string) error {
+	if id == "" || len(id) > 128 || id[0] == '.' {
+		return proto.Err(proto.CodeBadRequest, "invalid Firecracker workspace id")
+	}
+	for _, c := range id {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' {
+			continue
+		}
+		return proto.Err(proto.CodeBadRequest, "invalid Firecracker workspace id")
+	}
+	return nil
 }
 
 func brokerAddress(endpoint workspace.NetworkEndpoint) (netip.AddrPort, error) {
