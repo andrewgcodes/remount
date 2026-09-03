@@ -3353,7 +3353,11 @@ func (c *Control) wsRenew(ctx context.Context, node string, req *proto.WSRenewRe
 			continue
 		}
 		result.AuthoritativeGen = ws.Generation
-		renewable := ws.State == proto.WSClaimed || ws.State == proto.WSClaiming
+		// A prepared lifecycle operation still depends on this exact node and
+		// generation to retain the source until its commit is durable. Fencing
+		// it merely because the state is quiescing/checkpointing/destroying can
+		// race the prepare RPC and turn a safe destroy or move into data loss.
+		renewable := held(ws.State)
 		if ws.Node != node || !renewable || requested == 0 || requested != ws.Generation {
 			res.Results = append(res.Results, result)
 			continue

@@ -530,6 +530,42 @@ func TestReadyRenewAndPersistenceAreStrict(t *testing.T) {
 	}
 }
 
+func TestRenewKeepsPreparedLifecycleSourceAvailable(t *testing.T) {
+	for _, state := range []string{proto.WSQuiescing, proto.WSCheckpointing, proto.WSDestroying} {
+		t.Run(state, func(t *testing.T) {
+			f := newControlFixture(t, "", nil)
+			sender := &fakeSender{online: map[string]bool{"n_one": true}}
+			f.c.Attach(sender)
+			connectNode(t, f.c, "n_one", processNodeInfo(4096))
+			created := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{})
+			claim, err := f.c.wsClaim(context.Background(), "n_one", created.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.c.wsReady(context.Background(), "n_one", &proto.WSReadyReq{ID: created.ID, Gen: claim.Workspace.Generation}); err != nil {
+				t.Fatal(err)
+			}
+
+			f.c.mu.Lock()
+			transitioning := *f.c.workspaces[created.ID]
+			transitioning.State = state
+			if err := f.c.persistWS(&transitioning); err != nil {
+				f.c.mu.Unlock()
+				t.Fatal(err)
+			}
+			*f.c.workspaces[created.ID] = transitioning
+			f.c.mu.Unlock()
+
+			result, err := f.c.wsRenew(context.Background(), "n_one", &proto.WSRenewReq{
+				IDs: []string{created.ID}, Gen: map[string]uint64{created.ID: claim.Workspace.Generation},
+			})
+			if err != nil || len(result.Results) != 1 || !result.Results[0].Accepted || result.Results[0].Action != "continue" {
+				t.Fatalf("renew in %s = %#v, %v", state, result, err)
+			}
+		})
+	}
+}
+
 func TestRestartPreservesHolderAndReleasedRecovery(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "restart.db")
 	f1 := newControlFixture(t, path, nil)
