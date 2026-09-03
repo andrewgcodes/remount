@@ -41,3 +41,7 @@ func platformExitSignal(err *exec.ExitError) (string, int, bool) {
 	}
 	return status.Signal().String(), 128 + int(status.Signal()), true
 }
+
+func isPTYEOF(err error) bool {
+	return errors.Is(err, syscall.EIO)
+}

@@ -256,14 +256,33 @@ func TestKillWorkspaceConfirmsAllSessionsStopped(t *testing.T) {
 
 func TestPTYEchoAndResize(t *testing.T) {
 	m := newMgr(t)
-	s, err := m.Open(Spec{WS: "ws_1", Kind: proto.SessionPTY, Program: []string{"sh", "-c", "stty size; read x; echo got:$x"}, Rows: 30, Cols: 100})
+	s, err := m.Open(Spec{WS: "ws_1", Kind: proto.SessionPTY, Program: []string{"sh", "-c", "stty size; read x; stty size; echo got:$x"}, Rows: 30, Cols: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if s.Info.PID == 0 {
 		t.Fatal("no pid")
 	}
-	time.Sleep(100 * time.Millisecond)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		chunks, readErr := s.Log.Read(0, 0)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		var observed []byte
+		for _, chunk := range chunks {
+			if chunk.Stream == proto.StreamStdout {
+				observed = append(observed, chunk.Data...)
+			}
+		}
+		if bytes.Contains(observed, []byte("30 100")) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("initial PTY size was not observable: %q", observed)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if err := s.Resize(40, 120); err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +290,8 @@ func TestPTYEchoAndResize(t *testing.T) {
 		t.Fatal(err)
 	}
 	out, _, exit := collect(t, s)
-	if !bytes.Contains(out, []byte("30 100")) || !bytes.Contains(out, []byte("got:abc")) || exit.Code != 0 {
+	if !bytes.Contains(out, []byte("30 100")) || !bytes.Contains(out, []byte("40 120")) ||
+		!bytes.Contains(out, []byte("got:abc")) || exit.Code != 0 || exit.Error != "" {
 		t.Fatalf("%q %+v", out, exit)
 	}
 	// Resize on exec session is unsupported.
