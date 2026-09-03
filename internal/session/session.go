@@ -69,6 +69,7 @@ type Session struct {
 	timeout     *time.Timer
 	outputReady chan struct{} // pumps wait until StreamInfo is committed at seq 0
 	logErr      error
+	onFinish    func() // commits manager accounting before exited is closed
 }
 
 // Exited reports whether the process has finished.
@@ -216,6 +217,8 @@ func (s *Session) finish(info proto.ExitInfo) {
 	if s.timeout != nil {
 		s.timeout.Stop()
 	}
+	onFinish := s.onFinish
+	s.onFinish = nil
 	s.mu.Unlock()
 	metrics.SessionsExited.Inc()
 	if _, err := s.Log.Append(proto.StreamExit, proto.MustMarshal(info)); err != nil {
@@ -226,6 +229,13 @@ func (s *Session) finish(info proto.ExitInfo) {
 		s.mu.Unlock()
 	}
 	_ = s.Log.Close()
+	// A successful Wait must mean that the active-session admission slot is
+	// reusable. Commit manager accounting before publishing session exit; doing
+	// this in an observer after close(s.exited) left a scheduler-sized window in
+	// which a completed process could still spuriously exhaust active capacity.
+	if onFinish != nil {
+		onFinish()
+	}
 	close(s.exited)
 }
 
@@ -487,6 +497,7 @@ func (m *Manager) Open(spec Spec) (*Session, error) {
 		ID: id, WS: spec.WS, Kind: spec.Kind, Log: log, exited: make(chan struct{}), startDone: make(chan struct{}), outputReady: make(chan struct{}), Principal: spec.Principal, Tenant: spec.Tenant,
 		Info: proto.SessionInfo{ID: id, WS: spec.WS, Kind: spec.Kind, Program: spec.Program, OpenedAt: time.Now().UnixMilli()},
 	}
+	s.onFinish = func() { m.markInactive(id, s) }
 	m.sessions[id] = s
 	m.byWS[spec.WS]++
 	m.byPrincipal[principalKey]++
@@ -557,15 +568,18 @@ func sessionFingerprint(spec Spec) [32]byte {
 
 func (m *Manager) observe(s *Session) {
 	<-s.exited
-	m.mu.Lock()
-	if m.active > 0 {
-		m.active--
-	}
-	m.mu.Unlock()
 	if m.opts.OnExit != nil {
 		m.opts.OnExit(s, *s.ExitInfo())
 	}
 	m.scheduleReap(s)
+}
+
+func (m *Manager) markInactive(id string, s *Session) {
+	m.mu.Lock()
+	if current := m.sessions[id]; current == s && m.active > 0 {
+		m.active--
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) scheduleReap(s *Session) {
