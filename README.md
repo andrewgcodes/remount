@@ -261,6 +261,7 @@ verdict. See [docs/observability.md](docs/observability.md).
 - [docs/adr/](docs/adr/) — the decisions, and what each one costs.
 - [docs/tutorial.md](docs/tutorial.md) — a guided walkthrough from zero to a moved workspace.
 - [docs/harness-integration.md](docs/harness-integration.md) — running Claude Code, Codex, OpenCode and your own loop on Remount.
+- [docs/api.md](docs/api.md) — the agent HTTP API: agents, transcript streaming, approvals, diff, terminal, files, previews.
 - [docs/operations.md](docs/operations.md) — deploying, hardening and running it for real.
 - [docs/images.md](docs/images.md) — the default workspace image and what any substitute image must provide.
 - [docs/observability.md](docs/observability.md) — inspecting a deployment at three depths, and detecting damage.
