@@ -40,11 +40,19 @@ import (
 // Binding is a secret the control plane can lease to nodes.
 type Binding struct {
 	ID           string   `json:"id"`
-	Secret       string   `json:"secret"`
+	Secret       string   `json:"secret,omitempty"`
+	Source       string   `json:"source,omitempty"`
 	Destinations []string `json:"destinations"`
 	Principals   []string `json:"principals,omitempty"` // empty = any principal
+	Workspaces   []string `json:"workspaces,omitempty"` // empty = any authorized workspace
 	Placeholder  string   `json:"placeholder,omitempty"`
 	TTLSec       int64    `json:"ttl_sec,omitempty"` // default 600
+}
+
+// SecretResolver fetches an external binding value at lease time. Resolved
+// values must not be persisted or included in events and diagnostics.
+type SecretResolver interface {
+	Resolve(context.Context, string) (string, error)
 }
 
 // Subject is an authenticated user/service identity.
@@ -137,6 +145,7 @@ type Options struct {
 	// assignments for their recorded holders to reconnect. Default: 2 leases.
 	RecoveryGraceSec int64
 	Bindings         []Binding
+	SecretResolver   SecretResolver
 	Logger           *slog.Logger
 	// Artifacts lets the control plane report on and verify its blob store.
 	// Optional: without it, artifact checks report as unavailable rather
@@ -387,8 +396,11 @@ func New(opts Options) (*Control, error) {
 		started: opts.Now(), stop: make(chan struct{}),
 	}
 	for _, b := range opts.Bindings {
-		if b.ID == "" || b.Secret == "" || len(b.Destinations) == 0 {
-			return nil, fmt.Errorf("control: binding %q needs a non-empty id, secret and destinations", b.ID)
+		if b.ID == "" || (b.Secret == "") == (b.Source == "") || len(b.Destinations) == 0 {
+			return nil, fmt.Errorf("control: binding %q needs an id, exactly one secret source, and destinations", b.ID)
+		}
+		if b.Source != "" && opts.SecretResolver == nil {
+			return nil, fmt.Errorf("control: binding %q has an external source but no resolver", b.ID)
 		}
 		if _, exists := c.bindings[b.ID]; exists {
 			return nil, fmt.Errorf("control: duplicate binding %q", b.ID)
@@ -1980,7 +1992,7 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return c.bindingLease(ctx, f.From, req.WS)
+		return c.bindingLease(ctx, f.From, req.WS, req.Gen)
 	case proto.OpGrant:
 		req, err := decode[proto.GrantReq](f)
 		if err != nil {
@@ -4536,31 +4548,62 @@ func (c *Control) fireTimer(ctx context.Context, t *proto.Timer) {
 	}
 }
 
-func (c *Control) bindingLease(ctx context.Context, node, wsID string) (*proto.BindingLeaseRes, error) {
+func (c *Control) bindingLease(ctx context.Context, node, wsID string, generation uint64) (*proto.BindingLeaseRes, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	ws := c.workspaces[wsID]
 	leaseable := ws != nil && (ws.State == proto.WSClaimed || ws.State == proto.WSClaiming)
-	if !leaseable || ws.Node != node {
+	if !leaseable || ws.Node != node || (generation != 0 && ws.Generation != generation) {
+		c.mu.Unlock()
 		return nil, proto.Err(proto.CodeDenied, "workspace %s is not claimed by %s", wsID, node)
 	}
+	gen, principal := ws.Generation, ws.Spec.Principal
+	requested := append([]string(nil), ws.Spec.Bindings...)
+	bindings := make([]Binding, 0, len(requested))
+	for _, id := range requested {
+		if binding, ok := c.bindings[id]; ok {
+			binding.Destinations = append([]string(nil), binding.Destinations...)
+			binding.Principals = append([]string(nil), binding.Principals...)
+			binding.Workspaces = append([]string(nil), binding.Workspaces...)
+			bindings = append(bindings, binding)
+		}
+	}
+	c.mu.Unlock()
+
 	out := &proto.BindingLeaseRes{}
-	for _, id := range ws.Spec.Bindings {
-		b, ok := c.bindings[id]
-		if !ok {
+	for _, b := range bindings {
+		if len(b.Principals) > 0 && !contains(b.Principals, principal) {
 			continue
 		}
-		if len(b.Principals) > 0 && !contains(b.Principals, ws.Spec.Principal) {
+		if len(b.Workspaces) > 0 && !contains(b.Workspaces, wsID) {
 			continue
+		}
+		secret := b.Secret
+		if b.Source != "" {
+			var err error
+			secret, err = c.opts.SecretResolver.Resolve(ctx, b.Source)
+			if err != nil || secret == "" {
+				return nil, proto.Err(proto.CodeUnreachable, "binding %s source is unavailable", b.ID)
+			}
 		}
 		ttl := b.TTLSec
 		if ttl == 0 {
 			ttl = 600
 		}
 		out.Leases = append(out.Leases, proto.BindingLease{
-			ID: b.ID, Secret: b.Secret, Destinations: b.Destinations, Principals: b.Principals,
+			ID: b.ID, Secret: secret, Destinations: b.Destinations, Principals: b.Principals,
 			Placeholder: b.Placeholder, ExpiresAt: c.now().Add(time.Duration(ttl) * time.Second).UnixMilli(),
 		})
+	}
+	// Resolution may block on an external provider. Revalidate the authority
+	// boundary after it returns so a stale node never receives a credential for
+	// a workspace that moved while the source was being fetched.
+	c.mu.Lock()
+	current := c.workspaces[wsID]
+	valid := current != nil && current.Node == node && current.Generation == gen &&
+		(current.State == proto.WSClaimed || current.State == proto.WSClaiming) && current.Spec.Principal == principal
+	c.mu.Unlock()
+	if !valid {
+		return nil, proto.Err(proto.CodeDenied, "workspace %s authority changed while leasing bindings", wsID)
 	}
 	return out, nil
 }

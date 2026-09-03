@@ -810,7 +810,8 @@ type EventPost struct {
 }
 
 type BindingLeaseReq struct {
-	WS string `cbor:"ws" json:"ws"`
+	WS  string `cbor:"ws" json:"ws"`
+	Gen uint64 `cbor:"gen,omitempty" json:"gen,omitempty"`
 }
 
 // BindingLease is what a node receives: the real secret, scoped and time-limited.
