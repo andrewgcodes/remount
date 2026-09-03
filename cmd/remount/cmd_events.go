@@ -52,6 +52,9 @@ func eventJSON(e proto.Event) map[string]any {
 }
 
 func cmdEvents(ctx context.Context, args []string) error {
+	if len(args) > 0 && args[0] == "export" {
+		return cmdEventsExport(ctx, args[1:])
+	}
 	fs := flag.NewFlagSet("events", flag.ExitOnError)
 	var c common
 	c.flags(fs)
