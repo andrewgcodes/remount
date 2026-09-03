@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -22,6 +23,28 @@ import (
 
 // webhookBodyLimit bounds one inbound webhook body.
 const webhookBodyLimit = 1 << 20
+
+const (
+	githubProvider           = "github"
+	slackProvider            = "slack"
+	linearProvider           = "linear"
+	genericProvider          = "generic"
+	defaultSlackReplayWindow = 5 * time.Minute
+)
+
+// WebhookProviderConfig contains the independent credentials used to verify
+// provider-native webhook requests. GenericBearer is accepted only when the
+// request explicitly selects the generic adapter with X-Remount-Provider.
+type WebhookProviderConfig struct {
+	GitHubSecret       string
+	SlackSigningSecret string
+	LinearSecret       string
+	GenericBearer      string
+	// SlackReplayWindow defaults to five minutes, as required by Slack's
+	// signing protocol. A negative duration is invalid and zero selects the
+	// default.
+	SlackReplayWindow time.Duration
+}
 
 // webhookTemplateLimit bounds one rendered template (a task or a message);
 // the control plane's own message bound is the real ceiling.
@@ -86,6 +109,162 @@ func (s *Server) webhookSigned(r *http.Request, body []byte) bool {
 	return false
 }
 
+// webhookProvider authenticates and translates a provider-native request.
+// The bool reports whether a provider adapter was selected; selected requests
+// fail closed instead of falling through to ordinary bearer authentication.
+func (s *Server) webhookProvider(r *http.Request, body []byte, bearer string) (webhookRequest, any, string, bool, error) {
+	provider := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Remount-Provider")))
+	switch {
+	case r.Header.Get("X-GitHub-Event") != "":
+		provider = githubProvider
+	case r.Header.Get("X-Slack-Signature") != "" || r.Header.Get("X-Slack-Request-Timestamp") != "":
+		provider = slackProvider
+	case r.Header.Get("Linear-Signature") != "":
+		provider = linearProvider
+	}
+	if provider == "" {
+		return webhookRequest{}, nil, "", false, nil
+	}
+
+	var typ string
+	switch provider {
+	case githubProvider:
+		if !verifyPrefixedHMAC(s.opts.WebhookProviders.GitHubSecret, body, r.Header.Get("X-Hub-Signature-256"), "sha256=") {
+			return webhookRequest{}, nil, provider, true, proto.Err(proto.CodeUnauthorized, "invalid github webhook signature")
+		}
+		typ = "webhook.github." + webhookEventPart(r.Header.Get("X-GitHub-Event"))
+	case slackProvider:
+		window := s.opts.WebhookProviders.SlackReplayWindow
+		if window == 0 {
+			window = defaultSlackReplayWindow
+		}
+		if window < 0 {
+			return webhookRequest{}, nil, provider, true, proto.Err(proto.CodeUnauthorized, "slack webhook verification unavailable")
+		}
+		stamp, err := strconv.ParseInt(r.Header.Get("X-Slack-Request-Timestamp"), 10, 64)
+		if err != nil || stamp <= 0 || time.Since(time.Unix(stamp, 0)) > window || time.Until(time.Unix(stamp, 0)) > window {
+			return webhookRequest{}, nil, provider, true, proto.Err(proto.CodeUnauthorized, "stale slack webhook timestamp")
+		}
+		base := append([]byte("v0:"+strconv.FormatInt(stamp, 10)+":"), body...)
+		if !verifyPrefixedHMAC(s.opts.WebhookProviders.SlackSigningSecret, base, r.Header.Get("X-Slack-Signature"), "v0=") {
+			return webhookRequest{}, nil, provider, true, proto.Err(proto.CodeUnauthorized, "invalid slack webhook signature")
+		}
+		var envelope struct {
+			Type  string `json:"type"`
+			Event struct {
+				Type string `json:"type"`
+			} `json:"event"`
+		}
+		if err := decodeWebhookJSON(body, &envelope); err != nil {
+			return webhookRequest{}, nil, provider, true, proto.Err(proto.CodeBadRequest, "invalid slack webhook body")
+		}
+		name := envelope.Type
+		if envelope.Type == "event_callback" && envelope.Event.Type != "" {
+			name = envelope.Event.Type
+		}
+		typ = "webhook.slack." + webhookEventPart(name)
+	case linearProvider:
+		if !verifyPrefixedHMAC(s.opts.WebhookProviders.LinearSecret, body, r.Header.Get("Linear-Signature"), "") {
+			return webhookRequest{}, nil, provider, true, proto.Err(proto.CodeUnauthorized, "invalid linear webhook signature")
+		}
+		var envelope struct {
+			Type   string `json:"type"`
+			Action string `json:"action"`
+		}
+		if err := decodeWebhookJSON(body, &envelope); err != nil {
+			return webhookRequest{}, nil, provider, true, proto.Err(proto.CodeBadRequest, "invalid linear webhook body")
+		}
+		typ = "webhook.linear." + webhookEventPart(envelope.Type)
+		if action := webhookEventPart(envelope.Action); action != "unknown" {
+			typ += "." + action
+		}
+	case genericProvider:
+		if !constantTimeTextEqual(bearer, s.opts.WebhookProviders.GenericBearer) || bearer == "" {
+			return webhookRequest{}, nil, provider, true, proto.Err(proto.CodeUnauthorized, "invalid generic webhook bearer")
+		}
+		var in webhookRequest
+		if err := decodeWebhookJSON(body, &in); err != nil || in.Type == "" {
+			return webhookRequest{}, nil, provider, true, proto.Err(proto.CodeBadRequest, "generic event needs a non-empty type")
+		}
+		in.Type = "webhook.generic." + webhookEventPart(in.Type)
+		payload, err := decodeWebhookPayload(in.Payload)
+		return in, payload, provider, true, err
+	default:
+		return webhookRequest{}, nil, provider, true, proto.Err(proto.CodeBadRequest, "unsupported webhook provider")
+	}
+	if strings.HasSuffix(typ, ".unknown") {
+		return webhookRequest{}, nil, provider, true, proto.Err(proto.CodeBadRequest, "provider event type is missing")
+	}
+	payload, err := decodeWebhookPayload(json.RawMessage(body))
+	return webhookRequest{Type: typ, Payload: append(json.RawMessage(nil), body...)}, payload, provider, true, err
+}
+
+func verifyPrefixedHMAC(secret string, body []byte, supplied, prefix string) bool {
+	if secret == "" {
+		return false
+	}
+	hexSignature, ok := strings.CutPrefix(supplied, prefix)
+	if !ok {
+		return false
+	}
+	got, err := hex.DecodeString(hexSignature)
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(body)
+	return hmac.Equal(got, mac.Sum(nil))
+}
+
+func constantTimeTextEqual(a, b string) bool {
+	// Compare fixed-size digests so length is not an early-exit oracle.
+	aDigest, bDigest := sha256.Sum256([]byte(a)), sha256.Sum256([]byte(b))
+	return hmac.Equal(aDigest[:], bDigest[:])
+}
+
+func webhookEventPart(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' {
+			b.WriteRune(r)
+		} else if b.Len() > 0 && !strings.HasSuffix(b.String(), "_") {
+			b.WriteByte('_')
+		}
+		if b.Len() == 64 {
+			break
+		}
+	}
+	part := strings.Trim(b.String(), "_")
+	if part == "" {
+		return "unknown"
+	}
+	return part
+}
+
+func decodeWebhookJSON(body []byte, dst any) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	if dec.Decode(&struct{}{}) != io.EOF {
+		return errors.New("trailing webhook JSON")
+	}
+	return nil
+}
+
+func decodeWebhookPayload(raw json.RawMessage) (any, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var payload any
+	if err := decodeWebhookJSON(raw, &payload); err != nil {
+		return nil, proto.Err(proto.CodeBadRequest, "payload must be JSON")
+	}
+	return payload, nil
+}
+
 // handleEvents accepts a JSON event and appends it (webhook wake). With an
 // agent mapping it also wakes or creates an Agent. A caller authenticates
 // with the API bearer or with an HMAC signature; a signed request acts as the
@@ -102,7 +281,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	bearer, _, hasBearer := credential(r, false)
-	signed := s.webhookSigned(r, body)
+	in, payload, provider, providerSelected, providerErr := s.webhookProvider(r, body, bearer)
+	if providerErr != nil {
+		metrics.WebhookRejected.Inc()
+		writeError(w, providerErr)
+		return
+	}
+	signed := providerSelected || s.webhookSigned(r, body)
 	// Three ways in: the shared bearer, a credential the authenticator knows
 	// (checked by acquiring its client), or a valid signature.
 	shared := s.authed(r) && (hasBearer || s.opts.Token == "")
@@ -121,20 +306,17 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, proto.Err(proto.CodeUnauthorized, "missing credential or signature"))
 		return
 	}
-	var in webhookRequest
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&in); err != nil || in.Type == "" {
-		badRequest(w, "event must be a JSON object with a non-empty type")
-		return
-	}
-	var payload any
-	if len(in.Payload) > 0 {
+	if !providerSelected {
+		dec := json.NewDecoder(bytes.NewReader(body))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&in); err != nil || in.Type == "" {
+			badRequest(w, "event must be a JSON object with a non-empty type")
+			return
+		}
 		// Numbers stay as their literals: a template that renders an issue
 		// or comment id must not turn 2147483648 into 2.147483648e+09.
-		pd := json.NewDecoder(bytes.NewReader(in.Payload))
-		pd.UseNumber()
-		if err := pd.Decode(&payload); err != nil {
+		payload, err = decodeWebhookPayload(in.Payload)
+		if err != nil {
 			badRequest(w, "payload must be JSON")
 			return
 		}
@@ -173,11 +355,15 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			in.Stream = acted.WS
 		}
 	}
-	e := proto.Event{Type: in.Type, Stream: in.Stream, Principal: "webhook"}
+	principal := "webhook"
+	if provider != "" {
+		principal += ":" + provider
+	}
+	e := proto.Event{Type: in.Type, Stream: in.Stream, Principal: principal}
 	if payload != nil {
 		e.Payload = proto.MustMarshal(payload)
 	}
-	if err := s.Control.PostEvents(ctx, "webhook", []proto.Event{e}); err != nil {
+	if err := s.Control.PostEvents(ctx, principal, []proto.Event{e}); err != nil {
 		writeError(w, err)
 		return
 	}

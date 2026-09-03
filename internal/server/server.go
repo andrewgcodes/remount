@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"remount.dev/remount/internal/eventlog"
 	"remount.dev/remount/internal/identity"
 	"remount.dev/remount/internal/metrics"
+	"remount.dev/remount/internal/notifier"
 	nodepool "remount.dev/remount/internal/pool"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/provision"
@@ -106,6 +108,23 @@ type Options struct {
 	// agent actions run as; empty leaves signed requests append-only.
 	WebhookSecret string
 	WebhookToken  string
+	// WebhookProviders configures provider-native verification for POST
+	// /v1/events. Secrets are used only while authenticating the raw request
+	// and are never copied into the canonical event log.
+	WebhookProviders WebhookProviderConfig
+	// Notifications are preconfigured outbound routes. Each tenant gets its
+	// own durable export cursor and serialized worker.
+	Notifications                   []notifier.Subscription
+	NotifierBatchEvents             int
+	NotifierBatchBytes              int
+	NotifierAttempts                int
+	NotifierRetryBase               time.Duration
+	NotifierRetryMax                time.Duration
+	NotifierHTTPTimeout             time.Duration
+	MaxNotifierSubscriptions        int
+	MaxNotifierDeadLettersPerTenant int
+	NotifierDeadLetterRetention     time.Duration
+	NotifierDeadLetterGCInterval    time.Duration
 	// ProvisionDrivers are explicitly configured whole-node providers. Pools
 	// are enabled only with a node authenticator that can consume the minted
 	// one-time enrollment credentials.
@@ -149,9 +168,12 @@ type Server struct {
 	gcWG        sync.WaitGroup
 	// lifetime ends at Close; in-process API clients and their relay sides
 	// live on it rather than on any one request.
-	lifetime       context.Context
-	lifetimeCancel context.CancelFunc
-	clients        *clientPool
+	lifetime        context.Context
+	lifetimeCancel  context.CancelFunc
+	clients         *clientPool
+	notifiers       []*notifier.Runner
+	notifierDLQ     *notifier.SQLiteDeadLetterStore
+	notifierTenants []string
 }
 
 // New builds a server. Call Serve or Handler.
@@ -165,6 +187,30 @@ func New(opts Options) (*Server, error) {
 	if opts.MaxConcurrentRequests < 0 || opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 || opts.MaxMutationRecords < 0 ||
 		opts.MaxTimers < 0 || opts.MaxTimersPerWorkspace < 0 {
 		return nil, errors.New("server: control-plane quotas must not be negative")
+	}
+	if opts.WebhookProviders.SlackReplayWindow < 0 {
+		return nil, errors.New("server: Slack webhook replay window must not be negative")
+	}
+	if opts.NotifierBatchEvents < 0 || opts.NotifierBatchBytes < 0 || opts.NotifierAttempts < 0 ||
+		opts.MaxNotifierSubscriptions < 0 || opts.MaxNotifierDeadLettersPerTenant < 0 ||
+		opts.NotifierRetryBase < 0 || opts.NotifierRetryMax < 0 || opts.NotifierHTTPTimeout < 0 ||
+		opts.NotifierDeadLetterRetention < 0 {
+		return nil, errors.New("server: notifier limits must not be negative")
+	}
+	if opts.NotifierDeadLetterGCInterval == 0 {
+		opts.NotifierDeadLetterGCInterval = 10 * time.Minute
+	}
+	if opts.NotifierDeadLetterRetention == 0 {
+		opts.NotifierDeadLetterRetention = 30 * 24 * time.Hour
+	}
+	if opts.MaxNotifierSubscriptions == 0 {
+		opts.MaxNotifierSubscriptions = 128
+	}
+	if opts.MaxNotifierDeadLettersPerTenant == 0 {
+		opts.MaxNotifierDeadLettersPerTenant = 10_000
+	}
+	if len(opts.Notifications) > opts.MaxNotifierSubscriptions {
+		return nil, errors.New("server: notifier subscription capacity exceeded")
 	}
 	if opts.MaxArtifactBytes == 0 {
 		opts.MaxArtifactBytes = 8 << 30
@@ -360,9 +406,21 @@ func New(opts Options) (*Server, error) {
 	}
 	s.opts.MaxAPIClients, s.opts.APIClientIdle = opts.MaxAPIClients, opts.APIClientIdle
 	s.clients = newClientPool(s, opts.MaxAPIClients, opts.APIClientIdle)
+	if err := s.configureNotifiers(); err != nil {
+		s.clients.close()
+		s.lifetimeCancel()
+		s.Relay.Close()
+		s.Control.Stop()
+		_ = s.Log.Close()
+		if s.tempArtDir != "" {
+			_ = os.RemoveAll(s.tempArtDir)
+		}
+		return nil, err
+	}
 	s.gcWG.Add(1)
 	go s.clientSweepLoop(s.lifetime)
-	if opts.ArtifactGCInterval > 0 || opts.EventGCInterval > 0 || opts.RecordGCInterval > 0 {
+	if opts.ArtifactGCInterval > 0 || opts.EventGCInterval > 0 || opts.RecordGCInterval > 0 ||
+		(len(s.notifiers) > 0 && opts.NotifierDeadLetterGCInterval > 0) {
 		gcCtx, gcCancel := context.WithCancel(context.Background())
 		s.gcCtx = gcCtx
 		s.gcCancel = gcCancel
@@ -379,7 +437,144 @@ func New(opts Options) (*Server, error) {
 		s.gcWG.Add(1)
 		go s.recordGCLoop(s.gcCtx)
 	}
+	if len(s.notifiers) > 0 && opts.NotifierDeadLetterGCInterval > 0 {
+		s.gcWG.Add(1)
+		go s.notifierDeadLetterGCLoop(s.gcCtx)
+	}
+	for index, runner := range s.notifiers {
+		s.gcWG.Add(1)
+		go s.notifierLoop(s.lifetime, runner, s.notifierTenants[index])
+	}
 	return s, nil
+}
+
+func (s *Server) configureNotifiers() error {
+	if len(s.opts.Notifications) == 0 {
+		return nil
+	}
+	deadLetters, err := notifier.NewSQLiteDeadLetterStore(s.db, s.opts.MaxNotifierDeadLettersPerTenant)
+	if err != nil {
+		return fmt.Errorf("server: notifier dead-letter store unavailable: %w", err)
+	}
+	byTenant := make(map[string][]notifier.Subscription)
+	for _, subscription := range s.opts.Notifications {
+		byTenant[subscription.Tenant] = append(byTenant[subscription.Tenant], subscription)
+	}
+	tenants := make([]string, 0, len(byTenant))
+	for tenant := range byTenant {
+		tenants = append(tenants, tenant)
+	}
+	sort.Strings(tenants)
+	for _, tenant := range tenants {
+		cursors, err := s.Control.ExportCursors(tenant)
+		if err != nil {
+			return fmt.Errorf("server: notifier cursor unavailable: %w", err)
+		}
+		runner, err := notifier.New(notifier.Options{
+			Source: s.Log, Cursors: cursors, CursorName: "notifier-v1",
+			Subscriptions: byTenant[tenant], DeadLetters: deadLetters,
+			BatchEvents: s.opts.NotifierBatchEvents, BatchBytes: s.opts.NotifierBatchBytes,
+			Attempts: s.opts.NotifierAttempts, RetryBase: s.opts.NotifierRetryBase,
+			RetryMax: s.opts.NotifierRetryMax, HTTPTimeout: s.opts.NotifierHTTPTimeout,
+			MaxSubs: s.opts.MaxNotifierSubscriptions, Signal: s.recordNotifierSignal,
+		})
+		if err != nil {
+			return fmt.Errorf("server: invalid notifier configuration: %w", err)
+		}
+		s.notifiers = append(s.notifiers, runner)
+		s.notifierTenants = append(s.notifierTenants, tenant)
+	}
+	s.notifierDLQ = deadLetters
+	return nil
+}
+
+func (s *Server) recordNotifierSignal(ctx context.Context, signal notifier.Signal) error {
+	typ := proto.EvNotifyUnavailable
+	if signal.Kind == notifier.SignalDeadLettered {
+		typ = proto.EvNotifyDeadLetter
+	}
+	return s.Control.PostEvents(ctx, "notifier", []proto.Event{{
+		Type: typ, Tenant: signal.Tenant,
+		Payload: proto.MustMarshal(map[string]any{
+			"subscription": signal.SubscriptionID, "first_seq": signal.FirstSeq,
+			"last_seq": signal.LastSeq, "attempts": signal.Attempts, "reason": signal.Reason,
+		}),
+	}})
+}
+
+func (s *Server) notifierLoop(ctx context.Context, runner *notifier.Runner, tenant string) {
+	defer s.gcWG.Done()
+	defer runner.CloseIdleConnections()
+	backoff := time.Second
+	for {
+		err := runner.Run(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		// Never log the lower error: transports must not make a configured URL
+		// or credential observable.
+		s.logger.Error("notifier unavailable", "tenant", tenant)
+		metrics.NotificationUnavailable.Inc()
+		signalCtx, signalCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = s.recordNotifierSignal(signalCtx, notifier.Signal{
+			Kind: notifier.SignalUnavailable, Tenant: tenant, Reason: "destination_unavailable",
+		})
+		signalCancel()
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+		}
+		if err == nil {
+			backoff = time.Second
+		} else if backoff < time.Minute {
+			backoff *= 2
+			if backoff > time.Minute {
+				backoff = time.Minute
+			}
+		}
+	}
+}
+
+func (s *Server) notifierDeadLetterGCLoop(ctx context.Context) {
+	defer s.gcWG.Done()
+	ticker := time.NewTicker(s.opts.NotifierDeadLetterGCInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			for _, tenant := range s.notifierTenants {
+				removed, err := s.notifierDLQ.Prune(ctx, tenant, now.Add(-s.opts.NotifierDeadLetterRetention).UnixMilli(), 1000)
+				if err != nil {
+					metrics.NotificationUnavailable.Inc()
+					_ = s.recordNotifierSignal(ctx, notifier.Signal{Kind: notifier.SignalUnavailable, Tenant: tenant, Reason: "dead_letter_store_failed"})
+					continue
+				}
+				if removed > 0 {
+					metrics.NotificationDeadLettersPruned.Add(uint64(removed))
+					_ = s.Control.PostEvents(ctx, "notifier", []proto.Event{{
+						Type: proto.EvNotifyDLQPruned, Tenant: tenant,
+						Payload: proto.MustMarshal(map[string]any{"removed": removed}),
+					}})
+				}
+			}
+		}
+	}
+}
+
+// NotificationDeadLetters returns a bounded page of sanitized failed-delivery
+// evidence. It is unavailable when no notifier is configured.
+func (s *Server) NotificationDeadLetters(ctx context.Context, tenant string, afterID int64, limit int) ([]notifier.DeadLetterRecord, error) {
+	if s.notifierDLQ == nil {
+		return nil, errors.New("server: notifier unavailable")
+	}
+	return s.notifierDLQ.List(ctx, tenant, afterID, limit)
 }
 
 func (s *Server) clientSweepLoop(ctx context.Context) {

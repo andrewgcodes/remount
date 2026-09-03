@@ -107,7 +107,31 @@ func (s *exportCursorStore) CompareAndSwap(ctx context.Context, name string, pre
 				return proto.Err(proto.CodeResourceExhausted, "tenant export cursor limit %d reached", c.opts.MaxExportCursorsPerTenant)
 			}
 		}
+		// The cursor audit event is staged after this callback and the log's
+		// serialization mutex prevents another append from interleaving. Count
+		// already-durable and already-staged rows so the cursor atomically moves
+		// past its own audit record instead of exporting it forever.
+		var assigned, pending int64
+		if err := tx.QueryRow(`SELECT
+			COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'), 0),
+			(SELECT COUNT(*) FROM event_outbox)`).Scan(&assigned, &pending); err != nil {
+			return err
+		}
+		if assigned < 0 || pending < 0 || pending > math.MaxInt64-2 || assigned > math.MaxInt64-pending-2 {
+			return errors.New("control: event sequence exhausted")
+		}
+		auditSequence := uint64(assigned + pending + 1)
+		// Only cover the audit record when it is exactly the next sequence.
+		// If another producer appended after the exporter took its snapshot,
+		// those intervening rows have not been delivered and must remain ahead
+		// of the cursor.
+		if auditSequence == next {
+			next++
+		}
 		advanced = eventlog.Cursor{Name: name, Next: next, Revision: current.Revision + 1, UpdatedAt: c.now().UnixMilli()}
+		event.Payload = proto.MustMarshal(map[string]any{
+			"name": name, "from": previous.Next, "to": advanced.Next, "revision": advanced.Revision,
+		})
 		_, err = tx.Exec(`INSERT INTO export_cursors(tenant,name,next,revision,updated_at) VALUES(?,?,?,?,?)
 ON CONFLICT(tenant,name) DO UPDATE SET next=excluded.next,revision=excluded.revision,updated_at=excluded.updated_at`,
 			s.tenant, name, advanced.Next, advanced.Revision, advanced.UpdatedAt)

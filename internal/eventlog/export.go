@@ -194,6 +194,12 @@ func RunExport(ctx context.Context, source Exporter, sink BatchSink, cursors Cur
 				return delivered, errors.New("eventlog: event sequence exhausted")
 			}
 			from = delivered + 1
+			// A durable cursor store may advance through bookkeeping records it
+			// atomically created while accepting this batch. Honor that stronger
+			// fence during a followed run so those records cannot self-feed.
+			if cursors != nil && cursor.Next > from {
+				from = cursor.Next
+			}
 		}
 		timer := time.NewTimer(opts.PollInterval)
 		select {

@@ -484,6 +484,7 @@ func cmdServer(ctx context.Context, args []string) error {
 	insecure := fs.Bool("insecure", false, "allow an empty token")
 	bindings := fs.String("bindings", "", "bindings JSON file")
 	provisioners := fs.String("provisioners", "", "provider driver JSON file (credentials are env references)")
+	notifications := fs.String("notifications", "", "webhook and outbound notification JSON file (credentials are env references)")
 	lease := fs.Int64("lease", 30, "claim lease seconds")
 	artifactBytes := fs.Int64("artifact-object-bytes", 8<<30, "maximum compressed bytes per artifact")
 	artifactStoreBytes := fs.Int64("artifact-store-bytes", 64<<30, "maximum retained and staging artifact bytes")
@@ -537,6 +538,10 @@ func cmdServer(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	notificationConfig, err := loadNotifications(*notifications)
+	if err != nil {
+		return err
+	}
 	var secretResolver secretsource.Resolver
 	for _, binding := range b {
 		if binding.Source == "" {
@@ -549,7 +554,7 @@ func cmdServer(ctx context.Context, args []string) error {
 		secretResolver = resolver
 		break
 	}
-	srv, err := server.New(server.Options{
+	serverOptions := server.Options{
 		DataDir: *data, Token: *token, Bindings: b, SecretResolver: secretResolver, LeaseSec: *lease, Logger: slog.Default(), Mode: *mode,
 		ProvisionDrivers: drivers, PoolBootstrap: poolBootstrap,
 		MaxArtifactBytes: *artifactBytes, MaxArtifactStoreBytes: *artifactStoreBytes, MaxArtifactObjects: *artifactObjects,
@@ -561,7 +566,9 @@ func cmdServer(ctx context.Context, args []string) error {
 		MaxConcurrentRequests: *maxConcurrentRequests,
 		PublicURL:             *publicURL, AgentURLBase: *agentUI, CORSOrigins: splitList(*cors), MaxAPIClients: *maxAPIClients,
 		WebhookSecret: *webhookSecret, WebhookToken: *webhookToken,
-	})
+	}
+	notificationConfig.apply(&serverOptions)
+	srv, err := server.New(serverOptions)
 	if err != nil {
 		return err
 	}

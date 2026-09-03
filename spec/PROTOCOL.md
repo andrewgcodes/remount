@@ -346,7 +346,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `ws.list` | C | → `WSListRes{workspaces}` |
 | `ws.destroy` | C | `WSGetReq{id, idem}` → `{}` |
 | `ws.move` | C | `WSMoveReq{id, requires?, placement?, idem}` → `Workspace` |
-| `ws.sleep` | C | `WSSleepReq{id, after_sec\|at\|on, idem}` → `Timer` |
+| `ws.sleep` | C | `WSSleepReq{id, after_sec\|at\|on, match?, idem}` → `Timer`; `match` is a bounded exact payload-field predicate used only with `on` |
 | `ws.wake` | C | `WSGetReq{id, idem}` → `Workspace` |
 | `ws.acl` | C | `WSACLReq{id, acl{readers, writers}, idem}` → `Workspace`; owner or admin only; replaces the ACL and advances `authz_revision` (§4.1) |
 | `base.create` | C | `BaseCreateReq{name, artifact, workspace?, idem}` → `Base`; pins an uploaded artifact under a tenant-unique name (§10.1) |
@@ -1030,8 +1030,9 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `agent.destroyed`, `agent.child.finished`, `approval.pending`,
 `approval.decided`, `approval.expired`, `egress.pending`, `egress.allowed`,
 `egress.denied`, `policy.updated`, `budget.created`, `budget.removed`,
-`budget.reserved`, `budget.settled`, `budget.expired`, `budget.unmetered`
-and `export.cursor.advanced`.
+`budget.reserved`, `budget.settled`, `budget.expired`, `budget.unmetered`,
+`notifier.unavailable`, `notifier.dead_lettered`,
+`notifier.dead_letters_pruned` and `export.cursor.advanced`.
 
 Agent events are on the workspace stream and every one carries `agent`.
 `agent.created` carries `ws`, `owns_ws`, `recipe`, `mode`, `task_hash`,
@@ -1098,10 +1099,20 @@ payload's `status` is the upstream response status when headers arrived, or
 not. `error` is a class, never the transport's error text.
 
 `POST /v1/events` appends an event out of band. This is how a webhook wakes a
-sleeping workspace. The body is `{type, stream?, payload?, agent?}`; unknown
-fields are `400`. The caller authenticates with a bearer the control plane
-knows, or with an HMAC-SHA256 of the raw body under the configured webhook
-secret in `X-Remount-Signature` or `X-Hub-Signature-256` (`sha256=<hex>`).
+sleeping workspace. The Remount body is `{type, stream?, payload?, agent?}`;
+unknown fields are `400`. The caller authenticates with a bearer the control
+plane knows, or with an HMAC-SHA256 of the raw body under the configured
+webhook secret in `X-Remount-Signature` or `X-Hub-Signature-256`
+(`sha256=<hex>`).
+
+Provider-native requests are selected by their signature headers, or by
+`X-Remount-Provider` for the generic adapter. GitHub verifies
+`X-Hub-Signature-256` over the raw body; Slack verifies `v0:` plus the request
+timestamp and raw body and rejects timestamps outside its replay window;
+Linear verifies the hexadecimal `Linear-Signature`; generic verifies its own
+bearer. Selection fails closed. Valid requests produce canonical types under
+`webhook.github.*`, `webhook.slack.*`, `webhook.linear.*`, or
+`webhook.generic.*`; authentication material never enters the event payload.
 `agent` maps the event onto an Agent: `{wake, message}` sends `message` to an
 existing agent as a follow-up (waking it), where `wake` is an id or
 `name:<template>` naming exactly one live agent (none is `not_found`, several
@@ -1113,6 +1124,26 @@ signed request acts as the configured webhook credential; without one it may
 only append. The response is `202 {accepted, agent?, ws?, status?}` and the
 event lands on the agent's workspace stream when `stream` is empty. Redelivery
 with the same rendered `idempotency_key` returns the same agent or message.
+
+An event-driven `Timer` may carry `match: {field: value}`. Every entry must
+equal the decoded payload value before the timer fires. Dotted paths select
+nested object fields; `repo` aliases `repository.full_name`, and `label`
+matches one name in the GitHub issue or pull-request label list. Predicates are
+bounded at admission, retained with the timer, tenant checked, and evaluated
+only after the event append commits. A missing or malformed payload never
+matches.
+
+Outbound notification subscriptions are operator configuration, not protocol
+requests. A tenant worker consumes committed event sequences through one
+durable cursor and bounded batches. The only filters are `egress.pending`,
+`run.finished`, `ws.fenced`, and `pool.*`; the only destinations are Slack
+incoming webhooks and an allow-listed generic HTTPS endpoint. Acceptance is
+at least once. The cursor advances only after every matching destination has
+accepted the batch, or after sanitized dead-letter metadata and the matching
+`notifier.dead_lettered` event both commit. Failure to deliver or durably
+record fallback retains the cursor and emits `notifier.unavailable`. Generic
+payloads contain versioned canonical metadata and sequence numbers but no raw
+event payload; receivers deduplicate by subscription and sequence.
 
 Event history is finite. The reference control plane retains it by configured
 age and row budgets and records the oldest retained sequence as a durable

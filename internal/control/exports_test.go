@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"remount.dev/remount/internal/eventlog"
 	"remount.dev/remount/internal/proto"
@@ -83,4 +84,125 @@ func TestExportCursorCASFencesConcurrentExportersAndCapacity(t *testing.T) {
 			t.Fatalf("capacity error = %v", err)
 		}
 	}
+}
+
+func TestFollowedExportCursorSettlesPastOwnAuditEvent(t *testing.T) {
+	f := newControlFixture(t, "", nil)
+	if err := f.log.Append(context.Background(), &proto.Event{Type: "source", Tenant: "tenant-a"}); err != nil {
+		t.Fatal(err)
+	}
+	cursors, err := f.c.ExportCursors("tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sink := &countingExportSink{}
+	done := make(chan error, 1)
+	go func() {
+		_, err := eventlog.RunExport(ctx, f.log, sink, cursors, eventlog.RunOptions{
+			Name: "follow-no-spin", From: 1, Follow: true, PollInterval: time.Millisecond,
+		})
+		done <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		cursor, loadErr := cursors.Load(context.Background(), "follow-no-spin")
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		if cursor.Next >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cursor did not advance")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Several follow polls must observe a quiescent source: the audit event
+	// was atomically covered by the cursor rather than becoming new work.
+	time.Sleep(20 * time.Millisecond)
+	if sink.events.Load() != 1 {
+		t.Fatalf("delivered %d source events, want one", sink.events.Load())
+	}
+	last, err := f.log.Last(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := cursors.Load(context.Background(), "follow-no-spin")
+	if err != nil || cursor.Next != last+1 {
+		t.Fatalf("cursor=%+v last=%d err=%v", cursor, last, err)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunExport = %v", err)
+	}
+}
+
+func TestExportCursorDoesNotSkipAppendBetweenDeliveryAndCommit(t *testing.T) {
+	f := newControlFixture(t, "", nil)
+	if err := f.log.Append(context.Background(), &proto.Event{Type: "first", Tenant: "tenant-a"}); err != nil {
+		t.Fatal(err)
+	}
+	inner, err := f.c.ExportCursors("tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursors := &appendBeforeCursorCAS{inner: inner, log: f.log}
+	firstSink := &recordingControlExportSink{}
+	if _, err := eventlog.RunExport(context.Background(), f.log, firstSink, cursors, eventlog.RunOptions{
+		Name: "interleaved", From: 1, To: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := inner.Load(context.Background(), "interleaved")
+	if err != nil || cursor.Next != 2 {
+		t.Fatalf("cursor skipped interleaved seq: %+v, %v", cursor, err)
+	}
+	secondSink := &recordingControlExportSink{}
+	if _, err := eventlog.RunExport(context.Background(), f.log, secondSink, inner, eventlog.RunOptions{
+		Name: "interleaved", From: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(secondSink.types) < 1 || secondSink.types[0] != "interleaved" {
+		t.Fatalf("interleaved event was not replayed: %v", secondSink.types)
+	}
+}
+
+type appendBeforeCursorCAS struct {
+	inner eventlog.CursorStore
+	log   *eventlog.Log
+	once  sync.Once
+}
+
+func (s *appendBeforeCursorCAS) Load(ctx context.Context, name string) (eventlog.Cursor, error) {
+	return s.inner.Load(ctx, name)
+}
+
+func (s *appendBeforeCursorCAS) CompareAndSwap(ctx context.Context, name string, previous eventlog.Cursor, next uint64) (eventlog.Cursor, error) {
+	var appendErr error
+	s.once.Do(func() {
+		appendErr = s.log.Append(ctx, &proto.Event{Type: "interleaved", Tenant: "tenant-a"})
+	})
+	if appendErr != nil {
+		return previous, appendErr
+	}
+	return s.inner.CompareAndSwap(ctx, name, previous, next)
+}
+
+type recordingControlExportSink struct{ types []string }
+
+func (s *recordingControlExportSink) Send(_ context.Context, events []proto.Event) error {
+	for _, event := range events {
+		s.types = append(s.types, event.Type)
+	}
+	return nil
+}
+
+type countingExportSink struct{ events atomic.Int64 }
+
+func (s *countingExportSink) Send(_ context.Context, events []proto.Event) error {
+	s.events.Add(int64(len(events)))
+	return nil
 }

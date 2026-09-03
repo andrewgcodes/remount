@@ -2955,6 +2955,9 @@ func (c *Control) wsSleep(ctx context.Context, principal string, req *proto.WSSl
 	if req.AfterSec == 0 && req.AtMillis == 0 && req.OnEvent == "" {
 		return nil, proto.Err(proto.CodeBadRequest, "sleep needs after_sec, at or on")
 	}
+	if err := validateTimerMatch(req.OnEvent, req.Match); err != nil {
+		return nil, err
+	}
 	releaseTimerReservation, err := c.reserveTimer(req.ID)
 	if err != nil {
 		return nil, err
@@ -2964,7 +2967,7 @@ func (c *Control) wsSleep(ctx context.Context, principal string, req *proto.WSSl
 	if err != nil {
 		return nil, err
 	}
-	t := &proto.Timer{ID: ids.New("t"), WS: req.ID, Action: "resume", CreatedAt: c.now().UnixMilli(), OnEvent: req.OnEvent}
+	t := &proto.Timer{ID: ids.New("t"), WS: req.ID, Action: "resume", CreatedAt: c.now().UnixMilli(), OnEvent: req.OnEvent, Match: cloneMap(req.Match)}
 	if req.AfterSec > 0 {
 		t.At = c.now().Add(time.Duration(req.AfterSec) * time.Second).UnixMilli()
 	} else if req.AtMillis > 0 {
@@ -3002,6 +3005,7 @@ func (c *Control) wsSleep(ctx context.Context, principal string, req *proto.WSSl
 	next.Node = ""
 	next.LeaseUntil = 0
 	tcp := *t
+	tcp.Match = cloneMap(t.Match)
 	if err := c.persistWorkspaceTimerAndMutation(&next, t, scope, req.IdempotencyKey, proto.OpWSSleep, req, t,
 		c.wsEvent(&next, proto.EvTimerSet, principal, "", tcp),
 		c.wsEvent(&next, proto.EvWSPaused, principal, "", map[string]any{"timer": tcp.ID, "snapshot": snap})); err != nil {
@@ -4556,7 +4560,7 @@ func (c *Control) eventsPost(ctx context.Context, from string, req *proto.EventP
 			}
 			c.mu.Unlock()
 		}
-		c.fireEventTimers(ctx, e.Type, e.Tenant, e.Stream)
+		c.fireEventTimers(ctx, e)
 	}
 	return nil
 }
@@ -4643,18 +4647,18 @@ func (c *Control) PostEvents(ctx context.Context, principal string, events []pro
 		if err := c.log.Append(ctx, &e); err != nil {
 			return err
 		}
-		c.fireEventTimers(ctx, e.Type, e.Tenant, e.Stream)
+		c.fireEventTimers(ctx, e)
 	}
 	return nil
 }
 
-func (c *Control) fireEventTimers(ctx context.Context, typ, tenant, stream string) {
+func (c *Control) fireEventTimers(ctx context.Context, event proto.Event) {
 	c.mu.Lock()
 	var fire []*proto.Timer
 	for _, t := range c.timers {
-		if !t.Fired && t.OnEvent != "" && t.OnEvent == typ {
+		if !t.Fired && timerMatchesEvent(t, event) {
 			ws := c.workspaces[t.WS]
-			if ws != nil && ws.Tenant == tenant && (stream == "" || stream == ws.ID) {
+			if ws != nil && ws.Tenant == event.Tenant && (event.Stream == "" || event.Stream == ws.ID) {
 				fire = append(fire, t)
 			}
 		}
@@ -4804,7 +4808,9 @@ func (c *Control) timerListAuthorized(ctx context.Context, from string) (*proto.
 	resources := make(map[string]Resource)
 	for _, timer := range c.timers {
 		if ws := c.workspaces[timer.WS]; ws != nil {
-			timers = append(timers, *timer)
+			copyTimer := *timer
+			copyTimer.Match = cloneMap(timer.Match)
+			timers = append(timers, copyTimer)
 			resources[timer.WS] = workspaceResource(ws)
 		}
 	}
