@@ -2,8 +2,11 @@ package sim
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -64,17 +67,15 @@ func TestRunOpenCodeDockerIntegration(t *testing.T) {
 		Sandbox:  launch.SandboxWorkspaceWrite,
 		Model:    "openai/gpt-4o-mini",
 		Timeout:  6 * time.Minute,
-		Stderr:   os.Stderr,
+		Stderr:   io.Discard,
 	})
+	if res != nil && res.Workspace != nil {
+		registerDockerWorkspaceCleanup(t, c, d, res.Workspace.ID)
+	}
 	if err != nil {
-		t.Fatal(err)
+		fatalWithoutToken(t, err, key)
 	}
 	ws := res.Workspace
-	defer func() {
-		dctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cancel()
-		_ = c.DestroyWorkspace(dctx, ws.ID)
-	}()
 	var out []byte
 	for ch := range res.Session.Chunks() {
 		if ch.Stream == proto.StreamStdout || ch.Stream == proto.StreamStderr {
@@ -82,13 +83,13 @@ func TestRunOpenCodeDockerIntegration(t *testing.T) {
 		}
 	}
 	if err := res.Session.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if exit := res.Session.Exit(); exit == nil || exit.Code != 0 {
-		t.Fatalf("opencode exit = %+v\n%s\n%s", exit, out, egressLog(t, c, ws.ID, key))
+		fatalWithoutToken(t, err, key)
 	}
 	if strings.Contains(string(out), key) {
 		t.Fatal("session output carries the provider secret")
+	}
+	if exit := res.Session.Exit(); exit == nil || exit.Code != 0 {
+		t.Fatalf("opencode exit = %+v\n%s\n%s", exit, out, egressLog(t, c, ws.ID, key))
 	}
 	greeting, err := c.ReadFile(ctx, ws.ID, "GREETING.txt")
 	if err != nil {
@@ -101,7 +102,10 @@ func TestRunOpenCodeDockerIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(cfg), key) || !strings.Contains(string(cfg), `"apiKey": "ref:b_openai"`) {
+	if strings.Contains(string(cfg), key) {
+		t.Fatal("opencode.json carries the provider secret")
+	}
+	if !strings.Contains(string(cfg), `"apiKey": "ref:b_openai"`) {
 		t.Fatalf("opencode.json:\n%s", cfg)
 	}
 	if _, err := c.ReadFile(ctx, ws.ID, "opencode.json"); err == nil {
@@ -118,15 +122,18 @@ func TestRunOpenCodeDockerIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := scanForToken(t, info.Root, key); len(hits) != 0 {
-		t.Fatalf("provider key on workspace disk: %v", hits)
-	}
-	if err := c.WriteFile(ctx, ws.ID, "canary.txt", []byte("x "+key+" y\n"), 0o644); err != nil {
+	assertTokenAbsent(t, info.Root, key)
+	// Scanner self-validation must never write the provider credential merely
+	// to prove the scan works. This synthetic value is unique to the temporary
+	// workspace and has no authority outside the test.
+	scanCanary := "remount-nonsecret-scan-canary-" + ws.ID
+	if err := c.WriteFile(ctx, ws.ID, "canary.txt", []byte("x "+scanCanary+" y\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if hits := scanForToken(t, info.Root, key); len(hits) != 1 || filepath.Base(hits[0]) != "canary.txt" {
+	if hits := scanForToken(t, info.Root, scanCanary); len(hits) != 1 || filepath.Base(hits[0]) != "canary.txt" {
 		t.Fatalf("scan did not find the planted canary: %v", hits)
 	}
+	assertTokenAbsent(t, info.Root, key)
 
 	time.Sleep(300 * time.Millisecond)
 	evs, err := c.ReadEvents(ctx, 1, ws.ID)
@@ -157,6 +164,71 @@ func TestRunOpenCodeDockerIntegration(t *testing.T) {
 	}
 	if started != 1 || finished != 1 || used == 0 || denied != 0 {
 		t.Fatalf("events: run.started=%d run.finished=%d cred.used(openai)=%d egress.denied(openai)=%d\n%s", started, finished, used, denied, egressLog(t, c, ws.ID, key))
+	}
+}
+
+func fatalWithoutToken(t *testing.T, err error, token string) {
+	t.Helper()
+	if strings.Contains(err.Error(), token) {
+		t.Fatal("error carries the provider secret")
+	}
+	t.Fatal(err)
+}
+
+func assertTokenAbsent(t *testing.T, root, token string) {
+	t.Helper()
+	if hits := scanForToken(t, root, token); len(hits) != 0 {
+		t.Fatalf("provider key on workspace disk: %v", hits)
+	}
+}
+
+// registerDockerWorkspaceCleanup keeps cleanup observable while retaining a
+// direct backend fallback for a failed control-plane teardown. The final
+// inventory and filesystem checks make a leaked local sandbox fail the lane.
+func registerDockerWorkspaceCleanup(t *testing.T, c *client.Client, d *workspace.Docker, wsID string) {
+	t.Helper()
+	root := filepath.Join(d.Dir, wsID)
+	container := "remount-" + strings.ReplaceAll(wsID, "_", "-")
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := c.DestroyWorkspace(cleanupCtx, wsID); err != nil {
+			t.Errorf("destroy docker workspace: %v", err)
+			if handle, adoptErr := d.Adopt(cleanupCtx, wsID); adoptErr == nil {
+				if destroyErr := handle.Destroy(cleanupCtx); destroyErr != nil {
+					t.Errorf("fallback destroy docker workspace: %v", destroyErr)
+				}
+			}
+		}
+
+		out, err := exec.CommandContext(cleanupCtx, d.Binary, "ps", "-aq", "--filter", "label=remount.workspace="+wsID).CombinedOutput()
+		if err != nil {
+			t.Errorf("verify docker workspace cleanup: %v", err)
+			emergencyRemoveDockerContainer(t, d.Binary, container)
+		} else if strings.TrimSpace(string(out)) != "" {
+			t.Errorf("docker workspace container still present after destroy")
+			emergencyRemoveDockerContainer(t, d.Binary, container)
+		}
+		if _, err := os.Stat(root); err == nil {
+			t.Errorf("docker workspace root still present after destroy")
+			if removeErr := os.RemoveAll(root); removeErr != nil {
+				t.Errorf("emergency remove docker workspace root: %v", removeErr)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("verify docker workspace root cleanup: %v", err)
+		}
+		if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("docker workspace root remains after cleanup: %v", err)
+		}
+	})
+}
+
+func emergencyRemoveDockerContainer(t *testing.T, binary, container string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, binary, "rm", "-f", container).CombinedOutput(); err != nil && !strings.Contains(string(out), "No such container") {
+		t.Errorf("emergency docker cleanup: %v (%s)", err, strings.TrimSpace(string(out)))
 	}
 }
 
