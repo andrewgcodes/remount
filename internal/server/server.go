@@ -28,6 +28,7 @@ import (
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/relay"
+	"remount.dev/remount/internal/secretsource"
 	"remount.dev/remount/internal/transport"
 )
 
@@ -36,7 +37,10 @@ type Options struct {
 	DataDir  string // sqlite db + artifacts; "" = in-memory (tests / --standalone)
 	Token    string
 	Bindings []control.Binding
-	LeaseSec int64
+	// SecretResolver resolves Binding.Source only at lease time. Production
+	// modes require sources for every binding and refuse literal values.
+	SecretResolver secretsource.Resolver
+	LeaseSec       int64
 	// MaxArtifactBytes bounds one uploaded compressed artifact. Default 8 GiB.
 	MaxArtifactBytes int64
 	// MaxArtifactStoreBytes and MaxArtifactObjects bound retained artifacts and
@@ -228,7 +232,7 @@ func New(opts Options) (*Server, error) {
 	}
 	log := eventlog.New(sq)
 	ctrl, err := control.New(control.Options{DB: sq.DB(), Log: log, Token: opts.Token,
-		Bindings: opts.Bindings, LeaseSec: opts.LeaseSec, Logger: opts.Logger, Artifacts: store,
+		Bindings: opts.Bindings, SecretResolver: opts.SecretResolver, LeaseSec: opts.LeaseSec, Logger: opts.Logger, Artifacts: store,
 		Authenticator: opts.Authenticator, Authorizer: opts.Authorizer, ApprovedNodes: opts.ApprovedNodes,
 		SecurityProfileFloor: floor, MaxWorkspacesPerTenant: opts.MaxWorkspacesPerTenant,
 		MaxWorkspacesPerSubject: opts.MaxWorkspacesPerSubject, MaxMutationRecords: opts.MaxMutationRecords,
@@ -435,6 +439,11 @@ func validateSecurityMode(opts Options) (string, error) {
 	case ModeStandalone:
 		return proto.SecurityLocal, nil
 	case ModeProductionSingleTenant, ModeProductionMultiTenant:
+		for _, binding := range opts.Bindings {
+			if binding.Secret != "" || secretsource.ValidateSource(binding.Source) != nil || opts.SecretResolver == nil {
+				return "", fmt.Errorf("server: %s binding %q requires a valid external secret source and resolver", opts.Mode, binding.ID)
+			}
+		}
 		if opts.Token == "" || opts.Authenticator == nil || opts.Authorizer == nil || len(opts.ApprovedNodes) == 0 {
 			return "", fmt.Errorf("server: %s requires a node token, authenticator, authorizer, and approved nodes", opts.Mode)
 		}

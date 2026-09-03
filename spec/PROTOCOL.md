@@ -381,7 +381,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `ws.renew` | N | `WSRenewReq{ids, gen, authz}` → `WSRenewRes{results}`; each result explicitly says continue/fence/destroy/reconcile and, for a continued lease, carries `authz_revision`, `revoked`, `authz_reset` (§4.1) |
 | `ws.released` | N | `WSReleasedReq{id, gen, snapshot, reason, failed?}` → `{}`; `failed:true` means materialization could not complete and control holds the workspace out of placement with a growing delay (1s doubling to 30s, reset by the next `ws.ready`) instead of re-offering it at once |
 | `ws.snapshot.commit` | N | `WSSnapshotCommitReq{id, gen, snapshot}` → `{}` |
-| `binding.lease` | N | `BindingLeaseReq{ws}` → `BindingLeaseRes{leases}` |
+| `binding.lease` | N | `BindingLeaseReq{ws, gen}` → `BindingLeaseRes{leases}` |
 | `agent.report` | N | `AgentReport{agent, run, ws, gen, seq, kind, ...}` → `{}`; one observation about a run, fenced to the node, generation and run, deduplicated by `seq` (§6.1); `kind: transcript` carries `chunks[]` for the mirror (§6.2) |
 | `diag` | C | `DiagReq{verify}` → control diagnostics |
 
@@ -785,6 +785,7 @@ loopback that the workspace reaches two ways:
 A binding leased to a node looks like:
 
 ```
+BindingLeaseReq { ws, gen } // gen fences a source resolution that crosses a move
 BindingLease { id, secret, destinations: [host patterns],
                shape, principals, placeholder, expires_at }
 ```

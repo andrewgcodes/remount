@@ -1244,7 +1244,7 @@ func (n *Node) refreshLeases(ctx context.Context, w *ws) {
 	var res proto.BindingLeaseRes
 	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := p.Call(rctx, proto.PeerControl, proto.OpBindingLease, proto.BindingLeaseReq{WS: w.ID}, &res); err != nil {
+	if err := p.Call(rctx, proto.PeerControl, proto.OpBindingLease, proto.BindingLeaseReq{WS: w.ID, Gen: w.Generation}, &res); err != nil {
 		n.logger.Warn("lease refresh failed; broker will fail closed at expiry", "ws", w.ID, "err", err)
 		return
 	}
@@ -2811,7 +2811,7 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 			return retainOnError(proto.Err(proto.CodeUnreachable, "control connection lost before binding lease"))
 		}
 		lctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := p.Call(lctx, proto.PeerControl, proto.OpBindingLease, proto.BindingLeaseReq{WS: w.ID}, &res)
+		err := p.Call(lctx, proto.PeerControl, proto.OpBindingLease, proto.BindingLeaseReq{WS: w.ID, Gen: w.Generation}, &res)
 		cancel()
 		if err != nil {
 			return retainOnError(fmt.Errorf("binding lease: %w", err))

@@ -40,6 +40,7 @@ import (
 	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/localfs"
 	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/secretsource"
 	"remount.dev/remount/internal/server"
 	"remount.dev/remount/internal/transport"
 	"remount.dev/remount/internal/workspace"
@@ -517,8 +518,20 @@ func cmdServer(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	var secretResolver secretsource.Resolver
+	for _, binding := range b {
+		if binding.Source == "" {
+			continue
+		}
+		resolver, err := secretsource.New(secretsource.Config{})
+		if err != nil {
+			return err
+		}
+		secretResolver = resolver
+		break
+	}
 	srv, err := server.New(server.Options{
-		DataDir: *data, Token: *token, Bindings: b, LeaseSec: *lease, Logger: slog.Default(), Mode: *mode,
+		DataDir: *data, Token: *token, Bindings: b, SecretResolver: secretResolver, LeaseSec: *lease, Logger: slog.Default(), Mode: *mode,
 		MaxArtifactBytes: *artifactBytes, MaxArtifactStoreBytes: *artifactStoreBytes, MaxArtifactObjects: *artifactObjects,
 		ArtifactGCInterval: *artifactGCInterval, ArtifactGracePeriod: *artifactGrace,
 		EventRetention: *eventRetention, EventGCInterval: *eventGCInterval, MaxEvents: *maxEvents,
@@ -620,6 +633,18 @@ func cmdStandalone(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	var secretResolver secretsource.Resolver
+	for _, binding := range b {
+		if binding.Source == "" {
+			continue
+		}
+		resolver, err := secretsource.New(secretsource.Config{})
+		if err != nil {
+			return err
+		}
+		secretResolver = resolver
+		break
+	}
 	dataDir, err := absFlagPath("data", *data)
 	if err != nil {
 		return err
@@ -629,7 +654,7 @@ func cmdStandalone(ctx context.Context, args []string) error {
 		return fmt.Errorf("--data %s: %w", *data, err)
 	}
 	srv, err := server.New(server.Options{
-		DataDir: filepath.Join(*data, "server"), Bindings: b, Logger: slog.Default(), Mode: server.ModeStandalone,
+		DataDir: filepath.Join(*data, "server"), Bindings: b, SecretResolver: secretResolver, Logger: slog.Default(), Mode: server.ModeStandalone,
 		AgentURLBase: *agentUI, CORSOrigins: splitList(*cors),
 	})
 	if err != nil {

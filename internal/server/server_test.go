@@ -18,6 +18,7 @@ import (
 	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/secretsource"
 )
 
 type allowAuthorizer struct{}
@@ -304,5 +305,38 @@ func TestProductionModeRejectsCooperativeEgressBackend(t *testing.T) {
 	}
 	if profile, err := validateSecurityMode(base); err != nil || profile != proto.SecurityIsolated {
 		t.Fatalf("enforced production backend profile=%q err=%v", profile, err)
+	}
+}
+
+func TestProductionModeRejectsLiteralBindingSecrets(t *testing.T) {
+	resolver, err := secretsource.New(secretsource.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := Options{
+		Mode: ModeProductionSingleTenant, Token: "node-token",
+		Authenticator: control.StaticAuthenticator{"client-token": {ID: "user", Tenant: "tenant"}},
+		Authorizer:    allowAuthorizer{}, SecretResolver: resolver,
+		ApprovedNodes: map[string]control.NodeApproval{"n_one": {
+			PubKey: make([]byte, ed25519.PublicKeySize),
+			Info: proto.NodeInfo{BackendDescriptors: []proto.BackendDescriptor{{
+				Name: "sandbox", Security: proto.BackendSecurityCaps{
+					Isolation: "container", EgressMode: "enforced_gateway", BrokerIdentity: "token",
+				},
+			}}},
+		}},
+	}
+	base.Bindings = []control.Binding{{ID: "b_one", Secret: "must-not-persist", Destinations: []string{"api.example"}}}
+	if _, err := validateSecurityMode(base); err == nil {
+		t.Fatal("production mode accepted a literal binding secret")
+	}
+	base.Bindings[0].Secret = ""
+	base.Bindings[0].Source = "env://API_TOKEN"
+	if _, err := validateSecurityMode(base); err != nil {
+		t.Fatalf("production mode rejected external source: %v", err)
+	}
+	base.SecretResolver = nil
+	if _, err := validateSecurityMode(base); err == nil {
+		t.Fatal("production mode accepted an external source without a resolver")
 	}
 }
