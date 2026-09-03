@@ -304,6 +304,34 @@ func TestProductionModeRequiresIdentityAndRefusesSharedTokens(t *testing.T) {
 	}
 }
 
+func TestArtifactAuthorizationAcceptsConfiguredNodeOrClientCredential(t *testing.T) {
+	s := newTestServer(t, Options{
+		Token:         "node-token",
+		Authenticator: control.StaticAuthenticator{"client-token": {ID: "user", Tenant: "tenant"}},
+	})
+	id := testDigest("missing")
+	status := func(header string) int {
+		req := httptest.NewRequest(http.MethodHead, "/v1/artifacts/"+id, nil)
+		if header != "" {
+			req.Header.Set("Authorization", header)
+		}
+		recorder := httptest.NewRecorder()
+		s.Handler().ServeHTTP(recorder, req)
+		return recorder.Code
+	}
+	if got := status("Bearer node-token"); got != http.StatusNotFound {
+		t.Fatalf("configured node credential status = %d, want authenticated not-found", got)
+	}
+	if got := status("Bearer client-token"); got != http.StatusNotFound {
+		t.Fatalf("client principal credential status = %d, want authenticated not-found", got)
+	}
+	for _, header := range []string{"", "node-token", "Bearer wrong-token"} {
+		if got := status(header); got != http.StatusUnauthorized {
+			t.Fatalf("unauthorized header %q status = %d", header, got)
+		}
+	}
+}
+
 func TestProductionModeBuildsDurableIdentityByDefault(t *testing.T) {
 	s, err := New(Options{DataDir: t.TempDir(), Mode: ModeProductionMultiTenant})
 	if err != nil {

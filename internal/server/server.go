@@ -934,16 +934,21 @@ func (s *Server) handleLink(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) authed(r *http.Request) bool {
-	h := r.Header.Get("Authorization")
-	tok := strings.TrimPrefix(h, "Bearer ")
+	tok, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !bearer || tok == "" {
+		return s.opts.Token == "" && s.opts.Authenticator == nil
+	}
+	// Standalone deployments may layer tenant-aware client authentication on
+	// top of the shared node token. The node still needs that configured token
+	// for artifact transfer; production modes forbid configuring it at all.
+	if s.opts.Token != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(s.opts.Token)) == 1 {
+		return true
+	}
 	if s.opts.Authenticator != nil {
 		_, err := s.opts.Authenticator.Authenticate(r.Context(), control.Credential{Token: tok})
 		return err == nil
 	}
-	if s.opts.Token == "" {
-		return true
-	}
-	return subtle.ConstantTimeCompare([]byte(tok), []byte(s.opts.Token)) == 1
+	return false
 }
 
 func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
