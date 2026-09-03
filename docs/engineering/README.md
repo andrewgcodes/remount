@@ -10,9 +10,9 @@ statements that the described controls already exist.
 
 The current status document for the build plan: what Remount is, what the
 Phase 0 / 1 / 1A build delivered (with commits, ADRs and the honest state of
-every acceptance scenario), the reconnect fix in flight, and the full text of
-Phases 2–6 that remain, the verification lanes and secrets they need, and how
-to split the remaining work across parallel agents. Start here.
+every acceptance scenario), the reconnect fix merged in PR #6, and the
+remaining Phases 2–6, verification lanes and secret-name inventory, and safe
+parallel-work contracts. Start here.
 
 ### [Hardening lessons and review playbook](./hardening-lessons.md)
 
