@@ -7,6 +7,7 @@ package sim
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -741,6 +742,113 @@ func TestTypedWorkspaceEgressPolicyIsEnforcedAndAttributed(t *testing.T) {
 	}
 	if !deniedDecisions[broker.DecisionLimitExceeded] || !deniedDecisions[broker.DecisionDenied] {
 		t.Fatalf("limit/method denials were not classified as denied events: %#v", deniedDecisions)
+	}
+}
+
+func TestHostileWorkspacesUseIsolatedReadOnlyPackageConnector(t *testing.T) {
+	payload := []byte("immutable wheel from approved registry")
+	digestBytes := sha256.Sum256(payload)
+	digest := fmt.Sprintf("sha256:%x", digestBytes)
+	var hits atomic.Int32
+	var leakedIdentity atomic.Bool
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		for name := range r.Header {
+			lower := strings.ToLower(name)
+			if strings.Contains(lower, "remount") || strings.Contains(lower, "workspace") || strings.Contains(lower, "tenant") {
+				leakedIdentity.Store(true)
+			}
+		}
+		_, _ = w.Write(payload)
+	}))
+	defer upstream.Close()
+	upstreamHost := strings.TrimPrefix(upstream.URL, "https://")
+	roots := x509.NewCertPool()
+	roots.AddCert(upstream.Certificate())
+	w := newWorld(t)
+	w.nodeWithBrokerRoots("n1", nil, roots)
+	c := w.client("package-owner")
+	spec := func(name string) proto.WorkspaceSpec {
+		return proto.WorkspaceSpec{
+			Name: name,
+			Env: map[string]string{
+				"EXPECTED":    digest,
+				"PACKAGE_URL": "${REMOUNT_PACKAGE_CONNECTOR}/" + upstreamHost + "/artifact.whl",
+			},
+			Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+				ID: "approved-package-read", Connector: proto.EgressConnectorPackage,
+				Protocol: proto.EgressProtocolHTTPS, Hosts: []string{upstreamHost},
+				Methods: []string{http.MethodGet, http.MethodHead}, PathPrefixes: []string{"/artifact.whl"},
+				MaxRequests: 20, MaxResponseBytes: 1 << 20, SharedState: proto.SharedStateImmutableRead,
+			}}},
+			},
+		}
+	}
+	workspaceA := mustWS(t, c, spec("private-alpha"))
+	workspaceB := mustWS(t, c, spec("private-bravo"))
+	ctx := ctxT(t, 60*time.Second)
+	fetch := func(workspace string) string {
+		out, errOut, exit, err := c.Run(ctx, workspace, "sh", "-c",
+			`curl --fail --silent -H "X-Remount-Expected-Digest: $EXPECTED" "$PACKAGE_URL"`)
+		if err != nil || exit.Code != 0 {
+			t.Fatalf("package fetch workspace=%s err=%v exit=%+v stdout=%q stderr=%q", workspace, err, exit, out, errOut)
+		}
+		return string(out)
+	}
+	if got := fetch(workspaceA.ID); got != string(payload) {
+		t.Fatalf("workspace A body=%q", got)
+	}
+	if got := fetch(workspaceA.ID); got != string(payload) {
+		t.Fatalf("workspace A cached body=%q", got)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("workspace A did not reuse its own connector reference: hits=%d", hits.Load())
+	}
+	if got := fetch(workspaceB.ID); got != string(payload) {
+		t.Fatalf("workspace B body=%q", got)
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("workspace B observed A cache occupancy: hits=%d", hits.Load())
+	}
+	if leakedIdentity.Load() {
+		t.Fatal("managed connector leaked Remount identity headers upstream")
+	}
+
+	out, _, _, _ := c.Run(ctx, workspaceA.ID, "sh", "-c",
+		`curl --silent -o /dev/null -w "%{http_code}" -X PROPFIND "$PACKAGE_URL"`)
+	if string(out) != "403" || hits.Load() != 2 {
+		t.Fatalf("WebDAV method escaped connector: status=%q hits=%d", out, hits.Load())
+	}
+	out, _, _, _ = c.Run(ctx, workspaceA.ID, "sh", "-c",
+		`curl --silent -o /dev/null -w "%{http_code}" "$REMOUNT_BROKER/d/`+upstreamHost+`/artifact.whl"`)
+	if string(out) != "403" || hits.Load() != 2 {
+		t.Fatalf("package rule granted generic egress: status=%q hits=%d", out, hits.Load())
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	events, err := c.ReadEvents(ctx, 1, workspaceA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var provenance, methodDenied bool
+	for _, event := range events {
+		if event.Workspace != workspaceA.ID || (event.Type != proto.EvEgressAllowed && event.Type != proto.EvEgressDenied) {
+			continue
+		}
+		var body map[string]any
+		if err := proto.Unmarshal(event.Payload, &body); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type == proto.EvEgressAllowed && body["connector"] == proto.EgressConnectorPackage &&
+			body["digest"] == digest && body["rule"] == "approved-package-read" && event.Generation == workspaceA.Generation {
+			provenance = true
+		}
+		if event.Type == proto.EvEgressDenied && body["connector"] == proto.EgressConnectorPackage && body["method"] == "PROPFIND" {
+			methodDenied = true
+		}
+	}
+	if !provenance || !methodDenied {
+		t.Fatalf("package audit incomplete: provenance=%v method_denied=%v events=%#v", provenance, methodDenied, events)
 	}
 }
 

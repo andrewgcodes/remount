@@ -2,6 +2,7 @@ package broker
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"remount.dev/remount/internal/connector"
 	"remount.dev/remount/internal/proto"
 )
 
@@ -121,6 +123,146 @@ func get(t *testing.T, rawURL string, hdr map[string]string) (*http.Response, st
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	return resp, string(body)
+}
+
+func TestManagedPackageConnectorIsReadOnlyScopedAndAudited(t *testing.T) {
+	payload := []byte("signed immutable wheel bytes")
+	digestBytes := sha256.Sum256(payload)
+	digest := fmt.Sprintf("sha256:%x", digestBytes)
+	var upstreamCalls atomic.Int64
+	var leakedDigestHeader atomic.Bool
+	upstreamServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		if r.Header.Get(connector.ExpectedDigestHeader) != "" {
+			leakedDigestHeader.Store(true)
+		}
+		if r.URL.Path == "/redirect" {
+			w.Header().Set("Location", "/artifact.whl")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Set-Cookie", "registry-secret=must-not-cross")
+		_, _ = w.Write(payload)
+	}))
+	defer upstreamServer.Close()
+	upstreamURL, _ := url.Parse(upstreamServer.URL)
+	pool := x509.NewCertPool()
+	pool.AddCert(upstreamServer.Certificate())
+	store, err := connector.NewStore(t.TempDir(), connector.StoreOptions{
+		MaxBytes: 1 << 20, MaxBytesPerScope: 512 << 10, MaxObjectBytes: 256 << 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := proto.EgressRule{
+		ID: "approved-packages", Connector: proto.EgressConnectorPackage,
+		Protocol: proto.EgressProtocolHTTPS, Hosts: []string{upstreamURL.Host},
+		Methods: []string{http.MethodGet, http.MethodHead}, PathPrefixes: []string{"/"},
+		MaxRequests: 20, MaxResponseBytes: 256 << 10, SharedState: proto.SharedStateImmutableRead,
+	}
+	startPackage := func(workspace string, rec *recorder) *Broker {
+		b := New(Options{
+			WS: workspace, Generation: 9, Tenant: "tenant-a", Principal: "subject-a",
+			Network:      proto.NetworkPolicy{Default: proto.NetworkDefaultDeny, Rules: []proto.EgressRule{rule}},
+			AllowPrivate: []string{"127.0.0.1"}, RootCAs: pool, Audit: rec.add, ConnectorStore: store,
+		})
+		if _, err := b.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = b.Close() })
+		return b
+	}
+	recorderA := &recorder{}
+	brokerA := startPackage("ws_alpha", recorderA)
+	packageURL := brokerA.PackageURL() + "/" + upstreamURL.Host + "/artifact.whl"
+
+	for attempt := 0; attempt < 2; attempt++ {
+		response, body := get(t, packageURL, map[string]string{connector.ExpectedDigestHeader: digest})
+		if response.StatusCode != http.StatusOK || body != string(payload) {
+			t.Fatalf("attempt=%d status=%d body=%q", attempt, response.StatusCode, body)
+		}
+		if response.Header.Get(connector.ContentDigestHeader) != digest || response.Header.Get("Set-Cookie") != "" {
+			t.Fatalf("unsafe or missing connector headers: %v", response.Header)
+		}
+		for name, values := range response.Header {
+			if strings.Contains(strings.ToLower(name+strings.Join(values, ",")), "cache") {
+				t.Fatalf("cache state exposed to workspace: %s=%v", name, values)
+			}
+		}
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("workspace did not reuse its own immutable reference: calls=%d", got)
+	}
+	if leakedDigestHeader.Load() {
+		t.Fatal("connector-private expected digest leaked to registry")
+	}
+	allowed, ok := recorderA.lastDecision(DecisionAllowed)
+	if !ok || allowed.WS != "ws_alpha" || allowed.Generation != 9 || allowed.Rule != rule.ID ||
+		allowed.Connector != proto.EgressConnectorPackage || allowed.Digest != digest {
+		t.Fatalf("incomplete provenance audit: %+v", allowed)
+	}
+
+	// The package capability does not grant the same host to the generic proxy.
+	response, _ := get(t, DestURL(brokerA.BaseURL(), upstreamURL.Host)+"/artifact.whl", nil)
+	if response.StatusCode != http.StatusForbidden || upstreamCalls.Load() != 1 {
+		t.Fatalf("connector rule escaped to generic proxy: status=%d calls=%d", response.StatusCode, upstreamCalls.Load())
+	}
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, "PROPFIND", "MKCOL", "LOCK"} {
+		req, err := http.NewRequest(method, packageURL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusForbidden {
+			t.Fatalf("method %s status=%d", method, response.StatusCode)
+		}
+		denied := recorderA.last()
+		if denied.Decision != DecisionDenied || denied.Connector != proto.EgressConnectorPackage {
+			t.Fatalf("method %s audit=%+v", method, denied)
+		}
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("denied package methods reached registry: calls=%d", upstreamCalls.Load())
+	}
+
+	// B cannot turn A's blob occupancy into a cache hit. It establishes its own
+	// opaque reference with one independent registry request.
+	recorderB := &recorder{}
+	brokerB := startPackage("ws_bravo", recorderB)
+	response, body := get(t, brokerB.PackageURL()+"/"+upstreamURL.Host+"/artifact.whl", map[string]string{connector.ExpectedDigestHeader: digest})
+	if response.StatusCode != http.StatusOK || body != string(payload) || upstreamCalls.Load() != 2 {
+		t.Fatalf("workspace B observed A cache: status=%d body=%q calls=%d", response.StatusCode, body, upstreamCalls.Load())
+	}
+
+	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	response, err = noFollow.Get(brokerA.PackageURL() + "/" + upstreamURL.Host + "/redirect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	location := response.Header.Get("Location")
+	if response.StatusCode != http.StatusFound || !strings.HasPrefix(location, brokerA.PackageURL()+"/"+upstreamURL.Host+"/") {
+		t.Fatalf("redirect escaped connector: status=%d location=%q", response.StatusCode, location)
+	}
+}
+
+func TestPackageRuleFailsClosedWithoutConnectorStore(t *testing.T) {
+	b := New(Options{WS: "ws", Generation: 1, Tenant: "tenant", Network: proto.NetworkPolicy{
+		Rules: []proto.EgressRule{{
+			ID: "packages", Connector: proto.EgressConnectorPackage, Protocol: proto.EgressProtocolHTTPS,
+			Hosts: []string{"registry.example"}, SharedState: proto.SharedStateImmutableRead,
+		}},
+	}})
+	if _, err := b.Start(); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("package broker started without connector store: %v", err)
+	}
 }
 
 func TestSubstitutesBearerForBoundHost(t *testing.T) {

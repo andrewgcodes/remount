@@ -2300,6 +2300,11 @@ func (c *Control) eligibleBackendLocked(ws *proto.Workspace, n *nodeState) (stri
 			return "", false
 		}
 	}
+	for _, rule := range ws.Spec.Security.Network.Rules {
+		if rule.Connector != "" && !contains(n.Status.Info.Connectors, rule.Connector) {
+			return "", false
+		}
+	}
 	p := ws.Spec.Placement
 	if p.Node != "" && p.Node != n.Status.ID {
 		return "", false

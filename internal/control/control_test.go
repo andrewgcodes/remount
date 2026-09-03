@@ -336,6 +336,31 @@ func TestBackendSecurityIsPerBackendAndUnknownMemoryFailsClosed(t *testing.T) {
 	}
 }
 
+func TestPackageWorkspaceRequiresAdvertisedConnector(t *testing.T) {
+	f := newControlFixture(t, "", nil)
+	legacy := processNodeInfo(1024)
+	connectNode(t, f.c, "n_legacy", legacy)
+	workspace := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{
+		Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+			ID: "packages", Connector: proto.EgressConnectorPackage,
+			Protocol: proto.EgressProtocolHTTPS, Hosts: []string{"registry.example"},
+		}}}},
+	})
+	if _, err := f.c.wsClaim(context.Background(), "n_legacy", workspace.ID); err == nil {
+		t.Fatal("legacy node reinterpreted a connector rule as generic HTTPS authority")
+	}
+	capable := processNodeInfo(1024)
+	capable.Connectors = []string{proto.EgressConnectorPackage}
+	connectNode(t, f.c, "n_connector", capable)
+	claim, err := f.c.wsClaim(context.Background(), "n_connector", workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Workspace.ID != workspace.ID {
+		t.Fatalf("claimed workspace=%+v", claim.Workspace)
+	}
+}
+
 func TestGlobalWriteEgressRuleRequiresAdministrator(t *testing.T) {
 	f := newControlFixture(t, "", nil)
 	user := Subject{ID: "user", Tenant: "tenant-a"}

@@ -335,6 +335,7 @@ func cloneHello(in *proto.Hello) *proto.Hello {
 		node.Backends = append([]string(nil), in.Node.Backends...)
 		node.BackendDescriptors = append([]proto.BackendDescriptor(nil), in.Node.BackendDescriptors...)
 		node.Caps = append([]string(nil), in.Node.Caps...)
+		node.Connectors = append([]string(nil), in.Node.Connectors...)
 		out.Node = &node
 	}
 	return &out

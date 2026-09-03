@@ -48,6 +48,7 @@ type HelloOK struct {
 type NodeInfo struct {
 	Backends           []string            `cbor:"backends" json:"backends"` // legacy discovery names
 	BackendDescriptors []BackendDescriptor `cbor:"backend_descriptors,omitempty" json:"backend_descriptors,omitempty"`
+	Connectors         []string            `cbor:"connectors,omitempty" json:"connectors,omitempty"` // managed connector names implemented by this node
 	OS                 string              `cbor:"os" json:"os"`
 	Arch               string              `cbor:"arch" json:"arch"`
 	CPU                int                 `cbor:"cpu" json:"cpu"`
@@ -148,6 +149,11 @@ const (
 	EgressProtocolHTTPS   = "https"
 	EgressProtocolConnect = "connect"
 
+	// EgressConnectorPackage identifies the managed, read-only package
+	// retrieval surface. A connector-scoped rule is never usable through the
+	// generic HTTP proxy routes.
+	EgressConnectorPackage = "package"
+
 	SharedStateNone          = "none"
 	SharedStateImmutableRead = "immutable_read"
 	SharedStateScopedWrite   = "scoped_write"
@@ -176,6 +182,7 @@ type NetworkPolicy struct {
 // EgressRule constrains one outbound HTTP, HTTPS, or CONNECT capability.
 type EgressRule struct {
 	ID               string   `cbor:"id" json:"id"`
+	Connector        string   `cbor:"connector,omitempty" json:"connector,omitempty"`
 	Protocol         string   `cbor:"protocol" json:"protocol"`
 	Hosts            []string `cbor:"hosts,omitempty" json:"hosts,omitempty"`
 	Ports            []uint16 `cbor:"ports,omitempty" json:"ports,omitempty"`

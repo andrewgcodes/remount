@@ -150,7 +150,7 @@ generation and one bounded write to a run-scoped API:
 
 ```sh
 remount ws create --security local --network-default deny \
-  --egress-rule '{"id":"registry-read","protocol":"https","hosts":["registry.example"],"ports":[443],"methods":["GET","HEAD"],"path_prefixes":["/v2"],"max_requests":2,"max_response_bytes":8388608,"shared_state":"immutable_read"}' \
+  --egress-rule '{"id":"registry-read","connector":"package","protocol":"https","hosts":["registry.example"],"ports":[443],"methods":["GET","HEAD"],"path_prefixes":["/v2"],"max_requests":2,"max_response_bytes":8388608,"shared_state":"immutable_read"}' \
   --egress-rule @scoped-write-rule.json
 ```
 
@@ -161,6 +161,16 @@ generation changes. `immutable_read` is restricted to `GET`/`HEAD`;
 `scoped_write` requires workspace write authority; `global_write` requires an
 administrator. Every decision records the workspace, generation and matching
 rule. A redirect is sent back through the broker and checked again.
+
+A `connector:"package"` rule is deliberately narrower than ordinary host
+access. Use `${REMOUNT_PACKAGE_CONNECTOR}/registry.example/v2/...`; the same
+rule cannot be spent at `${REMOUNT_BROKER}/d/...` or through CONNECT. The
+connector accepts only GET/HEAD over HTTPS and blocks bodies, range requests,
+WebDAV methods and writable shared-state declarations. For a digest-verified
+download, send `X-Remount-Expected-Digest: sha256:<hex>`. The response contains
+`X-Remount-Content-Digest`, but never a cache path or hit indicator. Physical
+blobs are immutable and content-addressed; cache metadata and permission
+to reuse a blob are private to one tenant/workspace scope.
 
 `--allow` is per node and applies only to the legacy local policy. A fleet box
 that installs packages may need registry entries; production policy should put

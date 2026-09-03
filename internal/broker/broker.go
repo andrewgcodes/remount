@@ -40,6 +40,7 @@ import (
 	"sync"
 	"time"
 
+	"remount.dev/remount/internal/connector"
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 )
@@ -66,6 +67,9 @@ type Audit struct {
 	Rule          string // typed egress rule id when policy selected one
 	Protocol      string
 	SharedState   string
+	Connector     string
+	Digest        string
+	Cached        bool
 	Host          string
 	Method        string
 	Path          string
@@ -80,6 +84,7 @@ type Options struct {
 	WS         string
 	Generation uint64
 	Principal  string
+	Tenant     string
 	Leases     []proto.BindingLease
 	Network    proto.NetworkPolicy
 	// Allow lists hosts reachable without any credential. Patterns: exact
@@ -102,6 +107,9 @@ type Options struct {
 	// the full lifetime of CONNECT tunnels and streaming responses.
 	MaxConnections        int
 	MaxConcurrentRequests int
+	// ConnectorStore is the node-owned immutable package cache. Package rules
+	// fail closed when it is unavailable.
+	ConnectorStore *connector.Store
 }
 
 // Broker serves one workspace.
@@ -119,6 +127,7 @@ type Broker struct {
 	ruleRequests map[string]int64
 	tunnels      map[*brokerTunnel]struct{}
 	requestSlots chan struct{}
+	connectors   map[string]connector.Connector
 }
 
 type brokerTunnel struct {
@@ -194,6 +203,7 @@ func New(opts Options) *Broker {
 	b := &Broker{
 		opts: opts, leases: cloneLeases(opts.Leases), ruleRequests: map[string]int64{},
 		tunnels: map[*brokerTunnel]struct{}{}, requestSlots: make(chan struct{}, opts.MaxConcurrentRequests),
+		connectors: map[string]connector.Connector{},
 	}
 	dialer := &net.Dialer{Timeout: 15 * time.Second, Control: nil}
 	b.client = &http.Transport{
@@ -201,15 +211,21 @@ func New(opts Options) *Broker {
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return b.dial(ctx, dialer, network, addr)
 		},
-		TLSClientConfig:       &tls.Config{RootCAs: opts.RootCAs, MinVersion: tls.VersionTLS12},
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          64,
-		MaxIdleConnsPerHost:   16,
-		MaxConnsPerHost:       opts.MaxConcurrentRequests,
-		IdleConnTimeout:       60 * time.Second,
-		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 5 * time.Minute, // LLM streaming responses can take a while to start
-		DisableCompression:    true,            // pass bodies through untouched
+		TLSClientConfig:        &tls.Config{RootCAs: opts.RootCAs, MinVersion: tls.VersionTLS12},
+		ForceAttemptHTTP2:      true,
+		MaxIdleConns:           64,
+		MaxIdleConnsPerHost:    16,
+		MaxConnsPerHost:        opts.MaxConcurrentRequests,
+		IdleConnTimeout:        60 * time.Second,
+		TLSHandshakeTimeout:    15 * time.Second,
+		ResponseHeaderTimeout:  5 * time.Minute, // LLM streaming responses can take a while to start
+		MaxResponseHeaderBytes: 1 << 20,
+		DisableCompression:     true, // pass bodies through untouched
+	}
+	if opts.ConnectorStore != nil {
+		b.connectors[proto.EgressConnectorPackage] = connector.NewPackage(connector.PackageOptions{
+			Transport: b.client, Store: opts.ConnectorStore,
+		})
 	}
 	return b
 }
@@ -228,6 +244,11 @@ func (b *Broker) Start() (string, error) {
 		return "", fmt.Errorf("broker: network policy: %w", err)
 	}
 	b.opts.Network = security.Network
+	for _, rule := range b.opts.Network.Rules {
+		if rule.Connector != "" && b.connectors[rule.Connector] == nil {
+			return "", fmt.Errorf("broker: connector %q required by rule %q is unavailable", rule.Connector, rule.ID)
+		}
+	}
 	addr := b.opts.Listen
 	if addr == "" {
 		addr = "127.0.0.1:0"
@@ -273,6 +294,9 @@ func (b *Broker) BaseURL() string { return b.base }
 // ProxyURL returns an authenticated URL suitable for HTTP_PROXY and
 // HTTPS_PROXY. BaseURL is the capability-bearing reverse-proxy endpoint.
 func (b *Broker) ProxyURL() string { return b.proxyBase }
+
+// PackageURL is the capability-bearing base for managed package retrieval.
+func (b *Broker) PackageURL() string { return strings.TrimSuffix(b.base, "/") + "/package" }
 
 // Close stops the listener.
 func (b *Broker) Close() error {
@@ -344,6 +368,7 @@ func Placeholder(l proto.BindingLease) string {
 func (b *Broker) EnvFor() []string {
 	return []string{
 		"REMOUNT_BROKER=" + b.base,
+		"REMOUNT_PACKAGE_CONNECTOR=" + b.PackageURL(),
 		"HTTP_PROXY=" + b.proxyBase,
 		"HTTPS_PROXY=" + b.proxyBase,
 		"http_proxy=" + b.proxyBase,
@@ -411,11 +436,14 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/http/"):
 		host, rest := splitDest(strings.TrimPrefix(r.URL.Path, "/http/"))
 		b.proxy(w, r, "http", host, rest, r.URL.RawQuery)
+	case strings.HasPrefix(r.URL.Path, "/package/"):
+		host, rest := splitDest(strings.TrimPrefix(r.URL.Path, "/package/"))
+		b.packageProxy(w, r, host, rest, r.URL.RawQuery)
 	case r.URL.Path == "/healthz":
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok\n")
 	default:
-		http.Error(w, "remount broker: use /d/<host>/<path>, /http/<host>/<path>, or HTTP proxy mode", http.StatusNotFound)
+		http.Error(w, "remount broker: use /d/<host>/<path>, /http/<host>/<path>, /package/<host>/<path>, or HTTP proxy mode", http.StatusNotFound)
 	}
 }
 
@@ -574,9 +602,9 @@ var errRequestLimit = errors.New("request body exceeds rule limit")
 // authorizePolicy evaluates rules in declaration order and consumes a rule's
 // request budget atomically. An explicit typed policy replaces the legacy
 // node allow-list decision; it never falls through to that broader mechanism.
-func (b *Broker) authorizePolicy(protocol, host, method, requestPath string) policyAuthorization {
+func (b *Broker) authorizePolicy(connectorName, protocol, host, method, requestPath string) policyAuthorization {
 	policy := b.opts.Network
-	if policy.Default == "" && len(policy.Rules) == 0 {
+	if connectorName == "" && policy.Default == "" && len(policy.Rules) == 0 {
 		return policyAuthorization{}
 	}
 	authorization := policyAuthorization{enabled: true}
@@ -584,7 +612,7 @@ func (b *Broker) authorizePolicy(protocol, host, method, requestPath string) pol
 	requestPath = pathpkg.Clean("/" + strings.TrimPrefix(requestPath, "/"))
 	port, portOK := destinationPort(host, protocol)
 	for _, rule := range policy.Rules {
-		if rule.Protocol != protocol || !hostMatches(host, rule.Hosts) || !portOK ||
+		if rule.Connector != connectorName || rule.Protocol != protocol || !hostMatches(host, rule.Hosts) || !portOK ||
 			!containsPort(rule.Ports, port) || !containsStringFold(rule.Methods, method) ||
 			!pathPrefixMatches(requestPath, rule.PathPrefixes) {
 			continue
@@ -604,6 +632,10 @@ func (b *Broker) authorizePolicy(protocol, host, method, requestPath string) pol
 		b.ruleRequests[rule.ID] = used + 1
 		b.mu.Unlock()
 		authorization.allowed = true
+		return authorization
+	}
+	if connectorName != "" {
+		authorization.reason = "no typed connector rule matched"
 		return authorization
 	}
 	if policy.Default == proto.NetworkDefaultAllow {
@@ -738,6 +770,199 @@ func pathPrefixMatches(requestPath string, prefixes []string) bool {
 	return false
 }
 
+type credentialRejection struct {
+	decision string
+	binding  string
+	reason   string
+	public   string
+	status   int
+}
+
+// rewriteCredentials replaces exact placeholder tokens after binding the
+// request to a destination. The caller must emit the returned rejection and
+// must record every returned binding before attempting outbound I/O.
+func (b *Broker) rewriteCredentials(header http.Header, scheme, host string) (map[string]bool, *credentialRejection) {
+	b.mu.RLock()
+	leases := append([]proto.BindingLease(nil), b.leases...)
+	b.mu.RUnlock()
+	sort.SliceStable(leases, func(i, j int) bool {
+		return len(Placeholder(leases[i])) > len(Placeholder(leases[j]))
+	})
+	used := map[string]bool{}
+	for name, vals := range header {
+		for i, value := range vals {
+			plain, basic := credentialText(value)
+			var replacements []credentialReplacement
+			for _, lease := range leases {
+				placeholder := Placeholder(lease)
+				if !containsToken(plain, placeholder) {
+					continue
+				}
+				if !hostMatches(host, lease.Destinations) {
+					return nil, &credentialRejection{
+						decision: DecisionLeakBlocked, binding: lease.ID,
+						reason: "placeholder for " + lease.ID + " sent to " + host,
+						public: "credential " + lease.ID + " is not bound to " + host,
+						status: http.StatusForbidden,
+					}
+				}
+				if lease.ExpiresAt != 0 && time.Now().UnixMilli() > lease.ExpiresAt {
+					return nil, &credentialRejection{
+						decision: DecisionExpired, binding: lease.ID, reason: "lease expired",
+						public: "lease for " + lease.ID + " expired; fail closed",
+						status: http.StatusForbidden,
+					}
+				}
+				if scheme != proto.EgressProtocolHTTPS {
+					return nil, &credentialRejection{
+						decision: DecisionDenied, binding: lease.ID,
+						reason: "credential substitution requires a TLS upstream",
+						public: "credentials are never sent over plaintext HTTP",
+						status: http.StatusForbidden,
+					}
+				}
+				replacements = append(replacements, credentialReplacement{placeholder: placeholder, secret: lease.Secret})
+				used[lease.ID] = true
+			}
+			if len(replacements) > 0 {
+				rewritten := substituteAll(plain, replacements)
+				if basic {
+					rewritten = "Basic " + base64.StdEncoding.EncodeToString([]byte(rewritten))
+				}
+				vals[i] = rewritten
+			}
+		}
+		header[name] = vals
+	}
+	return used, nil
+}
+
+// packageProxy invokes the managed package connector. Connector-scoped rules
+// cannot be exercised through proxy(), and generic rules cannot reach here.
+func (b *Broker) packageProxy(w http.ResponseWriter, r *http.Request, host, requestPath, query string) {
+	audit := b.auditFor(r.Method, proto.EgressProtocolHTTPS, host, requestPath)
+	audit.Connector = proto.EgressConnectorPackage
+	if r.ContentLength > 0 || len(r.TransferEncoding) != 0 {
+		audit.Decision, audit.Reason = DecisionDenied, "package connector requests cannot carry a body"
+		b.emit(audit)
+		http.Error(w, "remount broker: "+audit.Reason, http.StatusBadRequest)
+		return
+	}
+	authority, err := normalizeAuthority(host, proto.EgressProtocolHTTPS)
+	if err != nil {
+		audit.Decision, audit.Reason = DecisionDenied, err.Error()
+		b.emit(audit)
+		http.Error(w, "remount broker: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	audit.Host = authority
+	policy := b.authorizePolicy(proto.EgressConnectorPackage, proto.EgressProtocolHTTPS, authority, r.Method, requestPath)
+	if policy.rule.ID != "" {
+		audit.Rule, audit.SharedState = policy.rule.ID, policy.rule.SharedState
+	}
+	if !policy.allowed {
+		audit.Decision, audit.Reason = DecisionDenied, policy.reason
+		status := http.StatusForbidden
+		if policy.reason == "request limit exhausted" {
+			audit.Decision, status = DecisionLimitExceeded, http.StatusTooManyRequests
+		}
+		b.emit(audit)
+		http.Error(w, "remount broker: "+policy.reason, status)
+		return
+	}
+	managed := b.connectors[proto.EgressConnectorPackage]
+	if managed == nil {
+		audit.Decision, audit.Reason = DecisionDenied, "package connector is unavailable"
+		b.emit(audit)
+		http.Error(w, "remount broker: "+audit.Reason, http.StatusServiceUnavailable)
+		return
+	}
+	used, rejected := b.rewriteCredentials(r.Header, proto.EgressProtocolHTTPS, authority)
+	if rejected != nil {
+		audit.Decision, audit.Binding, audit.Reason = rejected.decision, rejected.binding, rejected.reason
+		b.emit(audit)
+		http.Error(w, "remount broker: "+rejected.public, rejected.status)
+		return
+	}
+	for id := range used {
+		released := audit
+		released.Decision, released.Binding, released.Reason = DecisionSubstituted, id, "credential released to managed package connector"
+		b.emit(released)
+	}
+	target := &url.URL{Scheme: proto.EgressProtocolHTTPS, Host: authority, Path: requestPath, RawQuery: query}
+	response, err := managed.Execute(r.Context(), connector.ConnectorRequest{
+		Workspace: b.opts.WS, Tenant: b.opts.Tenant, Principal: b.opts.Principal,
+		Generation: b.opts.Generation, Rule: policy.rule, Method: strings.ToUpper(r.Method),
+		URL: target, Header: r.Header, ExpectedDigest: r.Header.Get(connector.ExpectedDigestHeader),
+	})
+	if err != nil {
+		status := http.StatusBadGateway
+		audit.Decision, audit.Reason = DecisionDenied, "package connector request failed"
+		var connectorErr *connector.Error
+		if errors.As(err, &connectorErr) {
+			if connectorErr.HTTPStatus != 0 {
+				status = connectorErr.HTTPStatus
+			}
+			audit.Reason = connectorErr.Error()
+			if connectorErr.Code == "resource_exhausted" || connectorErr.Code == "response_too_large" {
+				audit.Decision = DecisionLimitExceeded
+			}
+		}
+		b.emit(audit)
+		http.Error(w, "remount broker: "+audit.Reason, status)
+		return
+	}
+	defer response.Body.Close()
+	audit.Status = response.StatusCode
+	audit.ResponseBytes = response.ContentLength
+	if response.Provenance.SHA256 != "" {
+		audit.Digest = "sha256:" + response.Provenance.SHA256
+	}
+	audit.Cached = response.Provenance.Cached
+	if err := b.rewritePackageRedirect(response.Header, target); err != nil {
+		audit.Decision, audit.Reason = DecisionDenied, err.Error()
+		b.emit(audit)
+		http.Error(w, "remount broker: "+audit.Reason, http.StatusBadGateway)
+		return
+	}
+	for name, values := range response.Header {
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+	w.WriteHeader(response.StatusCode)
+	audit.Decision, audit.Reason = DecisionAllowed, "managed package retrieval"
+	b.emit(audit)
+	if r.Method != http.MethodHead {
+		_, _ = io.Copy(w, response.Body)
+	}
+}
+
+func (b *Broker) rewritePackageRedirect(header http.Header, source *url.URL) error {
+	raw := header.Get("Location")
+	if raw == "" {
+		return nil
+	}
+	reference, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid package registry redirect: %w", err)
+	}
+	destination := source.ResolveReference(reference)
+	if destination.Scheme != proto.EgressProtocolHTTPS || destination.Host == "" || destination.User != nil {
+		return errors.New("package registry redirect must target an HTTPS registry")
+	}
+	authority, err := normalizeAuthority(destination.Host, proto.EgressProtocolHTTPS)
+	if err != nil {
+		return fmt.Errorf("invalid package registry redirect: %w", err)
+	}
+	rewritten := strings.TrimSuffix(b.base, "/") + "/package/" + authority + destination.EscapedPath()
+	if destination.RawQuery != "" {
+		rewritten += "?" + destination.RawQuery
+	}
+	header.Set("Location", rewritten)
+	return nil
+}
+
 // proxy rewrites and forwards one request.
 func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, path, query string) {
 	scheme = strings.ToLower(scheme)
@@ -758,58 +983,17 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 	host = authority
 	matchHost := authority
 	audit.Host = authority
-	b.mu.RLock()
-	leases := append([]proto.BindingLease(nil), b.leases...)
-	b.mu.RUnlock()
-	sort.SliceStable(leases, func(i, j int) bool {
-		return len(Placeholder(leases[i])) > len(Placeholder(leases[j]))
-	})
-
 	// 1. Substitute placeholders; block any placeholder aimed elsewhere.
-	used := map[string]bool{}
-	for name, vals := range r.Header {
-		for i, v := range vals {
-			plain, basic := credentialText(v)
-			var replacements []credentialReplacement
-			for _, l := range leases {
-				ph := Placeholder(l)
-				if !containsToken(plain, ph) {
-					continue
-				}
-				if !hostMatches(matchHost, l.Destinations) {
-					audit.Decision, audit.Binding, audit.Reason = DecisionLeakBlocked, l.ID, "placeholder for "+l.ID+" sent to "+host
-					b.emit(audit)
-					http.Error(w, "remount broker: credential "+l.ID+" is not bound to "+host, http.StatusForbidden)
-					return
-				}
-				if l.ExpiresAt != 0 && time.Now().UnixMilli() > l.ExpiresAt {
-					audit.Decision, audit.Binding, audit.Reason = DecisionExpired, l.ID, "lease expired"
-					b.emit(audit)
-					http.Error(w, "remount broker: lease for "+l.ID+" expired; fail closed", http.StatusForbidden)
-					return
-				}
-				if scheme != "https" {
-					audit.Decision, audit.Binding, audit.Reason = DecisionDenied, l.ID, "credential substitution requires a TLS upstream"
-					b.emit(audit)
-					http.Error(w, "remount broker: credentials are never sent over plaintext HTTP", http.StatusForbidden)
-					return
-				}
-				replacements = append(replacements, credentialReplacement{placeholder: ph, secret: l.Secret})
-				used[l.ID] = true
-			}
-			if len(replacements) > 0 {
-				rewritten := substituteAll(plain, replacements)
-				if basic {
-					rewritten = "Basic " + base64.StdEncoding.EncodeToString([]byte(rewritten))
-				}
-				vals[i] = rewritten
-			}
-		}
-		r.Header[name] = vals
+	used, rejected := b.rewriteCredentials(r.Header, scheme, matchHost)
+	if rejected != nil {
+		audit.Decision, audit.Binding, audit.Reason = rejected.decision, rejected.binding, rejected.reason
+		b.emit(audit)
+		http.Error(w, "remount broker: "+rejected.public, rejected.status)
+		return
 	}
 	// 2. Destination policy. Typed workspace rules replace the legacy
 	// binding/node allow-list decision and are evaluated on every request.
-	policy := b.authorizePolicy(scheme, matchHost, r.Method, path)
+	policy := b.authorizePolicy("", scheme, matchHost, r.Method, path)
 	if policy.rule.ID != "" {
 		audit.Rule = policy.rule.ID
 		audit.SharedState = policy.rule.SharedState
@@ -977,7 +1161,7 @@ func (b *Broker) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	audit.Host = host
-	policy := b.authorizePolicy(proto.EgressProtocolConnect, host, r.Method, "")
+	policy := b.authorizePolicy("", proto.EgressProtocolConnect, host, r.Method, "")
 	if policy.rule.ID != "" {
 		audit.Rule = policy.rule.ID
 		audit.SharedState = policy.rule.SharedState
@@ -1276,6 +1460,7 @@ func ResolveEnv(env map[string]string, base string, leases []proto.BindingLease)
 			v = p
 		}
 		v = strings.ReplaceAll(v, "${REMOUNT_BROKER}", base)
+		v = strings.ReplaceAll(v, "${REMOUNT_PACKAGE_CONNECTOR}", strings.TrimSuffix(base, "/")+"/package")
 		out[k] = v
 	}
 	return out

@@ -19,7 +19,7 @@ func TestEgressRuleFlagParsesInlineAndFileStrictly(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "rule.json")
-	if err := os.WriteFile(path, []byte(`{"id":"packages","protocol":"https","hosts":["registry.example"],"shared_state":"immutable_read"}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"id":"packages","connector":"package","protocol":"https","hosts":["registry.example"]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := rules.Set("@" + path); err != nil {
@@ -35,7 +35,10 @@ func TestEgressRuleFlagParsesInlineAndFileStrictly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if security.Network.Default != proto.NetworkDefaultDeny ||
-		!reflect.DeepEqual(security.Network.Rules[0].Methods, []string{"GET"}) {
+		!reflect.DeepEqual(security.Network.Rules[0].Methods, []string{"GET"}) ||
+		security.Network.Rules[1].Connector != proto.EgressConnectorPackage ||
+		security.Network.Rules[1].SharedState != proto.SharedStateImmutableRead ||
+		!reflect.DeepEqual(security.Network.Rules[1].Methods, []string{"GET", "HEAD"}) {
 		t.Fatalf("normalized=%#v", security)
 	}
 	if err := rules.Set(`{"id":"bad","protocol":"https","hosts":["example.com"],"typo":true}`); err == nil {
