@@ -187,7 +187,7 @@ func (w *world) client(name string) *client.Client {
 
 // clientWithToken connects as whichever subject the server maps token to.
 func (w *world) clientWithToken(name, token string) *client.Client {
-	c := client.New(client.Options{Dialer: w.dialer(name), Token: token, Principal: "a_" + name})
+	c := client.New(client.Options{Dialer: w.dialer(name), Token: token, Principal: "a_" + name, ArtifactURL: w.http.URL + "/v1/artifacts"})
 	w.t.Cleanup(func() { c.Close() })
 	return c
 }

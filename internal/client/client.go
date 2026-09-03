@@ -10,12 +10,18 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
+	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/ids"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/transport"
@@ -33,6 +39,12 @@ type Options struct {
 	// MaxRunOutputBytes bounds stdout+stderr collected by Run. Streaming a
 	// Session through Chunks is unaffected. Default 64 MiB.
 	MaxRunOutputBytes int64
+	// ArtifactURL is the control plane's blob endpoint
+	// (http://host/v1/artifacts). Required by UploadArtifact and
+	// DownloadArtifact; the WebSocket link carries everything else.
+	ArtifactURL string
+	// HTTPClient performs artifact transfers. Default http.DefaultClient.
+	HTTPClient *http.Client
 }
 
 // OperationOption configures one logical mutating operation. Reuse the same
@@ -786,6 +798,121 @@ func (c *Client) Edit(ctx context.Context, wsID, path string, edits []proto.FSEd
 		return proto.FSEditReq{WS: wsID, Path: path, Edits: edits, IdempotencyKey: idem, Grant: g}
 	}, &res)
 	return res.Replacements, err
+}
+
+// ApplyTar overlays an artifact previously stored with UploadArtifact onto the
+// workspace tree. Files land one rename at a time; nothing else is removed.
+func (c *Client) ApplyTar(ctx context.Context, wsID, artifactID string, options ...OperationOption) (*proto.FSApplyTarRes, error) {
+	var res proto.FSApplyTarRes
+	idem, _ := operationKey(options)
+	err := c.nodeCall(ctx, wsID, proto.OpFSApplyTar, func(g *proto.Grant) any {
+		return proto.FSApplyTarReq{WS: wsID, Artifact: artifactID, IdempotencyKey: idem, Grant: g}
+	}, &res)
+	return &res, err
+}
+
+// ErrNoArtifactURL means Options.ArtifactURL was not configured.
+var ErrNoArtifactURL = errors.New("client: ArtifactURL not configured")
+
+// UploadArtifact stores r as a content-addressed artifact in the control
+// plane and returns its id. The stream is spooled to a temporary file so the
+// digest can be computed before the single PUT; the file is removed before
+// return.
+func (c *Client) UploadArtifact(ctx context.Context, r io.Reader) (string, int64, error) {
+	if c.opts.ArtifactURL == "" {
+		return "", 0, ErrNoArtifactURL
+	}
+	spool, err := os.CreateTemp("", "remount-upload-*")
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() {
+		spool.Close()
+		os.Remove(spool.Name())
+	}()
+	h := sha256.New()
+	size, err := io.Copy(io.MultiWriter(spool, h), r)
+	if err != nil {
+		return "", 0, err
+	}
+	if _, err := spool.Seek(0, io.SeekStart); err != nil {
+		return "", 0, err
+	}
+	id := artifact.ID(h.Sum(nil))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.artifactURL(id), spool)
+	if err != nil {
+		return "", 0, err
+	}
+	req.ContentLength = size
+	req.Header.Set("Authorization", "Bearer "+c.opts.Token)
+	req.Header.Set("Content-Type", "application/gzip")
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", 0, fmt.Errorf("client: upload artifact: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return id, size, nil
+}
+
+// DownloadArtifact streams an artifact from the control plane. The returned
+// reader fails with artifact.ErrDigestMismatch at EOF if the bytes do not
+// hash to id, so callers that consume the whole stream never act on a
+// corrupted or substituted archive without seeing an error.
+func (c *Client) DownloadArtifact(ctx context.Context, id string) (io.ReadCloser, error) {
+	if c.opts.ArtifactURL == "" {
+		return nil, ErrNoArtifactURL
+	}
+	if _, err := artifact.Digest(id); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.artifactURL(id), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.opts.Token)
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("client: download artifact %s: HTTP %d", id, resp.StatusCode)
+	}
+	return &verifyingReader{body: resp.Body, want: id, h: sha256.New()}, nil
+}
+
+type verifyingReader struct {
+	body io.ReadCloser
+	want string
+	h    hash.Hash
+}
+
+func (v *verifyingReader) Read(p []byte) (int, error) {
+	n, err := v.body.Read(p)
+	if n > 0 {
+		v.h.Write(p[:n])
+	}
+	if errors.Is(err, io.EOF) && artifact.ID(v.h.Sum(nil)) != v.want {
+		return n, artifact.ErrDigestMismatch
+	}
+	return n, err
+}
+
+func (v *verifyingReader) Close() error { return v.body.Close() }
+
+func (c *Client) artifactURL(id string) string {
+	return strings.TrimSuffix(c.opts.ArtifactURL, "/") + "/" + id
+}
+
+func (c *Client) httpClient() *http.Client {
+	if c.opts.HTTPClient != nil {
+		return c.opts.HTTPClient
+	}
+	return http.DefaultClient
 }
 
 // Snapshot takes a live, crash-inconsistent snapshot; upload pushes it to the

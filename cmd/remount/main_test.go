@@ -312,3 +312,19 @@ func TestEventsSessionFilterAndJSONShape(t *testing.T) {
 		t.Fatal("unattributed events must not carry a session key")
 	}
 }
+
+func TestWorkspaceCreateRejectsDirWithRestoreFrom(t *testing.T) {
+	err := cmdWS(context.Background(), []string{"create", "--dir", t.TempDir(), "--restore-from", "art_sha256:00", "--wait=false"})
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestPushAndPullRequireExactlyOneWorkspace(t *testing.T) {
+	if err := cmdPush(context.Background(), nil); err == nil {
+		t.Fatal("push without WS accepted")
+	}
+	if err := cmdPull(context.Background(), []string{"ws_a", "ws_b"}); err == nil {
+		t.Fatal("pull with two positionals accepted")
+	}
+}
