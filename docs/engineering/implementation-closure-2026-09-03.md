@@ -660,6 +660,12 @@ bug reports:
   seeds explicitly;
 - defaulting a frame's version during encoding mutated the caller-owned frame,
   creating avoidable shared-state risk; encoding now defaults a private copy;
+- active-session capacity was released by an asynchronous observer after
+  `Session.Wait` had already returned, allowing a completed session to cause a
+  transient quota rejection; exit publication now follows manager accounting;
+- the simulator port-forward conformance test used a fixed loopback port and a
+  separately started Python server, colliding with services on hosted runners;
+  it now uses an in-process HTTP server on an OS-assigned port;
 - the Unix descriptor implementation imported `golang.org/x/sys` directly
   while `go.mod` classified it as indirect; module metadata is corrected;
 - Modal readiness, JSON shape, volume lifecycle, and deployed-vs-ephemeral

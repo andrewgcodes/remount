@@ -391,10 +391,8 @@ func TestManagerEnforcesRetainedActiveAndWorkspaceQuotas(t *testing.T) {
 	if _, err := s.Wait(ctx); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for m.Stats().Active != 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
+	// Wait returning is the capacity handoff: callers must not have to poll an
+	// asynchronous accounting goroutine before opening the replacement.
 	second, err := m.Open(Spec{WS: "ws_two", Kind: proto.SessionExec, Program: []string{"sh", "-c", "true"}})
 	if err != nil {
 		t.Fatalf("active quota was not released: %v", err)

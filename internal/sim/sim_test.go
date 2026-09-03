@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1031,40 +1032,38 @@ func TestGrantsAreEnforced(t *testing.T) {
 	}
 }
 
-// Port forwarding: a server inside the workspace is reachable through a
-// port session.
+// Port forwarding: a server in the process backend's shared network namespace
+// is reachable through a workspace port session.
 func TestPortForward(t *testing.T) {
 	w := newWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ws := mustWS(t, c, proto.WorkspaceSpec{})
 	ctx := ctxT(t, 60*time.Second)
-	// Confirm python3 is available in the workspace; skip if not.
-	_, _, exit, err := c.Run(ctx, ws.ID, "sh", "-c", "command -v python3")
-	if err != nil || exit.Code != 0 {
-		t.Skip("python3 not available in workspace")
-	}
-	c.WriteFile(ctx, ws.ID, "index.html", []byte("<h1>remount</h1>"), 0)
-	srv, err := c.Exec(ctx, proto.SOpenReq{WS: ws.ID, Program: []string{"python3", "-m", "http.server", "18081", "--bind", "127.0.0.1"}})
+	// The process backend shares the node network namespace. Use a listener on
+	// an OS-assigned loopback port instead of a fixed port: hosted macOS runners
+	// can already have common development ports reserved, which made this test
+	// wait for the dial timeout even though port sessions themselves were sound.
+	origin := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(rw, "<h1>remount</h1>")
+	}))
+	defer origin.Close()
+	port := origin.Listener.Addr().(*net.TCPAddr).Port
+	s, err := c.OpenPort(ctx, ws.ID, port)
 	if err != nil {
-		t.Fatal(err)
-	}
-	defer srv.Close(ctx, true)
-	var s *client.Session
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		s, err = c.OpenPort(ctx, ws.ID, 18081)
-		if err == nil {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if err != nil || s == nil {
 		t.Fatalf("port open: %v", err)
 	}
-	s.Input(ctx, []byte("GET /index.html HTTP/1.0\r\nHost: x\r\n\r\n"), true)
+	if err := s.Input(ctx, []byte("GET /index.html HTTP/1.0\r\nHost: x\r\n\r\n"), true); err != nil {
+		t.Fatalf("port input: %v", err)
+	}
 	var out bytes.Buffer
-	client.Copy(s, &out, nil)
+	exit := client.Copy(s, &out, nil)
+	if err := s.Err(); err != nil {
+		t.Fatalf("port session: %v", err)
+	}
+	if exit == nil || exit.Code != 0 {
+		t.Fatalf("port exit: %+v", exit)
+	}
 	if !strings.Contains(out.String(), "200 OK") || !strings.Contains(out.String(), "<h1>remount</h1>") {
 		t.Fatalf("%q", out.String())
 	}
