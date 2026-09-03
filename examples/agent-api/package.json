@@ -1,0 +1,17 @@
+{
+  "name": "remount-agent-api-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "tsx --test test_typescript_example.ts"
+  },
+  "dependencies": {
+    "@remount/sdk": "file:../../sdk/typescript"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.2"
+  }
+}

@@ -19,5 +19,8 @@ coverage.txt
 __pycache__/
 *.py[cod]
 
+# JavaScript tooling
+node_modules/
+
 # stray example binaries
 /agentloop
