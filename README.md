@@ -237,6 +237,7 @@ verdict. See [docs/observability.md](docs/observability.md).
 - [docs/tutorial.md](docs/tutorial.md) — a guided walkthrough from zero to a moved workspace.
 - [docs/harness-integration.md](docs/harness-integration.md) — running Claude Code, Codex, OpenCode and your own loop on Remount.
 - [docs/operations.md](docs/operations.md) — deploying, hardening and running it for real.
+- [docs/images.md](docs/images.md) — the default workspace image and what any substitute image must provide.
 - [docs/observability.md](docs/observability.md) — inspecting a deployment at three depths, and detecting damage.
 - [docs/engineering/hardening-lessons.md](docs/engineering/hardening-lessons.md) — the review method distilled from the audits, race failures and live cloud tests.
 - [docs/engineering/](docs/engineering/) — dated audits, implementation requests, dispositions and verification evidence.
