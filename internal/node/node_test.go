@@ -177,6 +177,42 @@ func TestFetchArtifactMismatchCannotDeleteExistingBlob(t *testing.T) {
 	}
 }
 
+// A node connected to a control plane that never negotiated a capability an
+// isolated or multi-tenant workspace depends on refuses the workspace before
+// any bytes land; a local workspace is unaffected, and a current control
+// plane moves the decision on to backend security.
+func TestMaterializeRequiresUplinkCapabilitiesForProfile(t *testing.T) {
+	n := newTestNode(t, nil)
+	n.mu.Lock()
+	n.protocol = []string{proto.CapabilityV1}
+	n.mu.Unlock()
+	for _, profile := range []string{proto.SecurityIsolated, proto.SecurityMultiTenant} {
+		w := proto.Workspace{
+			ID: "ws_" + profile, Generation: 1, State: proto.WSClaiming,
+			Spec: proto.WorkspaceSpec{Requires: proto.Requires{Backend: "process"}, Security: proto.SecuritySpec{Profile: profile}},
+		}
+		err := n.materialize(context.Background(), w, false)
+		var pe *proto.Error
+		if !errors.As(err, &pe) || pe.Code != proto.CodeUnsupported || !strings.Contains(pe.Msg, proto.CapabilityAuthzPush) || !strings.Contains(pe.Msg, profile) {
+			t.Fatalf("%s under an old control plane: %v", profile, err)
+		}
+		if _, err := os.Stat(filepath.Join(n.opts.DataDir, "ws", w.ID)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("refused workspace materialized bytes: %v", err)
+		}
+	}
+	if err := n.requireUplinkCapabilities(proto.SecurityLocal); err != nil {
+		t.Fatalf("local profile refused under an old control plane: %v", err)
+	}
+	n.mu.Lock()
+	n.protocol = proto.PeerCapabilities()
+	n.mu.Unlock()
+	for _, profile := range []string{proto.SecurityLocal, proto.SecurityIsolated, proto.SecurityMultiTenant} {
+		if err := n.requireUplinkCapabilities(profile); err != nil {
+			t.Fatalf("%s refused under a current control plane: %v", profile, err)
+		}
+	}
+}
+
 func TestMaterializeRevalidatesBackendSecurity(t *testing.T) {
 	n := newTestNode(t, nil)
 	w := proto.Workspace{

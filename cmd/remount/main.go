@@ -1543,9 +1543,9 @@ func cmdNodes(ctx context.Context, args []string) error {
 		return nil
 	}
 	tw := tabWriter()
-	fmt.Fprintln(tw, "ID\tONLINE\tOS/ARCH\tCPU\tMEM_MiB\tBACKENDS\tLABELS\tWORKSPACES")
+	fmt.Fprintln(tw, "ID\tONLINE\tOS/ARCH\tCPU\tMEM_MiB\tBACKENDS\tPROTOCOL\tLABELS\tWORKSPACES")
 	for _, n := range nodes {
-		fmt.Fprintf(tw, "%s\t%v\t%s/%s\t%d\t%d\t%s\t%s\t%d\n", n.ID, n.Online, n.Info.OS, n.Info.Arch, n.Info.CPU, n.Info.MemMiB, strings.Join(n.Info.Backends, ","), kvFlag(n.Labels).String(), len(n.Workspaces))
+		fmt.Fprintf(tw, "%s\t%v\t%s/%s\t%d\t%d\t%s\t%s\t%s\t%d\n", n.ID, n.Online, n.Info.OS, n.Info.Arch, n.Info.CPU, n.Info.MemMiB, strings.Join(n.Info.Backends, ","), strings.Join(n.Protocol, ","), kvFlag(n.Labels).String(), len(n.Workspaces))
 	}
 	tw.Flush()
 	return nil

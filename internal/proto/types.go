@@ -442,6 +442,7 @@ type NodeStatus struct {
 	Online     bool              `cbor:"online" json:"online"`
 	LastSeen   int64             `cbor:"last_seen" json:"last_seen"`
 	Workspaces []string          `cbor:"workspaces,omitempty" json:"workspaces,omitempty"`
+	Protocol   []string          `cbor:"protocol,omitempty" json:"protocol,omitempty"` // capabilities negotiated at the node's last hello
 }
 
 type EventsTailReq struct {

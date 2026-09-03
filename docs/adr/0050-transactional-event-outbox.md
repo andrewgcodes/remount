@@ -1,4 +1,4 @@
-# ADR 0023: Every resource commit and its events are one transaction
+# ADR 0050: Every resource commit and its events are one transaction
 
 ## Status
 

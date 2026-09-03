@@ -182,16 +182,107 @@ func DecodeFrame(b []byte) (*Frame, error) {
 	return &f, nil
 }
 
-// NegotiateCapabilities returns the ordered intersection required for a v1
-// connection. v1 is a semantic baseline rather than an optional extension,
-// so peers that do not offer it are rejected explicitly.
+// Named capabilities. A change an old peer could ignore without weakening a
+// security property is an additive field; a change an old peer ignoring it
+// would weaken is a named capability, negotiated at hello and required by
+// the security profiles that depend on it (ADR 0040).
+const (
+	// CapabilityAuthzPush: the control plane pushes authorization revisions
+	// on renew and the node refuses stale grants and closes their sessions.
+	CapabilityAuthzPush = "authz-push"
+	// CapabilityControllerEpoch: frames carry the controller epoch and a
+	// node fences itself against a superseded controller.
+	CapabilityControllerEpoch = "controller-epoch"
+	// CapabilitySessionCap: sessions carry a principal-bound capability that
+	// a principal revocation invalidates.
+	CapabilitySessionCap = "session-cap"
+	// CapabilityChunkedArtifacts: artifacts move as verified chunks so a
+	// truncated transfer can never be restored as complete.
+	CapabilityChunkedArtifacts = "chunked-artifacts"
+	// CapabilityApprovals: an operation may be held for an approval decision
+	// and the peer honours the held state rather than proceeding.
+	CapabilityApprovals = "approvals"
+	// CapabilityEncryptedArtifacts: snapshot artifacts are encrypted at
+	// rest with the artifact key and refused when the key is absent.
+	CapabilityEncryptedArtifacts = "encrypted-artifacts"
+)
+
+// knownCapabilities is the canonical order in which negotiated
+// capabilities are reported. v1 is always first.
+var knownCapabilities = []string{
+	CapabilityV1,
+	CapabilityAuthzPush,
+	CapabilityControllerEpoch,
+	CapabilitySessionCap,
+	CapabilityChunkedArtifacts,
+	CapabilityApprovals,
+	CapabilityEncryptedArtifacts,
+}
+
+// implementedCapabilities is what a peer built from this release offers.
+// A capability joins this list in the same commit that lands its semantics
+// on both the node and the control plane; the identifiers above may be
+// defined ahead of that so the spec table and profile requirements are
+// stable.
+var implementedCapabilities = []string{
+	CapabilityV1,
+	CapabilityAuthzPush,
+}
+
+// PeerCapabilities returns the capabilities a peer built from this release
+// offers at hello. The slice is a fresh copy.
+func PeerCapabilities() []string {
+	return append([]string(nil), implementedCapabilities...)
+}
+
+// profileCapabilities maps a security profile to the named capabilities
+// every peer serving it must have negotiated. local requires none so an
+// older node keeps working there; isolated and multi_tenant require every
+// capability this release implements beyond v1, because each one closes a
+// hole those profiles promise is closed.
+var profileCapabilities = map[string][]string{
+	SecurityLocal:       nil,
+	SecurityIsolated:    {CapabilityAuthzPush},
+	SecurityMultiTenant: {CapabilityAuthzPush},
+}
+
+// SecurityCapabilities returns the named capabilities a peer must have
+// negotiated before it may serve a workspace, or a deployment, under
+// profile. An unknown or empty profile is treated as local. The slice is a
+// fresh copy.
+func SecurityCapabilities(profile string) []string {
+	return append([]string(nil), profileCapabilities[profile]...)
+}
+
+// NegotiateCapabilities returns the ordered intersection of offered and the
+// capabilities this release knows. v1 is a semantic baseline rather than an
+// optional extension, so peers that do not offer it are rejected explicitly.
+// Unknown identifiers are dropped, never echoed, so a peer can only rely on
+// what both sides understand.
 func NegotiateCapabilities(offered []string) ([]string, error) {
-	for _, capability := range offered {
-		if capability == CapabilityV1 {
-			return []string{CapabilityV1}, nil
+	if !HasCapability(offered, CapabilityV1) {
+		return nil, Err(CodeUnsupported, "peer does not offer required capability %q", CapabilityV1)
+	}
+	negotiated := make([]string, 0, len(implementedCapabilities))
+	for _, capability := range implementedCapabilities {
+		if HasCapability(offered, capability) {
+			negotiated = append(negotiated, capability)
 		}
 	}
-	return nil, Err(CodeUnsupported, "peer does not offer required capability %q", CapabilityV1)
+	return negotiated, nil
+}
+
+// MissingCapabilities returns, in canonical order, every identifier in
+// required that negotiated lacks. An empty result means the peer may serve
+// whatever required was derived from.
+func MissingCapabilities(negotiated, required []string) []string {
+	var missing []string
+	for _, capability := range knownCapabilities {
+		if HasCapability(required, capability) && !HasCapability(negotiated, capability) {
+			missing = append(missing, capability)
+		}
+	}
+	return missing
 }
 
 // HasCapability reports whether capabilities contains the exact identifier.

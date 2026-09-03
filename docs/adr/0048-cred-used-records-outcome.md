@@ -1,4 +1,4 @@
-# ADR 0021: `cred.used` records the upstream outcome
+# ADR 0048: `cred.used` records the upstream outcome
 
 ## Status
 

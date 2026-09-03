@@ -127,6 +127,7 @@ type Node struct {
 
 	mu         sync.Mutex
 	peer       *transport.Peer
+	protocol   []string // capabilities negotiated with the current uplink
 	ctrlPub    ed25519.PublicKey
 	leaseSec   int64
 	workspaces map[string]*ws
@@ -663,6 +664,14 @@ func (n *Node) runMutation(ctx context.Context, key string, request any, apply f
 // ID returns the node id.
 func (n *Node) ID() string { return n.id }
 
+// Protocol returns the capabilities negotiated with the current uplink, or
+// nil before the first hello. The slice is a fresh copy.
+func (n *Node) Protocol() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]string(nil), n.protocol...)
+}
+
 // Online is closed once the node has completed its first hello.
 func (n *Node) Online() <-chan struct{} { return n.online }
 
@@ -928,7 +937,7 @@ func (n *Node) connectOnce(ctx context.Context) error {
 	}
 	peer := transport.NewPeer(conn, transport.HandlerFunc(n.handle))
 	hello := proto.Hello{
-		Peer: n.id, Role: proto.RoleNode, Token: n.opts.Token, Caps: []string{proto.CapabilityV1},
+		Peer: n.id, Role: proto.RoleNode, Token: n.opts.Token, Caps: proto.PeerCapabilities(),
 		PubKey: n.priv.Public().(ed25519.PublicKey), Labels: n.opts.Labels,
 	}
 	info := workspace.HostInfoForRegistry(n.opts.Backends)
@@ -959,6 +968,7 @@ func (n *Node) helloAndServe(ctx context.Context, peer *transport.Peer, hello pr
 	}
 	n.mu.Lock()
 	n.peer = peer
+	n.protocol = ok.Caps
 	n.ctrlPub = ed25519.PublicKey(ok.PubKey)
 	n.leaseSec = ok.LeaseSec
 	n.grants = map[string]*proto.Grant{}
@@ -2523,7 +2533,26 @@ func (n *Node) tryClaim(ctx context.Context, wsID string, adopt bool) {
 	}
 }
 
+// requireUplinkCapabilities fails closed when the control plane never
+// negotiated a capability the workspace's security profile depends on. An
+// older control plane cannot deliver the property the profile promises, and
+// serving the workspace anyway would be exactly the silent weakening named
+// capabilities exist to prevent (ADR 0040).
+func (n *Node) requireUplinkCapabilities(profile string) error {
+	n.mu.Lock()
+	negotiated := n.protocol
+	n.mu.Unlock()
+	missing := proto.MissingCapabilities(negotiated, proto.SecurityCapabilities(profile))
+	if len(missing) == 0 {
+		return nil
+	}
+	return proto.Err(proto.CodeUnsupported, "control plane lacks protocol capabilities %s required by security profile %q", strings.Join(missing, ","), profile)
+}
+
 func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) error {
+	if err := n.requireUplinkCapabilities(w.Spec.Security.Profile); err != nil {
+		return err
+	}
 	be, err := n.opts.Backends.Get(w.Spec.Requires.Backend)
 	if err != nil {
 		return err

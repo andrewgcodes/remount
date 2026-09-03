@@ -93,6 +93,49 @@ the control plane derives subject and tenant from the presented credential.
 with it. `lease_sec` tells a node how often it must renew claims. A node MUST
 renew at an interval no greater than one third of the lease.
 
+### 3.1 Named capabilities
+
+Within v1, a change an older peer could ignore without weakening any security
+property is an additive field. A change an older peer *ignoring it* would
+weaken is a **named capability**: an exact, case-sensitive identifier offered
+in `Hello.caps` and echoed in `HelloOK.caps` only when both sides implement
+it. The server never echoes an identifier it does not implement, and a peer
+MUST NOT rely on a capability that was not echoed. Capabilities are returned
+in the canonical order of the table below, `v1` first.
+
+| Capability | Introduced for | An old peer ignoring it would |
+|---|---|---|
+| `v1` | the semantic baseline | not be a peer at all |
+| `authz-push` | revocation epochs pushed on renew | keep honouring a revoked principal's grant until it expires |
+| `controller-epoch` | controller failover fencing | accept a superseded controller's decisions |
+| `session-cap` | principal-bound session capabilities | leave a revoked principal's session open |
+| `chunked-artifacts` | verified chunked artifact transfer | restore a truncated artifact as complete |
+| `approvals` | held operations awaiting a decision | proceed while an approval is pending |
+| `encrypted-artifacts` | artifacts encrypted at rest | write or read a plaintext snapshot |
+
+A security profile requires the capabilities whose absence would break the
+promise the profile makes. `local` requires none, so an older node keeps
+working there. `isolated` and `multi_tenant` require every named capability
+this release implements; a capability is added to that requirement in the
+same release that implements it on both sides. This release implements
+`authz-push`; the remaining identifiers are reserved and are neither offered
+nor required yet.
+
+| Deployment security floor | Peer offers `v1` only | Peer offers this release's set |
+|---|---|---|
+| `local` | accepted | accepted |
+| `isolated` | hello refused, `unsupported`, names the missing capabilities and the profile | accepted |
+| `multi_tenant` | hello refused, `unsupported`, names the missing capabilities and the profile | accepted |
+
+Without a deployment floor the same rule applies per workspace: a node that
+negotiated fewer capabilities than a workspace's `security.profile` requires is
+not eligible for it and the workspace stays `pending` until an eligible node
+exists. A node connected to a control plane that echoed fewer capabilities than
+a claimed workspace's profile requires MUST refuse to materialize it
+(`unsupported`, naming the missing capabilities) and release the claim rather
+than serve the workspace with the property missing. `NodeStatus.protocol`
+reports what each node negotiated at its last hello.
+
 ## 4. Grants
 
 A client may not talk to a node about a workspace without a grant. A grant is
@@ -596,7 +639,10 @@ wrong and that a conformance suite should check:
 `v` is the frame version. Peers negotiate exact, case-sensitive capability
 strings in `hello`; this release requires `v1`. New optional operations and
 fields are additive within v1, and a peer that does not know an `op` answers
-`unsupported`. A semantic change, removal, or incompatible field change
+`unsupported`. A change whose omission by an older peer would weaken a
+security property is a named capability (§3.1), not an additive field. A
+semantic change, removal, or incompatible field change to the baseline
 requires a new frame version and an explicit dual-version migration window.
-The repository keeps a deterministic v1 golden fixture under
-`internal/proto/testdata` to catch accidental wire drift.
+The repository keeps deterministic v1 golden fixtures under
+`internal/proto/testdata` (a request frame and a hello offering every named
+capability) to catch accidental wire drift.

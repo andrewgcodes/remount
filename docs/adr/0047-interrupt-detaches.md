@@ -1,4 +1,4 @@
-# ADR 0020: Ctrl-C detaches; the timeout is the node's
+# ADR 0047: Ctrl-C detaches; the timeout is the node's
 
 ## Status
 

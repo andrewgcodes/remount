@@ -46,6 +46,11 @@ type world struct {
 	mu          sync.Mutex
 	conns       []*fault // every live pipe end handed to a dialer
 	nodeCancels map[string]context.CancelFunc
+	// peerHooks and serverHooks rewrite or drop frames sent by, respectively,
+	// the named peer and the server on that peer's connections. They model a
+	// peer built from a different release.
+	peerHooks   map[string]func(*proto.Frame) bool
+	serverHooks map[string]func(*proto.Frame) bool
 }
 
 // fault wraps a pipe end so tests can cut it.
@@ -66,6 +71,7 @@ func newWorld(t *testing.T, bindings ...control.Binding) *world {
 	w := &world{
 		t: t, artifactDir: filepath.Join(dataDir, "artifacts"), srv: srv,
 		http: hs, ctx: ctx, cancel: cancel, nodeCancels: make(map[string]context.CancelFunc),
+		peerHooks: make(map[string]func(*proto.Frame) bool), serverHooks: make(map[string]func(*proto.Frame) bool),
 	}
 	t.Cleanup(func() {
 		cancel()
@@ -79,6 +85,14 @@ func newWorld(t *testing.T, bindings ...control.Binding) *world {
 func (w *world) dialer(who string) transport.Dialer {
 	return transport.DialFunc(func(ctx context.Context) (transport.Conn, error) {
 		a, b := transport.Pipe(256)
+		w.mu.Lock()
+		if hook := w.peerHooks[who]; hook != nil {
+			transport.SetHook(a, hook)
+		}
+		if hook := w.serverHooks[who]; hook != nil {
+			transport.SetHook(b, hook)
+		}
+		w.mu.Unlock()
 		go w.srv.AcceptConn(w.ctx, b)
 		f := &fault{Conn: a, who: who}
 		w.mu.Lock()
