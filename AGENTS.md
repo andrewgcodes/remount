@@ -108,6 +108,7 @@ Check your own change against every line here before calling it done.
 | `Session.Wait` is the active-capacity handoff: accounting is committed before exit becomes observable. | `session.finish`, `session.Manager.markInactive` |
 | A check that cannot run is unavailable, never healthy. | `doctor`, `node.diag_unavailable`, `scripts/explain.py` |
 | Identity comes only from a live, unrevoked signed credential; one-time node enrollment is digest-only and atomically consumed once. Tenant isolation precedes role checks. | `identity.Manager`, the configured identity `Store` |
+| Artifact ids are plaintext digests, but encrypted physical objects are tenant/key-version scoped. Publication is atomic, decrypt verifies authentication and plaintext digest, and retired keys remain until verified migration. | `artifact/encrypted` (ADR 0065) |
 
 ## Where a change goes
 
