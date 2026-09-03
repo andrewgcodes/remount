@@ -328,3 +328,26 @@ func TestPushAndPullRequireExactlyOneWorkspace(t *testing.T) {
 		t.Fatal("pull with two positionals accepted")
 	}
 }
+
+func TestBaseSubcommandsValidateBeforeDialing(t *testing.T) {
+	if err := cmdBase(context.Background(), nil); err == nil {
+		t.Fatal("base without subcommand accepted")
+	}
+	if err := cmdBase(context.Background(), []string{"rm"}); err == nil {
+		t.Fatal("base rm without NAME accepted")
+	}
+	if err := cmdBase(context.Background(), []string{"rm", "a", "b"}); err == nil {
+		t.Fatal("base rm with two names accepted")
+	}
+	if err := cmdBase(context.Background(), []string{"mk", "x"}); err == nil || !strings.Contains(err.Error(), "unknown base subcommand") {
+		t.Fatalf("error=%v", err)
+	}
+	err := cmdWS(context.Background(), []string{"create", "--base", "golden", "--restore-from", "art_sha256:00", "--wait=false"})
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("error=%v", err)
+	}
+	err = cmdWS(context.Background(), []string{"snapshot", "ws_x", "--upload=false", "--as-base", "golden"})
+	if err == nil || !strings.Contains(err.Error(), "as-base") {
+		t.Fatalf("error=%v", err)
+	}
+}

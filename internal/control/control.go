@@ -153,6 +153,9 @@ type Options struct {
 	MaxMutationRecords    int
 	MaxTimers             int
 	MaxTimersPerWorkspace int
+	// MaxBasesPerTenant bounds pinned base images, each of which holds an
+	// artifact out of garbage collection. Zero selects 256.
+	MaxBasesPerTenant int
 }
 
 // ArtifactStore is the part of the blob store the control plane inspects.
@@ -188,6 +191,7 @@ type Control struct {
 	mutationLocks         map[string]*keyedMutex           // serialize duplicate logical mutations
 	fleetOps              map[string]*proto.FleetOperation
 	fleetLocks            map[string]*keyedMutex
+	bases                 map[string]*proto.Base // baseKey(tenant, name) -> pinned snapshot
 	fleetWake             chan struct{}
 	timerReservations     int
 	timerReservationsByWS map[string]int
@@ -269,7 +273,7 @@ func New(opts Options) (*Control, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	if opts.MaxConcurrentRequests < 0 || opts.MaxEvents < 0 || opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 ||
+	if opts.MaxConcurrentRequests < 0 || opts.MaxEvents < 0 || opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 || opts.MaxBasesPerTenant < 0 ||
 		opts.MaxMutationRecords < 0 || opts.MaxTimers < 0 || opts.MaxTimersPerWorkspace < 0 {
 		return nil, errors.New("control: resource limits must not be negative")
 	}
@@ -291,6 +295,9 @@ func New(opts Options) (*Control, error) {
 	if opts.MaxTimersPerWorkspace <= 0 {
 		opts.MaxTimersPerWorkspace = 128
 	}
+	if opts.MaxBasesPerTenant <= 0 {
+		opts.MaxBasesPerTenant = 256
+	}
 	requestCtx, requestCancel := context.WithCancel(context.Background())
 	overloadLimit := opts.MaxConcurrentRequests / 8
 	if overloadLimit < 8 {
@@ -307,6 +314,7 @@ func New(opts Options) (*Control, error) {
 		lifecycle: map[string]*keyedMutex{}, proofs: map[string]int64{}, producerSeq: map[string]uint64{},
 		producerLocks: map[string]*keyedMutex{}, mutationLocks: map[string]*keyedMutex{},
 		fleetOps: map[string]*proto.FleetOperation{}, fleetLocks: map[string]*keyedMutex{}, fleetWake: make(chan struct{}, 1),
+		bases:                 map[string]*proto.Base{},
 		timerReservationsByWS: map[string]int{},
 		requestSlots:          make(chan struct{}, opts.MaxConcurrentRequests), overloadSlots: make(chan struct{}, overloadLimit),
 		requestCtx: requestCtx, requestCancel: requestCancel, acceptRequests: true,
@@ -404,6 +412,7 @@ CREATE TABLE IF NOT EXISTS assignments (
 	PRIMARY KEY(workspace, generation, node)
 );
 CREATE TABLE IF NOT EXISTS fleet_operations (id TEXT PRIMARY KEY, data BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS bases (tenant TEXT NOT NULL, name TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(tenant, name));
 CREATE TABLE IF NOT EXISTS keys (name TEXT PRIMARY KEY, priv BLOB NOT NULL);
 `)
 	return err
@@ -586,6 +595,30 @@ func (c *Control) load() error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
+	rows, err = c.db.Query(`SELECT data FROM bases`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var b []byte
+		if err := rows.Scan(&b); err != nil {
+			rows.Close()
+			return err
+		}
+		var base proto.Base
+		if err := proto.Unmarshal(b, &base); err != nil {
+			rows.Close()
+			return fmt.Errorf("decode base: %w", err)
+		}
+		c.bases[baseKey(base.Tenant, base.Name)] = &base
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
 	rows, err = c.db.Query(`SELECT id, pubkey, data FROM nodes`)
 	if err != nil {
 		return err
@@ -722,6 +755,9 @@ func (c *Control) WithArtifactReferences(fn func([]string) error) error {
 				set[target.Snapshot] = struct{}{}
 			}
 		}
+	}
+	for _, base := range c.bases {
+		set[base.Artifact] = struct{}{}
 	}
 	references := make([]string, 0, len(set))
 	for id := range set {
@@ -1592,6 +1628,32 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return c.fleetList(ctx, subject)
+	case proto.OpBaseCreate:
+		req, err := decode[proto.BaseCreateReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.baseCreate(ctx, subject, req)
+	case proto.OpBaseList:
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.baseList(ctx, subject)
+	case proto.OpBaseRemove:
+		req, err := decode[proto.BaseRemoveReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return struct{}{}, c.baseRemove(ctx, subject, req)
 	case proto.OpNodeList:
 		subject, err := c.subjectOf(f.From)
 		if err != nil {
@@ -1710,6 +1772,9 @@ func (c *Control) wsCreate(ctx context.Context, subject Subject, req *proto.WSCr
 	// Authority comes only from the authenticated subject. A client may not
 	// select a different identity to gain bindings or ACL access.
 	req.Spec.Principal = subject.ID
+	if req.Spec.Base != "" && req.Spec.RestoreFrom != "" {
+		return nil, proto.Err(proto.CodeBadRequest, "base and restore_from are mutually exclusive")
+	}
 	scope := subject.Tenant + "|" + subject.ID + "|workspace.create"
 	unlockMutation := c.lockMutation(scope, req.IdempotencyKey)
 	defer unlockMutation()
@@ -1719,12 +1784,37 @@ func (c *Control) wsCreate(ctx context.Context, subject Subject, req *proto.WSCr
 	} else if hit {
 		return c.wsGet(prior.ID)
 	}
+	// The fingerprint must cover the request as the caller sent it: base
+	// resolution below rewrites RestoreFrom, and a replay after `base rm`
+	// must still find its prior result rather than a mismatch.
+	asSent := *req
+	// Authorize the base outside c.mu (an external Authorizer may block),
+	// then re-check under the lock that the same artifact is still pinned.
+	var baseArtifact string
+	if req.Spec.Base != "" {
+		base, err := c.baseGet(subject.Tenant, req.Spec.Base)
+		if err != nil {
+			return nil, err
+		}
+		if !c.baseReadable(ctx, subject, base) {
+			return nil, proto.Err(proto.CodeDenied, "subject %s may not read base %s", subject.ID, req.Spec.Base)
+		}
+		baseArtifact = base.Artifact
+	}
 	c.mu.Lock()
 	for _, b := range req.Spec.Bindings {
 		if _, ok := c.bindings[b]; !ok {
 			c.mu.Unlock()
 			return nil, proto.Err(proto.CodeNotFound, "binding %q is not defined", b)
 		}
+	}
+	if req.Spec.Base != "" {
+		base := c.bases[baseKey(subject.Tenant, req.Spec.Base)]
+		if base == nil || base.Artifact != baseArtifact {
+			c.mu.Unlock()
+			return nil, proto.Err(proto.CodeNotFound, "base %q is not defined", req.Spec.Base)
+		}
+		req.Spec.RestoreFrom = baseArtifact
 	}
 	if req.Spec.RestoreFrom != "" {
 		if c.opts.Artifacts == nil {
@@ -1766,7 +1856,7 @@ func (c *Control) wsCreate(ctx context.Context, subject Subject, req *proto.WSCr
 		ID: ids.New("ws"), Spec: req.Spec, State: proto.WSPending, CreatedAt: now, UpdatedAt: now,
 		Tenant: subject.Tenant, Owner: subject.ID, AuthzRevision: 1,
 	}
-	if err := c.persistWSAndMutation(ws, scope, req.IdempotencyKey, proto.OpWSCreate, req, mutationWorkspaceResult{ID: ws.ID},
+	if err := c.persistWSAndMutation(ws, scope, req.IdempotencyKey, proto.OpWSCreate, &asSent, mutationWorkspaceResult{ID: ws.ID},
 		c.wsEvent(ws, proto.EvWSCreated, subject.ID, "", req.Spec)); err != nil {
 		c.mu.Unlock()
 		return nil, err

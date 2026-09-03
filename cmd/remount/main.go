@@ -9,6 +9,7 @@
 //	remount fs       read|write|ls|stat|rm|mv|search WS ...
 //	remount port     WS PORT [--local ADDR]
 //	remount fleet    quarantine|ls|get
+//	remount base     ls|rm
 //	remount nodes / remount events [--follow] / remount timers
 //	remount standalone [--data DIR]   (server + node in one process, no token)
 package main
@@ -113,6 +114,8 @@ func run(ctx context.Context, argv []string) error {
 		return cmdPort(ctx, args)
 	case "fleet":
 		return cmdFleet(ctx, args)
+	case "base":
+		return cmdBase(ctx, args)
 	case "status":
 		return cmdStatus(ctx, args)
 	case "inspect":
@@ -175,8 +178,8 @@ func usage() {
   remount up          enroll this machine as a node (outbound only)
   remount standalone  server + node in one process (try it on a laptop)
 
-  remount ws create [--name N] [--dir PATH] [--backend B] [--image IMG] [--security PROFILE] [--egress-rule JSON] [--binding ID]
-  remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS [--authoritative] | acl WS [--reader P]... [--writer P]...
+  remount ws create [--name N] [--dir PATH | --base NAME] [--backend B] [--image IMG] [--security PROFILE] [--egress-rule JSON] [--binding ID]
+  remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS [--authoritative] [--as-base NAME] | acl WS [--reader P]... [--writer P]...
   remount exec WS -- cmd args...      run a command (stdout/stderr/exit streamed)
   remount sh WS [cmd]                 interactive shell (pty)
   remount attach WS SESSION [--from N]
@@ -185,6 +188,7 @@ func usage() {
   remount pull WS [--dir .] [--force]                                   snapshot the workspace and write what differs locally
   remount port WS PORT [--local 127.0.0.1:PORT]
   remount fleet quarantine --action freeze (--all | SELECTORS...) | ls | get OPERATION
+  remount base ls | rm NAME                                              named snapshots for ws create --base (pinned until rm)
   remount nodes | events [--follow] [--ws WS] | timers
 
 Inspection, at three depths. All take --json.
@@ -706,6 +710,7 @@ func cmdWS(ctx context.Context, args []string) error {
 		dir := fs.String("dir", "", "seed the workspace from this local directory (honors .gitignore and .remountignore)")
 		includeGit := fs.Bool("include-git", true, "with --dir: include .git so the agent can commit")
 		restoreFrom := fs.String("restore-from", "", "seed the workspace from an existing artifact id")
+		base := fs.String("base", "", "seed the workspace from a named base (see remount base ls)")
 		securityProfile := fs.String("security", "", "security profile: local, isolated, multi_tenant")
 		minIsolation := fs.String("min-isolation", "", "minimum backend isolation: none, process_sandbox, container, microvm")
 		requireSiblingIsolation := fs.Bool("require-sibling-isolation", false, "require a backend with sibling isolation")
@@ -722,8 +727,14 @@ func cmdWS(ctx context.Context, args []string) error {
 		if *principal != "" {
 			return errors.New("--principal is not supported; authenticated caller identity is authoritative")
 		}
-		if *dir != "" && *restoreFrom != "" {
-			return errors.New("--dir and --restore-from are mutually exclusive")
+		seeds := 0
+		for _, set := range []bool{*dir != "", *restoreFrom != "", *base != ""} {
+			if set {
+				seeds++
+			}
+		}
+		if seeds > 1 {
+			return errors.New("--dir, --restore-from and --base are mutually exclusive")
 		}
 		cl := c.client()
 		defer cl.Close()
@@ -735,7 +746,7 @@ func cmdWS(ctx context.Context, args []string) error {
 			*restoreFrom = id
 		}
 		spec := proto.WorkspaceSpec{
-			Name: *name, Run: *run, Model: *model, Labels: workspaceLabels, Image: *image, RestoreFrom: *restoreFrom,
+			Name: *name, Run: *run, Model: *model, Labels: workspaceLabels, Image: *image, RestoreFrom: *restoreFrom, Base: *base,
 			Requires:  proto.Requires{Backend: *backend, CPU: *cpu, MemMiB: *mem},
 			Placement: proto.Placement{Allow: labels, Node: *nodeID},
 			Bindings:  bindings, Env: env, Exclude: exclude,
@@ -937,9 +948,13 @@ func cmdWS(ctx context.Context, args []string) error {
 	case "snapshot":
 		authoritative := fs.Bool("authoritative", false, "quiesce managed execution and commit as failover state")
 		upload := fs.Bool("upload", true, "upload the snapshot to the control-plane artifact store")
+		asBase := fs.String("as-base", "", "pin the uploaded snapshot as a named base for ws create --base")
 		parse(fs, rest)
-		if err := arity(fs, 1, 1, "ws snapshot WS [--authoritative] [--upload=true]"); err != nil {
+		if err := arity(fs, 1, 1, "ws snapshot WS [--authoritative] [--upload=true] [--as-base NAME]"); err != nil {
 			return err
+		}
+		if *asBase != "" && !*upload {
+			return errors.New("--as-base requires --upload=true")
 		}
 		cl := c.client()
 		defer cl.Close()
@@ -956,12 +971,29 @@ func cmdWS(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		var base *proto.Base
+		if *asBase != "" {
+			base, err = cl.CreateBase(ctx, proto.BaseCreateReq{Name: *asBase, Artifact: res.Artifact, Workspace: fs.Arg(0)})
+			if err != nil {
+				return fmt.Errorf("snapshot %s uploaded but not pinned as base %q: %w", res.Artifact, *asBase, err)
+			}
+		}
 		if c.json {
+			if base != nil {
+				printJSON(struct {
+					*proto.WSSnapshotRes
+					Base *proto.Base `json:"base"`
+				}{res, base})
+				return nil
+			}
 			printJSON(res)
 			return nil
 		}
 		fmt.Println(res.Artifact)
 		fmt.Fprintf(os.Stderr, "%d bytes, consistency=%s, authoritative=%t\n", res.Bytes, res.Consistency, res.Authoritative)
+		if base != nil {
+			fmt.Fprintf(os.Stderr, "pinned as base %s\n", base.Name)
+		}
 	default:
 		return fmt.Errorf("unknown ws subcommand %q", sub)
 	}

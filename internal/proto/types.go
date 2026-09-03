@@ -126,6 +126,7 @@ type WorkspaceSpec struct {
 	Labels      map[string]string `cbor:"labels,omitempty" json:"labels,omitempty"`
 	Image       string            `cbor:"image,omitempty" json:"image,omitempty"`               // backend-specific (docker image); ignored by process
 	RestoreFrom string            `cbor:"restore_from,omitempty" json:"restore_from,omitempty"` // artifact id to restore the filesystem from
+	Base        string            `cbor:"base,omitempty" json:"base,omitempty"`                 // tenant base name; control resolves it into RestoreFrom at create
 	Requires    Requires          `cbor:"requires" json:"requires"`
 	Placement   Placement         `cbor:"placement" json:"placement"`
 	Bindings    []string          `cbor:"bindings,omitempty" json:"bindings,omitempty"`   // secret binding ids this workspace may use
@@ -280,6 +281,9 @@ const (
 	OpFleetQuarantine  = "fleet.quarantine"   // FleetQuarantineReq -> FleetOperation
 	OpFleetGet         = "fleet.get"          // FleetGetReq -> FleetOperation
 	OpFleetList        = "fleet.list"         // -> FleetListRes
+	OpBaseCreate       = "base.create"        // BaseCreateReq -> Base (pins a snapshot under a tenant-scoped name)
+	OpBaseList         = "base.list"          // -> BaseListRes
+	OpBaseRemove       = "base.remove"        // BaseRemoveReq -> {}
 )
 
 type WSCreateReq struct {
@@ -471,6 +475,41 @@ type FleetGetReq struct {
 // FleetListRes contains fleet operations visible to the caller.
 type FleetListRes struct {
 	Operations []FleetOperation `cbor:"operations" json:"operations"`
+}
+
+// Base is a named, tenant-scoped snapshot that new workspaces can start from.
+// The artifact stays pinned against garbage collection until the base is
+// removed, which is what distinguishes it from a workspace's last snapshot.
+type Base struct {
+	Name      string `cbor:"name" json:"name"`
+	Tenant    string `cbor:"tenant" json:"tenant"`
+	Owner     string `cbor:"owner" json:"owner"`
+	Artifact  string `cbor:"artifact" json:"artifact"`
+	Workspace string `cbor:"workspace,omitempty" json:"workspace,omitempty"` // the workspace it was snapshotted from, when known
+	Bytes     int64  `cbor:"bytes,omitempty" json:"bytes,omitempty"`
+	CreatedAt int64  `cbor:"created_at" json:"created_at"`
+}
+
+// BaseCreateReq pins an uploaded artifact under a base name in the caller's
+// tenant. Names are unique per tenant; a second create with the same name is a
+// conflict unless it replays the same idempotency key.
+type BaseCreateReq struct {
+	Name           string `cbor:"name" json:"name"`
+	Artifact       string `cbor:"artifact" json:"artifact"`
+	Workspace      string `cbor:"workspace,omitempty" json:"workspace,omitempty"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// BaseListRes lists the bases visible to the caller, sorted by name.
+type BaseListRes struct {
+	Bases []Base `cbor:"bases" json:"bases"`
+}
+
+// BaseRemoveReq unpins a base. Workspaces already created from it keep their
+// own RestoreFrom reference, so their artifact is unaffected.
+type BaseRemoveReq struct {
+	Name           string `cbor:"name" json:"name"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
 }
 
 type NodeStatus struct {
@@ -1144,5 +1183,7 @@ const (
 	EvFleetRequested = "fleet.quarantine.requested"
 	EvFleetTarget    = "fleet.quarantine.target"
 	EvFleetCompleted = "fleet.quarantine.completed"
+	EvBaseCreated    = "base.created"
+	EvBaseRemoved    = "base.removed"
 	EvWSOffer        = "ws.offer" // control -> node (not logged; a hint to claim)
 )

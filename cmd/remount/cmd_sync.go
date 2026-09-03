@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/localfs"
@@ -118,5 +119,64 @@ func cmdPull(ctx context.Context, args []string) error {
 		fmt.Fprintf(os.Stderr, ", skipped %s", strings.Join(res.Skipped, " "))
 	}
 	fmt.Fprintln(os.Stderr)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// bases: named, GC-pinned snapshots
+// ---------------------------------------------------------------------------
+
+func cmdBase(ctx context.Context, args []string) error {
+	if len(args) == 0 || isHelp(args[0]) {
+		return errors.New("base: ls|rm NAME  (create one with: remount ws snapshot WS --as-base NAME)")
+	}
+	sub, rest := args[0], args[1:]
+	fs := flag.NewFlagSet("base "+sub, flag.ExitOnError)
+	var c common
+	c.flags(fs)
+	switch sub {
+	case "ls":
+		parse(fs, rest)
+		if err := arity(fs, 0, 0, "base ls"); err != nil {
+			return err
+		}
+		cl := c.client()
+		defer cl.Close()
+		bases, err := cl.ListBases(ctx)
+		if err != nil {
+			return err
+		}
+		if c.json {
+			printJSON(bases)
+			return nil
+		}
+		tw := tabWriter()
+		fmt.Fprintln(tw, "NAME\tTENANT\tOWNER\tARTIFACT\tBYTES\tFROM\tCREATED")
+		for _, b := range bases {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n", b.Name, b.Tenant, b.Owner, short(b.Artifact), b.Bytes, b.Workspace,
+				time.UnixMilli(b.CreatedAt).UTC().Format(time.RFC3339))
+		}
+		tw.Flush()
+	case "rm":
+		idem := fs.String("idem", "", "stable idempotency key for retry after an ambiguous result")
+		parse(fs, rest)
+		if err := arity(fs, 1, 1, "base rm NAME"); err != nil {
+			return err
+		}
+		cl := c.client()
+		defer cl.Close()
+		var opts []client.OperationOption
+		if *idem != "" {
+			opts = append(opts, client.WithIdempotencyKey(*idem))
+		}
+		if err := cl.RemoveBase(ctx, fs.Arg(0), opts...); err != nil {
+			return err
+		}
+		if c.json {
+			printJSON(map[string]string{"removed": fs.Arg(0)})
+		}
+	default:
+		return fmt.Errorf("unknown base subcommand %q", sub)
+	}
 	return nil
 }

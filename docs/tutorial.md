@@ -264,6 +264,22 @@ WS=$(./remount ws create --dir ~/src/myapp --json | jq -r .id)
 atomically; `pull` never deletes local files either and reports the ones it
 left in place.
 
+### Bases: a prepared workspace many runs start from
+
+Once a workspace has the toolchain installed and the repo cloned, pin its
+snapshot under a name. Every member of your tenant can start from it, and the
+artifact is exempt from garbage collection until the base is removed.
+
+```sh
+./remount ws snapshot $WS --as-base golden
+./remount base ls
+NEW=$(./remount ws create --base golden --json | jq -r .id)
+./remount base rm golden        # workspaces already created from it are unaffected
+```
+
+A base names an artifact, not a workspace: re-snapshotting `$WS` does not move
+`golden`. To update it, `base rm` and snapshot `--as-base` again.
+
 ## 7. Sleep and wake
 
 A sleeping workspace has no node. Its last snapshot is kept, its timers are

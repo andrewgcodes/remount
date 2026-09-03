@@ -451,6 +451,36 @@ func (c *Client) QuarantineFleet(ctx context.Context, req proto.FleetQuarantineR
 	return &operation, err
 }
 
+// CreateBase pins an uploaded artifact under a tenant-scoped name so future
+// workspaces can start from it with WorkspaceSpec.Base. The artifact is
+// excluded from garbage collection until RemoveBase.
+func (c *Client) CreateBase(ctx context.Context, req proto.BaseCreateReq, options ...OperationOption) (*proto.Base, error) {
+	if key, set := operationKey(options); set {
+		req.IdempotencyKey = key
+	} else if req.IdempotencyKey == "" {
+		req.IdempotencyKey = ids.New("idem")
+	}
+	var base proto.Base
+	err := c.call(ctx, proto.PeerControl, proto.OpBaseCreate, req, &base)
+	return &base, err
+}
+
+// ListBases returns the bases visible to the caller, sorted by tenant and name.
+func (c *Client) ListBases(ctx context.Context) ([]proto.Base, error) {
+	var response proto.BaseListRes
+	err := c.call(ctx, proto.PeerControl, proto.OpBaseList, nil, &response)
+	return response.Bases, err
+}
+
+// RemoveBase unpins a base. Workspaces already created from it are unaffected.
+func (c *Client) RemoveBase(ctx context.Context, name string, options ...OperationOption) error {
+	idem, set := operationKey(options)
+	if !set {
+		idem = ids.New("idem")
+	}
+	return c.call(ctx, proto.PeerControl, proto.OpBaseRemove, proto.BaseRemoveReq{Name: name, IdempotencyKey: idem}, nil)
+}
+
 // GetFleetOperation returns one durable containment operation.
 func (c *Client) GetFleetOperation(ctx context.Context, id string) (*proto.FleetOperation, error) {
 	var operation proto.FleetOperation
