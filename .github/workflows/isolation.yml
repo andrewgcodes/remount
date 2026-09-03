@@ -1,0 +1,64 @@
+name: isolation
+
+on:
+  pull_request:
+    paths:
+      - "internal/netns/**"
+      - "internal/workspace/gvisor/**"
+      - "scripts/gvisor-spike.sh"
+      - ".github/workflows/isolation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gvisor-e4:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install host tools and verified runsc
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y apt-transport-https ca-certificates curl gnupg iproute2 nftables socat
+          curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | \
+            sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y runsc
+          runsc --version
+      - name: Build disposable Alpine rootfs
+        shell: bash
+        run: |
+          set -euo pipefail
+          container=$(docker create alpine:3.22)
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          mkdir -p /tmp/remount-gvisor-rootfs
+          docker export "$container" | sudo tar -C /tmp/remount-gvisor-rootfs -xf -
+          CGO_ENABLED=0 GOOS=linux go build -o /tmp/rawprobe ./internal/workspace/gvisor/testdata/rawprobe
+          sudo install -m 0755 /tmp/rawprobe /tmp/remount-gvisor-rootfs/rawprobe
+      - name: Run mechanism spike
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env REMOUNT_GVISOR_ROOTFS=/tmp/remount-gvisor-rootfs ./scripts/gvisor-spike.sh
+      - name: Run backend denial and revoke conformance
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -c -o /tmp/remount-gvisor.test ./internal/workspace/gvisor
+          sudo env REMOUNT_GVISOR_INTEGRATION=1 REMOUNT_GVISOR_ROOTFS=/tmp/remount-gvisor-rootfs \
+            /tmp/remount-gvisor.test -test.run '^TestE4DenialConformance$' -test.v -test.timeout=2m
+      - name: Unit and race tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -count=1 ./internal/netns ./internal/workspace/gvisor
+          go test -race -count=10 ./internal/netns ./internal/workspace/gvisor
