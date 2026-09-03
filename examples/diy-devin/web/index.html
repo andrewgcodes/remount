@@ -1,0 +1,127 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Remount agent</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 0; display: grid; grid-template-rows: auto 1fr auto; height: 100vh; }
+  header { padding: 8px 12px; border-bottom: 1px solid #ddd; display: flex; gap: 8px; align-items: center; }
+  header input { flex: 1; }
+  #out { padding: 12px; overflow: auto; white-space: pre-wrap; font-family: ui-monospace, monospace; }
+  #out .note { color: #666; }
+  #out .approval { background: #fff6d6; padding: 6px; margin: 6px 0; border-radius: 4px; }
+  footer { padding: 8px 12px; border-top: 1px solid #ddd; display: flex; gap: 8px; }
+  footer input { flex: 1; }
+</style>
+<header>
+  <input id="server" placeholder="server, e.g. http://127.0.0.1:7443">
+  <input id="token" placeholder="token" type="password">
+  <input id="agent" placeholder="agent id (empty: create)">
+  <input id="recipe" placeholder="recipe" value="codex" style="max-width: 8em">
+  <button id="go">Open</button>
+  <a id="preview" target="_blank" hidden>preview :3000</a>
+  <a id="diff" href="#" hidden>diff</a>
+  <span id="status"></span>
+</header>
+<div id="out"></div>
+<footer>
+  <input id="msg" placeholder="message to the agent (Enter to send)">
+  <button id="cancel">Cancel turn</button>
+  <button id="sleep">Sleep</button>
+</footer>
+<script type="module">
+// The page talks to the API with a bearer in the header, follows the
+// transcript over the WebSocket route (bearer as subprotocol, resumed from the
+// last index), and answers approvals. Start the server with --cors naming the
+// origin this page is served from.
+const $ = (id) => document.getElementById(id);
+const state = { base: "", token: "", agent: "", es: null, seen: new Set() };
+const note = (t, cls = "note") => { const d = document.createElement("div"); d.className = cls; d.textContent = t; $("out").append(d); d.scrollIntoView(); };
+const text = (t) => { const last = $("out").lastElementChild; if (last && last.className === "text") last.textContent += t; else { const s = document.createElement("span"); s.className = "text"; s.textContent = t; $("out").append(s); } $("out").scrollTop = $("out").scrollHeight; };
+
+async function api(method, path, body) {
+  const headers = { Accept: "application/json", Authorization: `Bearer ${state.token}` };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (method !== "GET") headers["Idempotency-Key"] = crypto.randomUUID();
+  const r = await fetch(state.base + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  if (!r.ok) { const e = await r.json().catch(() => ({ error: { code: r.status, message: r.statusText } })); throw new Error(`${e.error.code}: ${e.error.message}`); }
+  return r.status === 204 ? null : r.json();
+}
+
+async function refresh() {
+  const a = await api("GET", `/v1/agents/${state.agent}`);
+  $("status").textContent = `${a.status}${a.status_reason ? " — " + a.status_reason : ""} · ${a.turns} turns`;
+  $("preview").href = `${state.base}/v1/agents/${state.agent}/ports/3000/`; $("preview").hidden = false;
+  $("diff").hidden = false;
+  if (a.pending_approvals) for (const ap of (await api("GET", `/v1/agents/${state.agent}/approvals`)).approvals) askApproval(ap);
+  return a;
+}
+
+function askApproval(ap) {
+  if (state.seen.has(ap.id)) return; state.seen.add(ap.id);
+  const d = document.createElement("div"); d.className = "approval";
+  d.append(`${ap.kind}: ${ap.title || ap.id} `);
+  for (const o of ap.options || [{ id: "allow", name: "Allow" }]) {
+    const b = document.createElement("button"); b.textContent = o.name || o.id;
+    b.onclick = () => api("POST", `/v1/approvals/${ap.id}`, { option: o.id }).then(() => d.remove(), (e) => note(e.message));
+    d.append(" ", b);
+  }
+  const deny = document.createElement("button"); deny.textContent = "Deny";
+  deny.onclick = () => api("POST", `/v1/approvals/${ap.id}`, { denied: true }).then(() => d.remove(), (e) => note(e.message));
+  d.append(" ", deny); $("out").append(d); d.scrollIntoView();
+}
+
+function render(rec) {
+  if (rec.stream === "stderr") return note(rec.text);
+  if (rec.stream === "exit") return note("[harness exited]");
+  if (rec.stream !== "acp_out") return;
+  const f = rec.frame.frame;
+  if (f.method === "session/update") {
+    const u = f.params.update;
+    if (u.sessionUpdate === "agent_message_chunk" && u.content?.type === "text") text(u.content.text);
+    else if (u.sessionUpdate === "tool_call") note(`[tool: ${u.title || ""}]`);
+  } else if (f.method === "session/request_permission") refresh();
+}
+
+function follow(from = 0) {
+  state.es?.close();
+  // The transcript WebSocket takes the bearer as a subprotocol, so the page
+  // works from any origin the server lists in --cors without a cookie.
+  const proto = "remount.bearer." + btoa(state.token).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const ws = new WebSocket(`${state.base.replace(/^http/, "ws")}/v1/agents/${state.agent}/transcript?from=${from}`, [proto]);
+  let cursor = from;
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === "record") { cursor = m.record.index + 1; render(m.record); }
+    else if (m.type === "gap") { cursor = m.gap.to; note(`[records ${m.gap.from}..${m.gap.to - 1} were evicted]`); }
+    else if (m.type === "done") { ws.close(); refresh(); }
+  };
+  ws.onclose = (e) => { if (state.es === ws && e.code !== 1000) setTimeout(() => follow(cursor), 1000); }; // resume from the cursor
+  state.es = ws;
+}
+
+$("go").onclick = async () => {
+  state.base = $("server").value.replace(/\/$/, ""); state.token = $("token").value; $("out").textContent = "";
+  try {
+    await api("POST", "/v1/session").catch(() => {});   // cookie for the preview link (same-site deployments)
+    if (!$("agent").value) {
+      const task = prompt("Task for the agent");
+      if (!task) return;
+      const a = await api("POST", "/v1/agents", { workspace: { name: "web" }, spec: { recipe: $("recipe").value, task }, policy: { approve: "on-request", sleep_after_sec: 900 } });
+      $("agent").value = a.id;
+    }
+    state.agent = $("agent").value;
+    location.hash = state.agent;
+    await refresh(); follow(0);
+    setInterval(refresh, 5000);
+  } catch (e) { note(e.message); }
+};
+$("msg").onkeydown = async (e) => {
+  if (e.key !== "Enter" || !$("msg").value) return;
+  const t = $("msg").value; $("msg").value = "";
+  note(`> ${t}`);
+  try { await api("POST", `/v1/agents/${state.agent}/messages`, { text: t }); } catch (err) { note(err.message); }
+};
+$("cancel").onclick = () => api("POST", `/v1/agents/${state.agent}/cancel`).then(refresh, (e) => note(e.message));
+$("sleep").onclick = () => api("POST", `/v1/agents/${state.agent}/sleep`).then(refresh, (e) => note(e.message));
+$("diff").onclick = async (e) => { e.preventDefault(); try { const d = await api("GET", `/v1/agents/${state.agent}/diff`); note(d.diff || "(no changes)"); } catch (err) { note(err.message); } };
+if (location.hash.length > 1) $("agent").value = location.hash.slice(1);
+</script>

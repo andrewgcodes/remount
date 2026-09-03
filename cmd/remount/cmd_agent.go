@@ -26,7 +26,7 @@ import (
 // agent: durable agents (ADR 0043)
 // ---------------------------------------------------------------------------
 
-const agentUsage = `agent create RECIPE [--dir PATH | --base NAME | --repo URL[@REF] | --ws WS] [--binding ID[:PRESET]]... [--sleep-after DUR] [--max-turns N] [--approve M] [--acp-cmd ARG]... [--detach] -- TASK…
+const agentUsage = `agent create RECIPE [--dir PATH | --base NAME | --repo URL[@REF] | --ws WS] [--binding ID[:PRESET]]... [--sleep-after DUR] [--max-turns N] [--approve M] [--parent ID] [--at TIME] [--acp-cmd ARG]... [--detach] -- TASK…
     agent ls [--status S] [--ws WS] [--parent ID]
     agent get ID
     agent open ID [--ui]
@@ -72,12 +72,12 @@ func cmdAgent(ctx context.Context, args []string) error {
 
 // agentSeedFlags are the launch flags `agent create` shares with `run`.
 type agentSeedFlags struct {
-	dir, repo, base, ws, image, backend, name, model, security, sandbox, approve, mountPath, recipeFile string
-	includeGit                                                                                          bool
-	repoDepth                                                                                           int
-	bindings, exclude, acpCmd                                                                           listFlag
-	sleepAfter                                                                                          time.Duration
-	maxTurns                                                                                            int
+	dir, repo, base, ws, image, backend, name, model, security, sandbox, approve, mountPath, recipeFile, parent, at string
+	includeGit                                                                                                      bool
+	repoDepth                                                                                                       int
+	bindings, exclude, acpCmd                                                                                       listFlag
+	sleepAfter                                                                                                      time.Duration
+	maxTurns                                                                                                        int
 }
 
 func (f *agentSeedFlags) register(fs *flag.FlagSet) {
@@ -98,6 +98,8 @@ func (f *agentSeedFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.recipeFile, "recipe-file", "", "load the recipe from this YAML file instead of a built-in")
 	fs.DurationVar(&f.sleepAfter, "sleep-after", 0, "put the workspace to sleep this long after the agent starts waiting for input (0 = never)")
 	fs.IntVar(&f.maxTurns, "max-turns", 0, "finish the agent after this many turns (0 = unlimited)")
+	fs.StringVar(&f.parent, "parent", "", "create a child of this agent: it inherits bindings and policy caps and reports back when it finishes")
+	fs.StringVar(&f.at, "at", "", "hold the first run until this time: RFC 3339, HH:MM (next occurrence, local time) or a duration from now (90m)")
 	fs.Var(&f.bindings, "binding", "provider binding ID[:PRESET][?host=…] (repeatable)")
 	fs.Var(&f.exclude, "exclude", "snapshot exclude glob (repeatable)")
 	fs.Var(&f.acpCmd, "acp-cmd", "ACP server argv element (repeatable); overrides the recipe's acp.command")
@@ -114,6 +116,7 @@ type agentPlan struct {
 	policy     proto.AgentPolicy
 	dir        string
 	includeGit bool
+	parent     string
 }
 
 // loadRecipe resolves RECIPE to a built-in or the --recipe-file.
@@ -212,7 +215,40 @@ func planAgent(ctx context.Context, c *common, f *agentSeedFlags, recipe *launch
 	if policy.Approve == "" {
 		policy.Approve = proto.ApproveNever
 	}
-	return &agentPlan{recipe: recipe, recipeYAML: recipeYAML, opts: o, plan: plan, policy: policy, dir: f.dir, includeGit: f.includeGit}, nil
+	if f.at != "" {
+		at, err := parseStartAt(f.at, time.Now())
+		if err != nil {
+			return nil, err
+		}
+		policy.StartAt = at.UnixMilli()
+	}
+	return &agentPlan{recipe: recipe, recipeYAML: recipeYAML, opts: o, plan: plan, policy: policy, dir: f.dir, includeGit: f.includeGit, parent: f.parent}, nil
+}
+
+// parseStartAt reads --at: an RFC 3339 instant, a wall-clock HH:MM (the next
+// occurrence in local time, so 09:00 typed at 17:00 means tomorrow), or a
+// duration from now. Whatever the form, the result is in the future.
+func parseStartAt(s string, now time.Time) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		if !t.After(now) {
+			return time.Time{}, fmt.Errorf("--at %s is in the past", s)
+		}
+		return t, nil
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		if d <= 0 {
+			return time.Time{}, fmt.Errorf("--at %s must be a positive duration", s)
+		}
+		return now.Add(d), nil
+	}
+	if clock, err := time.ParseInLocation("15:04", s, now.Location()); err == nil {
+		t := time.Date(now.Year(), now.Month(), now.Day(), clock.Hour(), clock.Minute(), 0, 0, now.Location())
+		if !t.After(now) {
+			t = t.AddDate(0, 0, 1)
+		}
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("--at %q is not RFC 3339, HH:MM or a duration", s)
 }
 
 // create uploads the seed if any and creates the agent.
@@ -225,6 +261,7 @@ func (p *agentPlan) create(ctx context.Context, cl *client.Client, acpCmd []stri
 			Sandbox: p.opts.Sandbox, ACPCommand: acpCmd, Auth: p.plan.Auth, Mode: proto.AgentModeACP,
 		},
 		Policy: p.policy,
+		Parent: p.parent,
 	}
 	if p.opts.WS != "" {
 		req.WS = p.opts.WS
@@ -979,6 +1016,8 @@ func (r *transcriptRenderer) status(a *proto.Agent) {
 		r.note("[failed: %s]", a.StatusReason)
 	case proto.AgentFinished:
 		r.note("[finished: %s]", a.StatusReason)
+	case proto.AgentScheduled:
+		r.note("[scheduled: starts %s]", time.UnixMilli(a.Policy.StartAt).Local().Format(time.RFC3339))
 	default:
 		r.note("[%s]", a.Status)
 	}

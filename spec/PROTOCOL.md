@@ -386,11 +386,13 @@ Agent { id, tenant, owner, name, ws, owns_ws, spec, mode, acp_session_id,
         forked_from, policy, transcript_session, transcript_node,
         transcript_next, transcript_first, transcript_bytes,
         pending_approvals, url, created_at, updated_at, wake_timer,
-        idle_since, failures }
+        idle_since, failures, parent_notified }
 ```
 
 `status` is derived, never stored as intent: `creating` until a node first
-holds the workspace; `running` while a prompt is in flight or queued;
+holds the workspace; `scheduled` while `policy.start_at` (Unix ms) lies in the
+future and no run has started — the workspace is materialized, the inbox is
+held, nothing launches; `running` while a prompt is in flight or queued;
 `waiting_approval` while an approval is pending; `waiting_input` when the
 harness finished a turn and is still up; `idle` when no harness is running and
 nothing is queued; `sleeping` when the workspace is paused; `failed` after the
@@ -437,6 +439,25 @@ grant), then creates a new agent whose workspace restores that snapshot and
 whose `acp_session_id` is the parent's. A child's policy may only be narrower
 than its parent's: `approve` may not widen and a bounded `max_turns` may not
 grow or become unbounded.
+
+`agent.create` with `parent` makes a child of a live agent the caller may
+execute (a fork is a child too). A child inherits what it does not name —
+`providers`, `primary`, `sandbox`, the workspace `bindings`, the security
+profile — and may never hold more than the parent: a provider or binding the
+parent lacks is `denied`, as is a wider policy. Trees are at most three deep.
+When a child reaches `failed`, `finished` or `destroyed`, the control plane
+appends one `kind: child` message to the parent's inbox whose text is a
+`ChildSummary{child, name, status, reason, turns, ws, url}` JSON document,
+emits `agent.child.finished` on the parent's stream, and marks the child
+`parent_notified`, all in one transaction. A parent that is terminal or gone
+is marked notified without a message; a parent whose inbox is full is retried
+on the next reconcile. The parent handles the summary like any follow-up: it
+wakes if asleep and runs a turn.
+
+`policy.start_at` schedules the first run: the agent is created and its
+workspace claimed at once, but the reconciler neither launches nor delivers
+before that instant, and `agent.message` before it is queued. A start more than
+366 days out is `bad_request`.
 
 `policy.approve` is `never`, `on-request` (default) or `auto`. `auto` is
 refused with `denied` for a local process workspace; it needs the docker
@@ -957,8 +978,8 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `agent.run.started`, `agent.run.finished`, `agent.session`, `agent.turn`,
 `agent.tool_call`, `agent.waiting`, `agent.cancelled`, `agent.slept`,
 `agent.woken`, `agent.forked`, `agent.failed`, `agent.finished`,
-`agent.destroyed`, `approval.pending`, `approval.decided` and
-`approval.expired`.
+`agent.destroyed`, `agent.child.finished`, `approval.pending`,
+`approval.decided` and `approval.expired`.
 
 Agent events are on the workspace stream and every one carries `agent`.
 `agent.created` carries `ws`, `owns_ws`, `recipe`, `mode`, `task_hash`,
@@ -968,6 +989,8 @@ Agent events are on the workspace stream and every one carries `agent`.
 `error`, `cancelled` and `turns`; `agent.turn` carries `run`, `message`,
 `stop_reason` and `tokens`; `agent.cancelled` carries `run`, `dropped` (a
 count) and `by`; `agent.forked` carries `from` and `snapshot`;
+`agent.child.finished` is on the parent's stream and carries `child`,
+`status`, `reason`, `turns` and `message` (the inbox message id);
 `approval.pending` carries `run`, `title`, `tool_call`, `tool_kind` and
 `options` (a count); `approval.decided` carries `option`, `denied`, `by` and
 `run`. No agent or approval event carries a prompt's text, an elicitation's
@@ -1011,7 +1034,21 @@ payload's `status` is the upstream response status when headers arrived, or
 not. `error` is a class, never the transport's error text.
 
 `POST /v1/events` appends an event out of band. This is how a webhook wakes a
-sleeping workspace.
+sleeping workspace. The body is `{type, stream?, payload?, agent?}`; unknown
+fields are `400`. The caller authenticates with a bearer the control plane
+knows, or with an HMAC-SHA256 of the raw body under the configured webhook
+secret in `X-Remount-Signature` or `X-Hub-Signature-256` (`sha256=<hex>`).
+`agent` maps the event onto an Agent: `{wake, message}` sends `message` to an
+existing agent as a follow-up (waking it), where `wake` is an id or
+`name:<template>` naming exactly one live agent (none is `not_found`, several
+is `conflict`); `{create: AgentCreateReq}` creates one. `message`, `wake`,
+`create.spec.task`, `create.name`, `create.workspace.name` and
+`idempotency_key` are Go templates over the decoded payload with a missing key an error, so a payload
+that changed shape is refused rather than rendered into a half-empty prompt. A
+signed request acts as the configured webhook credential; without one it may
+only append. The response is `202 {accepted, agent?, ws?, status?}` and the
+event lands on the agent's workspace stream when `stream` is empty. Redelivery
+with the same rendered `idempotency_key` returns the same agent or message.
 
 Event history is finite. The reference control plane retains it by configured
 age and row budgets and records the oldest retained sequence as a durable

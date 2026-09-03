@@ -22,7 +22,7 @@ import (
 // run: seed a workspace, install a harness, launch it against brokered keys
 // ---------------------------------------------------------------------------
 
-const runUsage = "run RECIPE [--dir PATH | --base NAME | --repo URL[@REF] | --ws WS] [--binding ID[:PRESET]]... [--security P] [--sandbox M] [--approve M] [--mount-path /abs] [--detach] [--pty] [--sleep-after DUR] [--max-turns N] -- TASK…\n    run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM] | --queue-continue QUEUE"
+const runUsage = "run RECIPE [--dir PATH | --base NAME | --repo URL[@REF] | --ws WS] [--binding ID[:PRESET]]... [--security P] [--sandbox M] [--approve M] [--mount-path /abs] [--detach] [--pty] [--sleep-after DUR] [--max-turns N] [--parent ID] [--at TIME | --sleep-until HH:MM] -- TASK…\n    run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM] | --queue-continue QUEUE"
 
 func cmdRun(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
@@ -54,7 +54,9 @@ func cmdRun(ctx context.Context, args []string) error {
 	queueFile := fs.String("queue", "", "run the tasks listed in this file one after another (ADR 0041); - reads stdin")
 	queueContinue := fs.String("queue-continue", "", "continue an existing queue where it stopped")
 	sleepAfter := fs.Duration("sleep-after", 0, "with --queue, sleep the workspace this long between tasks")
-	sleepUntil := fs.String("sleep-until", "", "with --queue, sleep the workspace until this local HH:MM between tasks")
+	sleepUntil := fs.String("sleep-until", "", "with --queue, sleep the workspace until this local HH:MM between tasks; for an agent, hold its first run until then")
+	parent := fs.String("parent", "", "agent mode: create a child of this agent (inherits bindings and policy caps)")
+	at := fs.String("at", "", "agent mode: hold the first run until this time (RFC 3339, HH:MM or a duration)")
 	var bindings, exclude listFlag
 	fs.Var(&bindings, "binding", "provider binding ID[:PRESET][?host=…] (repeatable)")
 	fs.Var(&exclude, "exclude", "snapshot exclude glob (repeatable)")
@@ -70,9 +72,6 @@ func cmdRun(ctx context.Context, args []string) error {
 		rest = rest[1:]
 	}
 	queued := *queueFile != "" || *queueContinue != ""
-	if !queued && *sleepUntil != "" {
-		return errors.New("--sleep-until needs --queue")
-	}
 	if *queueFile != "" && *queueContinue != "" {
 		return errors.New("--queue and --queue-continue are mutually exclusive")
 	}
@@ -87,6 +86,9 @@ func cmdRun(ctx context.Context, args []string) error {
 			return err
 		}
 	}
+	if *sleepUntil != "" && *at != "" {
+		return errors.New("--sleep-until and --at are the same thing for an agent; pass one")
+	}
 	if queued && (*detach || *resume) {
 		return errors.New("--queue runs in the foreground; --detach and --resume do not apply")
 	}
@@ -98,15 +100,28 @@ func cmdRun(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	agentMode := recipe.Mode() == launch.ModeACP && !queued && !*resume && !*pty
+	if !agentMode {
+		if !queued && *sleepUntil != "" {
+			return errors.New("--sleep-until needs --queue or an agent (acp) recipe")
+		}
+		if *parent != "" || *at != "" {
+			return errors.New("--parent and --at apply to agents: an acp recipe without --queue, --resume or --pty")
+		}
+	}
 
 	// An ACP-capable recipe runs as a durable Agent: the conversation lives in
 	// the control plane and survives this process, node loss and sleep.
-	if recipe.Mode() == launch.ModeACP && !queued && !*resume && !*pty {
+	if agentMode {
+		startAt := *at
+		if *sleepUntil != "" {
+			startAt = *sleepUntil
+		}
 		seed := agentSeedFlags{
 			dir: *dir, repo: *repo, base: *base, ws: *wsID, image: *image, backend: *backend, name: *name, model: *model,
 			security: *security, sandbox: *sandbox, approve: *approve, mountPath: *mountPath, recipeFile: *recipeFile,
 			includeGit: *includeGit, repoDepth: *repoDepth, bindings: bindings, exclude: exclude,
-			sleepAfter: *sleepAfter, maxTurns: *maxTurns,
+			sleepAfter: *sleepAfter, maxTurns: *maxTurns, parent: *parent, at: startAt,
 		}
 		if *timeout != 0 {
 			return errors.New("--timeout applies to sessions; agents finish by --max-turns or remount agent cancel")

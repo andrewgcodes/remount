@@ -235,11 +235,18 @@ func buildAgentTransitions() map[statePair]struct{} {
 			out[statePair{from, t}] = struct{}{}
 		}
 	}
-	live := []string{proto.AgentCreating, proto.AgentRunning, proto.AgentWaitingInput, proto.AgentWaitingApproval, proto.AgentIdle, proto.AgentSleeping}
+	live := []string{proto.AgentCreating, proto.AgentScheduled, proto.AgentRunning, proto.AgentWaitingInput, proto.AgentWaitingApproval, proto.AgentIdle, proto.AgentSleeping}
 	// Any live status may fail, finish, be destroyed, or fall back to
 	// creating (workspace pending again after a wake or a lost node).
 	for _, from := range live {
 		add(from, proto.AgentFailed, proto.AgentFinished, proto.AgentDestroyed, proto.AgentCreating, proto.AgentSleeping, proto.AgentRunning, proto.AgentIdle)
+	}
+	// A schedule holds from creation; when it fires the agent takes whatever
+	// status its workspace and inbox imply, so scheduled is reachable from and
+	// leads to every live status.
+	for _, s := range live {
+		add(s, proto.AgentScheduled)
+		add(proto.AgentScheduled, s)
 	}
 	add(proto.AgentCreating, proto.AgentWaitingInput)
 	add(proto.AgentRunning, proto.AgentWaitingInput, proto.AgentWaitingApproval)
