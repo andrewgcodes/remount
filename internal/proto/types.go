@@ -475,6 +475,7 @@ type NodeListRes struct {
 // are rejected unless All is explicit.
 type WorkspaceSelector struct {
 	All           bool              `cbor:"all,omitempty" json:"all,omitempty"`
+	Workspace     string            `cbor:"workspace,omitempty" json:"workspace,omitempty"`
 	Tenant        string            `cbor:"tenant,omitempty" json:"tenant,omitempty"`
 	Principal     string            `cbor:"principal,omitempty" json:"principal,omitempty"`
 	Run           string            `cbor:"run,omitempty" json:"run,omitempty"`

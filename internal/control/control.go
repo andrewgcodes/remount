@@ -3628,7 +3628,7 @@ func cloneFleetOperation(in *proto.FleetOperation) *proto.FleetOperation {
 }
 
 func selectorSpecified(selector proto.WorkspaceSelector) bool {
-	return selector.All || selector.Tenant != "" || selector.Principal != "" || selector.Run != "" ||
+	return selector.All || selector.Workspace != "" || selector.Tenant != "" || selector.Principal != "" || selector.Run != "" ||
 		selector.Node != "" || selector.Model != "" || selector.Backend != "" || len(selector.Labels) > 0 ||
 		selector.CreatedAfter != 0 || selector.CreatedBefore != 0
 }
@@ -3687,6 +3687,9 @@ func (c *Control) fleetRPCContext(parent context.Context, operation *proto.Fleet
 
 func workspaceMatches(selector proto.WorkspaceSelector, ws *proto.Workspace, backend string) bool {
 	if ws == nil || ws.State == proto.WSDestroyed {
+		return false
+	}
+	if selector.Workspace != "" && selector.Workspace != ws.ID {
 		return false
 	}
 	if selector.Tenant != "" && selector.Tenant != ws.Tenant {
