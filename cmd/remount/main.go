@@ -544,7 +544,7 @@ func cmdUp(ctx context.Context, args []string) error {
 	data := fs.String("data", envOr("REMOUNT_NODE_DATA", defaultNodeData()), "node data directory")
 	labels := kvFlag{}
 	fs.Var(labels, "label", "node label k=v (repeatable)")
-	backends := fs.String("backend", "process", "comma-separated backends: process,docker")
+	backends := fs.String("backend", "process", "comma-separated backends: process,docker,gvisor")
 	image := fs.String("image", workspace.DefaultImage(version), "default docker image (ubuntu:24.04 for a plain distro)")
 	artifactBytes := fs.Int64("artifact-object-bytes", 8<<30, "maximum compressed bytes per cached artifact")
 	artifactStoreBytes := fs.Int64("artifact-store-bytes", 32<<30, "maximum node artifact-cache bytes")
