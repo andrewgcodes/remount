@@ -489,3 +489,162 @@ func TestAgentMaxTurnsStopsHarnessAndMirrorsExit(t *testing.T) {
 		t.Fatalf("mirrored exit = %+v, %v", exit, err)
 	}
 }
+
+// TestAgentSurvivesNodeLoss: the node running the harness dies for good.
+// The workspace fails over to another node from its last snapshot, the
+// agent's run is closed as lost, and the next message starts a fresh
+// attempt on the new node with the same ACP session id. The durable mirror
+// keeps every record from before the loss at its original index and
+// continues after it, so a reader that only ever saw the control plane sees
+// one conversation, not two.
+func TestAgentSurvivesNodeLoss(t *testing.T) {
+	w := newWorld(t)
+	nodes := map[string]string{}
+	for _, name := range []string{"n1", "n2"} {
+		nodes[w.node(name, map[string]string{"zone": "a"}).ID()] = name
+	}
+	c := w.client("c1")
+	ctx := ctxT(t, 150*time.Second)
+	a, err := c.CreateAgent(ctx, proto.AgentCreateReq{
+		Name:      "durable",
+		Workspace: &proto.WorkspaceSpec{Name: "durable-ws", Placement: proto.Placement{Allow: map[string]string{"zone": "a"}}},
+		Spec:      proto.AgentSpec{Recipe: "custom", Task: "first turn", ACPCommand: fakeACPCommand(t, "echo")},
+		Policy:    proto.AgentPolicy{Approve: proto.ApproveNever},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idle := waitAgent(t, ctx, c, a.ID, "idle after the first turn", func(a *proto.Agent) bool {
+		return len(a.Inbox) == 0 && len(a.Runs) == 1 && a.Runs[0].Turns == 1
+	})
+	if err := c.WriteFile(ctx, a.WS, "progress.txt", []byte("turn 1"), 0); err != nil {
+		t.Fatal(err)
+	}
+	// A graceful move records the snapshot a failover restores from. The
+	// run does not survive it (the workspace is released and re-claimed at a
+	// new generation) but the agent does: no failure is counted.
+	if _, err := c.MoveWorkspace(ctx, a.WS, nil, &proto.Placement{Allow: map[string]string{"zone": "a"}}); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := c.WaitClaimed(ctx, a.WS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterMove := waitAgent(t, ctx, c, a.ID, "run closed and awake after the move", func(a *proto.Agent) bool {
+		return len(a.Runs) == 1 && a.Runs[0].State == proto.AgentRunDone && a.Status != proto.AgentSleeping
+	})
+	if agentTerminalStatus(afterMove.Status) || afterMove.Failures != 0 {
+		t.Fatalf("after move = %+v runs=%+v", afterMove, afterMove.Runs)
+	}
+	// A turn on the moved workspace leaves a live, idle harness on the node
+	// that is about to die.
+	if _, err := c.MessageAgent(ctx, proto.AgentMessageReq{ID: a.ID, Text: "turn after the move"}); err != nil {
+		t.Fatal(err)
+	}
+	live := waitAgent(t, ctx, c, a.ID, "turn on the moved workspace", func(a *proto.Agent) bool {
+		return len(a.Inbox) == 0 && len(a.Runs) == 2 && a.Runs[1].Turns == 1 && a.Runs[1].State == proto.AgentRunActive
+	})
+	if live.Runs[1].Node != moved.Node || live.Runs[1].Generation != moved.Generation {
+		t.Fatalf("live run = %+v, workspace on %s gen %d", live.Runs[1], moved.Node, moved.Generation)
+	}
+	before := mirrorRecords(t, ctx, c, a.ID)
+	if len(before) == 0 {
+		t.Fatal("mirror empty before the loss")
+	}
+
+	// The node holding the workspace and the live harness dies permanently.
+	holder := nodes[moved.Node]
+	if holder == "" {
+		t.Fatalf("unknown holder %s", moved.Node)
+	}
+	w.stopNode(holder)
+	var failedOver *proto.Workspace
+	for deadline := time.Now().Add(60 * time.Second); time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
+		ws, err := c.GetWorkspace(ctx, a.WS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ws.State == proto.WSClaimed && ws.Node != moved.Node {
+			failedOver = ws
+			break
+		}
+	}
+	if failedOver == nil {
+		t.Fatal("workspace did not fail over")
+	}
+	if b, err := c.ReadFile(ctx, a.WS, "progress.txt"); err != nil || string(b) != "turn 1" {
+		t.Fatalf("restored file = %q, %v", b, err)
+	}
+
+	// The live run is closed as lost, and the next message launches attempt
+	// 3 on the surviving node, in the same ACP session; the turn completes.
+	lost := waitAgent(t, ctx, c, a.ID, "live run closed as lost", func(a *proto.Agent) bool {
+		return len(a.Runs) == 2 && a.Runs[1].State == proto.AgentRunDone
+	})
+	if lost.Runs[1].Error == "" || agentTerminalStatus(lost.Status) {
+		t.Fatalf("lost run = %+v status=%s", lost.Runs[1], lost.Status)
+	}
+	if _, err := c.MessageAgent(ctx, proto.AgentMessageReq{ID: a.ID, Text: "second turn after the loss"}); err != nil {
+		t.Fatal(err)
+	}
+	resumed := waitAgent(t, ctx, c, a.ID, "turn on the new node", func(a *proto.Agent) bool {
+		return len(a.Inbox) == 0 && len(a.Runs) == 3 && a.Runs[2].Turns == 1
+	})
+	if resumed.Runs[2].Node != failedOver.Node || resumed.Runs[2].Attempt != 3 || resumed.Runs[2].Generation != failedOver.Generation {
+		t.Fatalf("third run = %+v (workspace on %s gen %d)", resumed.Runs[2], failedOver.Node, failedOver.Generation)
+	}
+	if resumed.ACPSessionID != idle.ACPSessionID || resumed.Turns != 3 {
+		t.Fatalf("resumed agent = %+v", resumed)
+	}
+	after := mirrorRecords(t, ctx, c, a.ID)
+	if len(after) <= len(before) {
+		t.Fatalf("mirror did not grow after the loss: %d -> %d", len(before), len(after))
+	}
+	for i, rec := range before {
+		if after[i].Index != rec.Index || after[i].Run != rec.Run || after[i].Seq != rec.Seq || !bytes.Equal(after[i].Data, rec.Data) {
+			t.Fatalf("mirror record %d changed across the loss: %+v -> %+v", i, rec, after[i])
+		}
+	}
+	var text bytes.Buffer
+	runs := map[string]bool{}
+	for _, rec := range after {
+		runs[rec.Run] = true
+		if rec.Stream == proto.StreamACPIn || rec.Stream == proto.StreamACPOut {
+			text.Write(rec.Data)
+		}
+	}
+	if len(runs) != 3 || !bytes.Contains(text.Bytes(), []byte("first turn")) || !bytes.Contains(text.Bytes(), []byte("turn after the move")) || !bytes.Contains(text.Bytes(), []byte("second turn after the loss")) {
+		t.Fatalf("mirror does not span all runs (%d runs): %s", len(runs), text.Bytes())
+	}
+	// Each run is announced twice (dispatched pending, then active); the
+	// moved and the lost run each finished once, and the agent never failed.
+	types := eventTypes(t, ctx, c, a.WS)
+	if types[proto.EvAgentRunStarted] != 6 || types[proto.EvAgentRunFinished] != 2 || types[proto.EvAgentFailed] != 0 || types[proto.EvAgentTurn] != 3 || types["ws.lease_expired"] != 1 {
+		t.Fatalf("events = %v", types)
+	}
+}
+
+// mirrorRecords reads the whole durable mirror through the cursor.
+func mirrorRecords(t *testing.T, ctx context.Context, c *client.Client, agent string) []proto.TranscriptRecord {
+	t.Helper()
+	var out []proto.TranscriptRecord
+	var from uint64
+	for {
+		page, err := c.Transcript(ctx, agent, from, proto.MaxTranscriptPage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page.Gap != nil {
+			t.Fatalf("unexpected gap %+v", page.Gap)
+		}
+		out = append(out, page.Records...)
+		if len(page.Records) == 0 || page.Next == from {
+			return out
+		}
+		from = page.Next
+	}
+}
+
+func agentTerminalStatus(s string) bool {
+	return s == proto.AgentFailed || s == proto.AgentFinished || s == proto.AgentDestroyed
+}
