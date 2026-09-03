@@ -681,6 +681,27 @@ func (r *Recipe) ACPLauncher(d Data) (string, error) {
 	return r.launcher(d, out, out.ACP, out.ACPEnv)
 }
 
+// UILauncherPath is where the UI launcher for this recipe lives.
+func (r *Recipe) UILauncherPath() string {
+	return LauncherDir + "/" + r.Name + ".ui.sh"
+}
+
+// UILauncher renders the sh script that execs the recipe's web UI with the
+// same preamble as Launcher. Data.Port defaults to the recipe's UI port.
+func (r *Recipe) UILauncher(d Data) (string, error) {
+	if r.UI == nil {
+		return "", fmt.Errorf("recipe %s has no ui", r.Name)
+	}
+	if d.Port == 0 {
+		d.Port = r.UI.Port
+	}
+	out, err := r.render(d)
+	if err != nil {
+		return "", err
+	}
+	return r.launcher(d, out, out.UI, nil)
+}
+
 func (r *Recipe) launcher(d Data, out *rendered, argv []string, extraEnv map[string]string) (string, error) {
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\n")

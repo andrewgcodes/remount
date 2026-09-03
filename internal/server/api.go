@@ -41,9 +41,6 @@ const (
 	// idempotencyHeader is the header a client sets to make a retried
 	// mutation return the original result.
 	idempotencyHeader = "Idempotency-Key"
-	// wakeTimeout bounds how long a preview or a diff waits for a woken
-	// workspace to be claimed before it gives up with 503.
-	wakeTimeout = 90 * time.Second
 )
 
 type apiError struct {
@@ -888,140 +885,18 @@ func truncateReason(s string) string {
 // diff
 // ---------------------------------------------------------------------------
 
-// diffResult is git status and the unified diff of the workspace tree.
-type diffResult struct {
-	Status    string `json:"status"`
-	Diff      string `json:"diff"`
-	Truncated bool   `json:"truncated,omitempty"`
-}
-
-// maxDiffBytes bounds the diff text returned; larger diffs are cut and
-// marked truncated rather than streamed through the control plane.
-const maxDiffBytes = 4 << 20
-
-// handleDiff runs git in the workspace. It needs the tree, so a sleeping
-// agent is refused with 409 unless wake=true, in which case the workspace is
-// woken (agent.woken{by: diff}) and the request waits for it to be claimed.
 func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
 	cl, release := s.apiClient(w, r, true)
 	if cl == nil {
 		return
 	}
 	defer release()
-	id := r.PathValue("id")
-	wake := r.URL.Query().Get("wake") == "true"
-	a, err := s.materialized(r.Context(), cl, id, wake, proto.AgentWokenByDiff)
+	res, err := cl.Diff(r.Context(), r.PathValue("id"), r.URL.Query().Get("wake") == "true")
 	if err != nil {
 		writeError(w, err)
 		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
-	defer cancel()
-	status, stderr, exit, err := cl.Run(ctx, a.WS, "git", "status", "--porcelain=v1", "--untracked-files=all")
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if exit == nil || exit.Code != 0 || exit.Error != "" {
-		writeError(w, proto.Err(proto.CodeUnreachable, "git status failed in the workspace: %s", strings.TrimSpace(firstNonEmpty(string(stderr), exitText(exit)))))
-		return
-	}
-	diff, stderr, exit, err := cl.Run(ctx, a.WS, "git", "diff", "--no-color", "--no-ext-diff", "HEAD")
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if exit == nil || exit.Code != 0 || exit.Error != "" {
-		// A repository without a commit has no HEAD; the index diff is the
-		// closest honest answer.
-		diff, stderr, exit, err = cl.Run(ctx, a.WS, "git", "diff", "--no-color", "--no-ext-diff")
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		if exit == nil || exit.Code != 0 || exit.Error != "" {
-			writeError(w, proto.Err(proto.CodeUnreachable, "git diff failed in the workspace: %s", strings.TrimSpace(firstNonEmpty(string(stderr), exitText(exit)))))
-			return
-		}
-	}
-	res := diffResult{Status: string(status), Diff: string(diff)}
-	if len(res.Diff) > maxDiffBytes {
-		res.Diff = res.Diff[:maxDiffBytes]
-		res.Truncated = true
 	}
 	writeJSON(w, http.StatusOK, res)
-}
-
-func firstNonEmpty(a, b string) string {
-	if strings.TrimSpace(a) != "" {
-		return a
-	}
-	return b
-}
-
-func exitText(exit *proto.ExitInfo) string {
-	if exit == nil {
-		return "no exit status"
-	}
-	if exit.Error != "" {
-		return exit.Error
-	}
-	if exit.Signal != "" {
-		return "signal " + exit.Signal
-	}
-	return "exit status " + strconv.Itoa(exit.Code)
-}
-
-// materialized returns the agent once its workspace is claimed by a node.
-// A sleeping agent is woken only when wake is set; otherwise it is a 409 so
-// a read never has a side effect the caller did not ask for. Creating and
-// freshly woken workspaces are waited for, bounded by wakeTimeout.
-func (s *Server) materialized(ctx context.Context, cl *client.Client, id string, wake bool, by string) (*proto.Agent, error) {
-	a, err := cl.GetAgent(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	switch a.Status {
-	case proto.AgentDestroyed:
-		return nil, proto.Err(proto.CodeConflict, "agent %s is %s", a.ID, a.Status)
-	case proto.AgentSleeping:
-		if !wake {
-			return nil, proto.Err(proto.CodeConflict, "agent %s is sleeping; wake=true wakes it", a.ID)
-		}
-		if _, err := cl.WakeAgent(ctx, id, by); err != nil {
-			return nil, err
-		}
-	}
-	deadline := time.Now().Add(wakeTimeout)
-	for {
-		ws, err := cl.GetWorkspace(ctx, a.WS)
-		if err != nil {
-			return nil, err
-		}
-		switch ws.State {
-		case proto.WSClaimed:
-			return a, nil
-		case proto.WSDestroyed:
-			return nil, proto.Err(proto.CodeConflict, "workspace %s is destroyed", ws.ID)
-		case proto.WSPaused:
-			if !wake {
-				return nil, proto.Err(proto.CodeConflict, "agent %s is sleeping; wake=true wakes it", a.ID)
-			}
-			// The wake above was a replay against an already-woken agent, or
-			// the agent's status lagged its workspace; wake the tree itself.
-			if _, err := cl.WakeWorkspace(ctx, ws.ID); err != nil {
-				return nil, err
-			}
-		}
-		if time.Now().After(deadline) {
-			return nil, proto.Err(proto.CodeUnreachable, "workspace %s is %s; no node has claimed it", ws.ID, ws.State)
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(200 * time.Millisecond):
-		}
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,7 +918,7 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		path = "."
 	}
-	a, err := s.materialized(r.Context(), cl, id, false, "")
+	a, err := cl.AgentMaterialized(r.Context(), id, false, "")
 	if err != nil {
 		writeError(w, err)
 		return

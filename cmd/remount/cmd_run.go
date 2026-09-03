@@ -22,7 +22,7 @@ import (
 // run: seed a workspace, install a harness, launch it against brokered keys
 // ---------------------------------------------------------------------------
 
-const runUsage = "run RECIPE [--dir PATH | --base NAME | --repo URL[@REF] | --ws WS] [--binding ID[:PRESET]]... [--security P] [--sandbox M] [--approve M] [--mount-path /abs] [--detach] -- TASK…\n    run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM] | --queue-continue QUEUE"
+const runUsage = "run RECIPE [--dir PATH | --base NAME | --repo URL[@REF] | --ws WS] [--binding ID[:PRESET]]... [--security P] [--sandbox M] [--approve M] [--mount-path /abs] [--detach] [--pty] [--sleep-after DUR] [--max-turns N] -- TASK…\n    run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM] | --queue-continue QUEUE"
 
 func cmdRun(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
@@ -48,6 +48,8 @@ func cmdRun(ctx context.Context, args []string) error {
 	recipeFile := fs.String("recipe-file", "", "load the recipe from this YAML file instead of a built-in")
 	timeout := fs.Duration("timeout", 0, "server-side session timeout (0 = none)")
 	killOnInterrupt := fs.Bool("kill-on-interrupt", false, "Ctrl-C kills the harness instead of detaching")
+	pty := fs.Bool("pty", false, "run the harness's own terminal UI in a session instead of a durable ACP agent (recipes with acp)")
+	maxTurns := fs.Int("max-turns", 0, "agent mode: finish after this many turns (0 = unlimited)")
 	mountPath := fs.String("mount-path", "", "absolute path the tree appears at inside the workspace (default /work; needs docker)")
 	queueFile := fs.String("queue", "", "run the tasks listed in this file one after another (ADR 0041); - reads stdin")
 	queueContinue := fs.String("queue-continue", "", "continue an existing queue where it stopped")
@@ -68,8 +70,8 @@ func cmdRun(ctx context.Context, args []string) error {
 		rest = rest[1:]
 	}
 	queued := *queueFile != "" || *queueContinue != ""
-	if !queued && (*sleepAfter != 0 || *sleepUntil != "") {
-		return errors.New("--sleep-after and --sleep-until need --queue")
+	if !queued && *sleepUntil != "" {
+		return errors.New("--sleep-until needs --queue")
 	}
 	if *queueFile != "" && *queueContinue != "" {
 		return errors.New("--queue and --queue-continue are mutually exclusive")
@@ -92,27 +94,57 @@ func cmdRun(ctx context.Context, args []string) error {
 		return errors.New("--queue takes its tasks from the file; nothing may follow --")
 	}
 
-	var recipe *launch.Recipe
-	var err error
-	if *recipeFile != "" {
-		src, rerr := os.ReadFile(*recipeFile)
-		if rerr != nil {
-			return rerr
+	recipe, recipeYAML, err := loadRecipe(fs.Arg(0), *recipeFile)
+	if err != nil {
+		return err
+	}
+
+	// An ACP-capable recipe runs as a durable Agent: the conversation lives in
+	// the control plane and survives this process, node loss and sleep.
+	if recipe.Mode() == launch.ModeACP && !queued && !*resume && !*pty {
+		seed := agentSeedFlags{
+			dir: *dir, repo: *repo, base: *base, ws: *wsID, image: *image, backend: *backend, name: *name, model: *model,
+			security: *security, sandbox: *sandbox, approve: *approve, mountPath: *mountPath, recipeFile: *recipeFile,
+			includeGit: *includeGit, repoDepth: *repoDepth, bindings: bindings, exclude: exclude,
+			sleepAfter: *sleepAfter, maxTurns: *maxTurns,
 		}
-		recipe, err = launch.Parse(src)
-		if err != nil {
-			return fmt.Errorf("%s: %w", *recipeFile, err)
+		if *timeout != 0 {
+			return errors.New("--timeout applies to sessions; agents finish by --max-turns or remount agent cancel")
 		}
-		if recipe.Name != fs.Arg(0) {
-			return fmt.Errorf("%s declares recipe %q; the command names %q", *recipeFile, recipe.Name, fs.Arg(0))
-		}
-	} else {
-		recipe, err = launch.Load(fs.Arg(0))
+		p, err := planAgent(ctx, &c, &seed, recipe, recipeYAML, strings.Join(rest, " "))
 		if err != nil {
 			return err
 		}
+		if _, err := c.ensureLocalServer(ctx); err != nil {
+			return err
+		}
+		cl := c.client()
+		defer cl.Close()
+		a, err := p.create(ctx, cl, nil, "")
+		if err != nil {
+			return err
+		}
+		if p.plan.Auth == launch.AuthWorkspaceResident {
+			fmt.Fprintf(os.Stderr, "note: %s will use its own login kept inside workspace %s (no provider binding given)\n", recipe.Name, a.WS)
+		}
+		if *detach {
+			if c.json {
+				printJSON(a)
+				return nil
+			}
+			fmt.Printf("%s %s\n", a.ID, a.WS)
+			fmt.Fprintf(os.Stderr, "watch: remount agent watch %s\nevents: remount events --ws %s --follow\n", a.ID, a.WS)
+			return nil
+		}
+		fmt.Fprintf(os.Stderr, "agent %s in %s (Ctrl-C detaches; resume with: remount agent watch %s)\n", a.ID, a.WS, a.ID)
+		return watchAgent(ctx, cl, a.ID, 0, watchOptions{follow: true, interactive: term.IsTerminal(int(os.Stdin.Fd())), showStderr: true})
 	}
-
+	if !queued && *sleepAfter != 0 {
+		return errors.New("--sleep-after needs --queue or an acp recipe")
+	}
+	if *maxTurns != 0 {
+		return errors.New("--max-turns applies to agents (recipes with acp)")
+	}
 	o := launch.Options{
 		Recipe: recipe, WS: *wsID, Base: *base, Name: *name, Image: *image, Backend: *backend,
 		Security: *security, Sandbox: *sandbox, Approve: *approve, Model: *model, Exclude: exclude, Resume: *resume,
@@ -153,12 +185,12 @@ func cmdRun(ctx context.Context, args []string) error {
 		return errors.New("--repo-depth needs --repo")
 	}
 	stdinTTY := term.IsTerminal(int(os.Stdin.Fd()))
-	pty := !*detach && stdinTTY && term.IsTerminal(int(os.Stdout.Fd()))
-	o.PTY = pty
+	usePTY := !*detach && stdinTTY && term.IsTerminal(int(os.Stdout.Fd()))
+	o.PTY = usePTY
 	// Piped input is forwarded; a terminal on a non-pty run is not, so the
 	// harness sees EOF instead of a pipe nobody writes to.
 	o.Stdin = !*detach && !stdinTTY
-	if pty {
+	if usePTY {
 		if w, h, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
 			o.Cols, o.Rows = uint16(w), uint16(h)
 		}
@@ -220,7 +252,7 @@ func cmdRun(ctx context.Context, args []string) error {
 		return nil
 	}
 	fmt.Fprintf(os.Stderr, "session %s (Ctrl-C detaches; reattach with: remount attach %s %s)\n", s.ID, ws.ID, s.ID)
-	return drive(ctx, s, driveOptions{WS: ws.ID, Session: s.ID, Raw: pty, ForwardStdin: pty || o.Stdin, KillOnInterrupt: *killOnInterrupt})
+	return drive(ctx, s, driveOptions{WS: ws.ID, Session: s.ID, Raw: usePTY, ForwardStdin: usePTY || o.Stdin, KillOnInterrupt: *killOnInterrupt})
 }
 
 // ---------------------------------------------------------------------------

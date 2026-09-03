@@ -340,9 +340,12 @@ func (f *agentFixture) assertMirrored(t *testing.T, s *session.Session) {
 	}
 	want := map[uint64][]byte{}
 	for _, c := range chunks {
-		if c.Stream == proto.StreamACPIn || c.Stream == proto.StreamACPOut || c.Stream == proto.StreamStderr {
+		if c.Stream == proto.StreamACPIn || c.Stream == proto.StreamACPOut || c.Stream == proto.StreamStderr || c.Stream == proto.StreamExit {
 			want[c.Seq] = c.Data
 		}
+	}
+	if exit := s.ExitInfo(); exit == nil {
+		t.Fatal("assertMirrored before the session exited")
 	}
 	f.mu.Lock()
 	all := append([]*proto.AgentReport(nil), f.all...)

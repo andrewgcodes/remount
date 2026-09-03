@@ -625,6 +625,11 @@ func (r *agentRun) finish(exitCode int, runErr error, stopReason string, client 
 		exit.Reason = "cancelled"
 	}
 	r.transcript.End(exit)
+	// The mirror carries the exit chunk too, so a durable reader sees the
+	// run end the same way a live session subscriber does.
+	if r.reporter != nil {
+		r.reporter.chunk(proto.TranscriptChunk{Seq: r.transcript.Log.Next() - 1, Stream: proto.StreamExit, At: time.Now().UnixMilli(), Data: proto.MustMarshal(exit)})
+	}
 
 	r.n.mu.Lock()
 	if r.n.agentRuns[r.key] == r {
@@ -889,20 +894,9 @@ func (r *agentRun) record(stream uint8, data []byte) {
 // workspaceBindings reads the bindings `remount run` recorded on the
 // workspace so a run resolves the same placeholders a session would.
 func workspaceBindings(labels map[string]string) ([]launch.Binding, error) {
-	raw := labels[launch.LabelBindings]
-	if raw == "" {
-		return nil, nil
-	}
-	var out []launch.Binding
-	for _, spec := range strings.Split(raw, ",") {
-		if spec == "" {
-			continue
-		}
-		b, err := launch.ParseBinding(spec)
-		if err != nil {
-			return nil, proto.Err(proto.CodeBadRequest, "workspace binding label: %v", err)
-		}
-		out = append(out, b)
+	out, err := launch.BindingsFromLabels(labels)
+	if err != nil {
+		return nil, proto.Err(proto.CodeBadRequest, "%v", err)
 	}
 	return out, nil
 }

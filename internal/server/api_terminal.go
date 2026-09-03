@@ -68,7 +68,7 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	q := r.URL.Query()
-	a, err := s.materialized(r.Context(), cl, r.PathValue("id"), false, "")
+	a, err := cl.AgentMaterialized(r.Context(), r.PathValue("id"), false, "")
 	if err != nil {
 		writeError(w, err)
 		return

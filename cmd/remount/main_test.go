@@ -472,7 +472,12 @@ func TestRunQueueFlagsValidateBeforeDialing(t *testing.T) {
 		args []string
 		want string
 	}{
-		{"sleep needs queue", []string{"opencode", "--binding", "b_openai", "--sleep-after", "1h", "--", "x"}, "need --queue"},
+		{"sleep needs queue or agent", []string{"custom", "--sleep-after", "1h", "--", "true"}, "needs --queue"},
+		{"sleep until needs queue", []string{"opencode", "--binding", "b_openai", "--sleep-until", "09:00", "--", "x"}, "needs --queue"},
+		{"max turns needs agent", []string{"custom", "--max-turns", "2", "--", "true"}, "--max-turns"},
+		{"agent timeout", []string{"opencode", "--binding", "b_openai", "--timeout", "1h", "--", "x"}, "--timeout applies to sessions"},
+		{"agent negative sleep", []string{"opencode", "--binding", "b_openai", "--sleep-after", "-1s", "--", "x"}, "negative"},
+		{"agent bad approve", []string{"opencode", "--binding", "b_openai", "--approve", "always", "--", "x"}, "--approve"},
 		{"queue and continue", []string{"opencode", "--binding", "b_openai", "--queue", queue, "--queue-continue", "q_1"}, "mutually exclusive"},
 		{"both sleeps", []string{"opencode", "--binding", "b_openai", "--queue", queue, "--sleep-after", "1h", "--sleep-until", "09:00"}, "mutually exclusive"},
 		{"negative sleep", []string{"opencode", "--binding", "b_openai", "--queue", queue, "--sleep-after", "-1s"}, "negative"},

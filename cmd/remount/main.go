@@ -77,7 +77,7 @@ func run(ctx context.Context, argv []string) error {
 	}
 	cmd, args := argv[0], argv[1:]
 	switch cmd {
-	case "ws", "fs", "fleet", "run":
+	case "ws", "fs", "fleet", "run", "agent":
 		if len(args) > 0 && !isFlag(args[0]) {
 			args = append(append([]string{args[0]}, globals...), args[1:]...)
 		} else {
@@ -125,6 +125,8 @@ func run(ctx context.Context, argv []string) error {
 		return cmdResume(ctx, args)
 	case "binding":
 		return cmdBinding(ctx, args)
+	case "agent":
+		return cmdAgent(ctx, args)
 	case "approvals":
 		return cmdApprovals(ctx, args)
 	case "approve":
@@ -208,6 +210,11 @@ func usage() {
   remount handoff [--recipe R] [--task T] [--dir .]                      move this checkout and the harness's conversation into a workspace and keep it going
   remount resume WS [--task T]        rejoin a running harness, or wake the workspace and continue the conversation
   remount binding preset ls           provider presets a --binding may name
+  remount agent create RECIPE [seed flags] [--sleep-after DUR] [--max-turns N] [--approve M] [--detach] -- TASK
+                                      a durable ACP agent: survives disconnects, node loss and sleep; run does this for acp recipes
+  remount agent ls | get ID | open ID [--ui] | message ID [--steer] -- TEXT | cancel ID | fork ID | sleep ID | wake ID | destroy ID
+  remount agent watch ID [--from N] [--no-follow] [--raw]                 the transcript as a conversation; on a terminal, type to reply
+  remount agent diff ID [--wake] | approvals ID | approve APPROVAL
   remount approvals [--agent ID] [--status pending|decided|expired|all]   what an Agent is waiting on a human for
   remount approve ID [--option X | --deny | --content JSON]              answer one; no flag picks the first allow option
   remount nodes | events [--follow] [--ws WS] | timers

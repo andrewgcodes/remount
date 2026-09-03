@@ -54,7 +54,7 @@ func (s *Server) handlePort(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	a, err := s.materialized(r.Context(), cl, id, true, proto.AgentWokenByPreview)
+	a, err := cl.AgentMaterialized(r.Context(), id, true, proto.AgentWokenByPreview)
 	if err != nil {
 		writeError(w, err)
 		return

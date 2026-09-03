@@ -242,7 +242,7 @@ func TestAgentHTTPAuthAndLifecycle(t *testing.T) {
 
 	create := map[string]any{
 		"name":      "http-e2e",
-		"workspace": map[string]any{"name": "http-ws", "env": map[string]string{"LEAK_TOKEN": "tok-http-canary-0123456789"}},
+		"workspace": map[string]any{"name": "http-ws", "labels": map[string]string{"team": "http"}, "env": map[string]string{"LEAK_TOKEN": "tok-http-canary-0123456789"}},
 		"spec":      map[string]any{"recipe": "custom", "task": "say hello", "acp_command": fakeACPCommand(t, "echo")},
 		"policy":    map[string]any{"approve": proto.ApproveOnRequest},
 	}
