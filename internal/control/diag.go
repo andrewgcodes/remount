@@ -177,6 +177,7 @@ func (c *Control) Diag(ctx context.Context) *proto.ControlDiag {
 			Hint:   "output was evicted before a client asked for it; raise the session log limits",
 		})
 	}
+	d.Findings = append(d.Findings, c.tenantPolicyFindings(ctx)...)
 	return d
 }
 
@@ -187,7 +188,16 @@ func (c *Control) verifyArtifacts() []proto.Finding {
 	return c.verifyArtifactsForTenant(context.Background(), "")
 }
 
+// verifyArtifactsForTenant re-hashes every blob and then walks every
+// authoritative snapshot closure. The two answer different questions: a rehash
+// proves a blob still matches its content address, and the closure walk proves
+// a chunk manifest still decodes and still names objects that exist. A blob
+// can pass the first and fail the second.
 func (c *Control) verifyArtifactsForTenant(ctx context.Context, tenant string) []proto.Finding {
+	return append(c.verifyArtifactDigests(ctx, tenant), c.verifySnapshotClosures(ctx, tenant)...)
+}
+
+func (c *Control) verifyArtifactDigests(ctx context.Context, tenant string) []proto.Finding {
 	if c.opts.TenantArtifacts != nil {
 		return c.verifyResolvedArtifacts(ctx, tenant)
 	}

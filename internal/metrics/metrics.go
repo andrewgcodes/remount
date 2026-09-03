@@ -287,6 +287,7 @@ var (
 	WorkspacesPruned           = Count("remount_workspace_tombstones_pruned_total", "destroyed workspace records removed by control-record retention")
 	FleetOperationsPruned      = Count("remount_fleet_operations_pruned_total", "terminal fleet operations removed by control-record retention")
 	AssignmentsPruned          = Count("remount_assignment_records_pruned_total", "historical assignment records removed by control-record retention")
+	SessionLogsPruned          = Count("remount_session_logs_pruned_total", "expired session log records removed by retention, each with a session.log.deleted event")
 	RecordGCRuns               = Count("remount_control_record_gc_runs_total", "completed control-record retention passes")
 	RecordGCErrors             = Count("remount_control_record_gc_errors_total", "control-record retention passes that failed")
 	ControllerFenced           = Count("remount_controller_fenced_total", "control decisions refused because the writer lease or epoch was stale")
@@ -294,6 +295,17 @@ var (
 	ControllerEpoch            = Measure("remount_controller_epoch", "current fenced controller writer epoch")
 	ControllerReplicationLagMS = Measure("remount_controller_replication_lag_ms", "milliseconds since the last committed recovery point")
 	ControllerReconciling      = Measure("remount_controller_reconciling", "1 while a promoted controller reconciles node-authoritative state")
+
+	TenantQuotaExceeded       = Count("remount_tenant_quota_exceeded_total", "tenant admissions refused by a durable quota or reservation limit")
+	TenantResidencyDenied     = Count("remount_tenant_residency_denied_total", "placements and admissions refused because a node was outside the tenant residency policy")
+	TenantRetentionEnforced   = Count("remount_tenant_retention_enforced_total", "completed per-tenant retention passes that removed or redacted something")
+	TenantRetentionFailed     = Count("remount_tenant_retention_failed_total", "per-tenant retention passes that could not complete")
+	TenantEventsRedacted      = Count("remount_tenant_events_redacted_total", "canonical events whose payload was removed by per-tenant event retention")
+	TenantArtifactsCollected  = Count("remount_tenant_artifacts_collected_total", "unreferenced artifacts removed early by a per-tenant artifact retention policy")
+	TenantRetentionUnenforced = Measure("remount_tenant_retention_unenforced", "tenants whose retention policy cannot currently be enforced")
+	AuditExports              = Count("remount_audit_exports_total", "signed compliance bundles produced by audit export")
+	AuditExportDenied         = Count("remount_audit_exports_denied_total", "audit exports refused by tenant isolation, authorization or range validation")
+	AuditExportGaps           = Count("remount_audit_export_gaps_total", "audit exports refused because the requested range is no longer complete")
 )
 
 func init() {

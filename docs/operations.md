@@ -401,9 +401,30 @@ remount events --follow --json | jq -c 'select(.type|test("lease_expired|egress.
 | `fleet.quarantine.target` | one target changed containment state | inspect `operation_id`, acknowledgement, and error |
 | `fleet.quarantine.completed` | the bounded operation result changed to completed or partial | inspect every result; partial is not a clean bill of health |
 
+| `retention.enforced` | a tenant's expired event content was removed | expected on the retention tick; the payload names the tenant and how many rows |
+| `retention.violation` | a retention pass could not complete | the tenant's data was not removed on schedule; treat as a compliance incident |
+| `residency.denied` | a workspace is held on a node outside its tenant's residency policy | move it; the policy changed under a running workspace |
+| `audit.exported` | a signed compliance bundle was produced | the payload carries the range, event count and content hash |
+| `audit.export_denied` | an export was refused | inspect the principal and the tenant it asked for |
+
 `remount nodes` shows liveness, labels and how many workspaces each node holds.
 `remount ws ls` shows state, node and generation for every workspace. A
 workspace in `pending` for more than a few seconds has no eligible node.
+
+`remount doctor --deep` answers three separate questions about stored
+snapshots, and reports them under three separate names because the repairs
+differ:
+
+| Check | Question | A failure means |
+|---|---|---|
+| `artifact.digest` | do the bytes still match their content address? | the blob was damaged at rest or in transit |
+| `artifact.manifest_canonical` | does a chunk manifest still decode canonically? | the bytes hash correctly but no longer mean anything; a restore would fail |
+| `artifact.closure_complete` | is every chunk the manifest names present at its declared size? | the manifest is intact but its closure is not; the snapshot cannot be restored |
+
+A blob can pass the first and fail the second or third, which is why re-hashing
+alone is not a clean bill of health. When the walk cannot run at all — no
+artifact store, an unreadable manifest, an unauthenticated tenant — the result
+is `artifact.closure_unavailable` at warn severity, never a pass.
 
 ## Capacity, quotas, and retention
 
@@ -438,6 +459,136 @@ also returned by `status`, `inspect`, `doctor` and the JSON diagnostic methods.
 The managed connector cache is capacity-bounded but currently has no automatic
 age-based eviction; size it for the deployment and treat exhaustion as an
 operator-visible fail-closed condition.
+
+### Per-tenant retention
+
+A tenant policy carries four retention windows, all optional, each at least one
+hour and at most ten years:
+
+```json
+{
+  "retention": {
+    "events_ms":       2592000000,
+    "session_logs_ms":   86400000,
+    "artifacts_ms":      86400000,
+    "meter_events_ms": 2592000000
+  }
+}
+```
+
+Set them with `remount tenant create TENANT` or a tenant policy update. What
+each one does is deliberately different, because the resources have different
+shapes.
+
+**`events_ms` removes event content on the tenant's own schedule, and event
+envelopes on the deployment's.** The canonical log is one sequence and its
+retention deletes only a contiguous oldest prefix, so that a range which is
+missing events reports an explicit gap instead of a shorter answer. Per-tenant
+retention therefore works in two steps:
+
+1. the prefix is deleted at the oldest instant *any* tenant still requires,
+   which is `max(--event-retention, every tenant's events_ms)` before now; and
+2. between a tenant's own cutoff and that floor, that tenant's event payloads
+   are replaced in place with `{"remount_redacted": "tenant_retention"}`.
+
+The consequence to plan for: a tenant with a seven-day policy has its payloads
+destroyed after seven days, but the row envelope — sequence, time, type,
+tenant, workspace, principal — survives until the longest-lived tenant's window
+closes. `remount doctor` reports that as `tenant.retention_violation` and names
+the tenant holding the prefix. If envelopes must go too, shorten the longest
+policy. The `--max-events` row cap remains a capacity backstop that can delete
+an oldest prefix regardless of age; it is a last resort, not a policy.
+
+Redaction is visible in an exported bundle rather than hidden by it: the range
+stays contiguous and the redacted payloads say so, so an auditor is never shown
+a quietly shorter history.
+
+**`artifacts_ms` is a maximum age and can only collect sooner.** Unreferenced
+objects are already collected after `--artifact-grace`; a tenant policy
+shorter than that window collects that tenant's unreferenced objects sooner,
+and a policy longer than it changes nothing. Reachability always wins: an
+object named by a live workspace, base, fleet operation or session-log
+reference is never collected at any age. Per-tenant artifact retention requires
+an artifact store with real per-tenant namespaces; with the single-namespace
+compatibility store the policy is not enforced and `doctor` reports
+`tenant.retention_unavailable` rather than sweeping a shared namespace on one
+tenant's schedule.
+
+**`session_logs_ms`** bounds how long a completed session log record stays
+attachable, and **`meter_events_ms`** bounds retained usage meter rows.
+
+Every pass is both an event and a counter:
+`retention.enforced` / `remount_tenant_retention_enforced_total` when content
+was removed, `retention.violation` / `remount_tenant_retention_failed_total`
+when a pass could not complete, and
+`remount_tenant_events_redacted_total` for the rows themselves.
+
+### Residency
+
+A tenant policy can pin where its workspaces may run:
+
+```json
+{
+  "residency": {
+    "allowed_regions": ["us-east-1", "us-east-2"],
+    "required_labels": {"tier": "confidential"}
+  }
+}
+```
+
+`allowed_regions` is matched against each node's `region` label and an empty
+list allows any region. `required_labels` is an AND over exact node label
+values. Start nodes with the labels that make this true, for example
+`remount up --label region=us-east-1 --label tier=confidential`.
+
+Placement refuses a node outside the policy, so a workspace that cannot be
+placed stays pending and `doctor` reports `workspace.unplaceable`. Every
+refusal moves `remount_tenant_residency_denied_total`. A policy tightened
+*under* a running workspace is drift the scheduler cannot catch; the
+maintenance pass records it as a `residency.denied` event and `doctor` reports
+`tenant.residency_violation`. When tenant policy or a node's labels cannot be
+read, the check reports `tenant.residency_unavailable` at warn severity — an
+unverifiable residency control is never rendered as a pass.
+
+### Compliance export
+
+`remount audit export` produces one signed, tenant-scoped bundle of the
+canonical event log:
+
+```sh
+remount audit export --tenant acme --range 1..50000 --out acme-q3.jsonl
+remount audit verify acme-q3.jsonl --key "$(remount audit key --json | jq -r .public_key)" --tenant acme
+```
+
+**The range is inclusive on both ends.** `--range 10..20` contains sequence 10
+and sequence 20, eleven sequences in total. Sequence numbering starts at 1;
+neither endpoint has a default, because a range that silently widened would
+disclose more than the operator asked for. A three-dot form is rejected rather
+than guessed at.
+
+The bundle is JSON Lines: one canonical event object per line, then one final
+line holding the signed manifest. `payload_sha256` covers the exact event bytes
+preceding that line, so a verifier compares bytes rather than two
+interpretations of an event. Re-exporting the same range produces byte-identical
+event lines and the same hash; only the manifest's `created_at` differs.
+
+Rules worth knowing before you rely on it:
+
+- The tenant comes from the caller's own credential. A caller bound to one
+  tenant cannot export another's, `*` is never a valid export subject, and no
+  sequence number in the request can widen the result. Export requires
+  administrative authority: an agent credential cannot export its own tenant's
+  audit record. A refused export is recorded as `audit.export_denied` and
+  counted by `remount_audit_exports_denied_total`.
+- A range the log can no longer serve completely is refused with `evicted` and
+  the oldest sequence still available. A bundle is never truncated to fit, and
+  never omits events silently.
+- One bundle is capped at 16 MiB and one range at 1,048,576 sequences. Split a
+  larger disclosure into consecutive ranges.
+- The Ed25519 signing key is generated on first use and stored only in the
+  control-plane database. `remount audit key` publishes the public half; that
+  is what lets an auditor run `remount audit verify` offline, with no access to
+  the control plane. Keep a copy of the public key with the bundle.
 
 ## Restarts and upgrades
 

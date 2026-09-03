@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"remount.dev/remount/internal/eventlog"
+	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/tenant"
 )
@@ -267,5 +268,14 @@ func (c *Control) tenantResidencyAllowsLocked(workspace *proto.Workspace, labels
 		return true
 	}
 	current, err := c.opts.Tenants.Get(context.Background(), workspace.Tenant)
-	return err == nil && current.State != tenant.StateDeleted && tenant.MatchResidency(current.Policy.Residency, labels)
+	allowed := err == nil && current.State != tenant.StateDeleted && tenant.MatchResidency(current.Policy.Residency, labels)
+	if !allowed {
+		// A counter, not an event: this runs per candidate node inside the
+		// placement loop under c.mu, where a durable write would be both a
+		// lock violation and an amplifier. The paired durable record is the
+		// residency.denied event that EnforceTenantResidency emits for a
+		// workspace that is actually held outside its policy.
+		metrics.TenantResidencyDenied.Inc()
+	}
+	return allowed
 }

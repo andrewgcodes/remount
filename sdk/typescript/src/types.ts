@@ -329,6 +329,43 @@ export interface ArtifactProofRes {
   "proof": string;
 }
 
+export interface AuditExportReq {
+  "tenant"?: string;
+  "from": number;
+  "to": number;
+}
+
+export interface AuditExportRes {
+  "manifest": AuditManifest;
+  "signature": string;
+  "bundle": Uint8Array;
+}
+
+export interface AuditKeyReq {
+}
+
+export interface AuditKeyRes {
+  "key_id": string;
+  "algorithm": string;
+  "public_key": string;
+}
+
+export interface AuditManifest {
+  "schema": string;
+  "tenant": string;
+  "range_from": number;
+  "range_to": number;
+  "created_at": number;
+  "event_count": number;
+  "first_seq"?: number;
+  "last_seq"?: number;
+  "payload_bytes": number;
+  "payload_sha256": string;
+  "hash_algorithm": string;
+  "signature_algorithm": string;
+  "key_id": string;
+}
+
 export interface AuditPolicy {
   "required"?: boolean;
 }
@@ -641,6 +678,7 @@ export interface ExitInfo {
 export interface FSApplyTarReq {
   "ws": string;
   "artifact": string;
+  "format"?: string;
   "idem"?: string;
   "grant"?: Grant | null;
 }
@@ -1854,6 +1892,8 @@ export const OPERATIONS = {
   "approval.get": { constant: "OpApprovalGet", request: "ApprovalGetReq", response: "Approval" },
   "approval.list": { constant: "OpApprovalList", request: "ApprovalListReq", response: "ApprovalListRes" },
   "artifact.proof": { constant: "OpArtifactProof", request: "ArtifactProofReq", response: "ArtifactProofRes" },
+  "audit.export": { constant: "OpAuditExport", request: "AuditExportReq", response: "AuditExportRes" },
+  "audit.key": { constant: "OpAuditKey", request: "AuditKeyReq", response: "AuditKeyRes" },
   "base.create": { constant: "OpBaseCreate", request: "BaseCreateReq", response: "Base" },
   "base.list": { constant: "OpBaseList", request: "", response: "BaseListRes" },
   "base.remove": { constant: "OpBaseRemove", request: "BaseRemoveReq", response: "" },

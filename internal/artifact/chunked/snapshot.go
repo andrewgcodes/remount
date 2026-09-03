@@ -20,16 +20,24 @@ type SnapshotOptions struct {
 	Excludes []string
 	HotPaths []string
 	Limits   Limits
+	// Skip drops a path, and a skipped directory's whole subtree, in addition
+	// to Excludes. A local push passes localfs's selector here so the chunked
+	// and tar representations of one directory hold the same files; the
+	// selection rules live in one place rather than being restated per format.
+	Skip func(rel string, isDir bool) bool
 }
 
 // SnapshotResult reports logical identity and physical deduplication work.
+// The tags are load-bearing: `remount push --chunked --json` reports these
+// counters, because a deduplicating upload that deduplicated nothing is a
+// result the operator needs to see rather than infer.
 type SnapshotResult struct {
-	ManifestID     string
-	ManifestBytes  int64
-	PlaintextBytes int64
-	BytesUploaded  int64
-	Chunks         int
-	ChunksUploaded int
+	ManifestID     string `json:"manifest"`
+	ManifestBytes  int64  `json:"manifest_bytes"`
+	PlaintextBytes int64  `json:"plaintext_bytes"`
+	BytesUploaded  int64  `json:"bytes_uploaded"`
+	Chunks         int    `json:"chunks"`
+	ChunksUploaded int    `json:"chunks_uploaded"`
 }
 
 // Snapshot chunks the filesystem rooted at root, uploads only blobs that Head
@@ -59,7 +67,7 @@ func Snapshot(ctx context.Context, store artifact.BlobStore, root string, opts S
 			return nil
 		}
 		rel := filepath.ToSlash(name)
-		if artifact.Excluded(rel, opts.Excludes) {
+		if artifact.Excluded(rel, opts.Excludes) || (opts.Skip != nil && opts.Skip(rel, entry.IsDir())) {
 			if entry.IsDir() {
 				return fs.SkipDir
 			}

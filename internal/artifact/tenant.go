@@ -38,6 +38,17 @@ type TenantCollector interface {
 	CollectTenants(ctx context.Context, referenced []TenantReference, now, cutoff time.Time) (GCResult, error)
 }
 
+// TenantRetentionCollector applies a per-tenant age cutoff on top of the
+// shared grace window. One tenant's retention policy must never be able to
+// select another tenant's object, so the cutoff is indexed by the namespace
+// the pass is about to sweep and a tenant with no policy keeps the shared
+// cutoff. A store that cannot separate tenants must not implement this;
+// callers report an unenforceable policy rather than sweeping globally.
+type TenantRetentionCollector interface {
+	TenantCollector
+	CollectTenantRetention(ctx context.Context, referenced []TenantReference, now, cutoff time.Time, tenantCutoffs map[string]time.Time) (GCResult, error)
+}
+
 // TenantInventory enumerates physical tenant namespaces for diagnostics and
 // garbage collection. It must fail on malformed or unaccounted namespaces.
 type TenantInventory interface {
@@ -61,7 +72,9 @@ type TenantDeepVerifier interface {
 
 // SharedTenantResolver explicitly adapts the legacy global directory store.
 // It is suitable only for standalone mode, where "local" is the sole trust
-// domain.
+// domain. It deliberately does not implement TenantRetentionCollector,
+// because it cannot separate tenants and a caller must report a per-tenant
+// retention policy as unenforceable rather than sweep every tenant with it.
 type SharedTenantResolver struct {
 	store *Store
 }

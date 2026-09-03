@@ -66,26 +66,48 @@ type Manifest struct {
 	Missing []string `json:"missing,omitempty"`
 }
 
-// Pack writes a deterministic tar.gz of dir to w. The root directory itself
-// is not an entry; `.remount` is always omitted because the node owns it.
-func Pack(dir string, opts PackOptions, w io.Writer) (Manifest, error) {
-	var m Manifest
+// Selection is one directory's answer to "what would Pack leave out". It
+// exists so a caller that walks the tree itself — a chunked push, which never
+// builds a tar — asks the same question rather than reimplementing the ignore
+// rules. Two implementations would drift, and the first symptom would be a
+// developer's node_modules silently uploaded by one representation and not the
+// other.
+type Selection struct {
+	// Dir is the absolute directory the selection was resolved against.
+	Dir string
+	// Skip reports whether rel (slash-separated, relative to Dir) is left out.
+	// A directory that is skipped takes its whole subtree with it.
+	Skip func(rel string, isDir bool) bool
+	// Warnings are the same operator-visible notes Pack reports in its
+	// Manifest, such as an oversized .git pack left behind.
+	Warnings []string
+
+	root *os.Root
+}
+
+// Close releases the directory handle ignore files are read through. Skip must
+// not be called afterwards.
+func (s *Selection) Close() error { return s.root.Close() }
+
+// Select resolves the exact set of paths Pack would archive from dir. Pack
+// itself uses it, so no second caller can select a different file set.
+func Select(dir string, opts PackOptions) (*Selection, error) {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
-		return m, err
+		return nil, err
 	}
 	st, err := os.Stat(dir)
 	if err != nil {
-		return m, err
+		return nil, err
 	}
 	if !st.IsDir() {
-		return m, fmt.Errorf("localfs: %s is not a directory", dir)
+		return nil, fmt.Errorf("localfs: %s is not a directory", dir)
 	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return m, err
+		return nil, err
 	}
-	defer root.Close()
+	sel := &Selection{Dir: dir, root: root}
 	excludes := append([]string(nil), opts.Excludes...)
 	if !opts.NoDefaultExcludes {
 		excludes = append(excludes, DefaultExcludes...)
@@ -99,10 +121,10 @@ func Pack(dir string, opts PackOptions, w io.Writer) (Manifest, error) {
 		size, err := dirSize(root, ".git/objects/pack")
 		if err == nil && size > GitPackWarnBytes {
 			skipGitPack = true
-			m.Warnings = append(m.Warnings, fmt.Sprintf(".git/objects/pack is %d MiB; left out of the upload (working tree, index and refs are included)", size>>20))
+			sel.Warnings = append(sel.Warnings, fmt.Sprintf(".git/objects/pack is %d MiB; left out of the upload (working tree, index and refs are included)", size>>20))
 		}
 	}
-	skip := func(rel string, isDir bool) bool {
+	sel.Skip = func(rel string, isDir bool) bool {
 		if rel == artifact.OverlayStageDir || strings.HasPrefix(rel, artifact.OverlayStageDir+"/") {
 			return true
 		}
@@ -121,7 +143,20 @@ func Pack(dir string, opts PackOptions, w io.Writer) (Manifest, error) {
 		}
 		return ig != nil && ig.ignored(rel, isDir)
 	}
-	trees := []artifact.Tree{{Root: dir, Skip: skip}}
+	return sel, nil
+}
+
+// Pack writes a deterministic tar.gz of dir to w. The root directory itself
+// is not an entry; `.remount` is always omitted because the node owns it.
+func Pack(dir string, opts PackOptions, w io.Writer) (Manifest, error) {
+	var m Manifest
+	sel, err := Select(dir, opts)
+	if err != nil {
+		return m, err
+	}
+	defer sel.Close()
+	m.Warnings = sel.Warnings
+	trees := []artifact.Tree{{Root: sel.Dir, Skip: sel.Skip}}
 	for _, extra := range opts.Extra {
 		tree, ok, err := extraTree(extra)
 		if err != nil {

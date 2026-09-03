@@ -10,6 +10,7 @@ import (
 
 	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/eventlog"
+	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 )
 
@@ -241,6 +242,59 @@ func (c *Control) sessionLogDelete(node string, req *proto.SessionLogDeleteReq) 
 	}
 	delete(c.sessionLogs, req.Session)
 	return nil
+}
+
+// pruneSessionLogsLocked deletes expired session-log records and emits one
+// session.log.deleted event per removed row in the same transaction. It
+// returns how many rows were actually removed.
+//
+// Authority is the control plane's own retention pass, not a node, so the
+// event records `reason: retention` and carries no node. The irreversible
+// action is releasing the record's segment artifacts from the GC root set;
+// the durable commit is the DELETE plus its events. The postcondition is that
+// every deleted row has exactly one durable deletion event, and that a record
+// left behind by a failed transaction is still present in memory for the next
+// pass.
+//
+// The caller holds c.mu and has already committed the surrounding prune
+// transaction, so this opens a fresh one rather than nesting.
+func (c *Control) pruneSessionLogsLocked(ids []string) int {
+	if len(ids) == 0 {
+		return 0
+	}
+	records := make([]*proto.SessionLogRecord, 0, len(ids))
+	events := make([]*proto.Event, 0, len(ids))
+	for _, id := range ids {
+		record := c.sessionLogs[id]
+		if record == nil {
+			continue
+		}
+		event := c.newEvent(proto.EvSessionLogDeleted, record.Session, record.Principal, "", map[string]any{
+			"workspace": record.Workspace, "segments": len(record.Segments), "reason": "retention",
+		})
+		event.Tenant = record.Tenant
+		records = append(records, record)
+		events = append(events, event)
+	}
+	if len(records) == 0 {
+		return 0
+	}
+	if err := c.transact(func(tx *eventlog.Tx) error {
+		for _, record := range records {
+			if _, err := tx.Exec(`DELETE FROM session_logs WHERE id=?`, record.Session); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, events); err != nil {
+		c.logger.Error("session log retention prune deferred", "err", err, "records", len(records))
+		return 0
+	}
+	for _, record := range records {
+		delete(c.sessionLogs, record.Session)
+	}
+	metrics.SessionLogsPruned.Add(uint64(len(records)))
+	return len(records)
 }
 
 func (c *Control) sessionLogReferencesLocked(add func(string, string)) {

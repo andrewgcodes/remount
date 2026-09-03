@@ -78,7 +78,7 @@ var composites = []Operation{
 // invoked through a client-role MCP server.
 var protocolOperations = []string{
 	"agent.approval.decided", "agent.cancel", "agent.create", "agent.deliver", "agent.destroy", "agent.fork", "agent.get", "agent.list", "agent.message", "agent.report", "agent.run", "agent.run.cancel", "agent.sleep", "agent.transcript", "agent.wake",
-	"approval.decide", "approval.get", "approval.list", "artifact.proof", "base.create", "base.list", "base.remove", "binding.lease",
+	"approval.decide", "approval.get", "approval.list", "artifact.proof", "audit.export", "audit.key", "base.create", "base.list", "base.remove", "binding.lease",
 	"budget.create", "budget.list", "budget.remove", "budget.reserve", "budget.settle", "controller.state", "diag", "egress.approval",
 	"events.post", "events.stop", "events.tail", "fleet.get", "fleet.list", "fleet.quarantine",
 	"fs.apply_tar", "fs.edit", "fs.list", "fs.mkdir", "fs.read", "fs.remove", "fs.rename", "fs.search", "fs.stat", "fs.write", "grant",
@@ -88,12 +88,39 @@ var protocolOperations = []string{
 	"timer.list", "usage.get", "volume.archive", "volume.attach", "volume.create", "volume.detach", "volume.get", "volume.list", "volume.publish", "volume.publish.commit", "volume.remove", "ws.acl", "ws.claim", "ws.create", "ws.destroy", "ws.get", "ws.info", "ws.list", "ws.move", "ws.quarantine", "ws.quarantine.commit", "ws.ready", "ws.release", "ws.release.abort", "ws.release.abort.commit", "ws.release.commit", "ws.released", "ws.renew", "ws.sleep", "ws.snapshot", "ws.snapshot.commit", "ws.wake",
 }
 
+// protocolToolName is the tool name advertised for a protocol operation.
+func protocolToolName(op string) string {
+	return "op_" + strings.ReplaceAll(op, ".", "_")
+}
+
+// protocolOpByTool resolves an advertised tool name back to its exact protocol
+// operation. The forward mapping replaces dots with underscores, so reversing
+// it by replacing underscores with dots is lossy for any op that already
+// contains an underscore: `fs.apply_tar` becomes `op_fs_apply_tar` and reverses
+// to `fs.apply.tar`, an operation that does not exist. That advertised the tool
+// while making it permanently unreachable, so the reverse direction is a lookup
+// over the manifest rather than a second string substitution.
+var protocolOpByTool = func() map[string]string {
+	out := make(map[string]string, len(protocolOperations))
+	for _, op := range protocolOperations {
+		out[protocolToolName(op)] = op
+	}
+	return out
+}()
+
+// ProtocolOpForTool returns the protocol operation an op_ tool name names, and
+// whether the manifest advertises it.
+func ProtocolOpForTool(name string) (string, bool) {
+	op, ok := protocolOpByTool[name]
+	return op, ok
+}
+
 // Manifest returns a stable copy of every composite and protocol operation.
 func Manifest() []Operation {
 	out := make([]Operation, 0, len(composites)+len(protocolOperations))
 	out = append(out, composites...)
 	for _, op := range protocolOperations {
-		name := "op_" + strings.ReplaceAll(op, ".", "_")
+		name := protocolToolName(op)
 		out = append(out, Operation{Tool: Tool{
 			Name:        name,
 			Description: "Invoke the " + op + " Remount protocol operation with its JSON request body. Client-inaccessible peer operations report unavailable.",

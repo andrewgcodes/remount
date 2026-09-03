@@ -122,7 +122,18 @@ func TestRunOpenCodeDockerIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertTokenAbsent(t, info.Root, key)
+	// ws.info reports MountPathOf: the root the *workspace* sees, which under
+	// docker is the in-container mount, not a host directory. Scanning it as a
+	// local path is exactly the confusion HostFileSystem warns against, so the
+	// host tree is reached through the backend's own layout instead.
+	if info.Root != proto.DefaultMountPath {
+		t.Fatalf("docker ws.info root = %q, want the in-container mount path %q", info.Root, proto.DefaultMountPath)
+	}
+	hostRoot := filepath.Join(d.Dir, ws.ID)
+	if _, err := os.Stat(hostRoot); err != nil {
+		t.Fatalf("docker workspace host tree: %v", err)
+	}
+	assertTokenAbsent(t, hostRoot, key)
 	// Scanner self-validation must never write the provider credential merely
 	// to prove the scan works. This synthetic value is unique to the temporary
 	// workspace and has no authority outside the test.
@@ -130,10 +141,10 @@ func TestRunOpenCodeDockerIntegration(t *testing.T) {
 	if err := c.WriteFile(ctx, ws.ID, "canary.txt", []byte("x "+scanCanary+" y\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if hits := scanForToken(t, info.Root, scanCanary); len(hits) != 1 || filepath.Base(hits[0]) != "canary.txt" {
+	if hits := scanForToken(t, hostRoot, scanCanary); len(hits) != 1 || filepath.Base(hits[0]) != "canary.txt" {
 		t.Fatalf("scan did not find the planted canary: %v", hits)
 	}
-	assertTokenAbsent(t, info.Root, key)
+	assertTokenAbsent(t, hostRoot, key)
 
 	time.Sleep(300 * time.Millisecond)
 	evs, err := c.ReadEvents(ctx, 1, ws.ID)

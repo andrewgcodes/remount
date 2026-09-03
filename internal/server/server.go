@@ -779,6 +779,13 @@ func (s *Server) eventGCLoop(ctx context.Context) {
 				metrics.EventGCErrors.Inc()
 				s.logger.Error("event retention failed", "error", err)
 			}
+			// Residency drift is a tenant-policy fact with the same bounded
+			// maintenance cadence as retention: placement refuses a new
+			// assignment, but a policy tightened under a running workspace is
+			// only discoverable by looking.
+			if denied := s.Control.EnforceTenantResidency(ctx); denied > 0 {
+				s.logger.Warn("workspaces are held outside their tenant residency policy", "workspaces", denied)
+			}
 		}
 	}
 }
@@ -807,8 +814,18 @@ func (s *Server) recordGCLoop(ctx context.Context) {
 func (s *Server) CollectArtifacts(now time.Time) (artifact.GCResult, error) {
 	var result artifact.GCResult
 	if collector, ok := s.artifacts.(artifact.TenantCollector); ok {
+		// A tenant whose artifact retention is stricter than the shared grace
+		// window collects sooner, and only inside its own namespace. The plan
+		// is resolved before the reference set is frozen so no tenant policy
+		// read happens while collection holds the control mutex.
+		cutoffs := s.tenantArtifactCutoffs(now)
+		retention, perTenant := collector.(artifact.TenantRetentionCollector)
 		err := s.Control.WithTenantArtifactReferences(func(references []artifact.TenantReference) error {
 			var err error
+			if perTenant && len(cutoffs) > 0 {
+				result, err = retention.CollectTenantRetention(s.lifetime, references, now, now.Add(-s.opts.ArtifactGracePeriod), cutoffs)
+				return err
+			}
 			result, err = collector.CollectTenants(s.lifetime, references, now, now.Add(-s.opts.ArtifactGracePeriod))
 			return err
 		})
@@ -824,19 +841,47 @@ func (s *Server) CollectArtifacts(now time.Time) (artifact.GCResult, error) {
 	return result, err
 }
 
+// tenantArtifactCutoffs resolves each tenant's own artifact collection cutoff.
+// A failure returns no cutoffs rather than a global one: a policy that cannot
+// be read must not be approximated by sweeping every namespace on one tenant's
+// schedule, and `doctor` reports the unenforced policy separately.
+func (s *Server) tenantArtifactCutoffs(now time.Time) map[string]time.Time {
+	plan, err := s.Control.TenantRetentionPlan(s.lifetime, now, s.opts.EventRetention, s.opts.ArtifactGracePeriod)
+	if err != nil {
+		metrics.TenantRetentionFailed.Inc()
+		s.logger.Error("tenant artifact retention could not be resolved", "error", err)
+		return nil
+	}
+	if len(plan.ArtifactCutoffs) > 0 {
+		metrics.TenantRetentionEnforced.Inc()
+	}
+	return plan.ArtifactCutoffs
+}
+
 // PruneEvents removes every complete batch in the expired sequence prefix.
 // It yields the event-log mutex between batches so current appends can make
 // progress during a large first retention pass.
 func (s *Server) PruneEvents(ctx context.Context, now time.Time) (int64, error) {
 	const batch = 10_000
 	var total int64
+	plan, err := s.Control.TenantRetentionPlan(ctx, now, s.opts.EventRetention, s.opts.ArtifactGracePeriod)
+	if err != nil {
+		metrics.TenantRetentionFailed.Inc()
+		return 0, err
+	}
+	// Content first, then the prefix. A tenant whose own retention expired
+	// earlier than the floor loses its event payloads now; waiting for the
+	// floor would hold that content for the longest-lived tenant's window.
+	if _, err := s.Control.EnforceTenantEventRetention(ctx, plan); err != nil {
+		return 0, err
+	}
 	// Age and count limits both delete only an oldest contiguous prefix. Run
 	// age first so a quiet deployment still honors its audit-window policy.
 	for {
 		if err := ctx.Err(); err != nil {
 			return total, err
 		}
-		n, err := s.Log.Prune(ctx, now.Add(-s.opts.EventRetention).UnixMilli(), batch)
+		n, err := s.Log.Prune(ctx, plan.PruneBefore.UnixMilli(), batch)
 		total += n
 		if err != nil {
 			return total, err

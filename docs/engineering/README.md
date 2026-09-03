@@ -6,6 +6,14 @@ statements that the described controls already exist.
 
 ## Documents
 
+### [Hardening implementation closure — 2026-09-03](./implementation-closure-2026-09-03.md) — current status
+
+**Start here.** Its `2026-09 build plan disposition` section is the current
+status entry for the Phase 2–6 build plan: every numbered item, every
+acceptance scenario, the gates that were run, the defects found and fixed, and
+the residual gaps with a named owner and exact next proof for each. Read the
+two handoffs below for the requirements it dispositions.
+
 ### [Repository-executable Plan B — 2026-09-03](./plan-b-repository-executable-2026-09-03.md)
 
 The proposed next implementation plan. It replaces people-, customer-, and
@@ -18,17 +26,29 @@ secret-blind broker is the preferred harness lane.
 
 The current continuation ledger for the Phase 2–6 implementation pass. It
 records completed code and tests, integration/CI incidents, the exact remaining
-local and external gates, and a safe ownership/verification order. Start here
-for work after the quota-bounded Codex implementation session, then consult the
-original build handoff for the full requirements.
+local and external gates, and a safe ownership/verification order. Read it for
+the requirements of the pass that followed the quota-bounded Codex session; its
+current disposition is in the closure document above.
 
 ### [Build handoff — 2026-09-03](./handoff-2026-09-03.md)
 
-The current status document for the build plan: what Remount is, what the
-Phase 0 / 1 / 1A build delivered (with commits, ADRs and the honest state of
-every acceptance scenario), the reconnect fix merged in PR #6, and the
-remaining Phases 2–6, verification lanes and secret-name inventory, and safe
-parallel-work contracts. Start here.
+The originating build plan: what Remount is, what the Phase 0 / 1 / 1A build
+delivered (with commits, ADRs and the honest state of every acceptance
+scenario), the reconnect fix merged in PR #6, and Phases 2–6 with their
+verification lanes, secret-name inventory and safe parallel-work contracts. It
+defines the numbered items; the closure document above records what each one's
+status now is.
+
+### [External and live verification ledger — 2026-09](./verification-2026-09.md)
+
+The point-in-time record of external verification runs: the exact command, the
+provider identifiers used, the observed result and the teardown. Every entry is
+marked verified, verified but bounded, unavailable (externally gated), or not
+attempted.
+
+Read it before repeating a vendor run, and add to it whenever one is performed.
+An entry that says unavailable means the proof could not run; it is never
+evidence that the behavior works. Absence of an entry is not a pass.
 
 ### [Hardening lessons and review playbook](./hardening-lessons.md)
 
@@ -51,8 +71,9 @@ surviving adversarial finding, the incident-hardening requirements and the
 production-readiness gates to implementation evidence or an explicit residual
 external/architectural gate.
 
-Use this as the current status document. The older documents remain unchanged
-as point-in-time evidence of what was originally found and requested.
+This entry is listed in full at the top of this file; the older documents
+remain unchanged as point-in-time evidence of what was originally found and
+requested.
 
 ### [Adversarial review — 2026-09-02](./adversarial-review-2026-09-02.md)
 

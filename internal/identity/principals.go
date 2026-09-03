@@ -3,6 +3,7 @@ package identity
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
@@ -63,8 +64,16 @@ func (m *Manager) ListPrincipals(ctx context.Context, tenant string) ([]proto.Pr
 // not return or persist a refresh bearer.
 func (m *Manager) IssueAccessToken(ctx context.Context, tenant, subject, role string, ttl time.Duration) (string, time.Time, error) {
 	roles, err := normalizeRoles([]string{role})
-	if err != nil || slices.Contains(roles, RoleNode) || ttl < time.Second || ttl > 24*time.Hour {
+	if err != nil || slices.Contains(roles, RoleNode) || ttl < time.Second {
 		return "", time.Time{}, errors.New("identity: invalid access-token role or ttl")
+	}
+	// verify rejects an access token whose lifetime exceeds accessTTL, so a
+	// longer request would mint a bearer that is unusable the instant it is
+	// handed out and fails later as a bare unauthorized with nothing to
+	// explain it. Refuse at issue time, and say what the ceiling is: silently
+	// shortening the caller's requested lifetime is its own surprise.
+	if ttl > m.accessTTL {
+		return "", time.Time{}, fmt.Errorf("identity: access-token ttl %s exceeds the configured maximum %s", ttl, m.accessTTL)
 	}
 	store, ok := m.store.(PrincipalDirectoryStore)
 	if !ok {

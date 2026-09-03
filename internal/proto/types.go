@@ -1464,8 +1464,13 @@ type FSEditRes struct {
 // FSApplyTarReq names an artifact already present in the control plane's
 // store (uploaded with PUT /v1/artifacts/{id}) to overlay onto the workspace.
 type FSApplyTarReq struct {
-	WS             string `cbor:"ws" json:"ws"`
-	Artifact       string `cbor:"artifact" json:"artifact"`
+	WS       string `cbor:"ws" json:"ws"`
+	Artifact string `cbor:"artifact" json:"artifact"`
+	// Format names the representation Artifact is stored in. Empty means the
+	// legacy deterministic tar.gz, so a client built before chunked pushes
+	// existed keeps working unchanged; a node that cannot restore the named
+	// representation refuses the request rather than misparsing the body.
+	Format         string `cbor:"format,omitempty" json:"format,omitempty"`
 	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
 	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
@@ -1733,6 +1738,10 @@ const (
 	EvWSFenced          = "ws.fenced"
 	EvWSStateChanged    = "ws.state_changed"
 	EvControlReconciled = "control.reconciled"
+	// EvQuotaExceeded records an admission refusal. It is emitted by both the
+	// tenant-authority admission transaction and the legacy in-process limits,
+	// so a rejection is never only a counter.
+	EvQuotaExceeded     = "quota.exceeded"
 	EvControlRecovered  = "control.recovered"
 	EvWSACL             = "ws.acl"        // ACL replaced; payload names revoked principals and the new revision
 	EvAuthzRevoked      = "authz.revoked" // node closed a revoked principal's sessions

@@ -205,8 +205,8 @@ func (g *ClientGateway) Invoke(ctx context.Context, name string, raw json.RawMes
 		}
 		return map[string]any{"events": events, "next": next}, nil
 	}
-	if strings.HasPrefix(name, "op_") {
-		return g.invokeProtocol(ctx, strings.ReplaceAll(strings.TrimPrefix(name, "op_"), "_", "."), raw)
+	if op, ok := ProtocolOpForTool(name); ok {
+		return g.invokeProtocol(ctx, op, raw)
 	}
 	return nil, &UnavailableError{Operation: name}
 }
@@ -541,7 +541,11 @@ func (g *ClientGateway) invokeProtocol(ctx context.Context, op string, raw json.
 		if err != nil {
 			return nil, err
 		}
-		return g.Client.ApplyTar(ctx, req.WS, req.Artifact, operationOption(req.IdempotencyKey)...)
+		// Carry the requested representation through. Dropping it would apply a
+		// chunked manifest as though it were a tar archive: the node fails
+		// closed on the header rather than corrupting the tree, but the
+		// operation would be unusable through MCP for any non-tar format.
+		return g.Client.ApplyArtifact(ctx, req.WS, req.Artifact, req.Format, operationOption(req.IdempotencyKey)...)
 	case proto.OpWSSnapshot:
 		req, err := decode[proto.WSSnapshotReq](raw)
 		if err != nil {
