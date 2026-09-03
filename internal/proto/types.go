@@ -339,6 +339,10 @@ const (
 	OpQueueGet         = "queue.get"          // QueueGetReq -> Queue
 	OpQueueList        = "queue.list"         // QueueListReq -> QueueListRes
 	OpQueueAdvance     = "queue.advance"      // QueueAdvanceReq -> Queue (records one task's outcome, moves the cursor)
+	OpPoolCreate       = "pool.create"        // PoolCreateReq -> Pool
+	OpPoolGet          = "pool.get"           // PoolGetReq -> Pool
+	OpPoolList         = "pool.list"          // -> PoolListRes
+	OpPoolRemove       = "pool.remove"        // PoolRemoveReq -> {}
 )
 
 type WSCreateReq struct {
@@ -673,6 +677,81 @@ type QueueAdvanceReq struct {
 // BaseRemoveReq unpins a base. Workspaces already created from it keep their
 // own RestoreFrom reference, so their artifact is unaffected.
 type BaseRemoveReq struct {
+	Name           string `cbor:"name" json:"name"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// PoolSpec declares provider-backed node capacity for exactly one tenant.
+// Vendor credentials are server configuration and never cross this boundary.
+type PoolSpec struct {
+	Name               string            `cbor:"name" json:"name"`
+	Vendor             string            `cbor:"vendor" json:"vendor"`
+	Min                int               `cbor:"min" json:"min"`
+	Max                int               `cbor:"max" json:"max"`
+	Labels             map[string]string `cbor:"labels,omitempty" json:"labels,omitempty"`
+	Backend            string            `cbor:"backend" json:"backend"`
+	IdleScaleDownMilli int64             `cbor:"idle_scale_down_ms,omitempty" json:"idle_scale_down_ms,omitempty"`
+	Region             string            `cbor:"region,omitempty" json:"region,omitempty"`
+	Size               string            `cbor:"size,omitempty" json:"size,omitempty"`
+}
+
+// ValidatePoolSpec applies provider-independent admission checks. Provider
+// credentials and bootstrap URLs are server configuration, not protocol data.
+func ValidatePoolSpec(spec PoolSpec) error {
+	name := strings.TrimSpace(spec.Name)
+	if name == "" || len(name) > 64 || strings.HasPrefix(name, ".") || strings.ContainsAny(name, "/\\=\x00\n\r") {
+		return Err(CodeBadRequest, "pool name must be 1-64 path-safe characters and may not start with '.'")
+	}
+	if strings.TrimSpace(spec.Vendor) == "" || strings.TrimSpace(spec.Backend) == "" {
+		return Err(CodeBadRequest, "pool vendor and backend are required")
+	}
+	if spec.Min < 0 || spec.Max <= 0 || spec.Min > spec.Max {
+		return Err(CodeBadRequest, "pool capacity must satisfy 0 <= min <= max, max > 0")
+	}
+	if spec.IdleScaleDownMilli < 0 {
+		return Err(CodeBadRequest, "pool idle scale-down must not be negative")
+	}
+	for key, value := range spec.Labels {
+		if strings.TrimSpace(key) == "" || strings.ContainsAny(key, "=\x00\n\r") || strings.ContainsAny(value, "\x00\n\r") {
+			return Err(CodeBadRequest, "pool label %q is invalid", key)
+		}
+		if key == "remount.pool" {
+			return Err(CodeBadRequest, "pool label %q is reserved", key)
+		}
+	}
+	return nil
+}
+
+// Pool is a durable, tenant-scoped desired-capacity resource. Current is the
+// last observed provider inventory, not a scheduler grant.
+type Pool struct {
+	Spec      PoolSpec `cbor:"spec" json:"spec"`
+	Tenant    string   `cbor:"tenant" json:"tenant"`
+	Owner     string   `cbor:"owner" json:"owner"`
+	Current   int      `cbor:"current" json:"current"`
+	CreatedAt int64    `cbor:"created_at" json:"created_at"`
+	UpdatedAt int64    `cbor:"updated_at" json:"updated_at"`
+}
+
+// PoolCreateReq creates one pool in the caller's tenant.
+type PoolCreateReq struct {
+	Spec           PoolSpec `cbor:"spec" json:"spec"`
+	IdempotencyKey string   `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// PoolGetReq identifies a pool by its tenant-unique name.
+type PoolGetReq struct {
+	Name string `cbor:"name" json:"name"`
+}
+
+// PoolListRes contains the pools visible to the caller.
+type PoolListRes struct {
+	Pools []Pool `cbor:"pools" json:"pools"`
+}
+
+// PoolRemoveReq removes a pool only after its provider inventory reaches
+// zero; force-deleting machines is deliberately not a protocol side effect.
+type PoolRemoveReq struct {
 	Name           string `cbor:"name" json:"name"`
 	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
 }
@@ -1407,6 +1486,10 @@ const (
 	EvBaseRemoved    = "base.removed"
 	EvQueueCreated   = "queue.created"           // payload {queue, ws, items}
 	EvQueueAdvanced  = "queue.advanced"          // one queued task finished; payload {queue, index, exit, status}
+	EvPoolCreated    = "pool.created"            // a durable pool specification was admitted
+	EvPoolRemoved    = "pool.removed"            // an empty pool specification was removed
+	EvPoolScaled     = "pool.scaled"             // payload {pool, from, to, reason}
+	EvPoolFailed     = "pool.provision_failed"   // payload {pool, reason, retry_at}; no credentials
 	EvRunStarted     = "run.started"             // a harness launch opened its session; payload {s, recipe, task_hash, sandbox, auth}
 	EvRunFinished    = "run.finished"            // that session exited; payload {s, recipe, exit, signal}
 	EvAuthWSResident = "auth.workspace_resident" // a launch relies on a login the harness keeps inside the workspace; payload {s, recipe}

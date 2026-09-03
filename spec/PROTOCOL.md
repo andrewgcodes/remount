@@ -313,6 +313,17 @@ driver retries the same task. Queue state is never stored in the workspace
 tree; a queue is deleted with its workspace. Both mutations carry `idem` and
 commit the resource, the mutation record and their events in one transaction.
 
+### 5.3 Node pools
+
+A **pool** is tenant-scoped desired capacity:
+`Pool{spec{name, vendor, min, max, labels?, backend,
+idle_scale_down_ms?, region?, size?}, tenant, owner, current, created_at,
+updated_at}`. Provider credentials and enrollment tokens are absent. `current`
+is last observed provider inventory, not authority to place a workspace. Pool
+names are unique inside a tenant, `0 <= min <= max`, `max > 0`, and the
+`remount.pool` label is reserved for reconciliation. Removing a pool with
+non-zero inventory returns `conflict`; it never destroys machines implicitly.
+
 ## 6. Control-plane operations
 
 Sent to `control`. Client operations are marked C, node operations N.
@@ -334,6 +345,10 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `queue.get` | C | `QueueGetReq{id}` → `Queue`; owner, workspace principals or admin |
 | `queue.list` | C | `QueueListReq{ws?}` → `QueueListRes{queues}`; the caller's tenant only, unless admin |
 | `queue.advance` | C | `QueueAdvanceReq{id, index, session?, exit, signal?, idem}` → `Queue`; `index` must equal `cursor` or the call fails with `conflict` |
+| `pool.create` | C | `PoolCreateReq{spec, idem}` → `Pool`; tenant administrator only (§5.3) |
+| `pool.get` | C | `PoolGetReq{name}` → `Pool` |
+| `pool.list` | C | → `PoolListRes{pools}`; caller's tenant only |
+| `pool.remove` | C | `PoolRemoveReq{name, idem}` → `{}`; empty pools only |
 | `agent.create` | C | `AgentCreateReq{name?, ws?\|workspace?, spec, policy, parent?, acp_session_id?, idem}` → `Agent`; makes the workspace unless `ws` adopts one (§6.1) |
 | `agent.get` | C | `AgentGetReq{id}` → `Agent` |
 | `agent.list` | C | `AgentListReq{status?, ws?, parent?}` → `AgentListRes{agents}`; only agents the caller may read |
@@ -980,7 +995,8 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `fleet.quarantine.requested`, `fleet.quarantine.target`,
 `fleet.quarantine.completed`, `base.created`, `base.removed`, `run.started`,
 `run.finished`, `auth.workspace_resident`, `queue.created`,
-`queue.advanced`, `repo.cloned`, `agent.created`, `agent.message`,
+`queue.advanced`, `pool.created`, `pool.removed`, `pool.scaled`,
+`pool.provision_failed`, `repo.cloned`, `agent.created`, `agent.message`,
 `agent.run.started`, `agent.run.finished`, `agent.session`, `agent.turn`,
 `agent.tool_call`, `agent.waiting`, `agent.cancelled`, `agent.slept`,
 `agent.woken`, `agent.forked`, `agent.failed`, `agent.finished`,
@@ -1010,6 +1026,12 @@ None carries the task text, the harness argv or a provider key.
 `queue.created` carries `queue`, `ws` and `items` (a count); `queue.advanced`
 carries `queue`, `index`, `exit`, `signal`, `status` and `cursor`. Both are on
 the workspace stream and neither carries a task's text.
+
+`pool.created` and `pool.removed` contain only non-secret configuration.
+`pool.scaled` carries `pool`, `from`, `to` and `reason`.
+`pool.provision_failed` carries a sanitized reason and `retry_at`; it never
+carries a credential, enrollment token, provider response body or bootstrap
+environment.
 
 `repo.cloned` carries `repo` (canonical URL), `ref`, `depth`, `commit` and
 `backend`; it never carries the binding, its placeholder or the broker URL.

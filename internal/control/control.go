@@ -206,6 +206,7 @@ type Control struct {
 	fleetOps              map[string]*proto.FleetOperation
 	fleetLocks            map[string]*keyedMutex
 	bases                 map[string]*proto.Base // baseKey(tenant, name) -> pinned snapshot
+	pools                 map[string]*proto.Pool // poolKey(tenant, name) -> desired node capacity
 	queues                map[string]*proto.Queue
 	agents                map[string]*proto.Agent
 	approvals             map[string]*proto.Approval
@@ -351,6 +352,7 @@ func New(opts Options) (*Control, error) {
 		producerLocks: map[string]*keyedMutex{}, mutationLocks: map[string]*keyedMutex{},
 		fleetOps: map[string]*proto.FleetOperation{}, fleetLocks: map[string]*keyedMutex{}, fleetWake: make(chan struct{}, 1),
 		bases:                 map[string]*proto.Base{},
+		pools:                 map[string]*proto.Pool{},
 		queues:                map[string]*proto.Queue{},
 		agents:                map[string]*proto.Agent{},
 		approvals:             map[string]*proto.Approval{},
@@ -459,6 +461,7 @@ CREATE TABLE IF NOT EXISTS assignments (
 );
 CREATE TABLE IF NOT EXISTS fleet_operations (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS bases (tenant TEXT NOT NULL, name TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(tenant, name));
+CREATE TABLE IF NOT EXISTS pools (tenant TEXT NOT NULL, name TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(tenant, name));
 CREATE TABLE IF NOT EXISTS queues (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, data BLOB NOT NULL);
@@ -676,6 +679,9 @@ func (c *Control) load() error {
 		return err
 	}
 	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := c.loadPools(); err != nil {
 		return err
 	}
 	rows, err = c.db.Query(`SELECT data FROM queues`)
@@ -1832,6 +1838,42 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return c.queueAdvance(ctx, subject, req)
+	case proto.OpPoolCreate:
+		req, err := decode[proto.PoolCreateReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.poolCreate(ctx, subject, req)
+	case proto.OpPoolGet:
+		req, err := decode[proto.PoolGetReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.poolGet(ctx, subject, req.Name)
+	case proto.OpPoolList:
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.poolList(ctx, subject)
+	case proto.OpPoolRemove:
+		req, err := decode[proto.PoolRemoveReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return struct{}{}, c.poolRemove(ctx, subject, req)
 	case proto.OpAgentCreate:
 		req, err := decode[proto.AgentCreateReq](f)
 		if err != nil {

@@ -352,6 +352,21 @@ func TestBaseSubcommandsValidateBeforeDialing(t *testing.T) {
 	}
 }
 
+func TestPoolSubcommandsValidateBeforeDialing(t *testing.T) {
+	if err := cmdPool(context.Background(), nil); err == nil {
+		t.Fatal("pool without subcommand accepted")
+	}
+	if err := cmdPool(context.Background(), []string{"create", "workers", "--vendor", "fly"}); err == nil {
+		t.Fatal("pool create without backend accepted")
+	}
+	if err := cmdPool(context.Background(), []string{"rm"}); err == nil {
+		t.Fatal("pool rm without name accepted")
+	}
+	if err := cmdPool(context.Background(), []string{"wat"}); err == nil || !strings.Contains(err.Error(), "unknown pool subcommand") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestRunValidatesBeforeDialing(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
