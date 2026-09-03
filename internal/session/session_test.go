@@ -483,3 +483,26 @@ func TestSessionPrincipalKeyHasNoDelimiterAliases(t *testing.T) {
 		t.Fatal("distinct opaque tenant/principal pairs produced the same quota key")
 	}
 }
+
+func TestTerminateRecordsReasonInExitChunk(t *testing.T) {
+	m := newMgr(t)
+	s, err := m.Open(Spec{WS: "ws_1", Kind: proto.SessionPTY, Program: []string{"sleep", "30"}, Rows: 10, Cols: 40})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.Terminate(s.ID, proto.ExitReasonRevoked) {
+		t.Fatal("terminate should find the session")
+	}
+	_, _, exit := collect(t, s)
+	if exit.Reason != proto.ExitReasonRevoked || exit.Signal == "" {
+		t.Fatalf("exit=%+v", exit)
+	}
+	if m.Terminate("s_missing", proto.ExitReasonRevoked) {
+		t.Fatal("unknown session reported terminated")
+	}
+	// A normal exit carries no reason.
+	plain, _ := m.Open(Spec{WS: "ws_1", Kind: proto.SessionExec, Program: []string{"true"}})
+	if _, _, exit := collect(t, plain); exit.Reason != "" {
+		t.Fatalf("plain exit=%+v", exit)
+	}
+}

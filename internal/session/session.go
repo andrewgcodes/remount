@@ -70,6 +70,7 @@ type Session struct {
 	outputReady chan struct{} // pumps wait until StreamInfo is committed at seq 0
 	logErr      error
 	onFinish    func() // commits manager accounting before exited is closed
+	closeReason string // recorded in the exit chunk when the node ends the session
 }
 
 // Exited reports whether the process has finished.
@@ -203,11 +204,25 @@ func (s *Session) Kill() {
 	_ = s.Signal("KILL")
 }
 
+// Terminate kills the process and records reason in the exit chunk, so a
+// subscriber can tell a policy decision from the process ending on its own.
+func (s *Session) Terminate(reason string) {
+	s.mu.Lock()
+	if s.exit == nil && s.closeReason == "" {
+		s.closeReason = reason
+	}
+	s.mu.Unlock()
+	s.Kill()
+}
+
 func (s *Session) finish(info proto.ExitInfo) {
 	s.mu.Lock()
 	if s.exit != nil {
 		s.mu.Unlock()
 		return
+	}
+	if info.Reason == "" {
+		info.Reason = s.closeReason
 	}
 	s.exit = &info
 	if s.logErr != nil && info.Error == "" {
@@ -406,6 +421,22 @@ func (m *Manager) Remove(id string, kill bool) bool {
 	}
 	m.mu.Unlock()
 	s.Log.Release()
+	return true
+}
+
+// Terminate ends one live session with a reason and keeps its log so
+// subscribers observe the exit chunk. It reports whether the session existed.
+func (m *Manager) Terminate(id, reason string) bool {
+	m.mu.Lock()
+	s, ok := m.sessions[id]
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
+	<-s.startDone
+	if !s.Exited() {
+		s.Terminate(reason)
+	}
 	return true
 }
 

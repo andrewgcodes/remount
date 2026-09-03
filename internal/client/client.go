@@ -386,6 +386,17 @@ func (c *Client) MoveWorkspace(ctx context.Context, id string, req *proto.Requir
 	return &ws, err
 }
 
+// SetWorkspaceACL replaces who else may use a workspace. Only its owner or an
+// administrator may call it. Principals removed by the change lose access
+// within one node renew interval; everyone else's grants refresh transparently.
+func (c *Client) SetWorkspaceACL(ctx context.Context, id string, acl proto.WorkspaceACL, options ...OperationOption) (*proto.Workspace, error) {
+	var ws proto.Workspace
+	idem, _ := operationKey(options)
+	err := c.call(ctx, proto.PeerControl, proto.OpWSACL, proto.WSACLReq{ID: id, ACL: acl, IdempotencyKey: idem}, &ws)
+	c.forgetGrant(id)
+	return &ws, err
+}
+
 // SleepWorkspace pauses a workspace until a timer or event.
 func (c *Client) SleepWorkspace(ctx context.Context, req proto.WSSleepReq, options ...OperationOption) (*proto.Timer, error) {
 	var t proto.Timer

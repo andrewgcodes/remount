@@ -171,7 +171,7 @@ func usage() {
   remount standalone  server + node in one process (try it on a laptop)
 
   remount ws create [--name N] [--backend B] [--image IMG] [--security PROFILE] [--egress-rule JSON] [--binding ID]
-  remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS [--authoritative]
+  remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS [--authoritative] | acl WS [--reader P]... [--writer P]...
   remount exec WS -- cmd args...      run a command (stdout/stderr/exit streamed)
   remount sh WS [cmd]                 interactive shell (pty)
   remount attach WS SESSION [--from N]
@@ -668,7 +668,7 @@ func cmdStandalone(ctx context.Context, args []string) error {
 
 func cmdWS(ctx context.Context, args []string) error {
 	if len(args) == 0 || isHelp(args[0]) {
-		return errors.New("ws: create|ls|get|destroy|move|sleep|wake|snapshot")
+		return errors.New("ws: create|ls|get|destroy|move|sleep|wake|snapshot|acl")
 	}
 	sub, rest := args[0], args[1:]
 	fs := flag.NewFlagSet("ws "+sub, flag.ExitOnError)
@@ -856,6 +856,25 @@ func cmdWS(ctx context.Context, args []string) error {
 			return nil
 		}
 		fmt.Fprintf(os.Stderr, "moved: node=%s gen=%d restored_from=%s\n", ws.Node, ws.Generation, short(ws.LastSnapshot))
+	case "acl":
+		var readers, writers listFlag
+		fs.Var(&readers, "reader", "principal that may read (repeatable; replaces the current list)")
+		fs.Var(&writers, "writer", "principal that may read and mutate (repeatable; replaces the current list)")
+		parse(fs, rest)
+		if err := arity(fs, 1, 1, "ws acl WS [--reader P]... [--writer P]..."); err != nil {
+			return err
+		}
+		cl := c.client()
+		defer cl.Close()
+		ws, err := cl.SetWorkspaceACL(ctx, fs.Arg(0), proto.WorkspaceACL{Readers: readers, Writers: writers})
+		if err != nil {
+			return err
+		}
+		if c.json {
+			printJSON(ws)
+			return nil
+		}
+		fmt.Fprintf(os.Stderr, "acl set: readers=%s writers=%s authz_revision=%d\n", strings.Join(ws.Spec.ACL.Readers, ","), strings.Join(ws.Spec.ACL.Writers, ","), ws.AuthzRevision)
 	case "sleep":
 		after := fs.Duration("after", 0, "wake after duration")
 		on := fs.String("on", "", "wake on event type")

@@ -370,6 +370,24 @@ leaves the machine. An unlisted host with no credential is refused too.
 Nothing on the workspace's disk or in its environment ever contained the real
 key. The audit for all three requests is in the event log.
 
+### Sharing a workspace, and taking it back
+
+A workspace's ACL names who else may use it. Only the owner (or an
+administrator) changes it, and every change advances the workspace's
+authorization revision so that every grant already handed out stops verifying.
+
+```sh
+./remount ws acl $WS --writer bob --reader carol
+./remount ws acl $WS --reader carol            # bob is out
+```
+
+Bob is refused a new grant immediately. The node learns the new revision on
+its next lease renew, at most a third of the lease later (10 s by default),
+and ends bob's live sessions with `exit{reason: "revoked"}`. Carol's shell
+keeps running; her client fetches a fresh grant the next time it needs one.
+In standalone mode every client is the same local administrator, so try this
+against `remount server` with an authenticator that tells principals apart.
+
 ## 9. Watch everything
 
 Transactional resource rows are the source of lifecycle/recovery truth. The

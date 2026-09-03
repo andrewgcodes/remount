@@ -205,6 +205,17 @@ type WorkspaceACL struct {
 	Writers []string `cbor:"writers,omitempty" json:"writers,omitempty"`
 }
 
+// AuthzRevocation is one principal losing access to a workspace at one
+// authorization revision.
+type AuthzRevocation struct {
+	Revision  uint64 `cbor:"rev" json:"rev"`
+	Principal string `cbor:"principal" json:"principal"`
+}
+
+// MaxRetainedRevocations bounds Workspace.Revocations. A node whose known
+// revision is older than the oldest retained entry is told to reset.
+const MaxRetainedRevocations = 64
+
 // Idle policies (durations in seconds; 0 = disabled).
 type Idle struct {
 	SnapshotEverySec int64 `cbor:"snapshot_every_sec,omitempty" json:"snapshot_every_sec,omitempty"`
@@ -225,6 +236,12 @@ type Workspace struct {
 	Tenant        string        `cbor:"tenant,omitempty" json:"tenant,omitempty"`
 	Owner         string        `cbor:"owner,omitempty" json:"owner,omitempty"`
 	AuthzRevision uint64        `cbor:"authz_revision,omitempty" json:"authz_revision,omitempty"`
+	// Revocations records which principals lost access at which authorization
+	// revision, newest last, so a node renewing from an older revision learns
+	// exactly whose sessions to close. Entries below RevocationFloor have been
+	// pruned; a node behind the floor must fail closed for the whole workspace.
+	Revocations     []AuthzRevocation `cbor:"revocations,omitempty" json:"revocations,omitempty"`
+	RevocationFloor uint64            `cbor:"revocation_floor,omitempty" json:"revocation_floor,omitempty"`
 	// QuarantineOperation identifies the durable fleet operation that fenced
 	// this workspace. It prevents restart reconciliation from treating an
 	// incident response as an ordinary transient failure.
@@ -244,6 +261,7 @@ const (
 	OpWSMove           = "ws.move"            // WSMoveReq -> Workspace (re-queued)
 	OpWSSleep          = "ws.sleep"           // WSSleepReq -> Timer
 	OpWSWake           = "ws.wake"            // WSGetReq -> Workspace
+	OpWSACL            = "ws.acl"             // WSACLReq -> Workspace (bumps authz_revision)
 	OpWSClaim          = "ws.claim"           // node: WSClaimReq -> WSClaimRes
 	OpWSRenew          = "ws.renew"           // node: WSRenewReq -> WSRenewRes
 	OpWSReleased       = "ws.released"        // node: WSReleasedReq -> {}
@@ -294,6 +312,15 @@ type WSSleepReq struct {
 	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
 }
 
+// WSACLReq replaces a workspace's ACL. Principals present before and absent
+// after are revoked: their grants stop verifying and their live sessions are
+// closed within one renew interval.
+type WSACLReq struct {
+	ID             string       `cbor:"id" json:"id"`
+	ACL            WorkspaceACL `cbor:"acl" json:"acl"`
+	IdempotencyKey string       `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
 type WSClaimReq struct {
 	ID string `cbor:"id" json:"id"`
 }
@@ -311,6 +338,9 @@ type WSReadyReq struct {
 type WSRenewReq struct {
 	IDs []string          `cbor:"ids" json:"ids"`
 	Gen map[string]uint64 `cbor:"gen,omitempty" json:"gen,omitempty"`
+	// Authz is the authorization revision the node currently enforces for
+	// each workspace (authz-push). Control answers with what changed since.
+	Authz map[string]uint64 `cbor:"authz,omitempty" json:"authz,omitempty"`
 }
 
 // WSRenewResult is the control plane's affirmative ownership decision for
@@ -323,6 +353,14 @@ type WSRenewResult struct {
 	AuthoritativeGen uint64 `cbor:"authoritative_gen,omitempty" json:"authoritative_gen,omitempty"`
 	LeaseUntil       int64  `cbor:"lease_until,omitempty" json:"lease_until,omitempty"`
 	Action           string `cbor:"action" json:"action"` // continue | fence | destroy | reconcile
+	// AuthzRevision is the authoritative authorization revision (authz-push).
+	// Revoked lists principals that lost access after the revision the node
+	// reported in WSRenewReq.Authz. AuthzReset means the node's revision is
+	// older than the retained history: every session of the workspace must be
+	// closed because control cannot name the affected principals.
+	AuthzRevision uint64   `cbor:"authz_revision,omitempty" json:"authz_revision,omitempty"`
+	Revoked       []string `cbor:"revoked,omitempty" json:"revoked,omitempty"`
+	AuthzReset    bool     `cbor:"authz_reset,omitempty" json:"authz_reset,omitempty"`
 }
 
 type WSRenewRes struct {
@@ -611,7 +649,14 @@ type ExitInfo struct {
 	Code   int    `cbor:"code" json:"code"`
 	Signal string `cbor:"signal,omitempty" json:"signal,omitempty"`
 	Error  string `cbor:"error,omitempty" json:"error,omitempty"` // failed to start, etc.
+	// Reason names why the node ended the session when the process did not
+	// end on its own; empty for an ordinary exit.
+	Reason string `cbor:"reason,omitempty" json:"reason,omitempty"`
 }
+
+// ExitReasonRevoked marks a session the node closed because its principal
+// lost access to the workspace.
+const ExitReasonRevoked = "revoked"
 
 type SessionInfo struct {
 	ID       string   `cbor:"id" json:"id"`
@@ -1057,6 +1102,8 @@ const (
 	EvWSLeaseExpired = "ws.lease_expired"
 	EvWSFenced       = "ws.fenced"
 	EvWSStateChanged = "ws.state_changed"
+	EvWSACL          = "ws.acl"        // ACL replaced; payload names revoked principals and the new revision
+	EvAuthzRevoked   = "authz.revoked" // node closed a revoked principal's sessions
 	EvSOpened        = "s.opened"
 	EvSExited        = "s.exited"
 	EvSInput         = "s.input"

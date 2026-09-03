@@ -61,8 +61,18 @@ type fault struct {
 
 func newWorld(t *testing.T, bindings ...control.Binding) *world {
 	t.Helper()
+	return newWorldWith(t, func(o *server.Options) { o.Bindings = bindings })
+}
+
+// newWorldWith starts a world after letting the test adjust the server options.
+func newWorldWith(t *testing.T, adjust func(*server.Options)) *world {
+	t.Helper()
 	dataDir := filepath.Join(t.TempDir(), "server")
-	srv, err := server.New(server.Options{DataDir: dataDir, Token: "tok", Bindings: bindings, LeaseSec: 2})
+	opts := server.Options{DataDir: dataDir, Token: "tok", LeaseSec: 2}
+	if adjust != nil {
+		adjust(&opts)
+	}
+	srv, err := server.New(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +182,12 @@ func (w *world) nodeWith(name string, adjust func(*node.Options)) *node.Node {
 }
 
 func (w *world) client(name string) *client.Client {
-	c := client.New(client.Options{Dialer: w.dialer(name), Token: "tok", Principal: "a_" + name})
+	return w.clientWithToken(name, "tok")
+}
+
+// clientWithToken connects as whichever subject the server maps token to.
+func (w *world) clientWithToken(name, token string) *client.Client {
+	c := client.New(client.Options{Dialer: w.dialer(name), Token: token, Principal: "a_" + name})
 	w.t.Cleanup(func() { c.Close() })
 	return c
 }
@@ -271,14 +286,24 @@ func TestExecEndToEnd(t *testing.T) {
 	if !names["src"] || !names[".remount"] || len(ents) != 2 {
 		t.Fatalf("%+v", ents)
 	}
-	// Events made it to the control plane's canonical log.
-	evs, err := c.ReadEvents(ctx, 1, ws.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Events made it to the control plane's canonical log. Node events travel
+	// through an asynchronous outbox, so wait for the last command's s.exited
+	// rather than asserting on a single read.
+	var evs []proto.Event
 	types := map[string]int{}
-	for _, e := range evs {
-		types[e.Type]++
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		evs, err = c.ReadEvents(ctx, 1, ws.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		types = map[string]int{}
+		for _, e := range evs {
+			types[e.Type]++
+		}
+		if types[proto.EvSExited] >= types[proto.EvSOpened] && types[proto.EvSOpened] > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	for _, want := range []string{proto.EvWSCreated, proto.EvWSClaimed, proto.EvSOpened, proto.EvSExited, proto.EvFSWrite, proto.EvFSEdit} {
 		if types[want] == 0 {
