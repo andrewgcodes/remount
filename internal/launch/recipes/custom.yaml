@@ -1,0 +1,7 @@
+# custom: run any command with brokered provider credentials in the
+# environment. `remount run custom --binding b_openai -- python agent.py`.
+name: custom
+description: Any command; argv after -- runs as given
+auth: either
+providers: [anthropic, openai, google, openrouter, bedrock, vertex, azure-openai, mistral, groq, together, fireworks, deepseek, xai]
+command_from_args: true

@@ -132,6 +132,91 @@ func TestNegotiateCapabilities(t *testing.T) {
 	if _, err := NegotiateCapabilities(nil); !errors.Is(err, &Error{Code: CodeUnsupported}) {
 		t.Fatalf("missing baseline capability: %v", err)
 	}
+	// A named capability without the baseline is not a connection.
+	if _, err := NegotiateCapabilities([]string{CapabilityAuthzPush}); !errors.Is(err, &Error{Code: CodeUnsupported}) {
+		t.Fatalf("named capability without v1: %v", err)
+	}
+	// The result is canonical order, not the peer's order, and never echoes
+	// identifiers this release does not implement.
+	got, err = NegotiateCapabilities([]string{CapabilityEncryptedArtifacts, CapabilityAuthzPush, "x-vendor", CapabilityV1})
+	if err != nil || !reflect.DeepEqual(got, []string{CapabilityV1, CapabilityAuthzPush}) {
+		t.Fatalf("negotiated %v, %v", got, err)
+	}
+	full, err := NegotiateCapabilities(PeerCapabilities())
+	if err != nil || !reflect.DeepEqual(full, PeerCapabilities()) {
+		t.Fatalf("self-negotiation = %v, %v", full, err)
+	}
+}
+
+// Every profile-required capability is one this release's peers actually
+// offer, or the release would refuse itself under that profile.
+func TestSecurityCapabilitiesAreImplemented(t *testing.T) {
+	for _, profile := range []string{SecurityLocal, SecurityIsolated, SecurityMultiTenant, "", "unknown"} {
+		required := SecurityCapabilities(profile)
+		if missing := MissingCapabilities(PeerCapabilities(), required); len(missing) > 0 {
+			t.Fatalf("profile %q requires unimplemented %v", profile, missing)
+		}
+		if profile == SecurityLocal || profile == "" || profile == "unknown" {
+			if len(required) != 0 {
+				t.Fatalf("profile %q requires %v; local must accept an old peer", profile, required)
+			}
+			continue
+		}
+		if len(required) == 0 {
+			t.Fatalf("profile %q requires nothing", profile)
+		}
+		// An old peer offers only v1 and must be refused by these profiles.
+		if missing := MissingCapabilities([]string{CapabilityV1}, required); !reflect.DeepEqual(missing, required) {
+			t.Fatalf("profile %q: old peer missing %v, want %v", profile, missing, required)
+		}
+	}
+	// Missing is reported in canonical order regardless of the required order.
+	missing := MissingCapabilities([]string{CapabilityV1}, []string{CapabilityApprovals, CapabilityAuthzPush, CapabilityV1})
+	if !reflect.DeepEqual(missing, []string{CapabilityAuthzPush, CapabilityApprovals}) {
+		t.Fatalf("missing = %v", missing)
+	}
+	required := SecurityCapabilities(SecurityIsolated)
+	required[0] = "mutated"
+	if SecurityCapabilities(SecurityIsolated)[0] == "mutated" {
+		t.Fatal("SecurityCapabilities returned shared storage")
+	}
+}
+
+// The hello golden fixture pins how named capabilities travel on the wire:
+// a plain ordered array of exact identifiers, so an old peer sees strings it
+// does not know and simply never echoes them.
+func TestV1HelloGoldenFixture(t *testing.T) {
+	rawHex, err := os.ReadFile("testdata/v1-hello.hex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := hex.DecodeString(strings.TrimSpace(string(rawHex)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := DecodeFrame(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hello Hello
+	if err := frame.Decode(&hello); err != nil {
+		t.Fatal(err)
+	}
+	wantCaps := []string{CapabilityV1, CapabilityAuthzPush, CapabilityControllerEpoch, CapabilitySessionCap, CapabilityChunkedArtifacts, CapabilityApprovals, CapabilityEncryptedArtifacts}
+	if frame.T != KindHello || frame.ID != 1 || hello.Peer != "n_fixture" || hello.Role != RoleNode || !reflect.DeepEqual(hello.Caps, wantCaps) {
+		t.Fatalf("fixture changed semantics: frame=%+v hello=%+v", frame, hello)
+	}
+	reencoded, err := EncodeFrame(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(reencoded, raw) {
+		t.Fatalf("v1 hello encoding changed:\n got %x\nwant %x", reencoded, raw)
+	}
+	negotiated, err := NegotiateCapabilities(hello.Caps)
+	if err != nil || !reflect.DeepEqual(negotiated, PeerCapabilities()) {
+		t.Fatalf("fixture hello negotiated %v, %v", negotiated, err)
+	}
 }
 
 func TestDecodeRejectsNoKind(t *testing.T) {

@@ -9,6 +9,7 @@
 //	remount fs       read|write|ls|stat|rm|mv|search WS ...
 //	remount port     WS PORT [--local ADDR]
 //	remount fleet    quarantine|ls|get
+//	remount base     ls|rm
 //	remount nodes / remount events [--follow] / remount timers
 //	remount standalone [--data DIR]   (server + node in one process, no token)
 package main
@@ -24,6 +25,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -36,6 +38,7 @@ import (
 
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/control"
+	"remount.dev/remount/internal/localfs"
 	"remount.dev/remount/internal/node"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/server"
@@ -52,50 +55,7 @@ func main() {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	var err error
-	switch os.Args[1] {
-	case "server":
-		err = cmdServer(ctx, os.Args[2:])
-	case "up":
-		err = cmdUp(ctx, os.Args[2:])
-	case "standalone":
-		err = cmdStandalone(ctx, os.Args[2:])
-	case "ws":
-		err = cmdWS(ctx, os.Args[2:])
-	case "exec":
-		err = cmdExec(ctx, os.Args[2:], false)
-	case "sh":
-		err = cmdExec(ctx, os.Args[2:], true)
-	case "attach":
-		err = cmdAttach(ctx, os.Args[2:])
-	case "fs":
-		err = cmdFS(ctx, os.Args[2:])
-	case "port":
-		err = cmdPort(ctx, os.Args[2:])
-	case "fleet":
-		err = cmdFleet(ctx, os.Args[2:])
-	case "status":
-		err = cmdStatus(ctx, os.Args[2:])
-	case "inspect":
-		err = cmdInspect(ctx, os.Args[2:])
-	case "doctor":
-		err = cmdDoctor(ctx, os.Args[2:])
-	case "metrics":
-		err = cmdMetrics(ctx, os.Args[2:])
-	case "nodes":
-		err = cmdNodes(ctx, os.Args[2:])
-	case "events":
-		err = cmdEvents(ctx, os.Args[2:])
-	case "timers":
-		err = cmdTimers(ctx, os.Args[2:])
-	case "version":
-		fmt.Println("remount", version)
-	case "help", "-h", "--help":
-		usage()
-	default:
-		usage()
-		os.Exit(2)
-	}
+	err := run(ctx, os.Args[1:])
 	if err != nil {
 		var ee exitError
 		if errors.As(err, &ee) {
@@ -105,6 +65,122 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// run dispatches one invocation. Global flags (--server, --token, --json) may
+// precede the command as well as follow it; they are moved after the
+// (sub)command name so every FlagSet sees them.
+func run(ctx context.Context, argv []string) error {
+	globals, argv := splitGlobalFlags(argv)
+	if len(argv) == 0 {
+		usage()
+		return exitError(2)
+	}
+	cmd, args := argv[0], argv[1:]
+	switch cmd {
+	case "ws", "fs", "fleet", "run", "agent":
+		if len(args) > 0 && !isFlag(args[0]) {
+			args = append(append([]string{args[0]}, globals...), args[1:]...)
+		} else {
+			args = append(globals, args...)
+		}
+	case "server", "standalone", "version", "help", "-h", "--help":
+		if len(globals) > 0 {
+			return fmt.Errorf("%s does not accept %s before the command", cmd, globals[0])
+		}
+	default:
+		args = append(globals, args...)
+	}
+	switch cmd {
+	case "server":
+		return cmdServer(ctx, args)
+	case "up":
+		return cmdUp(ctx, args)
+	case "standalone":
+		return cmdStandalone(ctx, args)
+	case "ws":
+		return cmdWS(ctx, args)
+	case "exec":
+		return cmdExec(ctx, args, false)
+	case "sh":
+		return cmdExec(ctx, args, true)
+	case "attach":
+		return cmdAttach(ctx, args)
+	case "fs":
+		return cmdFS(ctx, args)
+	case "push":
+		return cmdPush(ctx, args)
+	case "pull":
+		return cmdPull(ctx, args)
+	case "port":
+		return cmdPort(ctx, args)
+	case "fleet":
+		return cmdFleet(ctx, args)
+	case "base":
+		return cmdBase(ctx, args)
+	case "run":
+		return cmdRun(ctx, args)
+	case "handoff":
+		return cmdHandoff(ctx, args)
+	case "resume":
+		return cmdResume(ctx, args)
+	case "binding":
+		return cmdBinding(ctx, args)
+	case "agent":
+		return cmdAgent(ctx, args)
+	case "approvals":
+		return cmdApprovals(ctx, args)
+	case "approve":
+		return cmdApprove(ctx, args)
+	case "status":
+		return cmdStatus(ctx, args)
+	case "inspect":
+		return cmdInspect(ctx, args)
+	case "doctor":
+		return cmdDoctor(ctx, args)
+	case "metrics":
+		return cmdMetrics(ctx, args)
+	case "nodes":
+		return cmdNodes(ctx, args)
+	case "events":
+		return cmdEvents(ctx, args)
+	case "timers":
+		return cmdTimers(ctx, args)
+	case "version":
+		fmt.Println("remount", version)
+		return nil
+	case "help", "-h", "--help":
+		usage()
+		return nil
+	}
+	usage()
+	return exitError(2)
+}
+
+// globalFlags are accepted before the command name.
+var globalFlags = map[string]bool{"server": true, "token": true, "json": false}
+
+// splitGlobalFlags peels leading global flags off argv. The bool records
+// whether the flag takes a value.
+func splitGlobalFlags(argv []string) (globals, rest []string) {
+	for len(argv) > 0 && isFlag(argv[0]) {
+		name, _, hasValue := strings.Cut(strings.TrimLeft(argv[0], "-"), "=")
+		takesValue, known := globalFlags[name]
+		if !known {
+			break
+		}
+		globals = append(globals, argv[0])
+		argv = argv[1:]
+		if takesValue && !hasValue && len(argv) > 0 {
+			globals = append(globals, argv[0])
+			argv = argv[1:]
+		}
+	}
+	return globals, argv
+}
+
+func isFlag(a string) bool { return len(a) > 1 && a[0] == '-' }
+
+func isHelp(a string) bool { return a == "help" || a == "-h" || a == "--help" }
 
 type exitError int
 
@@ -117,14 +193,30 @@ func usage() {
   remount up          enroll this machine as a node (outbound only)
   remount standalone  server + node in one process (try it on a laptop)
 
-	  remount ws create [--name N] [--backend B] [--security PROFILE] [--egress-rule JSON] [--binding ID]
-	  remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS [--authoritative]
+  remount ws create [--name N] [--dir PATH | --base NAME | --repo URL[@REF]] [--backend B] [--image IMG] [--security PROFILE] [--egress-rule JSON] [--binding ID]
+  remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS [--authoritative] [--as-base NAME] | acl WS [--reader P]... [--writer P]...
   remount exec WS -- cmd args...      run a command (stdout/stderr/exit streamed)
   remount sh WS [cmd]                 interactive shell (pty)
   remount attach WS SESSION [--from N]
   remount fs read|write|ls|stat|rm|mv|search|edit WS ...
+  remount push WS [--dir .] [--include-git=false] [--exclude GLOB]...   upload a local directory over the workspace
+  remount pull WS [--dir .] [--force]                                   snapshot the workspace and write what differs locally
   remount port WS PORT [--local 127.0.0.1:PORT]
   remount fleet quarantine --action freeze (--all | SELECTORS...) | ls | get OPERATION
+  remount base ls | rm NAME                                              named snapshots for ws create --base (pinned until rm)
+  remount run RECIPE [--dir . | --base NAME | --repo URL[@REF] | --ws WS] [--binding b_openai]... [--detach] -- TASK
+                                      seed a workspace, install a harness (claude, codex, opencode, openhands, goose, gemini, aider, cline, custom), run it
+  remount run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM]   run the file's tasks in order in one workspace, checkpointing or sleeping between them
+  remount handoff [--recipe R] [--task T] [--dir .]                      move this checkout and the harness's conversation into a workspace and keep it going
+  remount resume WS [--task T]        rejoin a running harness, or wake the workspace and continue the conversation
+  remount binding preset ls           provider presets a --binding may name
+  remount agent create RECIPE [seed flags] [--sleep-after DUR] [--max-turns N] [--approve M] [--detach] -- TASK
+                                      a durable ACP agent: survives disconnects, node loss and sleep; run does this for acp recipes
+  remount agent ls | get ID | open ID [--ui] | message ID [--steer] -- TEXT | cancel ID | fork ID | sleep ID | wake ID | destroy ID
+  remount agent watch ID [--from N] [--no-follow] [--raw]                 the transcript as a conversation; on a terminal, type to reply
+  remount agent diff ID [--wake] | approvals ID | approve APPROVAL
+  remount approvals [--agent ID] [--status pending|decided|expired|all]   what an Agent is waiting on a human for
+  remount approve ID [--option X | --deny | --content JSON]              answer one; no flag picks the first allow option
   remount nodes | events [--follow] [--ws WS] | timers
 
 Inspection, at three depths. All take --json.
@@ -133,7 +225,7 @@ Inspection, at three depths. All take --json.
   remount doctor                      every check for damage, loss or disagreement
   remount metrics [--node ID]         raw counters
 
-Common flags (or env): --server REMOUNT_SERVER (default http://127.0.0.1:7443) --token REMOUNT_TOKEN
+Common flags (or env), before or after the command: --server REMOUNT_SERVER (default http://127.0.0.1:7443) --token REMOUNT_TOKEN --json
 `)
 }
 
@@ -190,6 +282,70 @@ func parse(fs *flag.FlagSet, args []string) {
 	_ = fs.Parse(append(flags, positional...))
 }
 
+// arity enforces the positional count of a subcommand after parse. Extra
+// positionals are an error rather than silently ignored: `ws create
+// python:3.12` was accepted and created a workspace with the default image.
+func arity(fs *flag.FlagSet, min, max int, usage string) error {
+	args := fs.Args()
+	if len(args) < min {
+		return fmt.Errorf("missing argument: %s", usage)
+	}
+	if max >= 0 && len(args) > max {
+		extra := args[max]
+		if looksLikeImage(extra) {
+			return fmt.Errorf("unexpected argument %q: did you mean --image %s? usage: %s", extra, extra, usage)
+		}
+		return fmt.Errorf("unexpected argument %q: %s", extra, usage)
+	}
+	return nil
+}
+
+// looksLikeImage recognises the shapes people type for container images
+// (name:tag, registry/name, name@sha256:...).
+func looksLikeImage(s string) bool {
+	if s == "" || strings.ContainsAny(s, " \t") || strings.HasPrefix(s, "ws_") {
+		return false
+	}
+	return strings.Contains(s, ":") || strings.Contains(s, "/") || strings.Contains(s, "@sha256")
+}
+
+// mutationResult is the --json shape of a mutating command that has no
+// richer object to print.
+type mutationResult struct {
+	OK        bool   `json:"ok"`
+	Operation string `json:"operation"`
+	Workspace string `json:"workspace,omitempty"`
+	Path      string `json:"path,omitempty"`
+	To        string `json:"to,omitempty"`
+	Count     *int   `json:"count,omitempty"`
+}
+
+// absFlagPath resolves a directory flag against the current working directory.
+// Nodes hand the path to backends (Docker bind mounts need absolute paths) and
+// long-running processes may change directory, so relative data roots are a
+// latent bug rather than a convenience.
+func absFlagPath(flagName, value string) (string, error) {
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("--%s must not be empty", flagName)
+	}
+	abs, err := filepath.Abs(value)
+	if err != nil {
+		return "", fmt.Errorf("--%s %q: %w", flagName, value, err)
+	}
+	return abs, nil
+}
+
+// splitList splits a comma-separated flag, dropping empty items.
+func splitList(v string) []string {
+	var out []string
+	for _, item := range strings.Split(v, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
 func envOr(k, d string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -213,7 +369,10 @@ func (c *common) dialer() transport.Dialer {
 
 func (c *common) client() *client.Client {
 	principal := envOr("REMOUNT_PRINCIPAL", envOr("USER", "cli"))
-	return client.New(client.Options{Dialer: c.dialer(), Token: c.token, Principal: principal})
+	return client.New(client.Options{
+		Dialer: c.dialer(), Token: c.token, Principal: principal,
+		ArtifactURL: strings.TrimSuffix(c.server, "/") + "/v1/artifacts",
+	})
 }
 
 func printJSON(v any) {
@@ -328,12 +487,29 @@ func cmdServer(ctx context.Context, args []string) error {
 	maxWorkspaceTimers := fs.Int("max-workspace-timers", 128, "maximum retained durable timers per workspace")
 	maxConcurrentRequests := fs.Int("max-concurrent-requests", 128, "maximum concurrent control-plane requests")
 	mode := fs.String("mode", envOr("REMOUNT_SECURITY_MODE", server.ModeStandalone), "security mode: standalone, production-single-tenant, production-multi-tenant")
+	publicURL := fs.String("public-url", envOr("REMOUNT_PUBLIC_URL", ""), "externally reachable base URL agent links are minted under (https://host)")
+	agentUI := fs.String("agent-ui", envOr("REMOUNT_AGENT_UI", ""), "operator UI URL that /a/{id} redirects to; {id} is replaced, else appended")
+	cors := fs.String("cors", envOr("REMOUNT_CORS", ""), "comma-separated browser origins allowed to call the HTTP API (\"*\" for any, without credentials)")
+	maxAPIClients := fs.Int("max-api-clients", 256, "maximum distinct HTTP API credentials with a live in-process client")
+	webhookSecret := fs.String("webhook-secret", os.Getenv("REMOUNT_WEBHOOK_SECRET"), "HMAC-SHA256 secret that signs POST /v1/events (X-Remount-Signature / X-Hub-Signature-256)")
+	webhookToken := fs.String("webhook-token", os.Getenv("REMOUNT_WEBHOOK_TOKEN"), "credential signed webhooks act as when they create or wake agents (default: append-only)")
 	parse(fs, args)
+	if *publicURL != "" {
+		u, err := url.Parse(*publicURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("--public-url %q must be an http(s) URL", *publicURL)
+		}
+	}
 	if *token == "" && !*insecure {
 		return errors.New("--token is required (or --insecure for local experiments)")
 	}
-	if err := os.MkdirAll(*data, 0o700); err != nil {
+	dataDir, err := absFlagPath("data", *data)
+	if err != nil {
 		return err
+	}
+	*data = dataDir
+	if err := os.MkdirAll(*data, 0o700); err != nil {
+		return fmt.Errorf("--data %s: %w", *data, err)
 	}
 	b, err := loadBindings(*bindings)
 	if err != nil {
@@ -348,6 +524,8 @@ func cmdServer(ctx context.Context, args []string) error {
 		MaxWorkspacesPerTenant: *maxTenantWorkspaces, MaxWorkspacesPerSubject: *maxSubjectWorkspaces,
 		MaxMutationRecords: *maxMutationRecords, MaxTimers: *maxTimers, MaxTimersPerWorkspace: *maxWorkspaceTimers,
 		MaxConcurrentRequests: *maxConcurrentRequests,
+		PublicURL:             *publicURL, AgentURLBase: *agentUI, CORSOrigins: splitList(*cors), MaxAPIClients: *maxAPIClients,
+		WebhookSecret: *webhookSecret, WebhookToken: *webhookToken,
 	})
 	if err != nil {
 		return err
@@ -365,7 +543,7 @@ func cmdUp(ctx context.Context, args []string) error {
 	labels := kvFlag{}
 	fs.Var(labels, "label", "node label k=v (repeatable)")
 	backends := fs.String("backend", "process", "comma-separated backends: process,docker")
-	image := fs.String("image", "ubuntu:24.04", "default docker image")
+	image := fs.String("image", workspace.DefaultImage(version), "default docker image (ubuntu:24.04 for a plain distro)")
 	artifactBytes := fs.Int64("artifact-object-bytes", 8<<30, "maximum compressed bytes per cached artifact")
 	artifactStoreBytes := fs.Int64("artifact-store-bytes", 32<<30, "maximum node artifact-cache bytes")
 	artifactObjects := fs.Int("artifact-store-objects", 50_000, "maximum node artifact-cache objects")
@@ -393,6 +571,11 @@ func cmdUp(ctx context.Context, args []string) error {
 	fs.Var(&allow, "allow", "host pattern workspaces may reach without a credential (repeatable)")
 	fs.Var(&allowPrivate, "allow-private", "host pattern allowed to resolve to a private address (repeatable)")
 	parse(fs, args)
+	dataDir, err := absFlagPath("data", *data)
+	if err != nil {
+		return err
+	}
+	*data = dataDir
 	n, err := buildNode(*data, c, labels, *backends, *image, allow, allowPrivate, nodeResourceOptions{
 		artifactBytes: *artifactBytes, artifactStoreBytes: *artifactStoreBytes, artifactObjects: *artifactObjects,
 		artifactRetention: *artifactRetention, artifactGCInterval: *artifactGCInterval,
@@ -447,6 +630,9 @@ type nodeResourceOptions struct {
 }
 
 func buildNode(data string, c common, labels map[string]string, backends, image string, allow, allowPrivate []string, resources nodeResourceOptions) (*node.Node, error) {
+	if !filepath.IsAbs(data) {
+		return nil, fmt.Errorf("node data directory %q must be absolute", data)
+	}
 	var list []workspace.Backend
 	for _, b := range strings.Split(backends, ",") {
 		switch strings.TrimSpace(b) {
@@ -501,15 +687,25 @@ func cmdStandalone(ctx context.Context, args []string) error {
 	backends := fs.String("backend", "process", "backends")
 	var allow listFlag
 	fs.Var(&allow, "allow", "host pattern reachable without a credential")
+	agentUI := fs.String("agent-ui", envOr("REMOUNT_AGENT_UI", ""), "operator UI URL that /a/{id} redirects to; {id} is replaced, else appended")
+	cors := fs.String("cors", envOr("REMOUNT_CORS", ""), "comma-separated browser origins allowed to call the HTTP API; the standalone has no token, so any listed page may act on it")
 	parse(fs, args)
 	b, err := loadBindings(*bindings)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(*data, 0o700); err != nil {
+	dataDir, err := absFlagPath("data", *data)
+	if err != nil {
 		return err
 	}
-	srv, err := server.New(server.Options{DataDir: filepath.Join(*data, "server"), Bindings: b, Logger: slog.Default(), Mode: server.ModeStandalone})
+	*data = dataDir
+	if err := os.MkdirAll(*data, 0o700); err != nil {
+		return fmt.Errorf("--data %s: %w", *data, err)
+	}
+	srv, err := server.New(server.Options{
+		DataDir: filepath.Join(*data, "server"), Bindings: b, Logger: slog.Default(), Mode: server.ModeStandalone,
+		AgentURLBase: *agentUI, CORSOrigins: splitList(*cors),
+	})
 	if err != nil {
 		return err
 	}
@@ -530,7 +726,7 @@ func cmdStandalone(ctx context.Context, args []string) error {
 		return err
 	}
 	c := common{server: "http://" + addr}
-	n, err := buildNode(filepath.Join(*data, "node"), c, map[string]string{"standalone": "true"}, *backends, "ubuntu:24.04", allow, []string{"127.0.0.1", "localhost"}, nodeResourceOptions{})
+	n, err := buildNode(filepath.Join(*data, "node"), c, map[string]string{"standalone": "true"}, *backends, workspace.DefaultImage(version), allow, []string{"127.0.0.1", "localhost"}, nodeResourceOptions{})
 	if err != nil {
 		return err
 	}
@@ -543,8 +739,8 @@ func cmdStandalone(ctx context.Context, args []string) error {
 // ---------------------------------------------------------------------------
 
 func cmdWS(ctx context.Context, args []string) error {
-	if len(args) == 0 {
-		return errors.New("ws: create|ls|get|destroy|move|sleep|wake|snapshot")
+	if len(args) == 0 || isHelp(args[0]) {
+		return errors.New("ws: create|ls|get|destroy|move|sleep|wake|snapshot|acl")
 	}
 	sub, rest := args[0], args[1:]
 	fs := flag.NewFlagSet("ws "+sub, flag.ExitOnError)
@@ -569,6 +765,12 @@ func cmdWS(ctx context.Context, args []string) error {
 		var egressRules egressRuleFlag
 		fs.Var(&bindings, "binding", "binding id (repeatable)")
 		fs.Var(&exclude, "exclude", "snapshot exclude glob (repeatable)")
+		dir := fs.String("dir", "", "seed the workspace from this local directory (honors .gitignore and .remountignore)")
+		includeGit := fs.Bool("include-git", true, "with --dir: include .git so the agent can commit")
+		restoreFrom := fs.String("restore-from", "", "seed the workspace from an existing artifact id")
+		base := fs.String("base", "", "seed the workspace from a named base (see remount base ls)")
+		repo := fs.String("repo", "", "clone this repository into the fresh workspace: URL[@REF]; the node clones through the broker (ADR 0054)")
+		repoDepth := fs.Int("repo-depth", 0, "with --repo, shallow-clone depth (0 = full history)")
 		securityProfile := fs.String("security", "", "security profile: local, isolated, multi_tenant")
 		minIsolation := fs.String("min-isolation", "", "minimum backend isolation: none, process_sandbox, container, microvm")
 		requireSiblingIsolation := fs.Bool("require-sibling-isolation", false, "require a backend with sibling isolation")
@@ -579,13 +781,42 @@ func cmdWS(ctx context.Context, args []string) error {
 		fs.Var(&egressRules, "egress-rule", "typed egress rule as JSON or @path (repeatable)")
 		wait := fs.Bool("wait", true, "wait until claimed")
 		parse(fs, rest)
+		if err := arity(fs, 0, 0, "ws create [--name N] [--image IMG] [flags]"); err != nil {
+			return err
+		}
 		if *principal != "" {
 			return errors.New("--principal is not supported; authenticated caller identity is authoritative")
 		}
+		seeds := 0
+		for _, set := range []bool{*dir != "", *restoreFrom != "", *base != "", *repo != ""} {
+			if set {
+				seeds++
+			}
+		}
+		if seeds > 1 {
+			return errors.New("--dir, --restore-from, --base and --repo are mutually exclusive")
+		}
+		var repoSpec proto.RepoSpec
+		if *repo != "" {
+			r, err := proto.ParseRepoFlag(*repo, *repoDepth)
+			if err != nil {
+				return err
+			}
+			repoSpec = r
+		} else if *repoDepth != 0 {
+			return errors.New("--repo-depth needs --repo")
+		}
 		cl := c.client()
 		defer cl.Close()
+		if *dir != "" {
+			id, _, err := uploadDir(ctx, cl, *dir, localfs.PackOptions{ExcludeGit: !*includeGit, Excludes: exclude})
+			if err != nil {
+				return err
+			}
+			*restoreFrom = id
+		}
 		spec := proto.WorkspaceSpec{
-			Name: *name, Run: *run, Model: *model, Labels: workspaceLabels, Image: *image,
+			Name: *name, Run: *run, Model: *model, Labels: workspaceLabels, Image: *image, RestoreFrom: *restoreFrom, Base: *base, Repo: repoSpec,
 			Requires:  proto.Requires{Backend: *backend, CPU: *cpu, MemMiB: *mem},
 			Placement: proto.Placement{Allow: labels, Node: *nodeID},
 			Bindings:  bindings, Env: env, Exclude: exclude,
@@ -621,6 +852,9 @@ func cmdWS(ctx context.Context, args []string) error {
 		}
 	case "ls":
 		parse(fs, rest)
+		if err := arity(fs, 0, 0, "ws ls"); err != nil {
+			return err
+		}
 		cl := c.client()
 		defer cl.Close()
 		list, err := cl.ListWorkspaces(ctx)
@@ -639,8 +873,8 @@ func cmdWS(ctx context.Context, args []string) error {
 		tw.Flush()
 	case "get":
 		parse(fs, rest)
-		if fs.NArg() < 1 {
-			return errors.New("ws get WS")
+		if err := arity(fs, 1, 1, "ws get WS"); err != nil {
+			return err
 		}
 		cl := c.client()
 		defer cl.Close()
@@ -651,12 +885,17 @@ func cmdWS(ctx context.Context, args []string) error {
 		printJSON(ws)
 	case "destroy":
 		parse(fs, rest)
-		if fs.NArg() < 1 {
-			return errors.New("ws destroy WS")
+		if err := arity(fs, 1, 1, "ws destroy WS"); err != nil {
+			return err
 		}
 		cl := c.client()
 		defer cl.Close()
-		return cl.DestroyWorkspace(ctx, fs.Arg(0))
+		if err := cl.DestroyWorkspace(ctx, fs.Arg(0)); err != nil {
+			return err
+		}
+		if c.json {
+			printJSON(mutationResult{OK: true, Operation: "ws.destroy", Workspace: fs.Arg(0)})
+		}
 	case "move":
 		nodeID := fs.String("node", "", "pin to node id")
 		cpu := fs.Int("cpu", 0, "required cpus")
@@ -665,8 +904,8 @@ func cmdWS(ctx context.Context, args []string) error {
 		labels := kvFlag{}
 		fs.Var(labels, "label", "placement label k=v")
 		parse(fs, rest)
-		if fs.NArg() < 1 {
-			return errors.New("ws move WS [--node ID] [--cpu N] [--label k=v]")
+		if err := arity(fs, 1, 1, "ws move WS [--node ID] [--cpu N] [--label k=v]"); err != nil {
+			return err
 		}
 		cl := c.client()
 		defer cl.Close()
@@ -716,12 +955,38 @@ func cmdWS(ctx context.Context, args []string) error {
 			}
 			return err
 		}
+		if c.json {
+			printJSON(ws)
+			return nil
+		}
 		fmt.Fprintf(os.Stderr, "moved: node=%s gen=%d restored_from=%s\n", ws.Node, ws.Generation, short(ws.LastSnapshot))
+	case "acl":
+		var readers, writers listFlag
+		fs.Var(&readers, "reader", "principal that may read (repeatable; replaces the current list)")
+		fs.Var(&writers, "writer", "principal that may read and mutate (repeatable; replaces the current list)")
+		parse(fs, rest)
+		if err := arity(fs, 1, 1, "ws acl WS [--reader P]... [--writer P]..."); err != nil {
+			return err
+		}
+		cl := c.client()
+		defer cl.Close()
+		ws, err := cl.SetWorkspaceACL(ctx, fs.Arg(0), proto.WorkspaceACL{Readers: readers, Writers: writers})
+		if err != nil {
+			return err
+		}
+		if c.json {
+			printJSON(ws)
+			return nil
+		}
+		fmt.Fprintf(os.Stderr, "acl set: readers=%s writers=%s authz_revision=%d\n", strings.Join(ws.Spec.ACL.Readers, ","), strings.Join(ws.Spec.ACL.Writers, ","), ws.AuthzRevision)
 	case "sleep":
 		after := fs.Duration("after", 0, "wake after duration")
 		on := fs.String("on", "", "wake on event type")
 		parse(fs, rest)
-		if fs.NArg() < 1 || (*after == 0 && *on == "") {
+		if err := arity(fs, 1, 1, "ws sleep WS --after 1h | --on github.pr.merged"); err != nil {
+			return err
+		}
+		if *after == 0 && *on == "" {
 			return errors.New("ws sleep WS --after 1h | --on github.pr.merged")
 		}
 		cl := c.client()
@@ -733,8 +998,8 @@ func cmdWS(ctx context.Context, args []string) error {
 		printJSON(t)
 	case "wake":
 		parse(fs, rest)
-		if fs.NArg() < 1 {
-			return errors.New("ws wake WS")
+		if err := arity(fs, 1, 1, "ws wake WS"); err != nil {
+			return err
 		}
 		cl := c.client()
 		defer cl.Close()
@@ -745,13 +1010,21 @@ func cmdWS(ctx context.Context, args []string) error {
 		if ws, err = cl.WaitClaimed(ctx, ws.ID); err != nil {
 			return err
 		}
+		if c.json {
+			printJSON(ws)
+			return nil
+		}
 		fmt.Fprintf(os.Stderr, "awake: node=%s gen=%d\n", ws.Node, ws.Generation)
 	case "snapshot":
 		authoritative := fs.Bool("authoritative", false, "quiesce managed execution and commit as failover state")
 		upload := fs.Bool("upload", true, "upload the snapshot to the control-plane artifact store")
+		asBase := fs.String("as-base", "", "pin the uploaded snapshot as a named base for ws create --base")
 		parse(fs, rest)
-		if fs.NArg() < 1 {
-			return errors.New("ws snapshot WS [--authoritative] [--upload=true]")
+		if err := arity(fs, 1, 1, "ws snapshot WS [--authoritative] [--upload=true] [--as-base NAME]"); err != nil {
+			return err
+		}
+		if *asBase != "" && !*upload {
+			return errors.New("--as-base requires --upload=true")
 		}
 		cl := c.client()
 		defer cl.Close()
@@ -768,8 +1041,29 @@ func cmdWS(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		var base *proto.Base
+		if *asBase != "" {
+			base, err = cl.CreateBase(ctx, proto.BaseCreateReq{Name: *asBase, Artifact: res.Artifact, Workspace: fs.Arg(0)})
+			if err != nil {
+				return fmt.Errorf("snapshot %s uploaded but not pinned as base %q: %w", res.Artifact, *asBase, err)
+			}
+		}
+		if c.json {
+			if base != nil {
+				printJSON(struct {
+					*proto.WSSnapshotRes
+					Base *proto.Base `json:"base"`
+				}{res, base})
+				return nil
+			}
+			printJSON(res)
+			return nil
+		}
 		fmt.Println(res.Artifact)
 		fmt.Fprintf(os.Stderr, "%d bytes, consistency=%s, authoritative=%t\n", res.Bytes, res.Consistency, res.Authoritative)
+		if base != nil {
+			fmt.Fprintf(os.Stderr, "pinned as base %s\n", base.Name)
+		}
 	default:
 		return fmt.Errorf("unknown ws subcommand %q", sub)
 	}
@@ -792,7 +1086,7 @@ func parseRFC3339Millis(value string) (int64, error) {
 }
 
 func cmdFleet(ctx context.Context, args []string) error {
-	if len(args) == 0 {
+	if len(args) == 0 || isHelp(args[0]) {
 		return errors.New("fleet: quarantine|ls|get")
 	}
 	sub, rest := args[0], args[1:]
@@ -817,6 +1111,9 @@ func cmdFleet(ctx context.Context, args []string) error {
 		labels := kvFlag{}
 		fs.Var(labels, "label", "workspace label selector k=v (repeatable)")
 		parse(fs, rest)
+		if err := arity(fs, 0, 0, "fleet quarantine --action A (--all | selectors)"); err != nil {
+			return err
+		}
 		afterMillis, err := parseRFC3339Millis(*createdAfter)
 		if err != nil {
 			return err
@@ -852,8 +1149,8 @@ func cmdFleet(ctx context.Context, args []string) error {
 		printFleetOperation(operation, commonFlags.json)
 	case "get":
 		parse(fs, rest)
-		if fs.NArg() != 1 {
-			return errors.New("fleet get OPERATION")
+		if err := arity(fs, 1, 1, "fleet get OPERATION"); err != nil {
+			return err
 		}
 		cl := commonFlags.client()
 		defer cl.Close()
@@ -864,6 +1161,9 @@ func cmdFleet(ctx context.Context, args []string) error {
 		printFleetOperation(operation, commonFlags.json)
 	case "ls":
 		parse(fs, rest)
+		if err := arity(fs, 0, 0, "fleet ls"); err != nil {
+			return err
+		}
 		cl := commonFlags.client()
 		defer cl.Close()
 		operations, err := cl.ListFleetOperations(ctx)
@@ -921,11 +1221,15 @@ func cmdExec(ctx context.Context, args []string, pty bool) error {
 	cwd := fs.String("cwd", "", "working directory inside the workspace")
 	env := kvFlag{}
 	fs.Var(env, "env", "extra env K=V (repeatable)")
-	timeout := fs.Duration("timeout", 0, "kill after duration")
+	timeout := fs.Duration("timeout", 0, "server-side session timeout; the node kills the process after this (0 = none)")
 	stdin := fs.Bool("stdin", false, "forward stdin (exec)")
+	killOnInterrupt := fs.Bool("kill-on-interrupt", false, "Ctrl-C sends SIGINT to the remote process instead of detaching")
 	parse(fs, args)
-	if fs.NArg() < 1 {
-		return errors.New("exec WS -- cmd args… | sh WS [cmd]")
+	if err := arity(fs, 1, -1, "exec WS -- cmd args… | sh WS [cmd]"); err != nil {
+		return err
+	}
+	if *timeout < 0 {
+		return errors.New("--timeout must not be negative")
 	}
 	wsID := fs.Arg(0)
 	program := fs.Args()[1:]
@@ -953,7 +1257,7 @@ func cmdExec(ctx context.Context, args []string, pty bool) error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "session %s\n", s.ID)
-	return drive(ctx, s, pty, *stdin || pty)
+	return drive(ctx, s, driveOptions{WS: wsID, Session: s.ID, Raw: pty, ForwardStdin: *stdin || pty, KillOnInterrupt: *killOnInterrupt})
 }
 
 func cmdAttach(ctx context.Context, args []string) error {
@@ -961,9 +1265,10 @@ func cmdAttach(ctx context.Context, args []string) error {
 	var c common
 	c.flags(fs)
 	from := fs.Uint64("from", 0, "replay from seq")
+	killOnInterrupt := fs.Bool("kill-on-interrupt", false, "Ctrl-C sends SIGINT to the remote process instead of detaching")
 	parse(fs, args)
-	if fs.NArg() < 2 {
-		return errors.New("attach WS SESSION [--from N]")
+	if err := arity(fs, 2, 2, "attach WS SESSION [--from N]"); err != nil {
+		return err
 	}
 	cl := c.client()
 	defer cl.Close()
@@ -971,46 +1276,146 @@ func cmdAttach(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return drive(ctx, s, term.IsTerminal(int(os.Stdin.Fd())), true)
+	return drive(ctx, s, driveOptions{WS: fs.Arg(0), Session: fs.Arg(1), Raw: term.IsTerminal(int(os.Stdin.Fd())), ForwardStdin: true, KillOnInterrupt: *killOnInterrupt})
+}
+
+// liveSession is what drive needs from a client session. client.Session
+// satisfies it; tests substitute a fake.
+type liveSession interface {
+	Chunks() <-chan client.Chunk
+	Exit() *proto.ExitInfo
+	Input(ctx context.Context, data []byte, eof bool) error
+	Signal(ctx context.Context, sig string) error
+	Close(ctx context.Context, kill bool) error
+	Resize(ctx context.Context, rows, cols uint16) error
+}
+
+type driveOptions struct {
+	WS, Session     string
+	Raw             bool // put the local terminal in raw mode (pty sessions)
+	ForwardStdin    bool
+	KillOnInterrupt bool // SIGINT forwards to the remote process instead of detaching
+
+	// Test seams; nil means the real terminal and process signals.
+	stdin      io.Reader
+	stdout     io.Writer
+	stderr     io.Writer
+	interrupts <-chan os.Signal
 }
 
 // drive pumps a session to the terminal, forwarding stdin and resizes.
-func drive(ctx context.Context, s *client.Session, raw, forwardStdin bool) error {
+//
+// The session outlives this client on purpose: a Ctrl-C detaches and the
+// process keeps running on the node, because an agent's long build should
+// not die with the operator's terminal. --kill-on-interrupt opts into the
+// conventional behaviour. In raw (pty) mode Ctrl-C is a byte the remote
+// shell sees, so no signal arrives here.
+func drive(ctx context.Context, s liveSession, o driveOptions) error {
+	stdin, stdout, stderr := o.stdin, o.stdout, o.stderr
+	if stdin == nil {
+		stdin = os.Stdin
+	}
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	// The process-wide context is cancelled by the same SIGINT we handle
+	// here; session calls must survive it or the detach itself fails.
+	sctx := context.WithoutCancel(ctx)
+	interrupts := o.interrupts
+	if interrupts == nil {
+		ch := make(chan os.Signal, 2)
+		signal.Notify(ch, os.Interrupt)
+		defer signal.Stop(ch)
+		interrupts = ch
+	}
 	var restore func()
-	if raw && term.IsTerminal(int(os.Stdin.Fd())) {
+	if o.Raw && term.IsTerminal(int(os.Stdin.Fd())) {
 		old, err := term.MakeRaw(int(os.Stdin.Fd()))
 		if err == nil {
 			restore = func() { _ = term.Restore(int(os.Stdin.Fd()), old) }
 			defer restore()
 		}
-		go watchResize(ctx, s)
+		go watchResize(sctx, s)
 	}
-	if forwardStdin {
+	if o.ForwardStdin {
 		go func() {
 			buf := make([]byte, 4096)
 			for {
-				n, err := os.Stdin.Read(buf)
+				n, err := stdin.Read(buf)
 				if n > 0 {
-					if ierr := s.Input(ctx, append([]byte(nil), buf[:n]...), false); ierr != nil {
+					if ierr := s.Input(sctx, append([]byte(nil), buf[:n]...), false); ierr != nil {
 						return
 					}
 				}
 				if err != nil {
-					_ = s.Input(ctx, nil, true)
+					_ = s.Input(sctx, nil, true)
 					return
 				}
 			}
 		}()
 	}
-	exit := client.Copy(s, os.Stdout, os.Stderr)
+	chunks := s.Chunks()
+	for chunks != nil {
+		select {
+		case ch, ok := <-chunks:
+			if !ok {
+				chunks = nil
+				continue
+			}
+			writeChunk(ch, stdout, stderr)
+		case <-interrupts:
+			if o.KillOnInterrupt {
+				// Forward once; a second Ctrl-C detaches so a process that
+				// ignores SIGINT cannot trap the operator.
+				if err := s.Signal(sctx, "INT"); err != nil {
+					fmt.Fprintln(stderr, "remount: signal:", err)
+				}
+				o.KillOnInterrupt = false
+				continue
+			}
+			// Output that already arrived belongs on the terminal before
+			// the detach notice.
+		drain:
+			for {
+				select {
+				case ch, ok := <-chunks:
+					if !ok {
+						chunks = nil
+						break drain
+					}
+					writeChunk(ch, stdout, stderr)
+				default:
+					break drain
+				}
+			}
+			if chunks == nil {
+				continue // it exited under us; report the exit, not a detach
+			}
+			if restore != nil {
+				restore()
+			}
+			cctx, cancel := context.WithTimeout(sctx, 5*time.Second)
+			err := s.Close(cctx, false)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("detach: %w (the session is still running; reattach with: remount attach %s %s)", err, o.WS, o.Session)
+			}
+			fmt.Fprintf(stderr, "\ndetached; reattach with: remount attach %s %s\n", o.WS, o.Session)
+			return nil
+		}
+	}
 	if restore != nil {
 		restore()
 	}
+	exit := s.Exit()
 	if exit == nil {
 		return errors.New("session ended without an exit record")
 	}
 	if exit.Error != "" {
-		fmt.Fprintln(os.Stderr, "remount:", exit.Error)
+		fmt.Fprintln(stderr, "remount:", exit.Error)
 	}
 	if exit.Code != 0 {
 		return exitError(exit.Code)
@@ -1018,13 +1423,26 @@ func drive(ctx context.Context, s *client.Session, raw, forwardStdin bool) error
 	return nil
 }
 
+func writeChunk(ch client.Chunk, stdout, stderr io.Writer) {
+	switch ch.Stream {
+	case proto.StreamStdout:
+		_, _ = stdout.Write(ch.Data)
+	case proto.StreamStderr:
+		_, _ = stderr.Write(ch.Data)
+	case proto.StreamGap:
+		var gap proto.Gap
+		_ = proto.Unmarshal(ch.Data, &gap)
+		fmt.Fprintf(stderr, "\n[remount: output seq %d-%d elided]\n", gap.From, gap.To)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // fs
 // ---------------------------------------------------------------------------
 
 func cmdFS(ctx context.Context, args []string) error {
-	if len(args) == 0 {
-		return errors.New("fs read|write|ls|stat|rm|mv|search|edit WS PATH…")
+	if len(args) == 0 || isHelp(args[0]) {
+		return errors.New("fs read|write|ls|stat|rm|mv|mkdir|search|edit WS PATH…")
 	}
 	sub, rest := args[0], args[1:]
 	fs := flag.NewFlagSet("fs "+sub, flag.ExitOnError)
@@ -1035,38 +1453,75 @@ func cmdFS(ctx context.Context, args []string) error {
 	max := fs.Int("max", 0, "max results (search)")
 	all := fs.Bool("all", false, "replace all occurrences (edit)")
 	parse(fs, rest)
-	cl := c.client()
-	defer cl.Close()
 	a := fs.Args()
-	need := func(n int, u string) error {
-		if len(a) < n {
-			return errors.New(u)
+	need := func(min, max int, u string) error { return arity(fs, min, max, u) }
+	mutation := func(m mutationResult) {
+		if c.json {
+			m.OK = true
+			printJSON(m)
 		}
-		return nil
 	}
+	// Arity is checked before dialing so a typo never costs a connection.
 	switch sub {
 	case "read", "cat":
-		if err := need(2, "fs read WS PATH"); err != nil {
+		if err := need(2, 2, "fs read WS PATH"); err != nil {
 			return err
 		}
+	case "write":
+		if err := need(2, 2, "fs write WS PATH < data"); err != nil {
+			return err
+		}
+	case "ls":
+		if err := need(1, 2, "fs ls WS [PATH]"); err != nil {
+			return err
+		}
+	case "stat":
+		if err := need(2, 2, "fs stat WS PATH"); err != nil {
+			return err
+		}
+	case "rm":
+		if err := need(2, 2, "fs rm [-r] WS PATH"); err != nil {
+			return err
+		}
+	case "mv":
+		if err := need(3, 3, "fs mv WS FROM TO"); err != nil {
+			return err
+		}
+	case "mkdir":
+		if err := need(2, 2, "fs mkdir WS PATH"); err != nil {
+			return err
+		}
+	case "search", "grep":
+		if err := need(2, 3, "fs search WS PATTERN [PATH]"); err != nil {
+			return err
+		}
+	case "edit":
+		if err := need(4, 4, "fs edit [--all] WS PATH OLD NEW"); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unknown fs subcommand %q", sub)
+	}
+	cl := c.client()
+	defer cl.Close()
+	switch sub {
+	case "read", "cat":
 		b, err := cl.ReadFile(ctx, a[0], a[1])
 		if err != nil {
 			return err
 		}
 		_, _ = os.Stdout.Write(b)
 	case "write":
-		if err := need(2, "fs write WS PATH < data"); err != nil {
-			return err
-		}
 		data, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
-		return cl.WriteFile(ctx, a[0], a[1], data, 0)
-	case "ls":
-		if err := need(1, "fs ls WS [PATH]"); err != nil {
+		if err := cl.WriteFile(ctx, a[0], a[1], data, 0); err != nil {
 			return err
 		}
+		n := len(data)
+		mutation(mutationResult{Operation: "fs.write", Workspace: a[0], Path: a[1], Count: &n})
+	case "ls":
 		p := "/"
 		if len(a) > 1 {
 			p = a[1]
@@ -1089,33 +1544,27 @@ func cmdFS(ctx context.Context, args []string) error {
 			fmt.Printf("%s %04o %10d %s %s\n", kind, e.Mode, e.Size, time.UnixMilli(e.ModTime).Format("2006-01-02 15:04"), e.Name)
 		}
 	case "stat":
-		if err := need(2, "fs stat WS PATH"); err != nil {
-			return err
-		}
 		e, err := cl.Stat(ctx, a[0], a[1])
 		if err != nil {
 			return err
 		}
 		printJSON(e)
 	case "rm":
-		if err := need(2, "fs rm [-r] WS PATH"); err != nil {
+		if err := cl.Remove(ctx, a[0], a[1], *recursive); err != nil {
 			return err
 		}
-		return cl.Remove(ctx, a[0], a[1], *recursive)
+		mutation(mutationResult{Operation: "fs.rm", Workspace: a[0], Path: a[1]})
 	case "mv":
-		if err := need(3, "fs mv WS FROM TO"); err != nil {
+		if err := cl.Rename(ctx, a[0], a[1], a[2]); err != nil {
 			return err
 		}
-		return cl.Rename(ctx, a[0], a[1], a[2])
+		mutation(mutationResult{Operation: "fs.mv", Workspace: a[0], Path: a[1], To: a[2]})
 	case "mkdir":
-		if err := need(2, "fs mkdir WS PATH"); err != nil {
+		if err := cl.Mkdir(ctx, a[0], a[1]); err != nil {
 			return err
 		}
-		return cl.Mkdir(ctx, a[0], a[1])
+		mutation(mutationResult{Operation: "fs.mkdir", Workspace: a[0], Path: a[1]})
 	case "search", "grep":
-		if err := need(2, "fs search WS PATTERN [PATH]"); err != nil {
-			return err
-		}
 		p := "/"
 		if len(a) > 2 {
 			p = a[2]
@@ -1131,16 +1580,15 @@ func cmdFS(ctx context.Context, args []string) error {
 			fmt.Fprintln(os.Stderr, "(truncated)")
 		}
 	case "edit":
-		if err := need(4, "fs edit [--all] WS PATH OLD NEW"); err != nil {
-			return err
-		}
 		n, err := cl.Edit(ctx, a[0], a[1], []proto.FSEdit{{Old: a[2], New: a[3], All: *all}})
 		if err != nil {
 			return err
 		}
+		if c.json {
+			mutation(mutationResult{Operation: "fs.edit", Workspace: a[0], Path: a[1], Count: &n})
+			return nil
+		}
 		fmt.Fprintf(os.Stderr, "%d replacement(s)\n", n)
-	default:
-		return fmt.Errorf("unknown fs subcommand %q", sub)
 	}
 	return nil
 }
@@ -1155,12 +1603,12 @@ func cmdPort(ctx context.Context, args []string) error {
 	c.flags(fs)
 	local := fs.String("local", "", "local listen address (default 127.0.0.1:PORT)")
 	parse(fs, args)
-	if fs.NArg() < 2 {
-		return errors.New("port WS PORT [--local ADDR]")
+	if err := arity(fs, 2, 2, "port WS PORT [--local ADDR]"); err != nil {
+		return err
 	}
 	port, err := strconv.Atoi(fs.Arg(1))
-	if err != nil {
-		return err
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("PORT %q must be 1-65535", fs.Arg(1))
 	}
 	if *local == "" {
 		*local = "127.0.0.1:" + fs.Arg(1)
@@ -1225,6 +1673,9 @@ func cmdNodes(ctx context.Context, args []string) error {
 	var c common
 	c.flags(fs)
 	parse(fs, args)
+	if err := arity(fs, 0, 0, "nodes"); err != nil {
+		return err
+	}
 	cl := c.client()
 	defer cl.Close()
 	nodes, err := cl.ListNodes(ctx)
@@ -1236,53 +1687,11 @@ func cmdNodes(ctx context.Context, args []string) error {
 		return nil
 	}
 	tw := tabWriter()
-	fmt.Fprintln(tw, "ID\tONLINE\tOS/ARCH\tCPU\tMEM_MiB\tBACKENDS\tLABELS\tWORKSPACES")
+	fmt.Fprintln(tw, "ID\tONLINE\tOS/ARCH\tCPU\tMEM_MiB\tBACKENDS\tPROTOCOL\tLABELS\tWORKSPACES")
 	for _, n := range nodes {
-		fmt.Fprintf(tw, "%s\t%v\t%s/%s\t%d\t%d\t%s\t%s\t%d\n", n.ID, n.Online, n.Info.OS, n.Info.Arch, n.Info.CPU, n.Info.MemMiB, strings.Join(n.Info.Backends, ","), kvFlag(n.Labels).String(), len(n.Workspaces))
+		fmt.Fprintf(tw, "%s\t%v\t%s/%s\t%d\t%d\t%s\t%s\t%s\t%d\n", n.ID, n.Online, n.Info.OS, n.Info.Arch, n.Info.CPU, n.Info.MemMiB, strings.Join(n.Info.Backends, ","), strings.Join(n.Protocol, ","), kvFlag(n.Labels).String(), len(n.Workspaces))
 	}
 	tw.Flush()
-	return nil
-}
-
-func cmdEvents(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("events", flag.ExitOnError)
-	var c common
-	c.flags(fs)
-	follow := fs.Bool("follow", false, "stream new events")
-	ws := fs.String("ws", "", "filter by workspace")
-	from := fs.Uint64("from", 1, "first seq")
-	parse(fs, args)
-	cl := c.client()
-	defer cl.Close()
-	print := func(e proto.Event) {
-		if c.json {
-			var payload any
-			_ = proto.Unmarshal(e.Payload, &payload)
-			printJSON(map[string]any{"seq": e.Seq, "at": time.UnixMilli(e.At).Format(time.RFC3339Nano), "type": e.Type, "stream": e.Stream, "principal": e.Principal, "node": e.Node, "payload": payload})
-			return
-		}
-		var payload any
-		_ = proto.Unmarshal(e.Payload, &payload)
-		pj, _ := json.Marshal(payload)
-		fmt.Printf("%6d %s %-18s %-30s %-14s %s\n", e.Seq, time.UnixMilli(e.At).Format("15:04:05.000"), e.Type, e.Stream, e.Principal, string(pj))
-	}
-	if !*follow {
-		evs, err := cl.ReadEvents(ctx, *from, *ws)
-		if err != nil {
-			return err
-		}
-		for _, e := range evs {
-			print(e)
-		}
-		return nil
-	}
-	ch, err := cl.TailEvents(ctx, *from, *ws)
-	if err != nil {
-		return err
-	}
-	for e := range ch {
-		print(e)
-	}
 	return nil
 }
 
@@ -1291,6 +1700,9 @@ func cmdTimers(ctx context.Context, args []string) error {
 	var c common
 	c.flags(fs)
 	parse(fs, args)
+	if err := arity(fs, 0, 0, "timers"); err != nil {
+		return err
+	}
 	cl := c.client()
 	defer cl.Close()
 	timers, err := cl.ListTimers(ctx)

@@ -9,12 +9,10 @@ import (
 	"syscall"
 
 	"golang.org/x/term"
-
-	"remount.dev/remount/internal/client"
 )
 
 // watchResize forwards terminal size changes to a pty session.
-func watchResize(ctx context.Context, s *client.Session) {
+func watchResize(ctx context.Context, s liveSession) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGWINCH)
 	defer signal.Stop(ch)

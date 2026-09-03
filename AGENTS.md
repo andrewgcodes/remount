@@ -88,7 +88,7 @@ Check your own change against every line here before calling it done.
 | Invariant | Where it is enforced |
 |---|---|
 | The workspace is trusted with nothing. Secrets, policy and lifecycle live in the node or control plane. | `broker`, `node`, ADR 10 |
-| A state change that emits no event is a bug. | `control.emit`, `node.emit`; tests assert on events |
+| A state change that emits no event is a bug, and a control-plane resource row and its events commit in one SQLite transaction. | `control.transact` + `eventlog.Transact` (ADR 0050), `node.emit`; tests assert on events |
 | Seq 0 of every session is the `info` chunk and the `exit` chunk is last. | `session.Manager.Open`, `session.finish` |
 | A replay gap is reported with a `gap` chunk, never silent, never fatal to the session. | `node.subscribe` |
 | Input is deduplicated by `iseq`; a retried keystroke is never applied twice. | `session.Input` |

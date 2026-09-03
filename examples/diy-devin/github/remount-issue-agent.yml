@@ -1,0 +1,64 @@
+# Label an issue `agent` and a Remount agent starts on it; every later comment
+# on that issue becomes a follow-up to the same agent. Copy this into
+# .github/workflows/ and set two repository secrets:
+#
+#   REMOUNT_URL             https://remount.example.com
+#   REMOUNT_WEBHOOK_SECRET  the server's --webhook-secret
+#
+# The server needs --webhook-secret and --webhook-token (a credential the
+# agents run as). The body is Remount's envelope {type, payload, agent}: the
+# payload is GitHub's own event and the agent mapping says what to do with it,
+# signed with HMAC-SHA256 the way GitHub signs webhooks. A GitHub App cannot
+# post to /v1/events directly (it sends the bare event, and the server rejects
+# a body without the envelope); something must wrap it, and this Action is the
+# zero-infrastructure way to do that.
+name: remount-issue-agent
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+jobs:
+  agent:
+    if: >-
+      (github.event_name == 'issues' && github.event.label.name == 'agent') ||
+      (github.event_name == 'issue_comment' && contains(github.event.issue.labels.*.name, 'agent') && github.event.comment.user.type != 'Bot')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post to Remount
+        env:
+          REMOUNT_URL: ${{ secrets.REMOUNT_URL }}
+          SECRET: ${{ secrets.REMOUNT_WEBHOOK_SECRET }}
+          EVENT: ${{ toJSON(github.event) }}
+          KIND: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Labeled: create an agent whose idempotency key is the issue number,
+          # so a re-label or a redelivery maps onto the same agent.
+          # Comment: the same key names the agent; the control plane resolves
+          # the create's key to the existing agent and we message it.
+          if [ "$KIND" = issues ]; then
+            body=$(jq -cn --argjson p "$EVENT" --arg repo "$REPO" '{
+              type: "github.issues", payload: $p,
+              agent: {
+                idempotency_key: "gh-\($repo)-{{.issue.number}}",
+                create: {
+                  name: "issue-{{.issue.number}}",
+                  workspace: { name: "issue-{{.issue.number}}", bindings: ["github"],
+                               repo: { url: "https://github.com/\($repo)" } },
+                  spec: { recipe: "codex",
+                          task: "Work on GitHub issue #{{.issue.number}} in \($repo).\n\nTitle: {{.issue.title}}\n\n{{.issue.body}}\n\nOpen a pull request when done." },
+                  policy: { approve: "on-request", sleep_after_sec: 900 } } } }')
+          else
+            # A comment is a follow-up to the live agent named after the issue.
+            body=$(jq -cn --argjson p "$EVENT" --arg repo "$REPO" '{
+              type: "github.issue_comment", payload: $p,
+              agent: { idempotency_key: "gh-\($repo)-{{.issue.number}}-{{.comment.id}}",
+                       wake: "name:issue-{{.issue.number}}",
+                       message: "{{.comment.user.login}} commented on #{{.issue.number}}:\n\n{{.comment.body}}" } }')
+          fi
+          sig="sha256=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')"
+          curl -fsS -X POST "$REMOUNT_URL/v1/events" \
+            -H "Content-Type: application/json" -H "X-Hub-Signature-256: $sig" \
+            --data-binary "$body"

@@ -1,0 +1,22 @@
+# Gemini CLI (Google). https://github.com/google-gemini/gemini-cli
+name: gemini
+description: Gemini CLI
+auth: either
+providers: [google]
+hosts:
+  - registry.npmjs.org
+install: |
+  command -v gemini >/dev/null 2>&1 || npm install -g @google/gemini-cli
+env:
+  GEMINI_CLI_DISABLE_AUTOUPDATER: "1"
+  GEMINI_MODEL: "{{.Model}}"
+command: ["gemini", "-p", "{{.Task}}"]
+sandbox_flags:
+  read-only: ["--approval-mode", "default"]
+  workspace-write: ["--approval-mode", "auto_edit"]
+  full: ["--approval-mode", "yolo"]
+state_dirs: [".gemini"]
+path_keyed: true
+# ACP (verified: gemini-cli docs/cli/acp-mode.md).
+acp:
+  command: ["gemini", "--acp"]

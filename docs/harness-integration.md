@@ -6,9 +6,162 @@ through one interface and adds what no single machine gives you: sessions that
 survive a dropped connection, workspaces that move between machines, and egress
 that never exposes a real credential to the agent.
 
-This document covers three things. It shows the recipe we verified against
-OpenAI's Codex CLI. It gives the general pattern for pointing any harness at the
-broker. And it walks through writing your own loop against the Go SDK.
+This document covers four things. It shows `remount run`, which launches a
+harness from a recipe with one command. It shows the recipe we verified by
+hand against OpenAI's Codex CLI. It gives the general pattern for pointing any
+harness at the broker. And it walks through writing your own loop against the
+Go SDK.
+
+## `remount run`: one command from a checkout to a working agent
+
+```sh
+remount run opencode --dir . --binding b_openai --model openai/gpt-4o-mini \
+  -- 'Create a file named GREETING.txt containing exactly the word hello.'
+```
+
+`run` creates a workspace from `--dir` (or `--base NAME`, or reuses `--ws WS`),
+installs the harness if the image lacks it, writes a launcher under
+`.remount/launch/`, and opens a session that runs it. The launcher sources
+`.remount/env` when it starts, so the broker's address is discovered at run
+time and is never baked into a file that moves with the workspace. Ctrl-C
+detaches; `--detach` prints `WS SID` and the `attach` line and returns at
+once. Every launch is bracketed by `run.started{recipe, task_hash, sandbox,
+auth}` and `run.finished{exit}` in the event log; the task text is never
+logged.
+
+### Recipes
+
+A recipe is a YAML file embedded in the binary (`internal/launch/recipes/`).
+`--recipe-file PATH` loads your own with the same validator; adding a harness is
+a YAML pull request, not Go.
+
+| Recipe | Harness | Auth | Providers | `--sandbox` mapping | State that travels |
+|---|---|---|---|---|---|
+| `claude` | Claude Code | key or login | anthropic | `--permission-mode plan` / `acceptEdits` / `--dangerously-skip-permissions` | `.claude/`, `.claude.json` |
+| `codex` | Codex CLI | key or login | openai, azure-openai, openrouter | `--sandbox read-only` / `workspace-write` / `danger-full-access` | `.codex/` |
+| `opencode` | OpenCode | key or login | anthropic, openai, google, openrouter, groq, deepseek, xai, mistral | `permission.edit/bash/webfetch` in a generated config | `.local/share/opencode/` |
+| `openhands` | OpenHands CLI | key | anthropic, openai, google, openrouter, groq, together, fireworks, deepseek, xai, mistral | harness default | `.openhands/` |
+| `goose` | Goose | key | openai, anthropic, google, openrouter, groq | harness default | `.local/share/goose/`, `.config/goose/` |
+| `gemini` | Gemini CLI | key or login | google | harness default | `.gemini/` |
+| `aider` | aider | key | openai, anthropic, google, openrouter, groq, deepseek, xai, mistral | harness default | `.aider.*` in the workspace |
+| `cline` | Cline CLI | key or login | anthropic, openai, openrouter, google, xai, deepseek, mistral, groq | harness default | `.cline/` |
+| `pi` | pi coding agent | key | anthropic, openai, openrouter, google, groq, xai, mistral | harness default | `.pi/` |
+| `custom` | anything after `--` | key or login | every preset | env only | none |
+
+#### Agents: structured or PTY transcript
+
+An Agent (`remount agent create`, ADR 0043) runs the recipe's harness as an
+[Agent Client Protocol](https://agentclientprotocol.com) server when the recipe
+declares `acp.command`. That gives a **structured** transcript: message chunks,
+tool calls, plans and permission requests as typed frames the API can filter
+and a client can render. A recipe without `acp` still makes an Agent, but a
+degraded one: the harness runs on a pseudo-terminal, the transcript is the
+terminal log, and a follow-up message is typed at the prompt through the
+recipe's `prompt_template`. The table says which you get; the API reports it as
+`mode: acp | pty` so a client never has to guess.
+
+| Recipe | Transcript | `acp.command` | `load_session` | Adapter | `ui` |
+|---|---|---|---|---|---|
+| `opencode` | structured | `opencode acp` | yes | native | `opencode web` on 4096 |
+| `goose` | structured | `goose acp --with-builtin developer` | yes, with history | native | — |
+| `openhands` | structured | `openhands acp` | — (`--resume ID` is the harness-native path) | native | — |
+| `gemini` | structured | `gemini --acp` | — | native | — |
+| `cline` | structured | `cline --acp` | — | native | — |
+| `pi` | structured | `npx -y pi-acp` | — | `pi-acp` bridges to `pi --mode rpc`, which can steer mid-turn | — |
+| `claude` | structured | `npx -y @agentclientprotocol/claude-agent-acp` | yes | official adapter; subscription login stays workspace-resident (ADR 0039) | — |
+| `codex` | structured | `npx -y @agentclientprotocol/codex-acp` | — | official adapter | — |
+| `aider` | **pty** | — | — | none; `prompt_template` types the message | — |
+| `custom` | **pty** unless `--acp-cmd` | yours | — | — | — |
+
+`load_session` is the recipe's claim. The node checks it against what the
+agent advertises in `initialize` and records `agent.capabilities` either way;
+when an agent cannot reopen a session, a woken Agent starts a fresh one and the
+event says so. `session_id_from` (opencode: newest
+`.local/share/opencode/storage/session/*/ses_*.json`, key `id`) lets a handoff
+continue the laptop conversation on the node with `session/load`.
+
+Every backend sets `HOME` to the workspace root, so the state column is where
+the harness's `~/.something` actually lands: inside the workspace, in every
+snapshot, and back on your disk after `remount pull`. `--exclude` drops what
+you would rather not carry.
+
+Anything built on an SDK that honors `<PROVIDER>_API_KEY` and
+`<PROVIDER>_BASE_URL` needs no recipe: `remount run custom --binding b_openai
+-- python agent.py` gets the placeholder key and the broker URL in its
+environment.
+
+`--sandbox` names what the harness may write; it also shapes egress. Under
+`--security local`, `read-only` and `workspace-write` (the default) keep the
+node's own allow list and `full` opens it. Under `isolated` and `multi_tenant`
+the policy is deny-by-default, admits the bound providers over HTTPS and the
+recipe's declared `hosts` for `GET`/`HEAD` (so the harness can install itself
+even when read-only), and `full` adds `CONNECT` to those hosts. Those two profiles need
+a node whose backend enforces egress; the `process` and `docker` backends only
+cooperate through `HTTPS_PROXY`, so they serve `local`.
+
+### Hand-off, resume and queues
+
+The recipe's `resume_command`, `state_dirs` and `path_keyed` fields drive the
+unattended workflow (ADR 0041).
+
+```sh
+cd ~/proj                       # a checkout with a Claude Code conversation open
+remount handoff --task "finish the refactor and open a PR"
+```
+
+`handoff` finds the harness whose state directory exists under your home
+(`--recipe` when several do), packs the checkout and that state into one
+artifact, and starts the `resume_command` in a new workspace. For a
+`path_keyed` recipe — Claude Code, Codex, OpenCode, Gemini and Cline key their
+per-project state on the absolute path of the working tree — the tree is
+mounted at the same absolute path inside the workspace, which needs a node
+with a mount namespace (`docker`). A `process`-only deployment leaves the
+workspace `pending` and `handoff` says so; it never creates a symlink on the
+node to fake the path. Goose, OpenHands and aider keep path-independent state
+and run on either backend at `/work`.
+
+`remount resume WS` picks the conversation back up: it attaches if a harness
+session is still running, otherwise wakes the workspace if it sleeps and runs
+the `resume_command` with `--task` (default "Continue where you left off.").
+The recipe, bindings and model come from the workspace's labels, so the
+command needs nothing but the id.
+
+`remount run RECIPE --queue tasks.txt` runs one task per line in one
+workspace, in order, and records progress as a control-plane `Queue`
+resource rather than in the tree. Between tasks it checkpoints, or with
+`--sleep-after 30m` / `--sleep-until 02:00` puts the workspace to sleep on a
+durable timer and waits for it to come back — on whichever node claims it. A
+non-zero exit stops the queue with the cursor on that task;
+`remount run RECIPE --queue-continue QUEUE` retries it and carries on, from a
+different machine if need be. Events record `queue.advanced{index, exit}`,
+never the task text. `remount ws sleep WS --on EVENT` is the same mechanism
+for waking on an external event (a merged PR, a Slack reply) and is the
+intended hook for event-driven queues.
+
+### Provider bindings are presets
+
+A binding is a secret the node holds; a preset says how a harness consumes
+it. `remount binding preset ls` lists them: `anthropic`, `openai`, `google`,
+`openrouter`, `bedrock`, `vertex`, `azure-openai`, `mistral`, `groq`,
+`together`, `fireworks`, `deepseek`, `xai`. `--binding b_openai` picks the
+preset by id suffix; `--binding b_team:openai` names it; `--binding
+b_bedrock:bedrock?host=us-east-1` fills a region. The workspace receives
+`OPENAI_API_KEY=ref:b_openai` and
+`OPENAI_BASE_URL=${REMOUNT_BROKER}/d/api.openai.com/v1`; the broker
+substitutes the real key on the way out and records `cred.used`.
+
+### Two kinds of auth, stated plainly
+
+Remount brokers **API keys**. Claude Max, ChatGPT/Codex sign-in, Gemini's
+Google sign-in and Copilot are **harness-native logins**: the harness runs its
+own OAuth flow inside the workspace and keeps the token in its state directory.
+That token travels with the workspace, is visible to anything running in it,
+and is not secret-blind. When a recipe that supports a login is launched
+without a provider binding, `run` marks the session `auth: workspace_resident`
+and the node records `auth.workspace_resident{recipe}`. `--security isolated`
+and `multi_tenant` refuse such a launch. Remount never proxies or rewrites a
+subscription token; their terms restrict third-party use and the broker is not
+the place to argue with that.
 
 ## Verified: OpenAI Codex CLI
 
@@ -35,7 +188,9 @@ given as an environment reference so the file stays clean.
 ```
 
 Start the server with the binding and with the package registry allowed, since
-the install goes through the broker too.
+the install goes through the broker too. (`remount run` does all of this for
+you when nothing is listening locally: it starts a standalone whose bindings
+reference the provider keys in your environment by name; see the tutorial.)
 
 ```sh
 export OPENAI_API_KEY=...
@@ -155,7 +310,7 @@ a byte leaves the machine.
 |---|---|---|---|---|
 | Codex CLI | `base_url` in `.codex/config.toml` | `env_key` names an env var | `Authorization: Bearer` | Verified here, 0.152.1 |
 | Claude Code | `ANTHROPIC_BASE_URL` | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` | `x-api-key` and, on newer builds, `Authorization: Bearer` | Documented upstream, not tested here |
-| OpenCode | `provider.<id>.options.baseURL` in `opencode.json` | provider `apiKey` or env | SDK dependent, `x-api-key` for Anthropic | Documented upstream, not tested here |
+| OpenCode | `provider.<id>.options.baseURL` in `opencode.json` | provider `apiKey` or env | SDK dependent, `x-api-key` for Anthropic | Verified via `remount run opencode` (docker lane, 1.18.x) |
 | aider | `OPENAI_API_BASE` | `OPENAI_API_KEY` | `Authorization: Bearer` | Documented upstream, not tested here |
 
 The broker matches on the placeholder string wherever it appears in a header,
@@ -172,9 +327,13 @@ prefix check an OpenAI SDK performs.
 
 The broker is also an ordinary HTTP forward proxy. Every session in a workspace
 starts with `HTTP_PROXY`, `HTTPS_PROXY` and their lowercase twins set to the
-broker, and `NO_PROXY` set for loopback. Tools that honor those variables, which
-includes npm, pip, curl and git, route through the broker without any
-configuration.
+broker, and `NO_PROXY` set for loopback plus the broker's own advertised host
+(`host.docker.internal` for Docker workspaces). Tools that honor those
+variables, which includes npm, pip, curl and git, route through the broker
+without any configuration, and requests to `${REMOUNT_BROKER}` itself go
+direct rather than through the proxy. A client that ignores `NO_PROXY` and
+forwards a capability URL through the proxy anyway is still served as a direct
+request; the broker never re-originates a request to itself.
 
 Two request forms behave differently.
 
@@ -205,6 +364,46 @@ CONNECT proxy; a package manager needs an integration that can use its explicit
 read endpoint. The built-in process and Docker backends remain
 `cooperative_proxy`, so they cannot satisfy `isolated` or `multi_tenant`
 profiles.
+
+## Repositories: the git connector and the `/d/` stopgap
+
+Two ways exist to reach a repository from a workspace.
+
+The **stopgap** is the generic reverse proxy. With a binding whose hosts cover
+`github.com` and a placeholder in the URL's userinfo, this routes every
+`https://github.com/` URL through the broker and works because smart HTTP is
+plain GET/POST:
+
+```sh
+. .remount/env
+git config --global url."$REMOUNT_BROKER/d/github.com/".insteadOf https://github.com/
+git config --global http."$REMOUNT_BROKER/d/github.com/".extraHeader \
+  "Authorization: Basic $(printf 'x-access-token:%s' "$REMOUNT_REF_GH" | base64 -w0)"
+```
+
+It authorizes a *host*: anything the token can see on github.com — every
+repository, the REST API, release assets, LFS — is reachable. Use it only for a
+`local` profile you trust.
+
+The **typed connector** (`connector: "git"`, ADR 0054) authorizes a
+*repository*. Declare it on the workspace and the node does the rest:
+
+```sh
+remount ws create --repo github.com/acme/app@main --repo-depth 1 --binding b_gh
+remount run codex --repo github.com/acme/app -- "fix the flaky test"
+```
+
+The node clones through its own broker **before** the workspace is `claimed`,
+so the first `ls` shows the checkout and `repo.cloned{commit}` names the SHA
+that was served. The tree's git configuration arrives as `GIT_CONFIG_*` in
+`.remount/env` — insteadOf routing to `$REMOUNT_GIT_CONNECTOR/<host>/`,
+credential helpers disabled, prompts off — so `git fetch` and `git push` inside
+a session go through the same connector with the same placeholder. Only the
+declared repository is reachable (or the `repos:` patterns of a typed rule,
+with `push: true` required for `git-receive-pack`); `/api/`, raw files, LFS
+and every sibling repository are denied before any credential is substituted.
+A clone that fails never becomes an empty workspace: the tree is destroyed,
+the claim released, and the retry backed off.
 
 ## Writing your own loop
 

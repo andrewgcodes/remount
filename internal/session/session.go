@@ -44,6 +44,8 @@ type Spec struct {
 	// unique inside one tenant, so omitting this would let an actor in one
 	// tenant consume another tenant's per-principal session allowance.
 	Tenant string
+	// Run marks a harness launch; carried in the info chunk and to OnExit.
+	Run *proto.RunInfo
 }
 
 // Session is a running or finished process with its output log.
@@ -70,6 +72,40 @@ type Session struct {
 	outputReady chan struct{} // pumps wait until StreamInfo is committed at seq 0
 	logErr      error
 	onFinish    func() // commits manager accounting before exited is closed
+	closeReason string // recorded in the exit chunk when the node ends the session
+	// onSignal is how a record-only session (kind acp) hears a kill: there is
+	// no process, so the owner that appends to it decides what stopping means.
+	onSignal func(name string)
+}
+
+// Record appends one chunk to a record-only session. Kinds with a process
+// own their streams and refuse it.
+func (s *Session) Record(stream uint8, data []byte) (uint64, error) {
+	if s.Kind != proto.SessionACP {
+		return 0, proto.Err(proto.CodeBadRequest, "session %s is not record-only", s.ID)
+	}
+	<-s.startDone
+	if s.Exited() {
+		return 0, proto.Err(proto.CodeClosed, "session already exited")
+	}
+	return s.Log.Append(stream, data)
+}
+
+// End finishes a record-only session with info as its exit chunk.
+func (s *Session) End(info proto.ExitInfo) {
+	if s.Kind != proto.SessionACP {
+		return
+	}
+	<-s.startDone
+	s.finish(info)
+}
+
+// OnSignal registers what Signal does to a record-only session. Without a
+// handler a signal ends the session immediately.
+func (s *Session) OnSignal(fn func(name string)) {
+	s.mu.Lock()
+	s.onSignal = fn
+	s.mu.Unlock()
 }
 
 // Exited reports whether the process has finished.
@@ -192,6 +228,18 @@ func (s *Session) Signal(name string) error {
 		}
 		return nil
 	}
+	if s.Kind == proto.SessionACP {
+		if fn := s.onSignal; fn != nil {
+			s.mu.Unlock()
+			fn(name)
+			s.mu.Lock()
+			return nil
+		}
+		s.mu.Unlock()
+		s.finish(proto.ExitInfo{Code: -1, Error: "signal " + name})
+		s.mu.Lock()
+		return nil
+	}
 	if s.cmd == nil || s.cmd.Process == nil {
 		return proto.Err(proto.CodeNotFound, "no process")
 	}
@@ -203,11 +251,25 @@ func (s *Session) Kill() {
 	_ = s.Signal("KILL")
 }
 
+// Terminate kills the process and records reason in the exit chunk, so a
+// subscriber can tell a policy decision from the process ending on its own.
+func (s *Session) Terminate(reason string) {
+	s.mu.Lock()
+	if s.exit == nil && s.closeReason == "" {
+		s.closeReason = reason
+	}
+	s.mu.Unlock()
+	s.Kill()
+}
+
 func (s *Session) finish(info proto.ExitInfo) {
 	s.mu.Lock()
 	if s.exit != nil {
 		s.mu.Unlock()
 		return
+	}
+	if info.Reason == "" {
+		info.Reason = s.closeReason
 	}
 	s.exit = &info
 	if s.logErr != nil && info.Error == "" {
@@ -409,6 +471,22 @@ func (m *Manager) Remove(id string, kill bool) bool {
 	return true
 }
 
+// Terminate ends one live session with a reason and keeps its log so
+// subscribers observe the exit chunk. It reports whether the session existed.
+func (m *Manager) Terminate(id, reason string) bool {
+	m.mu.Lock()
+	s, ok := m.sessions[id]
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
+	<-s.startDone
+	if !s.Exited() {
+		s.Terminate(reason)
+	}
+	return true
+}
+
 // KillWorkspace terminates every session of a workspace and forgets it. An
 // error means at least one managed process could not be confirmed stopped, so
 // callers must not describe a following snapshot as quiesced.
@@ -442,43 +520,50 @@ func (m *Manager) Close() {
 // Open starts a session. If spec.IdempotencyKey names an existing session it
 // is returned instead of starting a second process.
 func (m *Manager) Open(spec Spec) (*Session, error) {
+	s, _, err := m.OpenOrReplay(spec)
+	return s, err
+}
+
+// OpenOrReplay is Open that also reports whether a new session was started
+// (created=true) or an idempotent replay returned an existing one.
+func (m *Manager) OpenOrReplay(spec Spec) (s *Session, created bool, err error) {
 	fingerprint := sessionFingerprint(spec)
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		return nil, proto.Err(proto.CodeClosed, "manager closed")
+		return nil, false, proto.Err(proto.CodeClosed, "manager closed")
 	}
 	if spec.IdempotencyKey != "" {
 		if existing, ok := m.byIdem[spec.IdempotencyKey]; ok {
 			if existing.fingerprint != fingerprint {
 				m.mu.Unlock()
-				return nil, proto.Err(proto.CodeConflict, "idempotency key was reused with different session arguments")
+				return nil, false, proto.Err(proto.CodeConflict, "idempotency key was reused with different session arguments")
 			}
 			s := m.sessions[existing.id]
 			m.mu.Unlock()
-			return s, nil
+			return s, false, nil
 		}
 	}
 	if len(m.sessions) >= m.opts.MaxSessions {
 		m.mu.Unlock()
 		metrics.SessionQuotaRejected.Inc()
-		return nil, proto.Err(proto.CodeResourceExhausted, "node session limit %d reached", m.opts.MaxSessions)
+		return nil, false, proto.Err(proto.CodeResourceExhausted, "node session limit %d reached", m.opts.MaxSessions)
 	}
 	if m.byWS[spec.WS] >= m.opts.MaxSessionsPerWorkspace {
 		m.mu.Unlock()
 		metrics.SessionQuotaRejected.Inc()
-		return nil, proto.Err(proto.CodeResourceExhausted, "workspace session limit %d reached", m.opts.MaxSessionsPerWorkspace)
+		return nil, false, proto.Err(proto.CodeResourceExhausted, "workspace session limit %d reached", m.opts.MaxSessionsPerWorkspace)
 	}
 	principalKey := sessionPrincipalKey(spec.Tenant, spec.Principal)
 	if m.byPrincipal[principalKey] >= m.opts.MaxSessionsPerPrincipal {
 		m.mu.Unlock()
 		metrics.SessionQuotaRejected.Inc()
-		return nil, proto.Err(proto.CodeResourceExhausted, "principal session limit %d reached", m.opts.MaxSessionsPerPrincipal)
+		return nil, false, proto.Err(proto.CodeResourceExhausted, "principal session limit %d reached", m.opts.MaxSessionsPerPrincipal)
 	}
 	if m.active >= m.opts.MaxActive {
 		m.mu.Unlock()
 		metrics.SessionQuotaRejected.Inc()
-		return nil, proto.Err(proto.CodeResourceExhausted, "node active-session limit %d reached", m.opts.MaxActive)
+		return nil, false, proto.Err(proto.CodeResourceExhausted, "node active-session limit %d reached", m.opts.MaxActive)
 	}
 	id := ids.New("s")
 	var spillPath string
@@ -491,11 +576,11 @@ func (m *Manager) Open(spec Spec) (*Session, error) {
 	})
 	if err != nil {
 		m.mu.Unlock()
-		return nil, err
+		return nil, false, err
 	}
-	s := &Session{
+	s = &Session{
 		ID: id, WS: spec.WS, Kind: spec.Kind, Log: log, exited: make(chan struct{}), startDone: make(chan struct{}), outputReady: make(chan struct{}), Principal: spec.Principal, Tenant: spec.Tenant,
-		Info: proto.SessionInfo{ID: id, WS: spec.WS, Kind: spec.Kind, Program: spec.Program, OpenedAt: time.Now().UnixMilli()},
+		Info: proto.SessionInfo{ID: id, WS: spec.WS, Kind: spec.Kind, Program: spec.Program, OpenedAt: time.Now().UnixMilli(), Run: spec.Run},
 	}
 	s.onFinish = func() { m.markInactive(id, s) }
 	m.sessions[id] = s
@@ -518,6 +603,8 @@ func (m *Manager) Open(spec Spec) (*Session, error) {
 		startErr = s.startPTY(spec)
 	case proto.SessionPort:
 		startErr = s.startPort(spec)
+	case proto.SessionACP:
+		// Record-only: the agent runner appends protocol frames and ends it.
 	default:
 		startErr = proto.Err(proto.CodeBadRequest, "unknown session kind %q", spec.Kind)
 	}
@@ -535,7 +622,7 @@ func (m *Manager) Open(spec Spec) (*Session, error) {
 			_ = s.Signal("KILL")
 		}
 		s.finish(proto.ExitInfo{Code: -1, Error: startErr.Error()})
-		return s, nil // the session exists; its log says why it failed
+		return s, true, nil // the session exists; its log says why it failed
 	}
 	if spec.Timeout > 0 {
 		s.mu.Lock()
@@ -545,7 +632,7 @@ func (m *Manager) Open(spec Spec) (*Session, error) {
 		s.mu.Unlock()
 	}
 	close(s.outputReady)
-	return s, nil
+	return s, true, nil
 }
 
 func sessionPrincipalKey(tenant, principal string) string {

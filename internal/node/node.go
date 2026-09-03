@@ -19,9 +19,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -78,7 +80,11 @@ type Options struct {
 	// BrokerRootCAs augments trust for broker-reoriginated TLS (primarily
 	// private providers and deterministic integration tests).
 	BrokerRootCAs *x509.CertPool
-	Version       string
+	// BrokerAdvertiseHost overrides the host workspaces dial to reach their
+	// broker. Docker workspaces default to host.docker.internal; an IP
+	// literal here is also the address the broker listens on.
+	BrokerAdvertiseHost string
+	Version             string
 	// Caps advertises extra capabilities (display, gpu …).
 	Caps []string
 	// MaxConcurrentRequests bounds request handlers independently of relay
@@ -122,9 +128,18 @@ type Node struct {
 
 	mu         sync.Mutex
 	peer       *transport.Peer
+	protocol   []string // capabilities negotiated with the current uplink
 	ctrlPub    ed25519.PublicKey
 	leaseSec   int64
 	workspaces map[string]*ws
+	// agentRuns are the live Agent run attempts keyed by agent|run;
+	// agentRunsDone remembers the ones that finished on this node (and
+	// when) so a replayed agent.run for a dead attempt is refused rather
+	// than restarted; entries age out, see pruneAgentRunsDoneLocked.
+	agentRuns     map[string]*agentRun
+	agentRunsDone map[string]time.Time
+	// agentReportSink replaces the uplink for agent reports in tests.
+	agentReportSink func(context.Context, *proto.AgentReport) error
 	// materializing holds workspaces this node has claimed but not finished
 	// restoring: their leases must be renewed too, or a slow restore loses
 	// the claim it is working on.
@@ -355,6 +370,7 @@ func New(opts Options) (*Node, error) {
 		opts: opts, id: id, priv: priv, logger: opts.Logger.With("node", id),
 		store: store, connectors: connectorStore, events: eventlog.New(eventlog.NewMemory(10000)),
 		workspaces: map[string]*ws{}, materializing: map[string]*materialization{},
+		agentRuns: map[string]*agentRun{}, agentRunsDone: map[string]time.Time{},
 		deadlines: map[string]time.Time{}, quarantined: map[string]struct{}{},
 		grants: map[string]*proto.Grant{}, subs: map[string]*subscriber{},
 		prepared: map[string]*preparedRelease{}, committed: map[string]uint64{},
@@ -371,7 +387,10 @@ func New(opts Options) (*Node, error) {
 		MaxSessions: opts.MaxSessions, MaxActive: opts.MaxActiveSessions, MaxSessionsPerWorkspace: opts.MaxSessionsPerWorkspace,
 		MaxSessionsPerPrincipal: opts.MaxSessionsPerPrincipal,
 		OnExit: func(s *session.Session, info proto.ExitInfo) {
-			n.emit(proto.EvSExited, s.WS, s.Principal, map[string]any{"s": s.ID, "code": info.Code, "signal": info.Signal})
+			n.emitSession(proto.EvSExited, s.WS, s.Principal, s.ID, map[string]any{"s": s.ID, "code": info.Code, "signal": info.Signal})
+			if run := s.Info.Run; run != nil {
+				n.emitSession(proto.EvRunFinished, s.WS, s.Principal, s.ID, map[string]any{"s": s.ID, "recipe": run.Recipe, "exit": info.Code, "signal": info.Signal})
+			}
 		},
 	})
 	return n, nil
@@ -658,6 +677,14 @@ func (n *Node) runMutation(ctx context.Context, key string, request any, apply f
 // ID returns the node id.
 func (n *Node) ID() string { return n.id }
 
+// Protocol returns the capabilities negotiated with the current uplink, or
+// nil before the first hello. The slice is a fresh copy.
+func (n *Node) Protocol() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]string(nil), n.protocol...)
+}
+
 // Online is closed once the node has completed its first hello.
 func (n *Node) Online() <-chan struct{} { return n.online }
 
@@ -717,7 +744,13 @@ func loadIdentity(path string) (string, ed25519.PrivateKey, error) {
 
 // emit records an event locally and forwards it to the control plane.
 func (n *Node) emit(typ, stream, principal string, payload any) {
-	e := &proto.Event{Type: typ, Stream: stream, Principal: principal, Node: n.id, Origin: "node", Actor: n.id}
+	n.emitSession(typ, stream, principal, "", payload)
+}
+
+// emitSession records an event attributed to one session so a reader can
+// follow a single command's history without parsing payloads.
+func (n *Node) emitSession(typ, stream, principal, session string, payload any) {
+	e := &proto.Event{Type: typ, Stream: stream, Principal: principal, Session: session, Node: n.id, Origin: "node", Actor: n.id}
 	if payload != nil {
 		e.Payload = proto.MustMarshal(payload)
 	}
@@ -917,13 +950,13 @@ func (n *Node) connectOnce(ctx context.Context) error {
 	}
 	peer := transport.NewPeer(conn, transport.HandlerFunc(n.handle))
 	hello := proto.Hello{
-		Peer: n.id, Role: proto.RoleNode, Token: n.opts.Token, Caps: []string{proto.CapabilityV1},
+		Peer: n.id, Role: proto.RoleNode, Token: n.opts.Token, Caps: proto.PeerCapabilities(),
 		PubKey: n.priv.Public().(ed25519.PublicKey), Labels: n.opts.Labels,
 	}
 	info := workspace.HostInfoForRegistry(n.opts.Backends)
 	info.Version = n.opts.Version
 	info.Caps = n.opts.Caps
-	info.Connectors = []string{proto.EgressConnectorPackage}
+	info.Connectors = []string{proto.EgressConnectorPackage, proto.EgressConnectorGit}
 	hello.Node = &info
 	hello.IssuedAt = time.Now().UnixMilli()
 	hello.Nonce = make([]byte, 32)
@@ -948,6 +981,7 @@ func (n *Node) helloAndServe(ctx context.Context, peer *transport.Peer, hello pr
 	}
 	n.mu.Lock()
 	n.peer = peer
+	n.protocol = ok.Caps
 	n.ctrlPub = ed25519.PublicKey(ok.PubKey)
 	n.leaseSec = ok.LeaseSec
 	n.grants = map[string]*proto.Grant{}
@@ -1030,10 +1064,11 @@ func (n *Node) fenceLoop(ctx context.Context) {
 func (n *Node) renew(ctx context.Context) {
 	n.mu.Lock()
 	p := n.peer
-	req := proto.WSRenewReq{Gen: map[string]uint64{}}
+	req := proto.WSRenewReq{Gen: map[string]uint64{}, Authz: map[string]uint64{}}
 	for id, w := range n.workspaces {
 		req.IDs = append(req.IDs, id)
 		req.Gen[id] = w.Generation
+		req.Authz[id] = w.AuthzRevision
 	}
 	for id, materializing := range n.materializing {
 		if _, done := n.workspaces[id]; !done && materializing.generation != 0 {
@@ -1087,15 +1122,81 @@ func (n *Node) applyRenewResults(req proto.WSRenewReq, res *proto.WSRenewRes) {
 		}
 		deadline := time.Now().Add(n.localLeaseWindow())
 		n.mu.Lock()
+		var revoke *revocation
 		if w := n.workspaces[id]; w != nil && w.Generation == result.Generation {
 			n.deadlines[id] = deadline
 			w.LeaseUntil = result.LeaseUntil
+			revoke = n.applyAuthzLocked(w, result)
 		}
 		if materializing := n.materializing[id]; materializing != nil && materializing.generation == result.Generation {
 			materializing.deadline = deadline
 		}
 		n.mu.Unlock()
+		if revoke != nil {
+			n.closeRevokedSessions(revoke)
+		}
 	}
+}
+
+// revocation is the work an authorization push leaves for after n.mu is
+// released: whose sessions to end and what to record.
+type revocation struct {
+	ws         *ws
+	revision   uint64
+	principals []string
+	reset      bool
+}
+
+// applyAuthzLocked adopts the authoritative authorization revision pushed on
+// renew (authz-push). Every cached grant minted under an older revision stops
+// verifying at once; the sessions of principals control names as revoked are
+// collected for closure. A reset means control could not name them, so every
+// session of the workspace is closed and still-authorized principals reopen
+// with fresh grants. Callers hold n.mu.
+func (n *Node) applyAuthzLocked(w *ws, result proto.WSRenewResult) *revocation {
+	if result.AuthzRevision <= w.AuthzRevision {
+		return nil
+	}
+	w.AuthzRevision = result.AuthzRevision
+	for key, g := range n.grants {
+		if g.Claims.WS == w.ID && g.Claims.AuthzRevision != w.AuthzRevision {
+			delete(n.grants, key)
+		}
+	}
+	if len(result.Revoked) == 0 && !result.AuthzReset {
+		return nil
+	}
+	return &revocation{ws: w, revision: result.AuthzRevision, principals: result.Revoked, reset: result.AuthzReset}
+}
+
+// confirmOpenAuthz closes the window between authorizing an open and the
+// session existing. A revision pushed in that window has already listed the
+// workspace's sessions, so a session started under the older grant would
+// outlive its principal's access; end it and answer as the grant check would.
+func (n *Node) confirmOpenAuthz(w *ws, claims proto.GrantClaims, s *session.Session) error {
+	n.mu.Lock()
+	current := w.AuthzRevision
+	n.mu.Unlock()
+	if claims.AuthzRevision == current {
+		return nil
+	}
+	n.sessions.Terminate(s.ID, proto.ExitReasonRevoked)
+	return proto.Err(proto.CodeUnauthorized, "grant authorization revision is stale")
+}
+
+func (n *Node) closeRevokedSessions(r *revocation) {
+	var closed []string
+	for _, s := range n.sessions.List(r.ws.ID) {
+		if !r.reset && !slices.Contains(r.principals, s.Principal) {
+			continue
+		}
+		if n.sessions.Terminate(s.ID, proto.ExitReasonRevoked) {
+			closed = append(closed, s.ID)
+		}
+	}
+	n.emit(proto.EvAuthzRevoked, r.ws.ID, r.ws.Spec.Principal, map[string]any{
+		"authz_revision": r.revision, "principals": r.principals, "reset": r.reset, "sessions": closed,
+	})
 }
 
 func (n *Node) localLeaseWindow() time.Duration {
@@ -1215,10 +1316,17 @@ func writeWorkspaceEnv(handle workspace.Handle, w *ws) error {
 	if w.broker != nil {
 		fmt.Fprintf(&b, "REMOUNT_BROKER=%s\n", w.broker.BaseURL())
 		fmt.Fprintf(&b, "REMOUNT_PACKAGE_CONNECTOR=%s\n", w.broker.PackageURL())
+		fmt.Fprintf(&b, "REMOUNT_GIT_CONNECTOR=%s\n", w.broker.GitURL())
 	}
 	for _, l := range w.leases {
 		// The placeholder, never the secret.
 		fmt.Fprintf(&b, "REMOUNT_REF_%s=%s\n", strings.ToUpper(strings.TrimPrefix(l.ID, "b_")), broker.Placeholder(l))
+	}
+	for _, kv := range gitConfigEnv(w.broker, w.Spec.Repo, w.leases) {
+		// GIT_CONFIG_* routes the declared repository through the broker for
+		// any shell that sources this file; values carry spaces, so quote.
+		key, value, _ := strings.Cut(kv, "=")
+		fmt.Fprintf(&b, "%s='%s'\n", key, strings.ReplaceAll(value, "'", `'\''`))
 	}
 	if err := handle.FS().Mkdir(EnvFileDir); err != nil {
 		return err
@@ -1266,8 +1374,12 @@ func appendWarning(existing, warning string) string {
 // first so queued starters fail their post-lock serviceability check.
 func (n *Node) stopWorkspaceSessions(w *ws) error {
 	w.treeMu.Lock()
-	defer w.treeMu.Unlock()
-	return n.sessions.KillWorkspace(w.ID)
+	err := n.sessions.KillWorkspace(w.ID)
+	w.treeMu.Unlock()
+	// Agent runs join after the tree boundary is released: a run still
+	// waiting to spawn needs the boundary to observe the workspace is gone.
+	n.stopAgentRuns(w.ID, "workspace sessions stopped")
+	return err
 }
 
 // fenceWorkspace stops all execution and egress but preserves the filesystem.
@@ -1860,6 +1972,36 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 				return nil, err
 			}
 			return struct{}{}, n.releaseAbort(req)
+		case proto.OpWSSnapshot:
+			req, err := decode[proto.WSSnapshotReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return n.controlSnapshot(ctx, p, req)
+		case proto.OpAgentRun:
+			req, err := decode[proto.AgentRunReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return n.agentRunStart(ctx, p, req)
+		case proto.OpAgentDeliver:
+			req, err := decode[proto.AgentDeliverReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return struct{}{}, n.agentRunDeliver(req)
+		case proto.OpAgentRunCancel:
+			req, err := decode[proto.AgentRunCancelReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return struct{}{}, n.agentRunCancel(req)
+		case proto.OpAgentApprovalDecided:
+			req, err := decode[proto.AgentApprovalDecidedReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return struct{}{}, n.agentApprovalDecided(req)
 		}
 		return nil, proto.Err(proto.CodeUnsupported, "unknown control op %q", f.Op)
 	}
@@ -2217,6 +2359,32 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		return result, nil
+	case proto.OpFSApplyTar:
+		req, err := decode[proto.FSApplyTarReq](f)
+		if err != nil {
+			return nil, err
+		}
+		w, err := n.authorize(f.From, req.WS, req.Grant)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := artifact.Digest(req.Artifact); err != nil {
+			return nil, proto.Err(proto.CodeBadRequest, "fs.apply_tar: %v", err)
+		}
+		clean := *req
+		clean.Grant = nil
+		key := n.mutationKey(f.From, w.ID, proto.OpFSApplyTar, req.IdempotencyKey)
+		raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
+			return n.applyTar(ctx, w, req.Artifact, f.From)
+		})
+		if err != nil {
+			return nil, err
+		}
+		var result proto.FSApplyTarRes
+		if err := proto.Unmarshal(raw, &result); err != nil {
+			return nil, err
+		}
+		return result, nil
 	case proto.OpWSSnapshot:
 		req, err := decode[proto.WSSnapshotReq](f)
 		if err != nil {
@@ -2286,7 +2454,7 @@ func (n *Node) status() proto.NodeStatus {
 	info := workspace.HostInfoForRegistry(n.opts.Backends)
 	info.Version = n.opts.Version
 	info.Caps = append([]string(nil), n.opts.Caps...)
-	info.Connectors = []string{proto.EgressConnectorPackage}
+	info.Connectors = []string{proto.EgressConnectorPackage, proto.EgressConnectorGit}
 	st := proto.NodeStatus{ID: n.id, Labels: n.opts.Labels, Info: info, Online: true, LastSeen: time.Now().UnixMilli()}
 	n.mu.Lock()
 	for id := range n.workspaces {
@@ -2302,33 +2470,53 @@ func (n *Node) status() proto.NodeStatus {
 // sessions and streaming
 // ---------------------------------------------------------------------------
 
-func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, claims proto.GrantClaims, w *ws, req *proto.SOpenReq) (any, error) {
-	unlock, err := n.lockWorkspaceTree(w, false)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
+// sessionEnv builds the environment a process in w starts with: the
+// workspace's env, then extra, with binding references resolved to
+// placeholders and ${REMOUNT_BROKER} expanded, plus the broker's own
+// variables. Real secrets are never in the result; they stay in the broker.
+func (n *Node) sessionEnv(w *ws, extra map[string]string) []string {
 	env := map[string]string{}
 	for k, v := range w.Spec.Env {
 		env[k] = v
 	}
-	for k, v := range req.Env {
+	for k, v := range extra {
 		env[k] = v
 	}
 	base := ""
 	if w.broker != nil {
 		base = w.broker.BaseURL()
 	}
-	env = broker.ResolveEnv(env, base, w.leases)
+	n.mu.Lock()
+	leases := slices.Clone(w.leases)
+	n.mu.Unlock()
+	env = broker.ResolveEnv(env, base, leases)
 	var envList []string
 	if w.broker != nil {
 		envList = append(envList, w.broker.EnvFor()...)
+		envList = append(envList, gitConfigEnv(w.broker, w.Spec.Repo, leases)...)
 	}
-	envList = append(envList, workspace.MapEnv(env)...)
+	return append(envList, workspace.MapEnv(env)...)
+}
+
+func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, claims proto.GrantClaims, w *ws, req *proto.SOpenReq) (any, error) {
+	if err := req.Run.Validate(); err != nil {
+		return nil, err
+	}
+	if req.Run != nil && req.Run.Auth == proto.RunAuthWorkspaceResident && w.Spec.Security.Profile != "" && w.Spec.Security.Profile != proto.SecurityLocal {
+		// The node is the authority on the workspace's security profile; a
+		// client cannot talk it into a login it would never see.
+		return nil, proto.Err(proto.CodeDenied, "workspace-resident harness auth is refused under security profile %s", w.Spec.Security.Profile)
+	}
+	unlock, err := n.lockWorkspaceTree(w, false)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	envList := n.sessionEnv(w, req.Env)
 	spec := session.Spec{
 		WS: w.ID, Kind: req.Kind, Program: req.Program, Cwd: req.Cwd, Env: envList,
 		Rows: req.Rows, Cols: req.Cols, Stdin: req.Stdin, IdempotencyKey: req.IdempotencyKey,
-		Principal: claims.Principal, Tenant: claims.Tenant,
+		Principal: claims.Principal, Tenant: claims.Tenant, Run: req.Run,
 	}
 	if req.IdempotencyKey != "" {
 		spec.IdempotencyKey = sessionOpenKey(claims, w.ID, proto.SessionExec, req.IdempotencyKey)
@@ -2339,11 +2527,20 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 	if err := w.handle.Prepare(&spec); err != nil {
 		return nil, err
 	}
-	s, err := n.sessions.Open(spec)
+	s, created, err := n.sessions.OpenOrReplay(spec)
 	if err != nil {
 		return nil, err
 	}
-	n.emit(proto.EvSOpened, w.ID, claims.Principal, map[string]any{"s": s.ID, "kind": req.Kind, "program": req.Program, "client": client})
+	if err := n.confirmOpenAuthz(w, claims, s); err != nil {
+		return nil, err
+	}
+	n.emitSession(proto.EvSOpened, w.ID, claims.Principal, s.ID, map[string]any{"s": s.ID, "kind": req.Kind, "program": req.Program, "client": client})
+	if run := req.Run; run != nil && created {
+		n.emitSession(proto.EvRunStarted, w.ID, claims.Principal, s.ID, map[string]any{"s": s.ID, "recipe": run.Recipe, "task_hash": run.TaskHash, "sandbox": run.Sandbox, "auth": run.Auth})
+		if run.Auth == proto.RunAuthWorkspaceResident {
+			n.emitSession(proto.EvAuthWSResident, w.ID, claims.Principal, s.ID, map[string]any{"s": s.ID, "recipe": run.Recipe})
+		}
+	}
 	if !req.NoSubscribe {
 		n.subscribe(p, client, s, 0)
 	}
@@ -2371,6 +2568,9 @@ func (n *Node) portOpen(ctx context.Context, p *transport.Peer, client string, c
 	}
 	s, err := n.sessions.Open(spec)
 	if err != nil {
+		return nil, err
+	}
+	if err := n.confirmOpenAuthz(w, claims, s); err != nil {
 		return nil, err
 	}
 	// A port session is a connection, not a program: if the dial failed there
@@ -2507,12 +2707,31 @@ func (n *Node) tryClaim(ctx context.Context, wsID string, adopt bool) {
 	if err := n.materialize(mctx, res.Workspace, adopt); err != nil {
 		n.logger.Error("materialize failed; releasing", "ws", wsID, "err", err)
 		rctx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		_ = p.Call(rctx, proto.PeerControl, proto.OpWSReleased, proto.WSReleasedReq{ID: wsID, Gen: res.Workspace.Generation, Reason: "materialize failed: " + err.Error()}, nil)
+		_ = p.Call(rctx, proto.PeerControl, proto.OpWSReleased, proto.WSReleasedReq{ID: wsID, Gen: res.Workspace.Generation, Reason: "materialize failed: " + err.Error(), Failed: true}, nil)
 		releaseCancel()
 	}
 }
 
+// requireUplinkCapabilities fails closed when the control plane never
+// negotiated a capability the workspace's security profile depends on. An
+// older control plane cannot deliver the property the profile promises, and
+// serving the workspace anyway would be exactly the silent weakening named
+// capabilities exist to prevent (ADR 0040).
+func (n *Node) requireUplinkCapabilities(profile string) error {
+	n.mu.Lock()
+	negotiated := n.protocol
+	n.mu.Unlock()
+	missing := proto.MissingCapabilities(negotiated, proto.SecurityCapabilities(profile))
+	if len(missing) == 0 {
+		return nil
+	}
+	return proto.Err(proto.CodeUnsupported, "control plane lacks protocol capabilities %s required by security profile %q", strings.Join(missing, ","), profile)
+}
+
 func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) error {
+	if err := n.requireUplinkCapabilities(w.Spec.Security.Profile); err != nil {
+		return err
+	}
 	be, err := n.opts.Backends.Get(w.Spec.Requires.Backend)
 	if err != nil {
 		return err
@@ -2528,6 +2747,16 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 	if adopt {
 		handle, err = be.Adopt(ctx, w.ID)
 		if err != nil {
+			adopt = false
+		} else if needsClone(w.Spec) && !cloneCompleted(handle) {
+			// The tree exists but its clone never finished (the node died
+			// mid-fetch or the clone failed). It was never ws.ready, so no
+			// client has written to it: nothing is lost by starting over,
+			// and serving it would hand out an empty checkout.
+			n.logger.Warn("discarding tree whose clone never completed", "ws", w.ID)
+			if err := handle.Destroy(ctx); err != nil {
+				return fmt.Errorf("discard incomplete clone: %w", err)
+			}
 			adopt = false
 		}
 	}
@@ -2593,7 +2822,7 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 	brokerOpts := broker.Options{
 		WS: w.ID, Generation: w.Generation, Principal: w.Spec.Principal, Tenant: w.Tenant, Leases: leases,
 		Network: w.Spec.Security.Network, Allow: n.opts.Allow, AllowPrivate: n.opts.AllowPrivate,
-		RootCAs: n.opts.BrokerRootCAs, ConnectorStore: n.connectors,
+		RootCAs: n.opts.BrokerRootCAs, ConnectorStore: n.connectors, Repo: w.Spec.Repo,
 		Audit: func(a broker.Audit) {
 			typ := proto.EvEgressAllowed
 			switch a.Decision {
@@ -2606,17 +2835,20 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 			n.emit(typ, a.WS, a.Principal, map[string]any{
 				"generation": a.Generation, "decision": a.Decision, "binding": a.Binding,
 				"rule": a.Rule, "protocol": a.Protocol, "shared_state": a.SharedState,
-				"connector": a.Connector, "digest": a.Digest, "cached": a.Cached,
+				"connector": a.Connector, "op": a.Op, "repo": a.Repo, "digest": a.Digest, "cached": a.Cached,
 				"host": a.Host, "method": a.Method, "path": a.Path, "reason": a.Reason,
-				"status": a.Status, "request_bytes": a.RequestBytes, "response_bytes": a.ResponseBytes,
+				"status": a.Status, "error": a.Error, "request_bytes": a.RequestBytes, "response_bytes": a.ResponseBytes,
 			})
 		},
 	}
-	if handle.Backend() == "docker" {
+	if advertise := n.brokerAdvertiseHost(handle.Backend()); advertise != "" {
 		// Containers cannot reach a host loopback listener. The random
 		// per-workspace capability authenticates this host-gateway listener.
 		brokerOpts.Listen = "0.0.0.0:0"
-		brokerOpts.AdvertiseHost = "host.docker.internal"
+		if ip := net.ParseIP(advertise); ip != nil {
+			brokerOpts.Listen = net.JoinHostPort(advertise, "0")
+		}
+		brokerOpts.AdvertiseHost = advertise
 	}
 	entry.broker = broker.New(brokerOpts)
 	if _, err := entry.broker.Start(); err != nil {
@@ -2634,6 +2866,32 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 		}); err != nil {
 			return retainOnError(fmt.Errorf("apply enforced network policy: %w", err))
 		}
+	}
+	// A declared repository is cloned into a fresh tree before the workspace
+	// is ever serviceable. A restore already carries the checkout, and an
+	// adopted tree is whatever the previous claim left; only a first
+	// materialization fetches. A failed clone is not quarantined like a
+	// failed restore: the tree was created moments ago and holds nothing of
+	// anyone's, so it is destroyed and the next offer starts clean instead of
+	// adopting an empty checkout.
+	cloned := ""
+	if needsClone(w.Spec) && !adopt {
+		commit, err := n.cloneRepo(ctx, entry)
+		if err == nil {
+			err = markCloneCompleted(handle, commit)
+		}
+		if err != nil {
+			metrics.RepoCloneFailures.Inc()
+			if revokeErr := n.revokeWorkspaceNetwork(ctx, entry); revokeErr != nil {
+				n.logger.Error("revoke network after clone failure", "ws", w.ID, "err", revokeErr)
+			}
+			entry.broker.Close()
+			if destroyErr := handle.Destroy(context.WithoutCancel(ctx)); destroyErr != nil {
+				n.logger.Error("discard tree after clone failure", "ws", w.ID, "err", destroyErr)
+			}
+			return fmt.Errorf("clone %s: %w", w.Spec.Repo.URL, err)
+		}
+		cloned = commit
 	}
 	// Drop a sourceable env file into the workspace. The broker's address
 	// changes every time a workspace is materialized, so anything that bakes
@@ -2660,6 +2918,10 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 		metrics.RestoresDone.Inc()
 		n.emit(proto.EvWSRestored, w.ID, w.Spec.Principal, map[string]any{"from": w.Spec.RestoreFrom, "backend": be.Name()})
 	}
+	if cloned != "" {
+		metrics.RepoClones.Inc()
+		n.emit(proto.EvRepoCloned, w.ID, w.Spec.Principal, cloneEventPayload(w.Spec.Repo, cloned, be.Name()))
+	}
 	n.logger.Info("workspace claimed", "ws", w.ID, "gen", w.Generation, "backend", be.Name(), "restore", w.Spec.RestoreFrom, "adopted", adopt)
 	// Only now is the workspace serviceable; tell the control plane so a
 	// client waiting on it is not handed a node that is still restoring.
@@ -2678,6 +2940,16 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 		return fmt.Errorf("ws.ready: %w", err)
 	}
 	return nil
+}
+
+func (n *Node) brokerAdvertiseHost(backend string) string {
+	if n.opts.BrokerAdvertiseHost != "" {
+		return n.opts.BrokerAdvertiseHost
+	}
+	if backend == "docker" {
+		return "host.docker.internal"
+	}
+	return ""
 }
 
 func (n *Node) fetchArtifact(ctx context.Context, id string) (io.ReadCloser, error) {
@@ -2715,6 +2987,40 @@ func (n *Node) fetchArtifact(ctx context.Context, id string) (io.ReadCloser, err
 	return r, err
 }
 
+// applyTar overlays an uploaded artifact onto a workspace tree. The fetch
+// happens before the tree lock so a slow download never blocks other file
+// operations; the overlay itself holds the lock because every rename must be
+// ordered against concurrent fs.* mutations.
+func (n *Node) applyTar(ctx context.Context, w *ws, id, client string) ([]byte, error) {
+	rc, err := n.fetchArtifact(ctx, id)
+	if err != nil {
+		return nil, proto.Err(proto.CodeNotFound, "fs.apply_tar: %v", err)
+	}
+	defer rc.Close()
+	unlock, err := n.lockWorkspaceTree(w, true)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	limits := artifact.RestoreLimits{MaxCompressedBytes: n.opts.MaxArtifactBytes}
+	res, err := artifact.ApplyOverlay(w.handle.FS().Root(), rc, limits)
+	// Whatever landed before a mid-archive refusal is real state; record it
+	// before reporting the failure.
+	if len(res.Paths) > 0 || res.Dirs > 0 {
+		n.emit(proto.EvFSApplyTar, w.ID, w.Spec.Principal, map[string]any{
+			"artifact": id, "files": len(res.Paths), "dirs": res.Dirs, "bytes": res.Bytes, "client": client,
+			"complete": err == nil,
+		})
+		for _, p := range res.Paths {
+			n.emit(proto.EvFSWrite, w.ID, w.Spec.Principal, map[string]any{"path": p, "artifact": id, "client": client})
+		}
+	}
+	if err != nil {
+		return nil, proto.Err(proto.CodeBadRequest, "fs.apply_tar: %v", err)
+	}
+	return proto.Marshal(proto.FSApplyTarRes{Files: len(res.Paths), Dirs: res.Dirs, Bytes: res.Bytes})
+}
+
 func (n *Node) snapshot(ctx context.Context, w *ws, upload bool) (string, int64, error) {
 	release, err := n.acquireSnapshot(ctx, w, false)
 	if err != nil {
@@ -2725,6 +3031,50 @@ func (n *Node) snapshot(ctx context.Context, w *ws, upload bool) (string, int64,
 	defer w.treeMu.Unlock()
 	result, err := n.snapshotRaw(ctx, w, upload, proto.SnapshotConsistencyQuiesced)
 	return result.Artifact, result.Bytes, err
+}
+
+// controlSnapshot serves a snapshot the control plane asks for on its own
+// authority (an agent fork). There is no client grant to verify; the request
+// is fenced to the generation the control plane believes this node holds so a
+// request that crossed a move cannot archive the wrong tree.
+func (n *Node) controlSnapshot(ctx context.Context, p *transport.Peer, req *proto.WSSnapshotReq) (any, error) {
+	n.mu.Lock()
+	w := n.workspaces[req.WS]
+	if w == nil {
+		n.mu.Unlock()
+		return nil, proto.Err(proto.CodeNotFound, "workspace %s not here", req.WS)
+	}
+	if w.Generation != req.Gen {
+		n.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "generation mismatch")
+	}
+	if w.checkpointing {
+		n.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace %s is checkpointing", req.WS)
+	}
+	n.mu.Unlock()
+	clean := *req
+	key := n.mutationKey(proto.PeerControl, w.ID, proto.OpWSSnapshot, req.IdempotencyKey)
+	raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
+		result, err := n.snapshotExplicit(ctx, w, req.Upload, req.Authoritative, func(id string) error {
+			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			return p.Call(cctx, proto.PeerControl, proto.OpWSSnapshotCommit,
+				proto.WSSnapshotCommitReq{ID: w.ID, Gen: w.Generation, Snapshot: id}, nil)
+		})
+		if err != nil {
+			return nil, err
+		}
+		return proto.Marshal(result)
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result proto.WSSnapshotRes
+	if err := proto.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (n *Node) snapshotExplicit(ctx context.Context, w *ws, upload, authoritative bool, commit func(string) error) (proto.WSSnapshotRes, error) {

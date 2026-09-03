@@ -82,7 +82,7 @@ remount up --server https://remount.example --token "$REMOUNT_TOKEN" \
 | `--data` | `~/.remount/node` | identity, workspaces, spill, artifact cache; also `REMOUNT_NODE_DATA` |
 | `--label k=v` | none | placement labels, repeatable |
 | `--backend` | `process` | comma-separated: `process`, `docker` |
-| `--image` | `ubuntu:24.04` | default image for docker workspaces |
+| `--image` | `ghcr.io/andrewgcodes/remount-workspace:<version>` | default image for docker workspaces; see `docs/images.md`; `ubuntu:24.04` still works |
 | `--allow` | none | hosts reachable without a credential, repeatable |
 | `--allow-private` | none | hosts allowed to resolve to private addresses, repeatable |
 | `--max-concurrent-requests` | `128` | active node request handlers |

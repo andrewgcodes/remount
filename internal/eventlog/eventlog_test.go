@@ -288,3 +288,76 @@ func TestSubscriptionCloseWakesBlockedNext(t *testing.T) {
 	// Idempotent close must not panic.
 	sub.Close()
 }
+
+func TestSQLitePersistsSessionAttribution(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.db")
+	s, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &proto.Event{Type: proto.EvSOpened, Stream: "ws_1", Session: "s_1", At: 1}
+	if err := s.Append(context.Background(), e); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s2, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	got, err := s2.Read(context.Background(), 1, "", 10)
+	if err != nil || len(got) != 1 || got[0].Session != "s_1" {
+		t.Fatalf("session attribution did not round-trip: %+v %v", got, err)
+	}
+}
+
+func TestExportPagesRangesAndReportsEviction(t *testing.T) {
+	ctx := context.Background()
+	for name, st := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			l := New(st)
+			defer l.Close()
+			const n = exportPage*2 + 7
+			for i := 0; i < n; i++ {
+				if _, err := l.Emit(ctx, "t", "ws", "", "", nil, 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var got []uint64
+			last, err := l.Export(ctx, 0, 0, func(e proto.Event) error { got = append(got, e.Seq); return nil })
+			if err != nil || last != n || len(got) != n {
+				t.Fatalf("full export: last=%d n=%d err=%v", last, len(got), err)
+			}
+			for i, s := range got {
+				if s != uint64(i+1) {
+					t.Fatalf("export out of order at %d: %d", i, s)
+				}
+			}
+			got = nil
+			last, err = l.Export(ctx, exportPage-1, exportPage+1, func(e proto.Event) error { got = append(got, e.Seq); return nil })
+			if err != nil || last != exportPage+1 || len(got) != 3 {
+				t.Fatalf("bounded export: last=%d got=%v err=%v", last, got, err)
+			}
+			boom := errors.New("sink full")
+			count := 0
+			last, err = l.Export(ctx, 1, 0, func(proto.Event) error {
+				count++
+				if count == 3 {
+					return boom
+				}
+				return nil
+			})
+			if !errors.Is(err, boom) || last != 2 {
+				t.Fatalf("sink error must stop at the last delivered seq: last=%d err=%v", last, err)
+			}
+			if _, err := l.Prune(ctx, time.Now().Add(time.Hour).UnixMilli(), 5); err != nil {
+				t.Fatal(err)
+			}
+			_, err = l.Export(ctx, 1, 0, func(proto.Event) error { return nil })
+			var pe *proto.Error
+			if !errors.As(err, &pe) || pe.Code != proto.CodeEvicted || pe.Oldest != 6 {
+				t.Fatalf("export below retention must be evicted with Oldest: %v", err)
+			}
+		})
+	}
+}

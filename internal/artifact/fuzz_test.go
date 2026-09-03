@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -47,4 +48,42 @@ func fuzzArchiveSeed() []byte {
 		panic(err)
 	}
 	return output.Bytes()
+}
+
+// FuzzApplyOverlay checks that no archive can make an overlay write outside
+// the root, into .remount, or leave anything behind in the staging area.
+func FuzzApplyOverlay(f *testing.F) {
+	f.Add(fuzzArchiveSeed())
+	f.Add([]byte("not a gzip stream"))
+	f.Add([]byte{0x1f, 0x8b, 0x08})
+	f.Fuzz(func(t *testing.T, archive []byte) {
+		if len(archive) > 1<<20 {
+			t.Skip()
+		}
+		parent := t.TempDir()
+		root := filepath.Join(parent, "ws")
+		if err := os.MkdirAll(filepath.Join(root, OverlayStageDir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, OverlayStageDir, "env"), []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		limits := RestoreLimits{
+			MaxCompressedBytes: 1 << 20, MaxExpandedBytes: 2 << 20,
+			MaxFileBytes: 1 << 20, MaxEntries: 128, MaxPathBytes: 256,
+			MaxDepth: 16, MaxCompressionRatio: 100,
+		}
+		_, _ = ApplyOverlay(root, bytes.NewReader(archive), limits)
+		entries, err := os.ReadDir(parent)
+		if err != nil || len(entries) != 1 || entries[0].Name() != "ws" {
+			t.Fatalf("overlay escaped the root: %v %v", entries, err)
+		}
+		if got, err := os.ReadFile(filepath.Join(root, OverlayStageDir, "env")); err != nil || string(got) != "keep" {
+			t.Fatalf(".remount/env changed: %q %v", got, err)
+		}
+		stage, err := os.ReadDir(filepath.Join(root, OverlayStageDir))
+		if err != nil || len(stage) != 1 {
+			t.Fatalf("staging area not cleaned: %v %v", stage, err)
+		}
+	})
 }

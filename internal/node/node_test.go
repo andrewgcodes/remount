@@ -177,6 +177,42 @@ func TestFetchArtifactMismatchCannotDeleteExistingBlob(t *testing.T) {
 	}
 }
 
+// A node connected to a control plane that never negotiated a capability an
+// isolated or multi-tenant workspace depends on refuses the workspace before
+// any bytes land; a local workspace is unaffected, and a current control
+// plane moves the decision on to backend security.
+func TestMaterializeRequiresUplinkCapabilitiesForProfile(t *testing.T) {
+	n := newTestNode(t, nil)
+	n.mu.Lock()
+	n.protocol = []string{proto.CapabilityV1}
+	n.mu.Unlock()
+	for _, profile := range []string{proto.SecurityIsolated, proto.SecurityMultiTenant} {
+		w := proto.Workspace{
+			ID: "ws_" + profile, Generation: 1, State: proto.WSClaiming,
+			Spec: proto.WorkspaceSpec{Requires: proto.Requires{Backend: "process"}, Security: proto.SecuritySpec{Profile: profile}},
+		}
+		err := n.materialize(context.Background(), w, false)
+		var pe *proto.Error
+		if !errors.As(err, &pe) || pe.Code != proto.CodeUnsupported || !strings.Contains(pe.Msg, proto.CapabilityAuthzPush) || !strings.Contains(pe.Msg, profile) {
+			t.Fatalf("%s under an old control plane: %v", profile, err)
+		}
+		if _, err := os.Stat(filepath.Join(n.opts.DataDir, "ws", w.ID)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("refused workspace materialized bytes: %v", err)
+		}
+	}
+	if err := n.requireUplinkCapabilities(proto.SecurityLocal); err != nil {
+		t.Fatalf("local profile refused under an old control plane: %v", err)
+	}
+	n.mu.Lock()
+	n.protocol = proto.PeerCapabilities()
+	n.mu.Unlock()
+	for _, profile := range []string{proto.SecurityLocal, proto.SecurityIsolated, proto.SecurityMultiTenant} {
+		if err := n.requireUplinkCapabilities(profile); err != nil {
+			t.Fatalf("%s refused under a current control plane: %v", profile, err)
+		}
+	}
+}
+
 func TestMaterializeRevalidatesBackendSecurity(t *testing.T) {
 	n := newTestNode(t, nil)
 	w := proto.Workspace{
@@ -1121,4 +1157,85 @@ func TestQuarantineCommitWithoutPhaseOneProofCannotDelete(t *testing.T) {
 	if _, err := os.Stat(root); err != nil {
 		t.Fatalf("unproven commit changed source: %v", err)
 	}
+}
+
+// TestAuthzPushClosesRevokedPrincipalOnly exercises the node side of a pushed
+// revision without a control plane: cached grants under the old revision are
+// dropped, only the named principal's sessions end with reason revoked, a
+// reset ends every session, and an open that raced the push is undone.
+func TestAuthzPushClosesRevokedPrincipalOnly(t *testing.T) {
+	n := newTestNode(t, nil)
+	w := &ws{Workspace: proto.Workspace{ID: "ws_authz", Generation: 1, AuthzRevision: 3, Tenant: "team"}}
+	n.mu.Lock()
+	n.workspaces[w.ID] = w
+	n.grants["c_a|ws_authz"] = &proto.Grant{Claims: proto.GrantClaims{WS: w.ID, AuthzRevision: 3}}
+	n.grants["c_b|ws_other"] = &proto.Grant{Claims: proto.GrantClaims{WS: "ws_other", AuthzRevision: 3}}
+	n.mu.Unlock()
+	open := func(principal string) *session.Session {
+		s, err := n.sessions.Open(session.Spec{WS: w.ID, Kind: proto.SessionExec, Program: []string{"sleep", "30"}, Principal: principal, Tenant: "team"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	revoked, kept := open("guest"), open("other")
+
+	n.mu.Lock()
+	if r := n.applyAuthzLocked(w, proto.WSRenewResult{AuthzRevision: 3}); r != nil {
+		t.Fatalf("same revision produced work: %+v", r)
+	}
+	r := n.applyAuthzLocked(w, proto.WSRenewResult{AuthzRevision: 4, Revoked: []string{"guest"}})
+	_, staleKept := n.grants["c_a|ws_authz"]
+	_, otherKept := n.grants["c_b|ws_other"]
+	n.mu.Unlock()
+	if r == nil || w.AuthzRevision != 4 || staleKept || !otherKept {
+		t.Fatalf("apply: r=%+v rev=%d stale=%v other=%v", r, w.AuthzRevision, staleKept, otherKept)
+	}
+	n.closeRevokedSessions(r)
+	if exit := waitExit(t, revoked); exit.Reason != proto.ExitReasonRevoked {
+		t.Fatalf("revoked exit %+v", exit)
+	}
+	if kept.Exited() {
+		t.Fatal("unaffected principal's session closed")
+	}
+
+	// An open authorized under revision 4 that lands after a push to 5 is
+	// terminated and refused, so no session outlives its grant's revision.
+	late := open("other")
+	n.mu.Lock()
+	n.applyAuthzLocked(w, proto.WSRenewResult{AuthzRevision: 5, Revoked: []string{"other"}})
+	n.mu.Unlock()
+	err := n.confirmOpenAuthz(w, proto.GrantClaims{AuthzRevision: 4}, late)
+	var pe *proto.Error
+	if !errors.As(err, &pe) || pe.Code != proto.CodeUnauthorized {
+		t.Fatalf("late open = %v", err)
+	}
+	if exit := waitExit(t, late); exit.Reason != proto.ExitReasonRevoked {
+		t.Fatalf("late exit %+v", exit)
+	}
+	if err := n.confirmOpenAuthz(w, proto.GrantClaims{AuthzRevision: 5}, kept); err != nil {
+		t.Fatalf("current open = %v", err)
+	}
+
+	// A reset closes everyone: control could not name the revoked principals.
+	n.mu.Lock()
+	r = n.applyAuthzLocked(w, proto.WSRenewResult{AuthzRevision: 9, AuthzReset: true})
+	n.mu.Unlock()
+	n.closeRevokedSessions(r)
+	if exit := waitExit(t, kept); exit.Reason != proto.ExitReasonRevoked {
+		t.Fatalf("reset exit %+v", exit)
+	}
+}
+
+func waitExit(t *testing.T, s *session.Session) *proto.ExitInfo {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.Exited() {
+			return s.ExitInfo()
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("session did not exit")
+	return nil
 }
