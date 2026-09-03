@@ -1519,6 +1519,16 @@ func (c *Control) finishRunLocked(a *proto.Agent, run *proto.AgentRun, ws *proto
 // reconcile: the loop that turns durable intent into node work
 // ---------------------------------------------------------------------------
 
+// deferAgent records a failed lifecycle action so the next reconcile does not
+// retry it at once. Without it a node that keeps refusing a sleep or wake
+// turns the kick-on-completion scheduler into a hot loop of round trips and
+// workspace transitions.
+func (c *Control) deferAgent(id string) {
+	c.mu.Lock()
+	c.agentRetry[id] = c.now().Add(agentRetryBackoff)
+	c.mu.Unlock()
+}
+
 // kickAgents asks the background loop to reconcile now rather than at the
 // next tick. It never blocks.
 func (c *Control) kickAgents() {
@@ -1674,13 +1684,14 @@ func (c *Control) agentDecide() []agentWork {
 					c.agentDelivered[m.ID] = now
 					marked = append(marked, m.ID)
 				}
-			case run == nil && len(a.Inbox) > 0 && ws.State == proto.WSPaused:
+			case run == nil && len(a.Inbox) > 0 && ws.State == proto.WSPaused && !c.agentRetry[a.ID].After(now):
 				agentID, wsID, timer := a.ID, a.WS, a.WakeTimer
 				pending = append(pending, func(ctx context.Context) {
 					wctx, cancel := context.WithTimeout(ctx, agentLifecycleTimeout)
 					defer cancel()
 					if err := c.agentWake(wctx, "", agentID, wsID, timer, "message", ""); err != nil {
 						c.logger.Warn("agent wake", "agent", agentID, "err", err)
+						c.deferAgent(agentID)
 					}
 				})
 			case run != nil && run.State == proto.AgentRunActive && run.TurnMessage == "" && len(a.Inbox) > 0 && ws.State == proto.WSClaimed:
@@ -1692,13 +1703,14 @@ func (c *Control) agentDecide() []agentWork {
 					pending = append(pending, func(ctx context.Context) { c.deliverToRun(ctx, node, &req) })
 				}
 			case (a.Status == proto.AgentWaitingInput || a.Status == proto.AgentIdle) && a.Policy.SleepAfterSec > 0 && a.IdleSince > 0 && ws.State == proto.WSClaimed &&
-				now.UnixMilli()-a.IdleSince >= a.Policy.SleepAfterSec*1000 && a.PendingApprovals == 0:
+				now.UnixMilli()-a.IdleSince >= a.Policy.SleepAfterSec*1000 && a.PendingApprovals == 0 && !c.agentRetry[a.ID].After(now):
 				agentID := a.ID
 				pending = append(pending, func(ctx context.Context) {
 					sctx, cancel := context.WithTimeout(ctx, agentLifecycleTimeout)
 					defer cancel()
 					if _, err := c.sleepAgent(sctx, "", agentID, "policy", ""); err != nil {
 						c.logger.Warn("agent policy sleep", "agent", agentID, "err", err)
+						c.deferAgent(agentID)
 					}
 				})
 			}
