@@ -14,25 +14,32 @@ import (
 func (c *Control) Diag(ctx context.Context) *proto.ControlDiag {
 	now := c.now()
 	d := &proto.ControlDiag{
-		Now:            now.UnixMilli(),
-		Uptime:         int64(now.Sub(c.started).Seconds()),
-		WorkspaceState: map[string]int{},
-		LeaseSec:       c.opts.LeaseSec,
-		Bindings:       c.Bindings(),
-		Metrics:        metrics.Default.Snapshot(),
+		Now:                     now.UnixMilli(),
+		Uptime:                  int64(now.Sub(c.started).Seconds()),
+		WorkspaceState:          map[string]int{},
+		LeaseSec:                c.opts.LeaseSec,
+		Bindings:                c.Bindings(),
+		Metrics:                 metrics.Default.Snapshot(),
+		TimersMax:               c.opts.MaxTimers,
+		MutationRecordsMax:      c.opts.MaxMutationRecords,
+		WorkspacesPerTenantMax:  c.opts.MaxWorkspacesPerTenant,
+		WorkspacesPerSubjectMax: c.opts.MaxWorkspacesPerSubject,
 	}
 	if seq, err := c.log.Last(ctx); err == nil {
 		d.EventSeq = seq
 	}
+	if seq, err := c.log.First(ctx); err == nil {
+		d.EventOldest = seq
+	}
+	_ = c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mutations`).Scan(&d.MutationRecords)
 	if c.opts.Artifacts != nil {
-		if ids, err := c.opts.Artifacts.List(); err == nil {
-			d.ArtifactCount = len(ids)
-			for _, id := range ids {
-				if _, n, err := c.opts.Artifacts.Open(id); err == nil {
-					d.ArtifactBytes += n
-				}
-			}
-		}
+		stats := c.opts.Artifacts.Stats()
+		d.ArtifactCount = stats.Objects
+		d.ArtifactBytes = stats.Bytes
+		d.ArtifactReservedBytes = stats.ReservedBytes
+		d.ArtifactReservedObjects = stats.ReservedObjects
+		d.ArtifactMaxBytes = stats.MaxBytes
+		d.ArtifactMaxObjects = stats.MaxObjects
 	}
 
 	c.mu.Lock()

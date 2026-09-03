@@ -39,12 +39,37 @@ type Options struct {
 	LeaseSec int64
 	// MaxArtifactBytes bounds one uploaded compressed artifact. Default 8 GiB.
 	MaxArtifactBytes int64
+	// MaxArtifactStoreBytes and MaxArtifactObjects bound retained artifacts and
+	// concurrent staging. Defaults are 64 GiB and 100,000 objects.
+	MaxArtifactStoreBytes int64
+	MaxArtifactObjects    int
+	// ArtifactGracePeriod protects uploads while a workspace operation commits
+	// its reference. ArtifactGCInterval controls reference-aware collection.
+	// Negative intervals disable the background collector (primarily for tests).
+	ArtifactGracePeriod time.Duration
+	ArtifactGCInterval  time.Duration
+	// EventRetention is the durable audit window. Pruning removes only a
+	// contiguous sequence prefix, and readers below it receive CodeEvicted.
+	// Negative intervals disable the background collector.
+	EventRetention  time.Duration
+	EventGCInterval time.Duration
+	// RecordRetention is the replay window for completed idempotency results
+	// and the visibility window for fired timers. RecordGCInterval controls
+	// bounded pruning passes. Negative intervals disable background pruning.
+	RecordRetention  time.Duration
+	RecordGCInterval time.Duration
 	Logger           *slog.Logger
 	// Mode declares the deployment trust posture.
 	Mode          string
 	Authenticator control.Authenticator
 	Authorizer    control.Authorizer
 	ApprovedNodes map[string]control.NodeApproval
+	// Workspace quotas are enforced atomically by the control plane.
+	MaxWorkspacesPerTenant  int
+	MaxWorkspacesPerSubject int
+	MaxMutationRecords      int
+	MaxTimers               int
+	MaxTimersPerWorkspace   int
 }
 
 const (
@@ -75,6 +100,9 @@ type Server struct {
 	closeOnce   sync.Once
 	closeErr    error
 	tempArtDir  string
+	gcCtx       context.Context
+	gcCancel    context.CancelFunc
+	gcWG        sync.WaitGroup
 }
 
 // New builds a server. Call Serve or Handler.
@@ -82,8 +110,48 @@ func New(opts Options) (*Server, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	if opts.MaxArtifactBytes <= 0 {
+	if opts.MaxArtifactBytes < 0 || opts.MaxArtifactStoreBytes < 0 || opts.MaxArtifactObjects < 0 {
+		return nil, errors.New("server: artifact limits must not be negative")
+	}
+	if opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 || opts.MaxMutationRecords < 0 ||
+		opts.MaxTimers < 0 || opts.MaxTimersPerWorkspace < 0 {
+		return nil, errors.New("server: control-plane quotas must not be negative")
+	}
+	if opts.MaxArtifactBytes == 0 {
 		opts.MaxArtifactBytes = 8 << 30
+	}
+	if opts.MaxArtifactStoreBytes == 0 {
+		opts.MaxArtifactStoreBytes = 64 << 30
+	}
+	if opts.MaxArtifactObjects == 0 {
+		opts.MaxArtifactObjects = 100_000
+	}
+	if opts.ArtifactGracePeriod == 0 {
+		opts.ArtifactGracePeriod = 24 * time.Hour
+	}
+	if opts.ArtifactGracePeriod < 0 {
+		return nil, errors.New("server: artifact grace period must not be negative")
+	}
+	if opts.ArtifactGCInterval == 0 {
+		opts.ArtifactGCInterval = 10 * time.Minute
+	}
+	if opts.EventRetention == 0 {
+		opts.EventRetention = 30 * 24 * time.Hour
+	}
+	if opts.EventRetention < 0 {
+		return nil, errors.New("server: event retention must not be negative")
+	}
+	if opts.EventGCInterval == 0 {
+		opts.EventGCInterval = 10 * time.Minute
+	}
+	if opts.RecordRetention == 0 {
+		opts.RecordRetention = 30 * 24 * time.Hour
+	}
+	if opts.RecordRetention < 0 {
+		return nil, errors.New("server: control-record retention must not be negative")
+	}
+	if opts.RecordGCInterval == 0 {
+		opts.RecordGCInterval = 10 * time.Minute
 	}
 	if opts.Mode == "" {
 		opts.Mode = ModeStandalone
@@ -113,7 +181,9 @@ func New(opts Options) (*Server, error) {
 		}
 		artDir = d
 	}
-	store, err := artifact.NewStore(artDir)
+	store, err := artifact.NewStoreWithOptions(artDir, artifact.StoreOptions{
+		MaxBytes: opts.MaxArtifactStoreBytes, MaxObjects: opts.MaxArtifactObjects,
+	})
 	if err != nil {
 		_ = sq.Close()
 		if opts.DataDir == "" {
@@ -125,7 +195,9 @@ func New(opts Options) (*Server, error) {
 	ctrl, err := control.New(control.Options{DB: sq.DB(), Log: log, Token: opts.Token,
 		Bindings: opts.Bindings, LeaseSec: opts.LeaseSec, Logger: opts.Logger, Artifacts: store,
 		Authenticator: opts.Authenticator, Authorizer: opts.Authorizer, ApprovedNodes: opts.ApprovedNodes,
-		SecurityProfileFloor: floor})
+		SecurityProfileFloor: floor, MaxWorkspacesPerTenant: opts.MaxWorkspacesPerTenant,
+		MaxWorkspacesPerSubject: opts.MaxWorkspacesPerSubject, MaxMutationRecords: opts.MaxMutationRecords,
+		MaxTimers: opts.MaxTimers, MaxTimersPerWorkspace: opts.MaxTimersPerWorkspace})
 	if err != nil {
 		_ = log.Close()
 		if opts.DataDir == "" {
@@ -143,7 +215,134 @@ func New(opts Options) (*Server, error) {
 	if opts.DataDir == "" {
 		s.tempArtDir = artDir
 	}
+	if opts.ArtifactGCInterval > 0 || opts.EventGCInterval > 0 || opts.RecordGCInterval > 0 {
+		gcCtx, gcCancel := context.WithCancel(context.Background())
+		s.gcCtx = gcCtx
+		s.gcCancel = gcCancel
+	}
+	if opts.ArtifactGCInterval > 0 {
+		s.gcWG.Add(1)
+		go s.artifactGCLoop(s.gcCtx)
+	}
+	if opts.EventGCInterval > 0 {
+		s.gcWG.Add(1)
+		go s.eventGCLoop(s.gcCtx)
+	}
+	if opts.RecordGCInterval > 0 {
+		s.gcWG.Add(1)
+		go s.recordGCLoop(s.gcCtx)
+	}
 	return s, nil
+}
+
+func (s *Server) artifactGCLoop(ctx context.Context) {
+	defer s.gcWG.Done()
+	ticker := time.NewTicker(s.opts.ArtifactGCInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			if _, err := s.CollectArtifacts(now); err != nil {
+				metrics.ArtifactGCErrors.Inc()
+				s.logger.Error("artifact garbage collection failed", "error", err)
+			}
+		}
+	}
+}
+
+func (s *Server) eventGCLoop(ctx context.Context) {
+	defer s.gcWG.Done()
+	ticker := time.NewTicker(s.opts.EventGCInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			if _, err := s.PruneEvents(ctx, now); err != nil && !errors.Is(err, context.Canceled) {
+				metrics.EventGCErrors.Inc()
+				s.logger.Error("event retention failed", "error", err)
+			}
+		}
+	}
+}
+
+func (s *Server) recordGCLoop(ctx context.Context) {
+	defer s.gcWG.Done()
+	ticker := time.NewTicker(s.opts.RecordGCInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			if _, err := s.PruneControlRecords(ctx, now); err != nil && !errors.Is(err, context.Canceled) {
+				metrics.RecordGCErrors.Inc()
+				s.logger.Error("control-record retention failed", "error", err)
+			}
+		}
+	}
+}
+
+// CollectArtifacts performs one reference-aware GC pass. Control keeps the
+// reference set stable until Store has finished unlinking candidates, while
+// the grace window protects freshly uploaded bytes not yet committed to a
+// workspace or fleet-operation record.
+func (s *Server) CollectArtifacts(now time.Time) (artifact.GCResult, error) {
+	var result artifact.GCResult
+	err := s.Control.WithArtifactReferences(func(references []string) error {
+		var err error
+		result, err = s.Store.Collect(references, now.Add(-s.opts.ArtifactGracePeriod))
+		return err
+	})
+	metrics.ArtifactGCRuns.Inc()
+	return result, err
+}
+
+// PruneEvents removes every complete batch in the expired sequence prefix.
+// It yields the event-log mutex between batches so current appends can make
+// progress during a large first retention pass.
+func (s *Server) PruneEvents(ctx context.Context, now time.Time) (int64, error) {
+	const batch = 10_000
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		n, err := s.Log.Prune(ctx, now.Add(-s.opts.EventRetention).UnixMilli(), batch)
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n < batch {
+			metrics.EventGCRuns.Inc()
+			return total, nil
+		}
+	}
+}
+
+// PruneControlRecords removes expired replay results and fired timers in
+// bounded, resumable transactions. Pending timers are never collected.
+func (s *Server) PruneControlRecords(ctx context.Context, now time.Time) (control.RecordPruneResult, error) {
+	const batch = 10_000
+	var total control.RecordPruneResult
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		result, err := s.Control.PruneRecords(ctx, now.Add(-s.opts.RecordRetention), batch)
+		total.Mutations += result.Mutations
+		total.Timers += result.Timers
+		if err != nil {
+			return total, err
+		}
+		if result.Mutations < batch && result.Timers < batch {
+			metrics.RecordGCRuns.Inc()
+			return total, nil
+		}
+	}
 }
 
 func validateSecurityMode(opts Options) (string, error) {
@@ -293,6 +492,10 @@ func (s *Server) Close() error {
 			s.readyOnce.Do(func() { close(s.ready) })
 		}
 		s.mu.Unlock()
+		if s.gcCancel != nil {
+			s.gcCancel()
+			s.gcWG.Wait()
+		}
 		var errs []error
 		if httpServer != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -380,6 +583,8 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case errors.Is(err, artifact.ErrTooLarge):
 				status = http.StatusRequestEntityTooLarge
+			case errors.Is(err, artifact.ErrStoreFull):
+				status = http.StatusInsufficientStorage
 			case errors.Is(err, artifact.ErrDigestMismatch):
 				status = http.StatusBadRequest
 			}

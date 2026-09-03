@@ -7,10 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/eventlog"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/transport"
@@ -136,6 +140,137 @@ func processNodeInfo(mem int) proto.NodeInfo {
 				Isolation: "none", EgressMode: "cooperative_proxy", BrokerIdentity: "token", FilesystemBoundary: "root_handle",
 			}, Runtime: proto.RuntimeCaps{Snapshots: "fs"},
 		}},
+	}
+}
+
+func TestArtifactReferencesAreStableAndRestoreMustExist(t *testing.T) {
+	store, err := artifact.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore, _, err := store.Put(strings.NewReader("restore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, _, err := store.Put(strings.NewReader("checkpoint"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newControlFixture(t, "", func(opts *Options) { opts.Artifacts = store })
+	ws := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{RestoreFrom: restore})
+	f.c.mu.Lock()
+	current := *f.c.workspaces[ws.ID]
+	current.LastSnapshot = checkpoint
+	if err := f.c.persistWS(&current); err != nil {
+		f.c.mu.Unlock()
+		t.Fatal(err)
+	}
+	f.c.workspaces[ws.ID] = &current
+	f.c.mu.Unlock()
+	var got []string
+	if err := f.c.WithArtifactReferences(func(references []string) error {
+		got = append([]string(nil), references...)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{checkpoint, restore}
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("artifact references = %v, want %v", got, want)
+	}
+	if _, err := f.c.wsCreate(context.Background(), localSubject(), &proto.WSCreateReq{
+		Spec: proto.WorkspaceSpec{RestoreFrom: artifact.ID(make([]byte, 32))},
+	}); !errors.Is(err, &proto.Error{Code: proto.CodeNotFound}) {
+		t.Fatalf("missing restore error = %v", err)
+	}
+}
+
+func TestWorkspaceQuotasAreAtomicPerTenantAndSubject(t *testing.T) {
+	f := newControlFixture(t, "", func(opts *Options) {
+		opts.MaxWorkspacesPerTenant = 2
+		opts.MaxWorkspacesPerSubject = 1
+	})
+	alice := Subject{ID: "alice", Tenant: "tenant", Roles: []string{"admin"}}
+	bob := Subject{ID: "bob", Tenant: "tenant", Roles: []string{"admin"}}
+	other := Subject{ID: "alice", Tenant: "other", Roles: []string{"admin"}}
+	createWorkspace(t, f.c, alice, proto.WorkspaceSpec{Name: "alice-1"})
+	if _, err := f.c.wsCreate(context.Background(), alice, &proto.WSCreateReq{Spec: proto.WorkspaceSpec{Name: "alice-2"}}); !errors.Is(err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+		t.Fatalf("subject quota error = %v", err)
+	}
+	createWorkspace(t, f.c, bob, proto.WorkspaceSpec{Name: "bob-1"})
+	if _, err := f.c.wsCreate(context.Background(), Subject{ID: "carol", Tenant: "tenant", Roles: []string{"admin"}}, &proto.WSCreateReq{Spec: proto.WorkspaceSpec{Name: "carol-1"}}); !errors.Is(err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+		t.Fatalf("tenant quota error = %v", err)
+	}
+	if _, err := f.c.wsCreate(context.Background(), other, &proto.WSCreateReq{Spec: proto.WorkspaceSpec{Name: "other-1"}}); err != nil {
+		t.Fatalf("sibling tenant was blocked: %v", err)
+	}
+}
+
+func TestDurableRecordQuotasRetentionAndLockCleanup(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	f := newControlFixture(t, "", func(opts *Options) {
+		opts.Now = func() time.Time { return now }
+		opts.MaxMutationRecords = 1
+		opts.MaxTimers = 3
+		opts.MaxTimersPerWorkspace = 1
+	})
+	subject := localSubject()
+	if _, err := f.c.wsCreate(context.Background(), subject, &proto.WSCreateReq{
+		Spec: proto.WorkspaceSpec{Name: "first"}, IdempotencyKey: "first",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.c.mu.Lock()
+	locks := len(f.c.mutationLocks)
+	f.c.mu.Unlock()
+	if locks != 0 {
+		t.Fatalf("completed mutation retained %d keyed locks", locks)
+	}
+	if _, err := f.c.wsCreate(context.Background(), subject, &proto.WSCreateReq{
+		Spec: proto.WorkspaceSpec{Name: "second"}, IdempotencyKey: "second",
+	}); !errors.Is(err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+		t.Fatalf("mutation quota error = %v", err)
+	}
+
+	now = now.Add(2 * time.Hour)
+	result, err := f.c.PruneRecords(context.Background(), now.Add(-time.Hour), 10)
+	if err != nil || result.Mutations != 1 {
+		t.Fatalf("PruneRecords mutation result = (%+v, %v)", result, err)
+	}
+	if _, err := f.c.wsCreate(context.Background(), subject, &proto.WSCreateReq{
+		Spec: proto.WorkspaceSpec{Name: "second"}, IdempotencyKey: "second",
+	}); err != nil {
+		t.Fatalf("mutation after retention prune = %v", err)
+	}
+
+	fired := &proto.Timer{ID: "t_fired", WS: "ws", Fired: true, CreatedAt: now.Add(-3 * time.Hour).UnixMilli(), FiredAt: now.Add(-2 * time.Hour).UnixMilli()}
+	pending := &proto.Timer{ID: "t_pending", WS: "ws", CreatedAt: now.Add(-3 * time.Hour).UnixMilli()}
+	f.c.mu.Lock()
+	for _, timer := range []*proto.Timer{fired, pending} {
+		if _, err := f.c.db.Exec(`INSERT INTO timers(id, data) VALUES(?,?)`, timer.ID, proto.MustMarshal(timer)); err != nil {
+			f.c.mu.Unlock()
+			t.Fatal(err)
+		}
+		f.c.timers[timer.ID] = timer
+	}
+	f.c.mu.Unlock()
+	if release, err := f.c.reserveTimer("ws"); release != nil || !errors.Is(err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+		if release != nil {
+			release()
+		}
+		t.Fatalf("workspace timer quota = (%v, %v)", release != nil, err)
+	}
+	result, err = f.c.PruneRecords(context.Background(), now.Add(-time.Hour), 10)
+	if err != nil || result.Timers != 1 {
+		t.Fatalf("PruneRecords timer result = (%+v, %v)", result, err)
+	}
+	f.c.mu.Lock()
+	_, firedPresent := f.c.timers[fired.ID]
+	_, pendingPresent := f.c.timers[pending.ID]
+	f.c.mu.Unlock()
+	if firedPresent || !pendingPresent {
+		t.Fatalf("timer retention fired=%t pending=%t", firedPresent, pendingPresent)
 	}
 }
 
@@ -484,7 +619,8 @@ func TestReleaseWithoutAbortAcknowledgementFailsClosed(t *testing.T) {
 }
 
 func TestNodeEventsDetectGapsDeduplicateAndUseAssignmentHistory(t *testing.T) {
-	f := newControlFixture(t, "", nil)
+	dbPath := filepath.Join(t.TempDir(), "control.db")
+	f := newControlFixture(t, dbPath, nil)
 	f.c.Attach(&fakeSender{online: map[string]bool{"n_one": true}})
 	connectNode(t, f.c, "n_one", processNodeInfo(4096))
 	ws := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{})
@@ -562,6 +698,24 @@ func TestNodeEventsDetectGapsDeduplicateAndUseAssignmentHistory(t *testing.T) {
 	forged.Generation = gen + 1
 	if err := f.c.eventsPost(context.Background(), "n_one", &proto.EventPost{Events: []proto.Event{forged}}); err == nil {
 		t.Fatal("event for an unassigned generation was accepted")
+	}
+
+	// Retention keeps the producer watermark even after it removes the event
+	// body. A restart must not manufacture a gap or wedge the node's durable
+	// outbox when the old acknowledged sequence is retried.
+	if _, err := f.log.Prune(context.Background(), time.Now().Add(24*time.Hour).UnixMilli(), 10_000); err != nil {
+		t.Fatal(err)
+	}
+	f.c.Stop()
+	if err := f.log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f2 := newControlFixture(t, dbPath, nil)
+	if got := f2.c.producerSeq["n_one"]; got != 4 {
+		t.Fatalf("recovered producer watermark = %d, want 4", got)
+	}
+	if err := f2.c.eventsPost(context.Background(), "n_one", &proto.EventPost{Events: []proto.Event{late}}); err != nil {
+		t.Fatalf("retry after retention = %v", err)
 	}
 }
 

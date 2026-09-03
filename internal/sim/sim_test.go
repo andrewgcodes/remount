@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/broker"
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/control"
@@ -190,6 +191,17 @@ func mustWS(t *testing.T, c *client.Client, spec proto.WorkspaceSpec) *proto.Wor
 	return ws
 }
 
+func ageArtifact(t *testing.T, root, id string, at time.Time) {
+	t.Helper()
+	digest, err := artifact.Digest(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(root, digest[:2], digest), at, at); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 
 func TestExecEndToEnd(t *testing.T) {
@@ -264,6 +276,46 @@ func TestExecEndToEnd(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if _, err := c.ReadFile(ctx, ws.ID, "src/a.txt"); err == nil {
 		t.Fatal("destroyed workspace still serves files")
+	}
+}
+
+func TestArtifactGCTracksWorkspaceReferencesAcrossDestroy(t *testing.T) {
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("gc-client")
+	ws := mustWS(t, c, proto.WorkspaceSpec{Name: "gc"})
+	ctx := ctxT(t, 60*time.Second)
+	if err := c.WriteFile(ctx, ws.ID, "keep.txt", []byte("referenced snapshot"), 0); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := c.Snapshot(ctx, ws.ID, true, client.WithIdempotencyKey("gc-snapshot"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, _, err := w.srv.Store.Put(strings.NewReader("unreferenced artifact"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	ageArtifact(t, w.artifactDir, snapshot.Artifact, now.Add(-48*time.Hour))
+	ageArtifact(t, w.artifactDir, orphan, now.Add(-48*time.Hour))
+	result, err := w.srv.CollectArtifacts(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !w.srv.Store.Has(snapshot.Artifact) || w.srv.Store.Has(orphan) || result.Removed != 1 {
+		t.Fatalf("first GC = %+v, referenced=%t orphan=%t", result,
+			w.srv.Store.Has(snapshot.Artifact), w.srv.Store.Has(orphan))
+	}
+	if err := c.DestroyWorkspace(ctx, ws.ID, client.WithIdempotencyKey("gc-destroy")); err != nil {
+		t.Fatal(err)
+	}
+	result, err = w.srv.CollectArtifacts(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.srv.Store.Has(snapshot.Artifact) || result.Removed != 1 {
+		t.Fatalf("post-destroy GC = %+v, referenced=%t", result, w.srv.Store.Has(snapshot.Artifact))
 	}
 }
 

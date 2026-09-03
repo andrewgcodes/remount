@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/eventlog"
 	"remount.dev/remount/internal/ids"
 	"remount.dev/remount/internal/metrics"
@@ -136,6 +137,16 @@ type Options struct {
 	// MaxConcurrentRequests bounds request handlers independently of relay
 	// connection count. Zero selects 128.
 	MaxConcurrentRequests int
+	// Workspace quotas count every non-destroyed workspace. Zero selects 1,000
+	// per tenant and 100 per owning subject.
+	MaxWorkspacesPerTenant  int
+	MaxWorkspacesPerSubject int
+	// Durable control-record quotas bound idempotency results and wake timers.
+	// Zero selects 100,000 total mutation records, 100,000 total timers, and
+	// 128 timers per workspace. Fired timers remain visible until retention GC.
+	MaxMutationRecords    int
+	MaxTimers             int
+	MaxTimersPerWorkspace int
 }
 
 // ArtifactStore is the part of the blob store the control plane inspects.
@@ -143,6 +154,7 @@ type ArtifactStore interface {
 	List() ([]string, error)
 	Verify(id string) error
 	Open(id string) (io.ReadCloser, int64, error)
+	Stats() artifact.StoreStats
 }
 
 // Control implements relay.Controller.
@@ -155,23 +167,25 @@ type Control struct {
 	logger *slog.Logger
 	now    func() time.Time
 
-	mu            sync.Mutex
-	workspaces    map[string]*proto.Workspace
-	timers        map[string]*proto.Timer
-	nodes         map[string]*nodeState
-	clients       map[string]*proto.Hello
-	subjects      map[string]Subject
-	idem          map[string]string
-	bindings      map[string]Binding
-	tails         map[string]map[string]*tailState // requester -> subscription -> tail
-	lifecycle     map[string]*sync.Mutex           // serializes long-running mutations per workspace
-	proofs        map[string]int64                 // recently accepted node proof -> expiry
-	producerSeq   map[string]uint64                // authenticated node -> last accepted event seq
-	producerLocks map[string]*sync.Mutex           // serialize batches from one node
-	mutationLocks map[string]*sync.Mutex           // serialize duplicate logical mutations
-	fleetOps      map[string]*proto.FleetOperation
-	fleetLocks    map[string]*sync.Mutex
-	fleetWake     chan struct{}
+	mu                    sync.Mutex
+	workspaces            map[string]*proto.Workspace
+	timers                map[string]*proto.Timer
+	nodes                 map[string]*nodeState
+	clients               map[string]*proto.Hello
+	subjects              map[string]Subject
+	idem                  map[string]string
+	bindings              map[string]Binding
+	tails                 map[string]map[string]*tailState // requester -> subscription -> tail
+	lifecycle             map[string]*sync.Mutex           // serializes long-running mutations per workspace
+	proofs                map[string]int64                 // recently accepted node proof -> expiry
+	producerSeq           map[string]uint64                // authenticated node -> last accepted event seq
+	producerLocks         map[string]*sync.Mutex           // serialize batches from one node
+	mutationLocks         map[string]*keyedMutex           // serialize duplicate logical mutations
+	fleetOps              map[string]*proto.FleetOperation
+	fleetLocks            map[string]*sync.Mutex
+	fleetWake             chan struct{}
+	timerReservations     int
+	timerReservationsByWS map[string]int
 
 	requestMu      sync.Mutex
 	requestSlots   chan struct{}
@@ -195,6 +209,17 @@ type nodeState struct {
 
 type tailState struct {
 	cancel context.CancelFunc
+}
+
+type keyedMutex struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// RecordPruneResult reports one resumable control-record retention pass.
+type RecordPruneResult struct {
+	Mutations int64
+	Timers    int64
 }
 
 type mutationWorkspaceResult struct {
@@ -222,8 +247,27 @@ func New(opts Options) (*Control, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	if opts.MaxConcurrentRequests < 0 || opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 ||
+		opts.MaxMutationRecords < 0 || opts.MaxTimers < 0 || opts.MaxTimersPerWorkspace < 0 {
+		return nil, errors.New("control: resource limits must not be negative")
+	}
 	if opts.MaxConcurrentRequests <= 0 {
 		opts.MaxConcurrentRequests = 128
+	}
+	if opts.MaxWorkspacesPerTenant <= 0 {
+		opts.MaxWorkspacesPerTenant = 1000
+	}
+	if opts.MaxWorkspacesPerSubject <= 0 {
+		opts.MaxWorkspacesPerSubject = 100
+	}
+	if opts.MaxMutationRecords <= 0 {
+		opts.MaxMutationRecords = 100_000
+	}
+	if opts.MaxTimers <= 0 {
+		opts.MaxTimers = 100_000
+	}
+	if opts.MaxTimersPerWorkspace <= 0 {
+		opts.MaxTimersPerWorkspace = 128
 	}
 	requestCtx, requestCancel := context.WithCancel(context.Background())
 	overloadLimit := opts.MaxConcurrentRequests / 8
@@ -239,9 +283,10 @@ func New(opts Options) (*Control, error) {
 		nodes: map[string]*nodeState{}, clients: map[string]*proto.Hello{}, subjects: map[string]Subject{}, idem: map[string]string{},
 		bindings: map[string]Binding{}, tails: map[string]map[string]*tailState{},
 		lifecycle: map[string]*sync.Mutex{}, proofs: map[string]int64{}, producerSeq: map[string]uint64{},
-		producerLocks: map[string]*sync.Mutex{}, mutationLocks: map[string]*sync.Mutex{},
+		producerLocks: map[string]*sync.Mutex{}, mutationLocks: map[string]*keyedMutex{},
 		fleetOps: map[string]*proto.FleetOperation{}, fleetLocks: map[string]*sync.Mutex{}, fleetWake: make(chan struct{}, 1),
-		requestSlots: make(chan struct{}, opts.MaxConcurrentRequests), overloadSlots: make(chan struct{}, overloadLimit),
+		timerReservationsByWS: map[string]int{},
+		requestSlots:          make(chan struct{}, opts.MaxConcurrentRequests), overloadSlots: make(chan struct{}, overloadLimit),
 		requestCtx: requestCtx, requestCancel: requestCancel, acceptRequests: true,
 		started: opts.Now(), stop: make(chan struct{}),
 	}
@@ -319,6 +364,7 @@ CREATE TABLE IF NOT EXISTS mutations (
 	completed_at INTEGER NOT NULL,
 	PRIMARY KEY(scope, key)
 );
+CREATE INDEX IF NOT EXISTS mutations_completed_at ON mutations(completed_at);
 CREATE TABLE IF NOT EXISTS assignments (
 	workspace TEXT NOT NULL,
 	generation INTEGER NOT NULL,
@@ -522,7 +568,11 @@ func (c *Control) load() error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
-	rows, err = c.db.Query(`SELECT node, MAX(producer_seq) FROM events WHERE node != '' AND producer_seq > 0 GROUP BY node`)
+	rows, err = c.db.Query(`SELECT node, MAX(producer_seq) FROM (
+		SELECT node, producer_seq FROM events WHERE node != '' AND producer_seq > 0
+		UNION ALL
+		SELECT node, producer_seq FROM event_producers WHERE node != '' AND producer_seq > 0
+	) GROUP BY node`)
 	if err != nil {
 		return err
 	}
@@ -570,6 +620,123 @@ func (c *Control) persistFleetOperation(operation *proto.FleetOperation) error {
 	_, err := c.db.Exec(`INSERT OR REPLACE INTO fleet_operations(id, data) VALUES(?,?)`,
 		operation.ID, proto.MustMarshal(operation))
 	return err
+}
+
+// WithArtifactReferences invokes fn while workspace and fleet-operation
+// references are stable. Garbage collection uses this critical section so an
+// artifact cannot become referenced between the mark check and its unlink.
+// The callback must not call back into Control.
+func (c *Control) WithArtifactReferences(fn func([]string) error) error {
+	if fn == nil {
+		return errors.New("control: artifact reference callback is required")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	set := make(map[string]struct{})
+	for _, ws := range c.workspaces {
+		if ws.State == proto.WSDestroyed {
+			continue
+		}
+		if ws.Spec.RestoreFrom != "" {
+			set[ws.Spec.RestoreFrom] = struct{}{}
+		}
+		if ws.LastSnapshot != "" {
+			set[ws.LastSnapshot] = struct{}{}
+		}
+	}
+	for _, operation := range c.fleetOps {
+		for _, target := range operation.Results {
+			if target.Snapshot != "" {
+				set[target.Snapshot] = struct{}{}
+			}
+		}
+	}
+	references := make([]string, 0, len(set))
+	for id := range set {
+		references = append(references, id)
+	}
+	sort.Strings(references)
+	return fn(references)
+}
+
+// PruneRecords removes completed idempotency results and fired timers older
+// than before. Pending timers and mutation intents are never eligible. The
+// bounded pass is safe to resume after interruption because the database and
+// in-memory timer index change only after the transaction commits.
+func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int) (RecordPruneResult, error) {
+	if limit <= 0 {
+		limit = 10_000
+	}
+	type timerCandidate struct {
+		id string
+		at int64
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	candidates := make([]timerCandidate, 0)
+	cutoff := before.UnixMilli()
+	for _, timer := range c.timers {
+		if !timer.Fired {
+			continue
+		}
+		at := timer.FiredAt
+		if at == 0 {
+			// Compatibility with records written before FiredAt existed.
+			at = timer.CreatedAt
+		}
+		if at < cutoff {
+			candidates = append(candidates, timerCandidate{id: timer.ID, at: at})
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].at == candidates[j].at {
+			return candidates[i].id < candidates[j].id
+		}
+		return candidates[i].at < candidates[j].at
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return RecordPruneResult{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	for _, candidate := range candidates {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM timers WHERE id=?`, candidate.id); err != nil {
+			return RecordPruneResult{}, err
+		}
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM mutations WHERE rowid IN (
+		SELECT rowid FROM mutations WHERE completed_at < ? ORDER BY completed_at, rowid LIMIT ?
+	)`, cutoff, limit)
+	if err != nil {
+		return RecordPruneResult{}, err
+	}
+	mutations, err := res.RowsAffected()
+	if err != nil {
+		return RecordPruneResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return RecordPruneResult{}, err
+	}
+	committed = true
+	for _, candidate := range candidates {
+		delete(c.timers, candidate.id)
+	}
+	result := RecordPruneResult{Mutations: mutations, Timers: int64(len(candidates))}
+	if result.Mutations > 0 {
+		metrics.MutationsPruned.Add(uint64(result.Mutations))
+	}
+	if result.Timers > 0 {
+		metrics.TimersPruned.Add(uint64(result.Timers))
+	}
+	return result, nil
 }
 
 func (c *Control) persistFleetOperationAndMutation(operation *proto.FleetOperation, scope, key string, request any) error {
@@ -1353,6 +1520,41 @@ func (c *Control) wsCreate(ctx context.Context, subject Subject, req *proto.WSCr
 			return nil, proto.Err(proto.CodeNotFound, "binding %q is not defined", b)
 		}
 	}
+	if req.Spec.RestoreFrom != "" {
+		if c.opts.Artifacts == nil {
+			c.mu.Unlock()
+			return nil, proto.Err(proto.CodeUnsupported, "artifact restore is unavailable")
+		}
+		r, _, err := c.opts.Artifacts.Open(req.Spec.RestoreFrom)
+		if err != nil {
+			c.mu.Unlock()
+			return nil, proto.Err(proto.CodeNotFound, "restore artifact %q is unavailable: %v", req.Spec.RestoreFrom, err)
+		}
+		if err := r.Close(); err != nil {
+			c.mu.Unlock()
+			return nil, proto.Err(proto.CodeInternal, "close restore artifact %q: %v", req.Spec.RestoreFrom, err)
+		}
+	}
+	tenantWorkspaces, subjectWorkspaces := 0, 0
+	for _, existing := range c.workspaces {
+		if existing.State == proto.WSDestroyed || existing.Tenant != subject.Tenant {
+			continue
+		}
+		tenantWorkspaces++
+		if existing.Owner == subject.ID {
+			subjectWorkspaces++
+		}
+	}
+	if tenantWorkspaces >= c.opts.MaxWorkspacesPerTenant {
+		c.mu.Unlock()
+		metrics.WorkspaceQuotaRejected.Inc()
+		return nil, proto.Err(proto.CodeResourceExhausted, "tenant workspace limit %d reached", c.opts.MaxWorkspacesPerTenant)
+	}
+	if subjectWorkspaces >= c.opts.MaxWorkspacesPerSubject {
+		c.mu.Unlock()
+		metrics.WorkspaceQuotaRejected.Inc()
+		return nil, proto.Err(proto.CodeResourceExhausted, "subject workspace limit %d reached", c.opts.MaxWorkspacesPerSubject)
+	}
 	now := c.now().UnixMilli()
 	ws := &proto.Workspace{
 		ID: ids.New("ws"), Spec: req.Spec, State: proto.WSPending, CreatedAt: now, UpdatedAt: now,
@@ -1473,12 +1675,54 @@ func (c *Control) lockMutation(scope, key string) func() {
 	c.mu.Lock()
 	lock := c.mutationLocks[name]
 	if lock == nil {
-		lock = &sync.Mutex{}
+		lock = &keyedMutex{}
 		c.mutationLocks[name] = lock
 	}
+	lock.refs++
 	c.mu.Unlock()
-	lock.Lock()
-	return lock.Unlock
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		c.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 && c.mutationLocks[name] == lock {
+			delete(c.mutationLocks, name)
+		}
+		c.mu.Unlock()
+	}
+}
+
+func (c *Control) reserveTimer(workspace string) (func(), error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.timers)+c.timerReservations >= c.opts.MaxTimers {
+		metrics.TimerQuotaRejected.Inc()
+		return nil, proto.Err(proto.CodeResourceExhausted,
+			"control timer limit %d reached", c.opts.MaxTimers)
+	}
+	workspaceTimers := c.timerReservationsByWS[workspace]
+	for _, existing := range c.timers {
+		if existing.WS == workspace {
+			workspaceTimers++
+		}
+	}
+	if workspaceTimers >= c.opts.MaxTimersPerWorkspace {
+		metrics.TimerQuotaRejected.Inc()
+		return nil, proto.Err(proto.CodeResourceExhausted,
+			"workspace timer limit %d reached", c.opts.MaxTimersPerWorkspace)
+	}
+	c.timerReservations++
+	c.timerReservationsByWS[workspace]++
+	return func() {
+		c.mu.Lock()
+		c.timerReservations--
+		if c.timerReservationsByWS[workspace] <= 1 {
+			delete(c.timerReservationsByWS, workspace)
+		} else {
+			c.timerReservationsByWS[workspace]--
+		}
+		c.mu.Unlock()
+	}, nil
 }
 
 func mutationFingerprint(request any) []byte {
@@ -1514,6 +1758,15 @@ func (c *Control) mutationLookup(scope, key, op string, request, out any) (bool,
 func (c *Control) insertMutationTx(tx *sql.Tx, scope, key, op string, request, result any) error {
 	if key == "" {
 		return nil
+	}
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM mutations`).Scan(&count); err != nil {
+		return err
+	}
+	if count >= c.opts.MaxMutationRecords {
+		metrics.MutationQuotaRejected.Inc()
+		return proto.Err(proto.CodeResourceExhausted,
+			"control idempotency record limit %d reached", c.opts.MaxMutationRecords)
 	}
 	_, err := tx.Exec(`INSERT INTO mutations(scope, key, op, fingerprint, result, completed_at) VALUES(?,?,?,?,?,?)`,
 		scope, key, op, mutationFingerprint(request), proto.MustMarshal(result), c.now().UnixMilli())
@@ -1734,6 +1987,7 @@ func (c *Control) wsDestroy(ctx context.Context, principal, id, idem string) err
 		if timer.WS == id && !timer.Fired {
 			copyTimer := *timer
 			copyTimer.Fired = true
+			copyTimer.FiredAt = c.now().UnixMilli()
 			timerUpdates = append(timerUpdates, &copyTimer)
 		}
 	}
@@ -1942,6 +2196,11 @@ func (c *Control) wsSleep(ctx context.Context, principal string, req *proto.WSSl
 	if req.AfterSec == 0 && req.AtMillis == 0 && req.OnEvent == "" {
 		return nil, proto.Err(proto.CodeBadRequest, "sleep needs after_sec, at or on")
 	}
+	releaseTimerReservation, err := c.reserveTimer(req.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseTimerReservation()
 	snap, err := c.release(ctx, req.ID, true, "sleep")
 	if err != nil {
 		return nil, err
@@ -2022,6 +2281,7 @@ func (c *Control) wsWake(ctx context.Context, principal, id, timerID, idem strin
 		}
 		copyTimer := *timer
 		copyTimer.Fired = true
+		copyTimer.FiredAt = c.now().UnixMilli()
 		nextTimer = &copyTimer
 	}
 	next := *ws
@@ -3037,6 +3297,15 @@ func (c *Control) eventsTail(ctx context.Context, from string, subject Subject, 
 		}
 		return proto.EventPost{Events: evs}, nil
 	}
+	if req.From != 0 {
+		first, err := c.log.First(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if req.From < first {
+			return nil, &proto.Error{Code: proto.CodeEvicted, Msg: "requested events are older than retention", Oldest: first}
+		}
+	}
 	subID := req.Subscription
 	if subID == "" {
 		subID = "default"
@@ -3200,11 +3469,17 @@ func (c *Control) eventsPost(ctx context.Context, from string, req *proto.EventP
 			last := c.producerSeq[from]
 			c.mu.Unlock()
 			if producerSeq <= last {
-				duplicate, err := c.sameNodeEvent(ctx, from, producerSeq, e.Type, e.Stream, e.Payload, observedAt, workspace, generation)
+				found, duplicate, err := c.sameNodeEvent(ctx, from, producerSeq, e.Type, e.Stream, e.Payload, observedAt, workspace, generation)
 				if err != nil {
 					return err
 				}
 				if duplicate {
+					continue
+				}
+				if !found {
+					// Retention may have removed the original after its producer
+					// watermark became durable. Acknowledge the retry without
+					// changing canonical history so the node can clear its outbox.
 					continue
 				}
 				return proto.Err(proto.CodeConflict, "node event sequence %d is out of order or changed", producerSeq)
@@ -3302,7 +3577,7 @@ func (c *Control) authorizeNodeEvent(node, workspace string, generation uint64) 
 	return tenant, workspace, generation, nil
 }
 
-func (c *Control) sameNodeEvent(ctx context.Context, node string, producerSeq uint64, typ, stream string, payload []byte, observedAt int64, workspace string, generation uint64) (bool, error) {
+func (c *Control) sameNodeEvent(ctx context.Context, node string, producerSeq uint64, typ, stream string, payload []byte, observedAt int64, workspace string, generation uint64) (bool, bool, error) {
 	var storedType, storedStream, storedWorkspace string
 	var storedPayload []byte
 	var storedObserved int64
@@ -3311,12 +3586,12 @@ func (c *Control) sameNodeEvent(ctx context.Context, node string, producerSeq ui
 		FROM events WHERE origin='node' AND event_id=?`, fmt.Sprintf("%s:%d", node, producerSeq)).
 		Scan(&storedType, &storedStream, &storedPayload, &storedObserved, &storedWorkspace, &storedGeneration)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return false, false, nil
 	}
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	return storedType == typ && storedStream == stream && bytes.Equal(storedPayload, payload) &&
+	return true, storedType == typ && storedStream == stream && bytes.Equal(storedPayload, payload) &&
 		storedObserved == observedAt && storedWorkspace == workspace && storedGeneration == generation, nil
 }
 

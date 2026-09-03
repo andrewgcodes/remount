@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -391,6 +392,12 @@ func (f *FS) Search(p, pattern, glob string, max int) (*proto.FSSearchRes, error
 					return errStop
 				}
 			}
+		}
+		if err := sc.Err(); err != nil {
+			if strings.Contains(err.Error(), "token too long") {
+				return proto.Err(proto.CodeResourceExhausted, "search line in %s exceeds 1048576 bytes", rel)
+			}
+			return fmt.Errorf("search %s: %w", rel, err)
 		}
 		return nil
 	})

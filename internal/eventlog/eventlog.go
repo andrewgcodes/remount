@@ -26,8 +26,13 @@ type Store interface {
 	// Read returns up to limit events with seq >= from, optionally filtered
 	// by stream (workspace or node id).
 	Read(ctx context.Context, from uint64, stream string, limit int) ([]proto.Event, error)
-	// Last returns the highest assigned seq (0 if empty).
+	// First returns the oldest retained sequence. It is one past the last
+	// assigned sequence when the store is empty after retention.
+	First(ctx context.Context) (uint64, error)
+	// Last returns the highest assigned seq (0 only if none was ever assigned).
 	Last(ctx context.Context) (uint64, error)
+	// Prune removes at most limit events older than beforeMillis.
+	Prune(ctx context.Context, beforeMillis int64, limit int) (int64, error)
 	Close() error
 }
 
@@ -82,11 +87,36 @@ func (l *Log) Append(ctx context.Context, e *proto.Event) error {
 
 // Read delegates to the store.
 func (l *Log) Read(ctx context.Context, from uint64, stream string, limit int) ([]proto.Event, error) {
+	first, err := l.store.First(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if from == 0 {
+		from = first
+	} else if from < first {
+		return nil, &proto.Error{Code: proto.CodeEvicted, Msg: "requested events are older than retention", Oldest: first}
+	}
 	return l.store.Read(ctx, from, stream, limit)
 }
 
+// First returns the oldest retained event sequence.
+func (l *Log) First(ctx context.Context) (uint64, error) { return l.store.First(ctx) }
+
 // Last delegates to the store.
 func (l *Log) Last(ctx context.Context) (uint64, error) { return l.store.Last(ctx) }
+
+// Prune removes old events while serialized with appends and fan-out. A
+// subscriber that subsequently asks below First receives CodeEvicted rather
+// than a silently incomplete history.
+func (l *Log) Prune(ctx context.Context, beforeMillis int64, limit int) (int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n, err := l.store.Prune(ctx, beforeMillis, limit)
+	if n > 0 {
+		metrics.EventsPruned.Add(uint64(n))
+	}
+	return n, err
+}
 
 // Close closes the store.
 func (l *Log) Close() error { return l.store.Close() }
@@ -266,6 +296,30 @@ func (m *Memory) Last(ctx context.Context) (uint64, error) {
 	return m.next - 1, nil
 }
 
+func (m *Memory) First(context.Context) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.first, nil
+}
+
+func (m *Memory) Prune(_ context.Context, beforeMillis int64, limit int) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 {
+		limit = len(m.events)
+	}
+	remove := 0
+	for remove < len(m.events) && remove < limit && m.events[remove].At < beforeMillis {
+		remove++
+	}
+	if remove == 0 {
+		return 0, nil
+	}
+	m.events = append([]proto.Event(nil), m.events[remove:]...)
+	m.first += uint64(remove)
+	return int64(remove), nil
+}
+
 func (m *Memory) Close() error { return nil }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +362,11 @@ func OpenSQLite(path string) (*SQLite, error) {
 		generation INTEGER NOT NULL DEFAULT 0,
 		operation_id TEXT NOT NULL DEFAULT '',
 		producer_seq INTEGER NOT NULL DEFAULT 0
-	); CREATE INDEX IF NOT EXISTS events_stream ON events(stream, seq);`); err != nil {
+	); CREATE INDEX IF NOT EXISTS events_stream ON events(stream, seq);
+	CREATE TABLE IF NOT EXISTS event_producers (
+		node TEXT PRIMARY KEY,
+		producer_seq INTEGER NOT NULL
+	);`); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -421,7 +479,76 @@ func (s *SQLite) Last(ctx context.Context) (uint64, error) {
 	if err := s.db.QueryRowContext(ctx, `SELECT MAX(seq) FROM events`).Scan(&last); err != nil {
 		return 0, err
 	}
-	return uint64(last.Int64), nil
+	if last.Valid {
+		return uint64(last.Int64), nil
+	}
+	var assigned sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT seq FROM sqlite_sequence WHERE name='events'`).Scan(&assigned); errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	}
+	return uint64(assigned.Int64), nil
+}
+
+func (s *SQLite) First(ctx context.Context) (uint64, error) {
+	var first sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT MIN(seq) FROM events`).Scan(&first); err != nil {
+		return 0, err
+	}
+	if first.Valid {
+		return uint64(first.Int64), nil
+	}
+	var assigned sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT seq FROM sqlite_sequence WHERE name='events'`).Scan(&assigned); errors.Is(err, sql.ErrNoRows) {
+		return 1, nil
+	} else if err != nil {
+		return 0, err
+	}
+	return uint64(assigned.Int64) + 1, nil
+}
+
+func (s *SQLite) Prune(ctx context.Context, beforeMillis int64, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 10_000
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO event_producers(node, producer_seq)
+		SELECT node, MAX(producer_seq) FROM events
+		WHERE origin='node' AND node != '' AND producer_seq > 0 GROUP BY node
+		ON CONFLICT(node) DO UPDATE SET producer_seq=MAX(producer_seq, excluded.producer_seq)`); err != nil {
+		return 0, err
+	}
+	// Remove only a contiguous prefix. Even if the wall clock moved backward,
+	// retention must never punch silent holes into the middle of sequence space.
+	res, err := tx.ExecContext(ctx, `DELETE FROM events WHERE seq IN (
+		SELECT seq FROM events
+		WHERE seq < COALESCE((SELECT MIN(seq) FROM events WHERE at >= ?), 9223372036854775807)
+		ORDER BY seq LIMIT ?
+	)`, beforeMillis, limit)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	committed = true
+	return n, nil
 }
 
 func (s *SQLite) Close() error { return s.db.Close() }

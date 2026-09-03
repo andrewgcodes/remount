@@ -93,6 +93,58 @@ func TestArtifactPutEnforcesDeclaredAndStreamingLimits(t *testing.T) {
 	}
 }
 
+func TestArtifactPutEnforcesStoreCapacityAndAllowsDigestRetry(t *testing.T) {
+	s := newTestServer(t, Options{
+		MaxArtifactBytes: 1024, MaxArtifactStoreBytes: 4, MaxArtifactObjects: 1,
+		ArtifactGCInterval: -1,
+	})
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/v1/artifacts/"+testDigest(body), strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := put("1234"); rec.Code != http.StatusOK {
+		t.Fatalf("initial PUT = %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := put("1234"); rec.Code != http.StatusOK {
+		t.Fatalf("idempotent PUT at capacity = %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := put("x"); rec.Code != http.StatusInsufficientStorage {
+		t.Fatalf("over-capacity PUT = %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.Store.Has(testDigest("x")) {
+		t.Fatal("over-capacity object was published")
+	}
+}
+
+func TestEventRetentionPrunesPrefixAndExposesOldestSequence(t *testing.T) {
+	s := newTestServer(t, Options{
+		EventRetention: time.Hour, EventGCInterval: -1, ArtifactGCInterval: -1,
+	})
+	now := time.Now()
+	for _, at := range []time.Time{now.Add(-2 * time.Hour), now.Add(-90 * time.Minute), now} {
+		if err := s.Log.Append(context.Background(), &proto.Event{Type: "retention", At: at.UnixMilli()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed, err := s.PruneEvents(context.Background(), now)
+	if err != nil || removed != 2 {
+		t.Fatalf("PruneEvents = (%d, %v)", removed, err)
+	}
+	first, err := s.Log.First(context.Background())
+	if err != nil || first != 3 {
+		t.Fatalf("First = (%d, %v)", first, err)
+	}
+	if _, err := s.Log.Read(context.Background(), 1, "", 10); !errors.Is(err, &proto.Error{Code: proto.CodeEvicted}) {
+		t.Fatalf("old event read = %v", err)
+	}
+	events, err := s.Log.Read(context.Background(), 0, "", 10)
+	if err != nil || len(events) != 1 || events[0].Seq != 3 {
+		t.Fatalf("retained events = %+v, %v", events, err)
+	}
+}
+
 func TestServeWaitReadyHealthAndIdempotentClose(t *testing.T) {
 	s := newTestServer(t, Options{})
 	ctx, cancel := context.WithCancel(context.Background())

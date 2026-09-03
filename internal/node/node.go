@@ -54,6 +54,10 @@ type Options struct {
 	// MaxArtifactBytes bounds compressed snapshots and remote downloads.
 	// Zero selects 8 GiB.
 	MaxArtifactBytes int64
+	// MaxArtifactStoreBytes and MaxArtifactObjects bound this node's snapshot
+	// cache, including concurrent staging. Zero selects 32 GiB / 50,000.
+	MaxArtifactStoreBytes int64
+	MaxArtifactObjects    int
 	// Package connector cache limits. Zero values select conservative node,
 	// workspace, and object defaults in connector.NewStore.
 	MaxConnectorCacheBytes     int64
@@ -73,6 +77,22 @@ type Options struct {
 	// MaxConcurrentRequests bounds request handlers independently of relay
 	// connection count. Zero selects 128.
 	MaxConcurrentRequests int
+	// Session limits bound retained logs and live processes/connections.
+	MaxSessions             int
+	MaxActiveSessions       int
+	MaxSessionsPerWorkspace int
+	MaxSessionsPerPrincipal int
+	// MutationRetention is the replay window for completed node-side
+	// idempotency results. Pending/ambiguous intents are never pruned. Zero
+	// selects 30 days; MaxMutationRecords defaults to 10,000.
+	MutationRetention  time.Duration
+	MaxMutationRecords int
+	// Snapshot admission bounds concurrent archive construction across the
+	// node and user-requested snapshot frequency per workspace. Lifecycle
+	// checkpoints bypass the frequency limit but still share the concurrency
+	// budget. Zero selects 4 concurrent snapshots and a one-second interval.
+	MaxConcurrentSnapshots int
+	SnapshotMinInterval    time.Duration
 }
 
 // Node is the supervisor.
@@ -104,9 +124,11 @@ type Node struct {
 	committed     map[string]uint64 // idempotent release commits by workspace
 	eventClaims   map[string]eventClaim
 
-	mutationMu   sync.Mutex
-	mutations    map[string]*mutationEntry
-	mutationPath string
+	mutationMu    sync.Mutex
+	mutations     map[string]*mutationEntry
+	mutationPath  string
+	snapshotMu    sync.Mutex
+	snapshotSlots chan struct{}
 
 	requestMu      sync.Mutex
 	requestSlots   chan struct{}
@@ -127,9 +149,10 @@ type Node struct {
 // ws is a claimed workspace on this node.
 type ws struct {
 	proto.Workspace
-	handle workspace.Handle
-	broker *broker.Broker
-	leases []proto.BindingLease
+	handle       workspace.Handle
+	broker       *broker.Broker
+	leases       []proto.BindingLease
+	lastSnapshot time.Time
 }
 
 // subscriber streams one session's log to one client.
@@ -182,9 +205,8 @@ type persistedMutation struct {
 }
 
 const (
-	mutationPending    = "pending"
-	mutationCompleted  = "completed"
-	maxMutationRecords = 10_000
+	mutationPending   = "pending"
+	mutationCompleted = "completed"
 )
 
 // New loads or creates the node identity and prepares runtime state.
@@ -198,11 +220,36 @@ func New(opts Options) (*Node, error) {
 	if opts.HTTPClient == nil {
 		opts.HTTPClient = &http.Client{Timeout: 10 * time.Minute}
 	}
-	if opts.MaxArtifactBytes <= 0 {
+	if opts.MaxArtifactBytes < 0 || opts.MaxArtifactStoreBytes < 0 || opts.MaxArtifactObjects < 0 ||
+		opts.MaxSessions < 0 || opts.MaxActiveSessions < 0 || opts.MaxSessionsPerWorkspace < 0 ||
+		opts.MaxSessionsPerPrincipal < 0 || opts.MaxConcurrentRequests < 0 ||
+		opts.MutationRetention < 0 || opts.MaxMutationRecords < 0 || opts.MaxConcurrentSnapshots < 0 ||
+		opts.SnapshotMinInterval < 0 {
+		return nil, errors.New("node: resource limits must not be negative")
+	}
+	if opts.MaxArtifactBytes == 0 {
 		opts.MaxArtifactBytes = 8 << 30
+	}
+	if opts.MaxArtifactStoreBytes == 0 {
+		opts.MaxArtifactStoreBytes = 32 << 30
+	}
+	if opts.MaxArtifactObjects == 0 {
+		opts.MaxArtifactObjects = 50_000
 	}
 	if opts.MaxConcurrentRequests <= 0 {
 		opts.MaxConcurrentRequests = 128
+	}
+	if opts.MutationRetention == 0 {
+		opts.MutationRetention = 30 * 24 * time.Hour
+	}
+	if opts.MaxMutationRecords == 0 {
+		opts.MaxMutationRecords = 10_000
+	}
+	if opts.MaxConcurrentSnapshots == 0 {
+		opts.MaxConcurrentSnapshots = 4
+	}
+	if opts.SnapshotMinInterval == 0 {
+		opts.SnapshotMinInterval = time.Second
 	}
 	for _, d := range []string{"", "ws", "spill", "artifacts"} {
 		if err := os.MkdirAll(filepath.Join(opts.DataDir, d), 0o700); err != nil {
@@ -220,7 +267,9 @@ func New(opts Options) (*Node, error) {
 		}
 		opts.Backends = workspace.NewRegistry(pb)
 	}
-	store, err := artifact.NewStore(filepath.Join(opts.DataDir, "artifacts"))
+	store, err := artifact.NewStoreWithOptions(filepath.Join(opts.DataDir, "artifacts"), artifact.StoreOptions{
+		MaxBytes: opts.MaxArtifactStoreBytes, MaxObjects: opts.MaxArtifactObjects,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -253,12 +302,15 @@ func New(opts Options) (*Node, error) {
 		prepared: map[string]*preparedRelease{}, committed: map[string]uint64{},
 		eventClaims: map[string]eventClaim{},
 		mutations:   mutations, mutationPath: mutationPath,
-		requestSlots: make(chan struct{}, opts.MaxConcurrentRequests), overloadSlots: make(chan struct{}, overloadLimit),
+		snapshotSlots: make(chan struct{}, opts.MaxConcurrentSnapshots),
+		requestSlots:  make(chan struct{}, opts.MaxConcurrentRequests), overloadSlots: make(chan struct{}, overloadLimit),
 		requestCtx: requestCtx, requestCancel: requestCancel, acceptRequests: true,
 		started: time.Now(), stop: make(chan struct{}), online: make(chan struct{}),
 	}
 	n.sessions = session.NewManager(session.ManagerOptions{
 		SpillDir: filepath.Join(opts.DataDir, "spill"), MemBytes: 2 << 20, SpillBytes: 128 << 20,
+		MaxSessions: opts.MaxSessions, MaxActive: opts.MaxActiveSessions, MaxSessionsPerWorkspace: opts.MaxSessionsPerWorkspace,
+		MaxSessionsPerPrincipal: opts.MaxSessionsPerPrincipal,
 		OnExit: func(s *session.Session, info proto.ExitInfo) {
 			n.emit(proto.EvSExited, s.WS, s.Principal, map[string]any{"s": s.ID, "code": info.Code, "signal": info.Signal})
 		},
@@ -279,6 +331,10 @@ func loadMutations(path string) (map[string]*mutationEntry, error) {
 	if err := proto.Unmarshal(b, &stored); err != nil {
 		return nil, fmt.Errorf("node: corrupt mutation journal: %w", err)
 	}
+	legacyCompletedAt := time.Now().UnixMilli()
+	if info, statErr := os.Stat(path); statErr == nil {
+		legacyCompletedAt = info.ModTime().UnixMilli()
+	}
 	for key, record := range stored {
 		if len(record.Fingerprint) != sha256.Size {
 			return nil, fmt.Errorf("node: corrupt mutation journal fingerprint for %q", key)
@@ -291,6 +347,9 @@ func loadMutations(path string) (map[string]*mutationEntry, error) {
 		}
 		if state != mutationPending && state != mutationCompleted {
 			return nil, fmt.Errorf("node: corrupt mutation journal state %q for %q", state, key)
+		}
+		if state == mutationCompleted && record.CompletedAt == 0 {
+			record.CompletedAt = legacyCompletedAt
 		}
 		entry := &mutationEntry{
 			State: state, Result: append([]byte(nil), record.Result...),
@@ -305,6 +364,34 @@ func loadMutations(path string) (map[string]*mutationEntry, error) {
 		out[key] = entry
 	}
 	return out, nil
+}
+
+func (n *Node) pruneExpiredMutationsLocked(now time.Time) map[string]*mutationEntry {
+	retention := n.opts.MutationRetention
+	if retention <= 0 {
+		retention = 30 * 24 * time.Hour
+	}
+	cutoff := now.Add(-retention).UnixMilli()
+	removed := make(map[string]*mutationEntry)
+	for key, entry := range n.mutations {
+		if entry.State == mutationCompleted && entry.CompletedAt > 0 && entry.CompletedAt < cutoff {
+			removed[key] = entry
+			delete(n.mutations, key)
+		}
+	}
+	return removed
+}
+
+func (n *Node) restorePrunedMutationsLocked(removed map[string]*mutationEntry) {
+	for key, entry := range removed {
+		n.mutations[key] = entry
+	}
+}
+
+func recordMutationPrune(removed map[string]*mutationEntry) {
+	if len(removed) > 0 {
+		metrics.MutationsPruned.Add(uint64(len(removed)))
+	}
 }
 
 func (n *Node) persistMutationsLocked() error {
@@ -362,10 +449,27 @@ func (n *Node) runMutation(ctx context.Context, key string, request any, apply f
 	}
 	fingerprint := sha256.Sum256(proto.MustMarshal(request))
 	n.mutationMu.Lock()
+	pruned := n.pruneExpiredMutationsLocked(time.Now())
 	if existing := n.mutations[key]; existing != nil {
 		if existing.Fingerprint != fingerprint {
+			if len(pruned) > 0 {
+				if err := n.persistMutationsLocked(); err != nil {
+					n.restorePrunedMutationsLocked(pruned)
+					n.mutationMu.Unlock()
+					return nil, proto.Err(proto.CodeInternal, "persist mutation retention: %v", err)
+				}
+				recordMutationPrune(pruned)
+			}
 			n.mutationMu.Unlock()
 			return nil, proto.Err(proto.CodeConflict, "idempotency key was reused with different arguments")
+		}
+		if len(pruned) > 0 {
+			if err := n.persistMutationsLocked(); err != nil {
+				n.restorePrunedMutationsLocked(pruned)
+				n.mutationMu.Unlock()
+				return nil, proto.Err(proto.CodeInternal, "persist mutation retention: %v", err)
+			}
+			recordMutationPrune(pruned)
 		}
 		done := existing.done
 		n.mutationMu.Unlock()
@@ -388,10 +492,23 @@ func (n *Node) runMutation(ctx context.Context, key string, request any, apply f
 		}
 		return result, err
 	}
-	if len(n.mutations) >= maxMutationRecords {
+	maxRecords := n.opts.MaxMutationRecords
+	if maxRecords <= 0 {
+		maxRecords = 10_000
+	}
+	if len(n.mutations) >= maxRecords {
+		if len(pruned) > 0 {
+			if err := n.persistMutationsLocked(); err != nil {
+				n.restorePrunedMutationsLocked(pruned)
+				n.mutationMu.Unlock()
+				return nil, proto.Err(proto.CodeInternal, "persist mutation retention: %v", err)
+			}
+			recordMutationPrune(pruned)
+		}
 		n.mutationMu.Unlock()
+		metrics.MutationQuotaRejected.Inc()
 		return nil, proto.Err(proto.CodeResourceExhausted,
-			"node mutation journal contains %d records", maxMutationRecords)
+			"node mutation journal contains %d records", maxRecords)
 	}
 	entry := &mutationEntry{
 		Fingerprint: fingerprint, State: mutationPending, CompletedAt: time.Now().UnixMilli(),
@@ -400,11 +517,13 @@ func (n *Node) runMutation(ctx context.Context, key string, request any, apply f
 	n.mutations[key] = entry
 	if err := n.persistMutationsLocked(); err != nil {
 		delete(n.mutations, key)
+		n.restorePrunedMutationsLocked(pruned)
 		entry.err = proto.Err(proto.CodeInternal, "persist mutation intent before execution: %v", err)
 		close(entry.done)
 		n.mutationMu.Unlock()
 		return nil, entry.err
 	}
+	recordMutationPrune(pruned)
 	n.mutationMu.Unlock()
 
 	result, err := apply()
@@ -1424,32 +1543,38 @@ func decode[T any](f *proto.Frame) (*T, error) {
 	return &v, nil
 }
 
-// authorize checks the grant for (client, ws); grants are cached per connection.
-func (n *Node) authorize(client, wsID string, g *proto.Grant) (*ws, error) {
+// authorizeClaims checks the grant for (client, ws) and returns its signed
+// actor identity. Grants are cached per connection.
+func (n *Node) authorizeClaims(client, wsID string, g *proto.Grant) (*ws, proto.GrantClaims, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	w := n.workspaces[wsID]
 	if w == nil {
-		return nil, proto.Err(proto.CodeNotFound, "workspace %s is not on this node", wsID)
+		return nil, proto.GrantClaims{}, proto.Err(proto.CodeNotFound, "workspace %s is not on this node", wsID)
 	}
 	key := client + "|" + wsID
 	if g == nil {
 		g = n.grants[key]
 	}
 	if err := control.VerifyGrant(n.ctrlPub, g, time.Now()); err != nil {
-		return nil, err
+		return nil, proto.GrantClaims{}, err
 	}
 	if g.Claims.Client != client || g.Claims.WS != wsID || g.Claims.Node != n.id {
-		return nil, proto.Err(proto.CodeUnauthorized, "grant is for a different client, workspace or node")
+		return nil, proto.GrantClaims{}, proto.Err(proto.CodeUnauthorized, "grant is for a different client, workspace or node")
 	}
 	if g.Claims.Gen != w.Generation {
-		return nil, proto.Err(proto.CodeConflict, "grant generation %d != workspace generation %d (workspace moved?)", g.Claims.Gen, w.Generation)
+		return nil, proto.GrantClaims{}, proto.Err(proto.CodeConflict, "grant generation %d != workspace generation %d (workspace moved?)", g.Claims.Gen, w.Generation)
 	}
 	if g.Claims.Tenant != w.Tenant || g.Claims.AuthzRevision != w.AuthzRevision {
-		return nil, proto.Err(proto.CodeUnauthorized, "grant authorization revision or tenant is stale")
+		return nil, proto.GrantClaims{}, proto.Err(proto.CodeUnauthorized, "grant authorization revision or tenant is stale")
 	}
 	n.grants[key] = g
-	return w, nil
+	return w, g.Claims, nil
+}
+
+func (n *Node) authorize(client, wsID string, g *proto.Grant) (*ws, error) {
+	w, _, err := n.authorizeClaims(client, wsID, g)
+	return w, err
 }
 
 // mutationKey scopes caller-selected keys to the authenticated subject,
@@ -1471,6 +1596,17 @@ func (n *Node) mutationKey(client, wsID, op, key string) string {
 		Tenant, Principal, Workspace, Operation, Key string
 	}{tenant, principal, wsID, op, key}))
 	return fmt.Sprintf("mutation:%x", sum[:])
+}
+
+func sessionOpenKey(claims proto.GrantClaims, wsID, kind, key string) string {
+	// Authenticator-produced tenant and principal strings are opaque. Hash a
+	// structured encoding instead of joining them with a delimiter, which
+	// would let distinct identities alias if a custom authenticator admitted
+	// that delimiter.
+	sum := sha256.Sum256(proto.MustMarshal(struct {
+		Tenant, Principal, Workspace, Kind, Key string
+	}{claims.Tenant, claims.Principal, wsID, kind, key}))
+	return fmt.Sprintf("session:%x", sum[:])
 }
 
 func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) (any, error) {
@@ -1542,21 +1678,21 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		w, err := n.authorize(f.From, req.WS, req.Grant)
+		w, claims, err := n.authorizeClaims(f.From, req.WS, req.Grant)
 		if err != nil {
 			return nil, err
 		}
-		return n.sOpen(ctx, p, f.From, w, req)
+		return n.sOpen(ctx, p, f.From, claims, w, req)
 	case proto.OpPortOpen:
 		req, err := decode[proto.PortOpenReq](f)
 		if err != nil {
 			return nil, err
 		}
-		w, err := n.authorize(f.From, req.WS, req.Grant)
+		w, claims, err := n.authorizeClaims(f.From, req.WS, req.Grant)
 		if err != nil {
 			return nil, err
 		}
-		return n.portOpen(ctx, p, f.From, w, req)
+		return n.portOpen(ctx, p, f.From, claims, w, req)
 	case proto.OpSAttach:
 		req, err := decode[proto.SAttachReq](f)
 		if err != nil {
@@ -1831,7 +1967,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		clean.Grant = nil
 		key := n.mutationKey(f.From, w.ID, proto.OpWSSnapshot, req.IdempotencyKey)
 		raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
-			id, size, err := n.snapshot(ctx, w, req.Upload)
+			id, size, err := n.snapshotExplicit(ctx, w, req.Upload)
 			if err != nil {
 				return nil, err
 			}
@@ -1906,7 +2042,7 @@ func (n *Node) status() proto.NodeStatus {
 // sessions and streaming
 // ---------------------------------------------------------------------------
 
-func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, w *ws, req *proto.SOpenReq) (any, error) {
+func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, claims proto.GrantClaims, w *ws, req *proto.SOpenReq) (any, error) {
 	env := map[string]string{}
 	for k, v := range w.Spec.Env {
 		env[k] = v
@@ -1927,10 +2063,10 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, w *w
 	spec := session.Spec{
 		WS: w.ID, Kind: req.Kind, Program: req.Program, Cwd: req.Cwd, Env: envList,
 		Rows: req.Rows, Cols: req.Cols, Stdin: req.Stdin, IdempotencyKey: req.IdempotencyKey,
-		Principal: w.Spec.Principal,
+		Principal: claims.Principal, Tenant: claims.Tenant,
 	}
 	if req.IdempotencyKey != "" {
-		spec.IdempotencyKey = client + "|" + w.ID + "|" + req.IdempotencyKey
+		spec.IdempotencyKey = sessionOpenKey(claims, w.ID, proto.SessionExec, req.IdempotencyKey)
 	}
 	if req.TimeoutSec > 0 {
 		spec.Timeout = time.Duration(req.TimeoutSec) * time.Second
@@ -1942,23 +2078,23 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, w *w
 	if err != nil {
 		return nil, err
 	}
-	n.emit(proto.EvSOpened, w.ID, w.Spec.Principal, map[string]any{"s": s.ID, "kind": req.Kind, "program": req.Program, "client": client})
+	n.emit(proto.EvSOpened, w.ID, claims.Principal, map[string]any{"s": s.ID, "kind": req.Kind, "program": req.Program, "client": client})
 	if !req.NoSubscribe {
 		n.subscribe(p, client, s, 0)
 	}
 	return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq()}, nil
 }
 
-func (n *Node) portOpen(ctx context.Context, p *transport.Peer, client string, w *ws, req *proto.PortOpenReq) (any, error) {
+func (n *Node) portOpen(ctx context.Context, p *transport.Peer, client string, claims proto.GrantClaims, w *ws, req *proto.PortOpenReq) (any, error) {
 	if req.Host != "" {
 		return nil, proto.Err(proto.CodeDenied, "port.open host is backend-controlled")
 	}
 	if req.Port < 1 || req.Port > 65535 {
 		return nil, proto.Err(proto.CodeBadRequest, "port must be between 1 and 65535")
 	}
-	spec := session.Spec{WS: w.ID, Kind: proto.SessionPort, Host: req.Host, Port: req.Port, Principal: w.Spec.Principal}
+	spec := session.Spec{WS: w.ID, Kind: proto.SessionPort, Host: req.Host, Port: req.Port, Principal: claims.Principal, Tenant: claims.Tenant}
 	if req.IdempotencyKey != "" {
-		spec.IdempotencyKey = client + "|" + w.ID + "|port|" + req.IdempotencyKey
+		spec.IdempotencyKey = sessionOpenKey(claims, w.ID, proto.SessionPort, req.IdempotencyKey)
 	}
 	if err := w.handle.Prepare(&spec); err != nil {
 		return nil, err
@@ -2310,6 +2446,56 @@ func (n *Node) fetchArtifact(ctx context.Context, id string) (io.ReadCloser, err
 }
 
 func (n *Node) snapshot(ctx context.Context, w *ws, upload bool) (string, int64, error) {
+	release, err := n.acquireSnapshot(ctx, w, false)
+	if err != nil {
+		return "", 0, err
+	}
+	defer release()
+	return n.snapshotRaw(ctx, w, upload)
+}
+
+func (n *Node) snapshotExplicit(ctx context.Context, w *ws, upload bool) (string, int64, error) {
+	release, err := n.acquireSnapshot(ctx, w, true)
+	if err != nil {
+		return "", 0, err
+	}
+	defer release()
+	return n.snapshotRaw(ctx, w, upload)
+}
+
+func (n *Node) acquireSnapshot(ctx context.Context, w *ws, explicit bool) (func(), error) {
+	if explicit {
+		select {
+		case n.snapshotSlots <- struct{}{}:
+		default:
+			metrics.SnapshotQuotaRejected.Inc()
+			return nil, proto.Err(proto.CodeResourceExhausted,
+				"node concurrent snapshot limit %d reached", cap(n.snapshotSlots))
+		}
+	} else {
+		select {
+		case n.snapshotSlots <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if explicit {
+		now := time.Now()
+		n.snapshotMu.Lock()
+		if !w.lastSnapshot.IsZero() && now.Sub(w.lastSnapshot) < n.opts.SnapshotMinInterval {
+			n.snapshotMu.Unlock()
+			<-n.snapshotSlots
+			metrics.SnapshotQuotaRejected.Inc()
+			return nil, proto.Err(proto.CodeResourceExhausted,
+				"workspace snapshot interval %s has not elapsed", n.opts.SnapshotMinInterval)
+		}
+		w.lastSnapshot = now
+		n.snapshotMu.Unlock()
+	}
+	return func() { <-n.snapshotSlots }, nil
+}
+
+func (n *Node) snapshotRaw(ctx context.Context, w *ws, upload bool) (string, int64, error) {
 	// .remount is node-local truth and must never travel with the workspace.
 	excludes := append([]string{EnvFileDir}, w.Spec.Exclude...)
 	pr, pw := io.Pipe()

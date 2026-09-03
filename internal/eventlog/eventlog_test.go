@@ -2,6 +2,7 @@ package eventlog
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -137,7 +138,10 @@ func TestMemoryBounded(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		l.Emit(ctx, "e", "", "", "", nil, 0)
 	}
-	evs, _ := l.Read(ctx, 1, "", 0)
+	if _, err := l.Read(ctx, 1, "", 0); !errors.Is(err, &proto.Error{Code: proto.CodeEvicted}) {
+		t.Fatalf("retention gap error = %v", err)
+	}
+	evs, _ := l.Read(ctx, 0, "", 0)
 	if len(evs) != 3 || evs[0].Seq != 3 {
 		t.Fatalf("%+v", evs)
 	}
@@ -162,6 +166,74 @@ func TestSQLitePersistsAcrossOpen(t *testing.T) {
 	s2.Append(context.Background(), e)
 	if e.Seq != 2 {
 		t.Fatal(e.Seq)
+	}
+}
+
+func TestPruneReportsRetentionGapAndNeverPunchesMiddleHole(t *testing.T) {
+	for name, st := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			defer st.Close()
+			l := New(st)
+			ctx := context.Background()
+			for _, at := range []int64{1, 100, 2} {
+				if err := l.Append(ctx, &proto.Event{Type: "test", At: at}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			removed, err := l.Prune(ctx, 50, 10)
+			if err != nil || removed != 1 {
+				t.Fatalf("first prune = (%d, %v)", removed, err)
+			}
+			first, _ := l.First(ctx)
+			if first != 2 {
+				t.Fatalf("first retained = %d, want 2", first)
+			}
+			if _, err := l.Read(ctx, 1, "", 10); !errors.Is(err, &proto.Error{Code: proto.CodeEvicted}) {
+				t.Fatalf("read below retention = %v", err)
+			} else {
+				var protocolErr *proto.Error
+				if !errors.As(err, &protocolErr) || protocolErr.Oldest != 2 {
+					t.Fatalf("retention error = %+v", protocolErr)
+				}
+			}
+			events, err := l.Read(ctx, 0, "", 10)
+			if err != nil || len(events) != 2 || events[0].Seq != 2 || events[1].Seq != 3 {
+				t.Fatalf("retained events = %+v, %v", events, err)
+			}
+			// Bounded passes are resumable and preserve the highest assigned seq
+			// even after every row has been removed.
+			if n, err := l.Prune(ctx, 200, 1); err != nil || n != 1 {
+				t.Fatalf("second prune = (%d, %v)", n, err)
+			}
+			if n, err := l.Prune(ctx, 200, 1); err != nil || n != 1 {
+				t.Fatalf("third prune = (%d, %v)", n, err)
+			}
+			if first, _ := l.First(ctx); first != 4 {
+				t.Fatalf("first after full prune = %d, want 4", first)
+			}
+			if last, _ := l.Last(ctx); last != 3 {
+				t.Fatalf("last assigned after full prune = %d, want 3", last)
+			}
+		})
+	}
+}
+
+func TestSQLitePrunePersistsNodeProducerHighWatermark(t *testing.T) {
+	s, err := OpenSQLite(filepath.Join(t.TempDir(), "producer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	e := &proto.Event{Type: "node", At: 1, Origin: "node", Node: "n_one", ProducerSeq: 7}
+	if err := s.Append(context.Background(), e); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.Prune(context.Background(), 2, 10); err != nil || n != 1 {
+		t.Fatalf("Prune = (%d, %v)", n, err)
+	}
+	var seq uint64
+	if err := s.DB().QueryRow(`SELECT producer_seq FROM event_producers WHERE node='n_one'`).Scan(&seq); err != nil || seq != 7 {
+		t.Fatalf("producer watermark = (%d, %v)", seq, err)
 	}
 }
 
