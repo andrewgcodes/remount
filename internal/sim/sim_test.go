@@ -495,8 +495,13 @@ func TestAuthoritativeCheckpointFencesManagedProcessWriters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sessions) != 0 {
-		t.Fatalf("process writer survived checkpoint: %+v", sessions)
+	if len(sessions) == 0 {
+		t.Fatal("checkpoint discarded the terminated session replay record")
+	}
+	for _, status := range sessions {
+		if !status.Exited {
+			t.Fatalf("process writer survived checkpoint: %+v", sessions)
+		}
 	}
 }
 
