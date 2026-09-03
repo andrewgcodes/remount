@@ -17,6 +17,7 @@ import (
 
 	"github.com/creack/pty"
 
+	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/ids"
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
@@ -283,22 +284,23 @@ func (s *Session) finish(info proto.ExitInfo) {
 	s.onFinish = nil
 	s.mu.Unlock()
 	metrics.SessionsExited.Inc()
-	if _, err := s.Log.Append(proto.StreamExit, proto.MustMarshal(info)); err != nil {
+	if _, err := s.Log.appendTerminal(proto.StreamExit, proto.MustMarshal(info)); err != nil {
 		s.mu.Lock()
 		if s.exit != nil && s.exit.Error == "" {
 			s.exit.Error = "session log: " + err.Error()
 		}
 		s.mu.Unlock()
 	}
-	_ = s.Log.Close()
 	// A successful Wait must mean that the active-session admission slot is
 	// reusable. Commit manager accounting before publishing session exit; doing
 	// this in an observer after close(s.exited) left a scheduler-sized window in
 	// which a completed process could still spuriously exhaust active capacity.
-	if onFinish != nil {
-		onFinish()
-	}
-	close(s.exited)
+	_ = s.Log.closeWithPublish(func() {
+		if onFinish != nil {
+			onFinish()
+		}
+		close(s.exited)
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +316,18 @@ type ManagerOptions struct {
 	MaxChunks  int
 	// Retention keeps finished sessions (and their logs) for late attachers.
 	Retention time.Duration
+	// RetentionForTenant overrides Retention for one tenant. A non-positive
+	// result uses Retention. The callback must not call back into Manager.
+	RetentionForTenant func(tenant string) time.Duration
+	// BlobStoreForTenant returns a tenant-scoped artifact view. When set,
+	// CommitLogRecord is required and receives every complete replacement of
+	// the session's remote segment references. Both callbacks run outside any
+	// BlobStore operation but under the individual Log lock; they must not call
+	// back into that Log.
+	BlobStoreForTenant func(tenant string) (artifact.BlobStore, error)
+	CommitLogRecord    func(sessionID, tenant string, record LogRecord) error
+	SegmentBytes       int64
+	MaxLogSegments     int
 	// MaxSessions includes retained exited sessions; MaxActive bounds processes
 	// and port connections; per-workspace and per-principal limits prevent one
 	// tenant actor from consuming the node-wide retained-session budget. Zero
@@ -449,6 +463,13 @@ func (m *Manager) Remove(id string, kill bool) bool {
 		m.mu.Unlock()
 		return false
 	}
+	// Capacity and the session record remain authoritative until remote
+	// references are durably released. Forget runs while the manager lock keeps
+	// Get/Open from observing a half-removed retained session.
+	if err := s.Log.Forget(); err != nil {
+		m.mu.Unlock()
+		return false
+	}
 	delete(m.sessions, id)
 	if m.byWS[s.WS] <= 1 {
 		delete(m.byWS, s.WS)
@@ -467,7 +488,6 @@ func (m *Manager) Remove(id string, kill bool) bool {
 		}
 	}
 	m.mu.Unlock()
-	s.Log.Release()
 	return true
 }
 
@@ -570,9 +590,28 @@ func (m *Manager) OpenOrReplay(spec Spec) (s *Session, created bool, err error) 
 	if m.opts.SpillDir != "" {
 		spillPath = filepath.Join(m.opts.SpillDir, id+".log")
 	}
+	var blobStore artifact.BlobStore
+	if m.opts.BlobStoreForTenant != nil {
+		blobStore, err = m.opts.BlobStoreForTenant(spec.Tenant)
+		if err != nil {
+			m.mu.Unlock()
+			return nil, false, fmt.Errorf("session artifact store for tenant: %w", err)
+		}
+		if m.opts.CommitLogRecord == nil {
+			m.mu.Unlock()
+			return nil, false, errors.New("session: CommitLogRecord required with BlobStoreForTenant")
+		}
+	}
+	commitRecord := func(record LogRecord) error {
+		return m.opts.CommitLogRecord(id, spec.Tenant, record)
+	}
+	if blobStore == nil {
+		commitRecord = nil
+	}
 	log, err := NewLog(LogOptions{
 		MemBytes: m.opts.MemBytes, SpillBytes: m.opts.SpillBytes, SpillPath: spillPath,
-		MaxChunk: m.opts.MaxChunk, MaxChunks: m.opts.MaxChunks,
+		MaxChunk: m.opts.MaxChunk, MaxChunks: m.opts.MaxChunks, BlobStore: blobStore,
+		SegmentBytes: m.opts.SegmentBytes, MaxSegments: m.opts.MaxLogSegments, CommitRecord: commitRecord,
 	})
 	if err != nil {
 		m.mu.Unlock()
@@ -670,7 +709,28 @@ func (m *Manager) markInactive(id string, s *Session) {
 }
 
 func (m *Manager) scheduleReap(s *Session) {
-	time.AfterFunc(m.opts.Retention, func() { m.Remove(s.ID, false) })
+	retention := m.opts.Retention
+	if m.opts.RetentionForTenant != nil {
+		if configured := m.opts.RetentionForTenant(s.Tenant); configured > 0 {
+			retention = configured
+		}
+	}
+	time.AfterFunc(retention, func() { m.reap(s.ID) })
+}
+
+func (m *Manager) reap(id string) {
+	if m.Remove(id, false) {
+		return
+	}
+	// A durable reference-release failure keeps the session and its quota
+	// reservation. Retry at a bounded cadence rather than pretending retention
+	// completed or spinning against an unavailable record store.
+	m.mu.Lock()
+	s, ok := m.sessions[id]
+	m.mu.Unlock()
+	if ok && s.Exited() {
+		time.AfterFunc(time.Minute, func() { m.reap(id) })
+	}
 }
 
 // ---- runners ----

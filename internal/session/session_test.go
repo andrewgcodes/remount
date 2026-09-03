@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/proto"
 )
 
@@ -481,6 +482,154 @@ func TestManagerEnforcesPrincipalQuotaAcrossWorkspaces(t *testing.T) {
 func TestSessionPrincipalKeyHasNoDelimiterAliases(t *testing.T) {
 	if sessionPrincipalKey("tenant", "a\x00b") == sessionPrincipalKey("tenant\x00a", "b") {
 		t.Fatal("distinct opaque tenant/principal pairs produced the same quota key")
+	}
+}
+
+func TestManagerAppliesRetentionPerTenant(t *testing.T) {
+	m := NewManager(ManagerOptions{
+		SpillDir: t.TempDir(), MemBytes: 1 << 20, SpillBytes: 1 << 20,
+		Retention: time.Hour,
+		RetentionForTenant: func(tenant string) time.Duration {
+			if tenant == "short" {
+				return 20 * time.Millisecond
+			}
+			return time.Hour
+		},
+	})
+	defer m.Close()
+	short, err := m.Open(Spec{WS: "ws_short", Tenant: "short", Kind: proto.SessionACP})
+	if err != nil {
+		t.Fatal(err)
+	}
+	long, err := m.Open(Spec{WS: "ws_long", Tenant: "long", Kind: proto.SessionACP})
+	if err != nil {
+		t.Fatal(err)
+	}
+	short.End(proto.ExitInfo{Code: 0})
+	long.End(proto.ExitInfo{Code: 0})
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := m.Get(short.ID); !ok {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, ok := m.Get(short.ID); ok {
+		t.Fatal("short-retention tenant session was not reaped")
+	}
+	if _, ok := m.Get(long.ID); !ok {
+		t.Fatal("long-retention tenant session was reaped")
+	}
+}
+
+func TestManagerCommitsAndReleasesTenantLogRecord(t *testing.T) {
+	store := newMemoryBlobStore()
+	var mu sync.Mutex
+	records := map[string]LogRecord{}
+	m := NewManager(ManagerOptions{
+		SpillDir: t.TempDir(), MemBytes: 64, SpillBytes: 1024, MaxChunk: 64, MaxChunks: 4,
+		SegmentBytes: 231, Retention: 20 * time.Millisecond,
+		BlobStoreForTenant: func(tenant string) (artifact.BlobStore, error) {
+			if tenant != "tenant-a" {
+				return nil, errors.New("unexpected tenant store request")
+			}
+			return store, nil
+		},
+		CommitLogRecord: func(id, tenant string, record LogRecord) error {
+			if tenant != "tenant-a" {
+				return errors.New("record escaped tenant")
+			}
+			mu.Lock()
+			records[id] = LogRecord{Version: record.Version, MaxChunk: record.MaxChunk, Segments: append([]SegmentRef(nil), record.Segments...)}
+			mu.Unlock()
+			return nil
+		},
+	})
+	defer m.Close()
+	s, err := m.Open(Spec{WS: "ws", Tenant: "tenant-a", Kind: proto.SessionACP})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Record(proto.StreamStdout, bytes.Repeat([]byte("x"), 512)); err != nil {
+		t.Fatal(err)
+	}
+	s.End(proto.ExitInfo{Code: 0})
+	if _, err := s.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	sealed := records[s.ID]
+	mu.Unlock()
+	if len(sealed.Segments) == 0 {
+		t.Fatal("session record did not reference sealed segments")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := m.Get(s.ID); !ok {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, ok := m.Get(s.ID); ok {
+		t.Fatal("retained session was not reaped")
+	}
+	mu.Lock()
+	released := records[s.ID]
+	mu.Unlock()
+	if len(released.Segments) != 0 {
+		t.Fatalf("retention left remote refs pinned: %+v", released)
+	}
+}
+
+func TestManagerRetentionFailureKeepsSessionAndReferences(t *testing.T) {
+	store := newMemoryBlobStore()
+	var mu sync.Mutex
+	releaseBlocked := true
+	var latest LogRecord
+	m := NewManager(ManagerOptions{
+		SpillDir: t.TempDir(), MemBytes: 32, SpillBytes: 512, MaxChunk: 32, MaxChunks: 2,
+		SegmentBytes: 90, Retention: 15 * time.Millisecond,
+		BlobStoreForTenant: func(string) (artifact.BlobStore, error) { return store, nil },
+		CommitLogRecord: func(_ string, _ string, record LogRecord) error {
+			mu.Lock()
+			defer mu.Unlock()
+			if len(record.Segments) == 0 && releaseBlocked {
+				return errors.New("record store unavailable")
+			}
+			latest = record
+			return nil
+		},
+	})
+	defer m.Close()
+	s, err := m.Open(Spec{WS: "ws", Tenant: "tenant", Kind: proto.SessionACP})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Record(proto.StreamStdout, bytes.Repeat([]byte("y"), 128)); err != nil {
+		t.Fatal(err)
+	}
+	s.End(proto.ExitInfo{Code: 0})
+	if _, err := s.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, ok := m.Get(s.ID); !ok {
+		t.Fatal("failed durable dereference released session capacity")
+	}
+	if len(s.Log.SegmentRefs()) == 0 {
+		t.Fatal("failed durable dereference dropped authoritative refs")
+	}
+	mu.Lock()
+	releaseBlocked = false
+	mu.Unlock()
+	if !m.Remove(s.ID, false) {
+		t.Fatal("manual retention retry failed")
+	}
+	mu.Lock()
+	released := latest
+	mu.Unlock()
+	if len(released.Segments) != 0 {
+		t.Fatalf("successful retry left refs: %+v", released)
 	}
 }
 
