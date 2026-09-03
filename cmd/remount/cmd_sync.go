@@ -10,43 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"remount.dev/remount/internal/artifact"
-	"remount.dev/remount/internal/artifact/chunked"
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/localfs"
 	"remount.dev/remount/internal/proto"
 )
-
-type clientArtifactReadStore struct {
-	ctx context.Context
-	cl  *client.Client
-}
-
-func (*clientArtifactReadStore) Put(io.Reader) (string, int64, error) {
-	return "", 0, errors.New("client artifact view is read-only")
-}
-
-func (s *clientArtifactReadStore) Open(id string) (io.ReadCloser, int64, error) {
-	return s.cl.DownloadArtifactWithSize(s.ctx, id)
-}
-
-func (s *clientArtifactReadStore) Head(id string) (int64, error) {
-	r, size, err := s.Open(id)
-	if r != nil {
-		_ = r.Close()
-	}
-	return size, err
-}
-
-func (*clientArtifactReadStore) Delete(string) error {
-	return errors.New("client artifact view is read-only")
-}
-
-func (*clientArtifactReadStore) List() ([]string, error) {
-	return nil, errors.New("client artifact enumeration is unavailable")
-}
-
-var _ artifact.BlobStore = (*clientArtifactReadStore)(nil)
 
 // uploadDir packs dir and streams it into the control plane's artifact store
 // in one pass. Warnings (a skipped oversized .git pack) go to stderr because
@@ -129,35 +96,13 @@ func cmdPull(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	var rc io.ReadCloser
-	var producer <-chan error
-	format, err := proto.NormalizeArtifactFormat(snap.Format)
+	rc, err := cl.DownloadSnapshot(ctx, snap.Artifact, snap.Format)
 	if err != nil {
 		return err
 	}
-	if format == proto.ArtifactFormatChunkedV1 {
-		pr, pw := io.Pipe()
-		done := make(chan error, 1)
-		go func() {
-			err := chunked.ExportTar(ctx, &clientArtifactReadStore{ctx: ctx, cl: cl}, snap.Artifact, pw, chunked.Limits{})
-			_ = pw.CloseWithError(err)
-			done <- err
-		}()
-		rc = pr
-		producer = done
-	} else {
-		rc, err = cl.DownloadArtifact(ctx, snap.Artifact)
-		if err != nil {
-			return err
-		}
-	}
 	res, err := localfs.Unpack(*dir, rc, localfs.UnpackOptions{Force: *force})
 	closeErr := rc.Close()
-	var producerErr error
-	if producer != nil {
-		producerErr = <-producer
-	}
-	err = errors.Join(err, closeErr, producerErr)
+	err = errors.Join(err, closeErr)
 	if errors.Is(err, localfs.ErrDirty) {
 		return fmt.Errorf("%s has uncommitted changes; commit or stash them, or pass --force", *dir)
 	}

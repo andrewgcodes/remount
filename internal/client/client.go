@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"remount.dev/remount/internal/artifact"
+	"remount.dev/remount/internal/artifact/chunked"
 	"remount.dev/remount/internal/ids"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/transport"
@@ -1087,6 +1088,57 @@ func (c *Client) DownloadArtifact(ctx context.Context, id string) (io.ReadCloser
 	r, _, err := c.DownloadArtifactWithSize(ctx, id)
 	return r, err
 }
+
+// DownloadSnapshot returns a deterministic tar.gz stream for a snapshot in
+// either the legacy tar or chunked representation. Callers must pass the
+// format returned by Snapshot or stored on the workspace; downloading a
+// chunked manifest as though it were a tar archive is an invalid header.
+func (c *Client) DownloadSnapshot(ctx context.Context, id, format string) (io.ReadCloser, error) {
+	format, err := proto.NormalizeArtifactFormat(format)
+	if err != nil {
+		return nil, err
+	}
+	if format != proto.ArtifactFormatChunkedV1 {
+		return c.DownloadArtifact(ctx, id)
+	}
+	pr, pw := io.Pipe()
+	go func() {
+		err := chunked.ExportTar(ctx, clientArtifactReadStore{ctx: ctx, client: c}, id, pw, chunked.Limits{})
+		_ = pw.CloseWithError(err)
+	}()
+	return pr, nil
+}
+
+type clientArtifactReadStore struct {
+	ctx    context.Context
+	client *Client
+}
+
+func (clientArtifactReadStore) Put(io.Reader) (string, int64, error) {
+	return "", 0, errors.New("client artifact view is read-only")
+}
+
+func (s clientArtifactReadStore) Open(id string) (io.ReadCloser, int64, error) {
+	return s.client.DownloadArtifactWithSize(s.ctx, id)
+}
+
+func (s clientArtifactReadStore) Head(id string) (int64, error) {
+	r, size, err := s.Open(id)
+	if r != nil {
+		_ = r.Close()
+	}
+	return size, err
+}
+
+func (clientArtifactReadStore) Delete(string) error {
+	return errors.New("client artifact view is read-only")
+}
+
+func (clientArtifactReadStore) List() ([]string, error) {
+	return nil, errors.New("client artifact enumeration is unavailable")
+}
+
+var _ artifact.BlobStore = clientArtifactReadStore{}
 
 // DownloadArtifactWithSize is DownloadArtifact plus the authenticated
 // plaintext Content-Length. Chunked snapshot exporters use the size to apply
