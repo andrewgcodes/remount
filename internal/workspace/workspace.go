@@ -95,6 +95,18 @@ type SessionPreparer interface {
 	Prepare(spec *session.Spec) error
 }
 
+// CheckpointKind names what a checkpoint archive captures. It is the value a
+// backend's Caps.Snapshots advertises and the value stored on a snapshot so a
+// restore knows whether processes resume or restart.
+type CheckpointKind string
+
+const (
+	// CheckpointFS is the filesystem alone; processes restart on restore.
+	CheckpointFS CheckpointKind = "fs"
+	// CheckpointFSMem is filesystem plus process memory; processes resume.
+	CheckpointFSMem CheckpointKind = "fs+mem"
+)
+
 // Checkpointer owns snapshot consistency. Snapshot is explicitly live and may
 // observe concurrent workspace writes. Checkpoint must freeze backend-managed
 // execution until the archive is complete; the node additionally excludes its
@@ -104,6 +116,25 @@ type Checkpointer interface {
 	Snapshot(ctx context.Context, excludes []string, w io.Writer) error
 	// Checkpoint streams a quiesced tar.gz suitable for authoritative failover.
 	Checkpoint(ctx context.Context, excludes []string, w io.Writer) error
+}
+
+// MemoryCheckpointer is implemented by handles whose Checkpoint captures more
+// than the filesystem. A handle that does not implement it is CheckpointFS;
+// callers use KindOf and never type-assert on a concrete backend.
+type MemoryCheckpointer interface {
+	Checkpointer
+	// CheckpointKind reports what Checkpoint will produce for this handle.
+	CheckpointKind() CheckpointKind
+}
+
+// KindOf reports the checkpoint kind a handle produces. Only a kind the
+// handle itself claims is trusted; an unknown claim degrades to CheckpointFS
+// so a caller never records a memory snapshot that is not one.
+func KindOf(h Checkpointer) CheckpointKind {
+	if m, ok := h.(MemoryCheckpointer); ok && m.CheckpointKind() == CheckpointFSMem {
+		return CheckpointFSMem
+	}
+	return CheckpointFS
 }
 
 // Destroyer permanently removes one materialization.

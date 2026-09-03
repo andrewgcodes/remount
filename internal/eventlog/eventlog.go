@@ -102,6 +102,66 @@ func (l *Log) Read(ctx context.Context, from uint64, stream string, limit int) (
 	return l.store.Read(ctx, from, stream, limit)
 }
 
+// Exporter copies a contiguous range of the log to a sink. Every audit export
+// destination (a file, object storage, a SIEM) is built on this one contract
+// so retention, redaction and resumption are decided in one place.
+type Exporter interface {
+	// Export sends events with from <= seq <= to to sink in order, stopping
+	// at the first sink error, and returns the last sequence delivered. A
+	// zero to means "through the newest event". A from below the oldest
+	// retained sequence is CodeEvicted carrying Oldest so the caller can
+	// record the hole instead of silently skipping it.
+	Export(ctx context.Context, from, to uint64, sink func(proto.Event) error) (uint64, error)
+}
+
+var _ Exporter = (*Log)(nil)
+
+// exportPage bounds one store read during Export so an export of a large log
+// never pins the whole range in memory.
+const exportPage = 512
+
+// Export implements Exporter by paging through the store.
+func (l *Log) Export(ctx context.Context, from, to uint64, sink func(proto.Event) error) (uint64, error) {
+	first, err := l.store.First(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if from == 0 {
+		from = first
+	} else if from < first {
+		return 0, &proto.Error{Code: proto.CodeEvicted, Msg: "requested events are older than retention", Oldest: first}
+	}
+	if to == 0 {
+		if to, err = l.store.Last(ctx); err != nil {
+			return 0, err
+		}
+	}
+	var last uint64
+	for from <= to {
+		if err := ctx.Err(); err != nil {
+			return last, err
+		}
+		page, err := l.store.Read(ctx, from, "", exportPage)
+		if err != nil {
+			return last, err
+		}
+		if len(page) == 0 {
+			return last, nil
+		}
+		for _, e := range page {
+			if e.Seq > to {
+				return last, nil
+			}
+			if err := sink(e); err != nil {
+				return last, err
+			}
+			last = e.Seq
+		}
+		from = last + 1
+	}
+	return last, nil
+}
+
 // First returns the oldest retained event sequence.
 func (l *Log) First(ctx context.Context) (uint64, error) { return l.store.First(ctx) }
 

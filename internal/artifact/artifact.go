@@ -122,6 +122,26 @@ func Digest(id string) (string, error) {
 	return h, nil
 }
 
+// BlobStore is the content-addressed blob contract every artifact backend
+// satisfies. Ids are "sha256:<hex>"; Put computes the id, so a caller can
+// never store bytes under a name that does not verify. Open and Head report
+// os.ErrNotExist-compatible errors for unknown ids so callers branch on
+// errors.Is rather than on backend-specific text.
+type BlobStore interface {
+	// Put stores the bytes of r and returns their id and size.
+	Put(r io.Reader) (id string, size int64, err error)
+	// Open returns the blob and its size.
+	Open(id string) (io.ReadCloser, int64, error)
+	// Head returns the size of a blob without opening it.
+	Head(id string) (int64, error)
+	// Delete removes a blob; a blob with active readers is refused.
+	Delete(id string) error
+	// List returns every id the store holds.
+	List() ([]string, error)
+}
+
+var _ BlobStore = (*Store)(nil)
+
 // Store is a directory of blobs named by digest.
 type Store struct {
 	dir  string
@@ -506,6 +526,24 @@ func (s *Store) Open(id string) (io.ReadCloser, int64, error) {
 		return nil, 0, err
 	}
 	return f, st.Size(), nil
+}
+
+// Head returns the size of a stored blob without opening it.
+func (s *Store) Head(id string) (int64, error) {
+	digest, err := Digest(id)
+	if err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := os.Lstat(s.pathFor(digest))
+	if err != nil {
+		return 0, err
+	}
+	if !st.Mode().IsRegular() {
+		return 0, fmt.Errorf("artifact: blob %q is not a regular file", digest)
+	}
+	return st.Size(), nil
 }
 
 // Has reports whether id is present.
