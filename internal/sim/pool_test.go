@@ -143,8 +143,7 @@ func (s *simProvisioner) List(_ context.Context, options provision.ListOptions) 
 func TestE17PoolClaimScalesUpAndIdleScalesDown(t *testing.T) {
 	enrollment := newSimEnrollment()
 	provider := &simProvisioner{machines: map[string]provision.Machine{}, cancels: map[string]context.CancelFunc{}}
-	var w *world
-	w = newWorldWith(t, func(options *server.Options) {
+	w := newWorldWith(t, func(options *server.Options) {
 		options.NodeAuthenticator = enrollment
 		options.PoolEnrollmentSource = enrollment
 		options.ProvisionDrivers = []provision.Driver{provider}
