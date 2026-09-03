@@ -1,0 +1,130 @@
+name: vendor provisioners
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fake-contracts:
+    name: fake provider contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: true
+      - run: go test -race -count=10 ./internal/provision/...
+
+  live-availability:
+    # A green availability job is not a live-provider pass. The provider test
+    # step is visibly skipped unless every required secret/config value exists,
+    # and the package test also emits an explicit SKIPPED marker. Live tests
+    # prove only provider Create/List/Destroy; the pool E17 lane is separate.
+    name: ${{ matrix.vendor }} live availability
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        vendor: [fly, e2b, modal, ix, ssh]
+    env:
+      FLY_IO_2026_CORRECT_KEY: ${{ secrets.FLY_IO_2026_CORRECT_KEY }}
+      E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      IX_DEV_API_KEY: ${{ secrets.IX_DEV_API_KEY }}
+      REMOUNT_VENDOR_ENROLL_TOKEN: ${{ secrets.REMOUNT_VENDOR_ENROLL_TOKEN }}
+      REMOUNT_SSH_PRIVATE_KEY: ${{ secrets.REMOUNT_SSH_PRIVATE_KEY }}
+      REMOUNT_SSH_KNOWN_HOSTS: ${{ secrets.REMOUNT_SSH_KNOWN_HOSTS }}
+      REMOUNT_VENDOR_SERVER_URL: ${{ vars.REMOUNT_VENDOR_SERVER_URL }}
+      REMOUNT_VENDOR_BINARY_URL: ${{ vars.REMOUNT_VENDOR_BINARY_URL }}
+      REMOUNT_VENDOR_TENANT: ${{ vars.REMOUNT_VENDOR_TENANT }}
+      REMOUNT_VENDOR_POOL: ${{ vars.REMOUNT_VENDOR_POOL }}
+      REMOUNT_VENDOR_BACKEND: ${{ vars.REMOUNT_VENDOR_BACKEND }}
+      REMOUNT_VENDOR_DATA_DIR: ${{ vars.REMOUNT_VENDOR_DATA_DIR }}
+      REMOUNT_FLY_APP: ${{ vars.REMOUNT_FLY_APP }}
+      REMOUNT_FLY_IMAGE: ${{ vars.REMOUNT_FLY_IMAGE }}
+      REMOUNT_FLY_REGION: ${{ vars.REMOUNT_FLY_REGION }}
+      REMOUNT_FLY_SIZE: ${{ vars.REMOUNT_FLY_SIZE }}
+      REMOUNT_E2B_TEMPLATE: ${{ vars.REMOUNT_E2B_TEMPLATE }}
+      REMOUNT_MODAL_HELPER: ${{ vars.REMOUNT_MODAL_HELPER }}
+      REMOUNT_MODAL_APP: ${{ vars.REMOUNT_MODAL_APP }}
+      REMOUNT_MODAL_IMAGE: ${{ vars.REMOUNT_MODAL_IMAGE }}
+      REMOUNT_MODAL_REGION: ${{ vars.REMOUNT_MODAL_REGION }}
+      REMOUNT_MODAL_SIZE: ${{ vars.REMOUNT_MODAL_SIZE }}
+      MODAL_ENVIRONMENT: ${{ vars.MODAL_ENVIRONMENT }}
+      REMOUNT_IX_HELPER: ${{ vars.REMOUNT_IX_HELPER }}
+      REMOUNT_IX_PLAYGROUND: ${{ vars.REMOUNT_IX_PLAYGROUND }}
+      REMOUNT_IX_ACCOUNT: ${{ vars.REMOUNT_IX_ACCOUNT }}
+      REMOUNT_SSH_HOST: ${{ vars.REMOUNT_SSH_HOST }}
+      REMOUNT_SSH_PORT: ${{ vars.REMOUNT_SSH_PORT }}
+      REMOUNT_SSH_USER: ${{ vars.REMOUNT_SSH_USER }}
+      REMOUNT_SSH_REMOTE_HELPER: ${{ vars.REMOUNT_SSH_REMOTE_HELPER }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: true
+      - name: Install pinned Fly CLI setup action
+        if: matrix.vendor == 'fly'
+        uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+      - id: gate
+        name: Classify provider availability
+        shell: bash
+        run: |
+          set -eu
+          missing=""
+          require() {
+            value="${!1-}"
+            if [ -z "$value" ]; then missing="${missing}${missing:+, }$1"; fi
+          }
+          require REMOUNT_VENDOR_SERVER_URL
+          require REMOUNT_VENDOR_ENROLL_TOKEN
+          require REMOUNT_VENDOR_BINARY_URL
+          require REMOUNT_VENDOR_TENANT
+          require REMOUNT_VENDOR_POOL
+          case "${{ matrix.vendor }}" in
+            fly) require FLY_IO_2026_CORRECT_KEY; require REMOUNT_FLY_APP; require REMOUNT_FLY_IMAGE ;;
+            e2b) require E2B_API_KEY; require REMOUNT_E2B_TEMPLATE ;;
+            modal) require MODAL_TOKEN_ID; require MODAL_TOKEN_SECRET; require REMOUNT_MODAL_HELPER; require REMOUNT_MODAL_APP; require REMOUNT_MODAL_IMAGE ;;
+            ix) require IX_DEV_API_KEY; require REMOUNT_IX_HELPER; require REMOUNT_IX_PLAYGROUND; require REMOUNT_IX_ACCOUNT ;;
+            ssh) require REMOUNT_SSH_HOST; require REMOUNT_SSH_USER; require REMOUNT_SSH_PRIVATE_KEY; require REMOUNT_SSH_KNOWN_HOSTS ;;
+          esac
+          if [ -n "$missing" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "${{ matrix.vendor }}: SKIPPED (unavailable; missing $missing)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Prepare pinned SSH material
+        if: matrix.vendor == 'ssh' && steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -eu
+          install -d -m 700 "$RUNNER_TEMP/remount-vendor-ssh"
+          printf '%s\n' "$REMOUNT_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/remount-vendor-ssh/id"
+          printf '%s\n' "$REMOUNT_SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/remount-vendor-ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/remount-vendor-ssh/id" "$RUNNER_TEMP/remount-vendor-ssh/known_hosts"
+          echo "REMOUNT_SSH_IDENTITY_FILE=$RUNNER_TEMP/remount-vendor-ssh/id" >> "$GITHUB_ENV"
+          echo "REMOUNT_SSH_KNOWN_HOSTS_FILE=$RUNNER_TEMP/remount-vendor-ssh/known_hosts" >> "$GITHUB_ENV"
+      - name: Live Create/List/Destroy contract
+        if: steps.gate.outputs.ready == 'true'
+        run: go test -tags=integration -timeout=12m ./internal/provision/${{ matrix.vendor }} -run '^TestLiveProvisionerLifecycle$' -count=1 -v
+      - name: Record live pass
+        if: steps.gate.outputs.ready == 'true' && success()
+        run: |
+          echo "${{ matrix.vendor }}: PASSED live Create/List/Destroy; cleanup verified by the test" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove SSH material
+        if: always() && matrix.vendor == 'ssh'
+        shell: bash
+        run: |
+          key="$RUNNER_TEMP/remount-vendor-ssh/id"
+          hosts="$RUNNER_TEMP/remount-vendor-ssh/known_hosts"
+          rm -f -- "$key" "$hosts"

@@ -45,6 +45,65 @@ crosses a goroutine or reconciliation boundary.
 - The control plane must mint, consume once, expire, and audit node enrollment
   tokens before pool-created nodes can be wired into production.
 
+## Verified provider contracts (2026-09-03)
+
+The implementations use only the following documented surfaces. A provider
+feature that is absent from these surfaces returns `provision.ErrUnavailable`;
+the driver does not infer success or invent an undocumented request.
+
+- **Fly Machines:** Bearer-authenticated `POST` and `GET
+  /v1/apps/{app}/machines`, `GET .../{id}/wait`, and forced `DELETE .../{id}`
+  follow the [Machines resource](https://fly.io/docs/machines/api/machines-resource/).
+  Region and the documented `shared-cpu-Nx` / `performance-Nx` guest shapes
+  are native Machine fields. The enrollment value is staged from stdin with
+  [`fly secrets import --stage`](https://fly.io/docs/flyctl/secrets-import/),
+  referenced by name in the Machine process, then removed with the documented
+  staged [`fly secrets unset`](https://fly.io/docs/flyctl/secrets-unset/).
+- **E2B:** `POST /sandboxes`, paginated `GET /v2/sandboxes`, and idempotent
+  `DELETE /sandboxes/{id}` use E2B's checked-in [OpenAPI
+  contract](https://github.com/e2b-dev/e2b/blob/main/spec/openapi.yml). The API
+  authenticates with `X-API-Key`; bootstrap values use `NewSandbox.envVars`
+  and tenant/pool identity uses `metadata`. The public create schema has no
+  explicit region or size fields, so requests containing either are
+  unavailable. Inventory follows `X-Next-Token` with a finite page bound.
+- **Modal:** the supported [Sandbox SDK
+  contract](https://modal.com/docs/guide/sandboxes) provides create, tags,
+  list, terminate, inline secrets, resources, and region placement. Modal does
+  not publish a stable Sandbox REST contract, and its CLI does not expose the
+  full reconciliation lifecycle. Remount therefore requires an independently
+  versioned `remount-modal-provisioner` helper built against a supported Modal
+  SDK instead of guessing private HTTP. Missing helper or Modal credentials is
+  unavailable.
+- **iximiuz Labs:** the official [labctl
+  contract](https://github.com/iximiuz/labctl) documents playground start,
+  list, SSH, stop/restart, and destroy, but does not publish a stable
+  machine-JSON/metadata API suitable for tenant-pool reconciliation. Remount
+  requires a versioned helper around that CLI and pins it to a dedicated
+  account, tenant, and pool. Region and size are unavailable. Missing helper or
+  API credential is unavailable.
+- **BYO SSH:** OpenSSH documents that remote arguments are joined into one
+  command string before transmission ([`ssh(1)`](https://man.openbsd.org/ssh.1)),
+  and [RFC 4254 section 6.5](https://www.rfc-editor.org/rfc/rfc4254#section-6.5)
+  defines that remote `exec` string. Consequently only a fixed absolute helper
+  path and fixed `create|list|destroy` words enter that string; the JSON request
+  and enrollment token travel on stdin. `BatchMode`,
+  `StrictHostKeyChecking=yes`, a dedicated `UserKnownHostsFile`, no global
+  known-host fallback, and a pinned identity follow
+  [`ssh_config(5)`](https://man.openbsd.org/ssh_config.5). An unreachable host
+  is unavailable/error state, never empty healthy inventory.
+
+External helper adapters use the same bounded JSON protocol: invoke
+`HELPER create|list|destroy`, provide exactly one JSON request on stdin, accept
+bounded JSON stdout (1 MiB by default, 16 MiB hard maximum), discard stderr,
+and never include helper output in an error. `create` returns one non-secret
+`provision.Machine`; `list` returns
+`{"machines":[...]}` (SSH returns `{"present":bool,"machine":...}`); and
+`destroy` returns no body and treats an absent provider object as success. The
+Modal helper receives credentials only through `MODAL_TOKEN_ID` and
+`MODAL_TOKEN_SECRET`; the ix helper receives `IX_DEV_API_KEY`. Neither helper
+may copy those credentials or the enrollment value into argv, tags, stdout,
+stderr, a reusable image, or provider inventory.
+
 ## Rejected alternatives
 
 - A remote `workspace.Backend` or `remount shim`: it duplicates the node
