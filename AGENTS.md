@@ -31,6 +31,28 @@ If `make race` is red, the change is not done.
 Go 1.27, `CGO_ENABLED=0` everywhere. SQLite is `modernc.org/sqlite`, pure Go,
 so the binary stays static.
 
+## Before changing a moving checkout
+
+Read `docs/engineering/README.md` and follow its current-status link before a
+review or hardening change. Read the relevant ADRs, protocol sections,
+`MISTAKES.md`, and
+`docs/engineering/hardening-lessons.md`. Codex agents should use the
+repo-scoped `remount-hardening-review` skill in
+`.agents/skills/remount-hardening-review/`; Claude agents should also read
+`.claude/skills/remount-dev/SKILL.md`.
+
+This tree may have another agent writing to it:
+
+1. Fetch and record `git status --short --branch`, `HEAD`, and
+   `origin/main` before editing.
+2. Treat every unfamiliar dirty path as user-owned. Use narrow patches and
+   never reset or check out another contributor's work.
+3. State the authority, resource, irreversible action, durable commit point and
+   expected observable postcondition before changing a lifecycle boundary.
+4. Add a regression test that makes the forbidden result observable.
+5. Inspect the complete diff and fetch again before commit or push. If upstream
+   moved, integrate it and rerun the affected proof.
+
 ## Layout
 
 | Path | Owns |
@@ -54,6 +76,8 @@ so the binary stays static.
 | `internal/ids` | prefixed, time-sortable ids |
 | `spec/PROTOCOL.md` | the normative wire protocol |
 | `docs/` | design, tutorial, operations, harness integration, ADRs |
+| `.agents/skills/` | repo-scoped Codex workflows; keep the detailed engineering truth in `docs/` |
+| `.claude/skills/` | repo-scoped Claude development and operating workflows |
 | `examples/` | a minimal real agent loop against the SDK |
 | `deploy/` | the Modal deployment that was actually run |
 
@@ -75,6 +99,14 @@ Check your own change against every line here before calling it done.
 | Every mutating request carries an idempotency key and a replay is a no-op. | `client`, `control.wsCreate`, `session.Manager.Open` |
 | `.remount/env` is rewritten on every materialize and never travels in a snapshot. | `node.writeWorkspaceEnv`, `node.snapshot` |
 | Anything returned from under `control.mu` is a copy, never a live pointer. | `control.snapshotWS` and every `cp := *ws` |
+| Every workspace state change passes through the central transition table and validates actor, predecessor and authority. | `control/state_machine.go` |
+| A destructive lifecycle operation retains and fences the source until the checkpoint and next state are durably committed. | release/quarantine prepare and commit handlers in `control` and `node` |
+| Authorization is revalidated after acquiring the workspace tree boundary. A queued stale operation never touches the handle. | `node.lockWorkspaceTree` |
+| Cancellation is not completion. Snapshot producers and managed sessions are joined before locks, capacity or success are released. | `node.snapshotRaw`, `session.Manager.KillWorkspace` |
+| Session output loss is an explicit `gap` and public helpers return `evicted`; incomplete output is never reported complete. | `session.Log`, `client.Copy`, `client.Run` |
+| Every retained collection and staging path has admission, accounting, cleanup and an observable rejection or degradation signal. | resource options, GC loops, diagnostics and quota metrics |
+| `Session.Wait` is the active-capacity handoff: accounting is committed before exit becomes observable. | `session.finish`, `session.Manager.markInactive` |
+| A check that cannot run is unavailable, never healthy. | `doctor`, `node.diag_unavailable`, `scripts/explain.py` |
 
 ## Where a change goes
 
@@ -116,6 +148,14 @@ The sim tests check that the contracts compose.
 
 Keep test contexts generous. The `go test -timeout` is the real bound, and the
 race detector makes everything several times slower.
+
+Match the proof to the boundary. Protocol changes also need negotiation,
+compatibility and golden-fixture coverage. Public SDK changes need
+`make public-api`, which compiles from outside the module. Capacity changes
+need concurrent overcommit and idempotent-at-capacity tests. Deployment changes
+need the exact candidate exercised against the named service, with readiness,
+restart when relevant, observability capture and verified cleanup. The full
+matrix is in `docs/engineering/hardening-lessons.md`.
 
 ## Deploying to a cloud sandbox
 

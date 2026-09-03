@@ -1,6 +1,6 @@
 ---
 name: remount-operate
-description: Use when running agents on a live Remount deployment. Creating and moving workspaces, running commands and shells in them, giving a workspace a secret it can use but never see, pointing a harness like Codex at the broker, reading the event log, and diagnosing a workspace that is stuck pending.
+description: "Use when operating a live Remount deployment: creating or moving workspaces, running harnesses, configuring typed egress or brokered credentials, using the package connector, inspecting health, or containing an incident. Not for changing Remount code; use remount-dev."
 ---
 
 # Operating Remount
@@ -23,13 +23,13 @@ N` and `remount ws move --node N WS` are the same.
 | Command | Does |
 |---|---|
 | `remount nodes` | list nodes with OS, CPU, memory, backends, labels |
-| `remount ws create [--name N] [--node ID] [--label k=v] [--binding ID] [--env K=V] [--backend B] [--cpu N] [--mem MiB] [--exclude GLOB]` | create and wait until claimed |
+| `remount ws create [--name N] [--node ID] [--label k=v] [--binding ID] [--env K=V] [--backend B] [--security PROFILE] [--egress-rule JSON] [--cpu N] [--mem MiB] [--exclude GLOB]` | create and wait until claimed |
 | `remount ws ls` | every workspace with state, node, generation, last snapshot |
 | `remount ws get WS` | full JSON, including requires and placement |
 | `remount ws move WS [--node ID] [--label k=v] [--cpu N] [--mem MiB] [--backend B]` | snapshot, re-queue, wait for the new node |
 | `remount ws sleep WS --after 72h` or `--on event.type` | snapshot, release, pause until a timer or event |
 | `remount ws wake WS` | resume a paused workspace now |
-| `remount ws snapshot WS` | snapshot and upload; prints the artifact id |
+| `remount ws snapshot WS [--authoritative]` | take a live snapshot, or quiesce and commit authoritative failover state |
 | `remount ws destroy WS` | release and delete |
 | `remount exec WS -- cmd args` | run a command; stdout, stderr and exit code stream back |
 | `remount exec --timeout 10m --cwd DIR --env K=V --stdin WS -- cmd` | with options |
@@ -43,6 +43,8 @@ N` and `remount ws move --node N WS` are the same.
 | `remount port WS PORT [--local ADDR]` | forward a port out of the workspace |
 | `remount events [--follow] [--ws WS] [--from N] [--json]` | the canonical log |
 | `remount timers` | durable timers |
+| `remount fleet quarantine --action ACTION SELECTORS...` | durably freeze, revoke, checkpoint, stop or destroy an incident scope |
+| `remount status`, `inspect WS`, `doctor --deep`, `metrics` | inspect fleet, workspace, integrity and capacity |
 
 Add `--json` to `ws`, `nodes`, `fs ls`, and `events` for machine-readable output.
 
@@ -86,6 +88,21 @@ Hosts a workspace may reach without a credential are set per node with
 else is denied. `--allow-private HOST` permits a host that resolves to a
 private address, for a local model server.
 
+That is the legacy `local` security profile. An explicit typed network policy
+replaces it with first-match capabilities for protocol, host, port, method,
+path, request count and byte budgets. Production-oriented profiles require a
+backend that can enforce the gateway. The built-in process and Docker backends
+only provide cooperative proxying, so Remount rejects them for `isolated` and
+`multi_tenant` profiles instead of presenting proxy environment variables as
+non-bypassable isolation.
+
+For an immutable package read, grant a `connector:"package"` HTTPS GET/HEAD
+rule and use `${REMOUNT_PACKAGE_CONNECTOR}/<registry-host>/<path>`. This
+managed path rechecks policy, can require
+`X-Remount-Expected-Digest: sha256:<hex>`, returns the content digest, and
+keeps cache paths and hit state private to the workspace. It cannot be spent
+through the model reverse proxy or CONNECT.
+
 ## Pointing a harness at the broker
 
 The broker's address is per node and per materialize. Read it from
@@ -116,8 +133,11 @@ inside the workspace with `remount exec $WS -- npm install @openai/codex` after
 allowing `registry.npmjs.org` on the node.
 
 Model traffic goes through the `/d/<host>/` reverse-proxy path, where the
-credential is substituted. Package installs go through `HTTPS_PROXY`, which is
-set automatically, as a `CONNECT` tunnel with no substitution.
+credential is substituted. In the legacy local profile, credential-free package
+installs can use the automatically set `HTTPS_PROXY` as CONNECT only when the
+node explicitly `--allow`s the registry. A binding never grants CONNECT.
+Typed production policy should use the managed package connector or an explicit
+`protocol:"connect"` rule whose deliberately weaker guarantees are acceptable.
 
 ## Running a harness that survives a move
 
@@ -198,3 +218,30 @@ curl -X POST $REMOUNT_SERVER/v1/events -H "Authorization: Bearer $REMOUNT_TOKEN"
 
 A sleeping workspace has no node and costs only storage. Waking restores from
 the snapshot taken at sleep and waits for `claimed`.
+
+## Incident containment
+
+Use `fleet quarantine` when a tenant, principal, run, model, node, backend or
+label set may be compromised. Always provide at least one selector or explicit
+`--all`, and reuse a stable incident idempotency key.
+
+```sh
+remount fleet quarantine --run run_20260902 --action stop --idem incident-4821
+remount fleet quarantine --node n_abc --action revoke_egress --idem node-4821
+remount fleet quarantine --tenant acme --action destroy --deadline 10m \
+  --idem incident-4821-destroy --json
+remount fleet get fleet_abc --json
+```
+
+`destroy` checkpoints and durably commits the generation fence before the
+node may delete source bytes. A partial operation remains durable and continues
+reconciling unreachable targets; inspect each result instead of treating the
+aggregate deadline as proof of containment.
+
+## Diagnostics are three-valued
+
+`remount doctor --deep` distinguishes healthy, unhealthy and unavailable. A
+node it could not authenticate to or reach is not a pass. Use
+`scripts/collect.sh --deep` and `scripts/explain.py`; an incomplete
+collection has its own nonzero exit status. Preserve that distinction in
+automation and incident notes.

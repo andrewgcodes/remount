@@ -6,13 +6,20 @@ description: Use when working on the Remount codebase itself. Building, running 
 # Developing Remount
 
 Remount is a Go monorepo with one binary and one protocol. Read `AGENTS.md`
-first for layout and invariants. This skill is the working loop.
+first for layout and invariants. This skill is the working loop. For lifecycle,
+concurrency, durability, security, capacity, public-API or deployment work,
+also read `docs/engineering/hardening-lessons.md`; it contains the authority
+map, failure patterns and change-to-test matrix distilled from the hardening
+pass.
 
 ## The loop
 
 ```sh
 make            # vet, unit and sim tests, static binary
 make race       # required before any change is done
+make conformance # hostile-input and failure-model packages under -race
+make fuzz       # every registered fuzz target
+make public-api # compile the exported SDK from an external module
 go test -count=1 -run 'TestName$' -v -timeout 60s ./internal/sim/
 ```
 
@@ -89,6 +96,30 @@ not emit it, which is itself the bug.
   materializing.
 - Anything returned from under `control.mu` is a copy.
 - `.remount/env` is rewritten on materialize and excluded from snapshots.
+- Every lifecycle state mutation goes through `control/state_machine.go` with
+  actor, predecessor, generation and node checks.
+- Prepare, quiesce, verify and durable commit precede destructive cleanup. An
+  ambiguous failure retains and fences the source.
+- Authorization is revalidated after acquiring the workspace tree lock.
+- A cancelled snapshot producer or process is joined before its lock, capacity
+  or success is released.
+- Every retained collection and staging path is bounded, collectible,
+  observable and reconstructed after restart when durable.
+- A session gap is returned as `evicted`; an unavailable diagnostic is never
+  rendered healthy.
+
+## Before editing an active tree
+
+Fetch and record `HEAD`, `origin/main`, and `git status --short --branch`.
+Another agent may be editing the same checkout. Treat unfamiliar changes as
+user-owned, make narrow patches, and never reset or check out work you did not
+create. Fetch again before integration, inspect the complete diff, and rerun
+affected tests after resolving an upstream change.
+
+Before changing a boundary, identify the authoritative state, resource at risk,
+generation or operation fence, irreversible action, durable commit, spawned
+workers, capacity rule and observable postcondition. Authorization before a
+blocking lock is stale until it is revalidated after the lock.
 
 ## Debugging playbook
 
@@ -135,8 +166,17 @@ written reason; the binary is static and 13 MB.
 
 ```sh
 make lint      # vet, gofmt, and the lock-discipline check
+make test      # includes the separate-module public SDK test
 make race      # the whole suite under the race detector
+make conformance
 ```
+
+Run `make fuzz`, module/static/vulnerability checks and `make dist` when the
+changed boundary calls for them. A deployment change also needs the exact
+candidate tested against the named deployed service, authenticated readiness
+and node enrollment, restart/re-adoption when persistence changed, inspection
+through events/metrics/doctor, and verified cleanup. Do not print or place a
+real credential in an argument, workspace, fixture, log or commit.
 
 `scripts/lint-locks.sh` catches reads of mutex-guarded state after an unlock.
 That class of bug appeared once in this codebase, failed roughly one run in

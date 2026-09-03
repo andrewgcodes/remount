@@ -6,6 +6,19 @@ statements that the described controls already exist.
 
 ## Documents
 
+### [Hardening lessons and review playbook](./hardening-lessons.md)
+
+A living synthesis of the failure patterns behind the audits and fixes. It
+explains authority and commit boundaries, post-lock revalidation, goroutine
+joining, bounded-state design, truthful diagnostics, the test ladder, live
+E2B/Modal validation, shared-worktree hygiene and the limits that must remain
+explicit.
+
+Use it when designing or reviewing a new change. The repo-scoped
+[remount-hardening-review
+skill](../../.agents/skills/remount-hardening-review/SKILL.md) turns the same
+lessons into an executable agent workflow.
+
 ### [Hardening implementation closure — 2026-09-03](./implementation-closure-2026-09-03.md)
 
 The current disposition and verification ledger for the two reviews and two
@@ -84,3 +97,8 @@ Architecture decisions that become stable should be recorded in `docs/adr/`.
 User-facing behavior belongs in the README, tutorial, protocol specification or
 operations guide. Keep this directory focused on assessments, requirements and
 verification evidence.
+
+The hardening playbook is the one intentional living exception: update it when
+a completed investigation reveals a reusable engineering method. Keep
+point-in-time findings and their original severity unchanged, and record newly
+accepted architecture in a new ADR.

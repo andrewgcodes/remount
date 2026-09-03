@@ -230,6 +230,8 @@ verdict. See [docs/observability.md](docs/observability.md).
 - [docs/harness-integration.md](docs/harness-integration.md) — running Claude Code, Codex, OpenCode and your own loop on Remount.
 - [docs/operations.md](docs/operations.md) — deploying, hardening and running it for real.
 - [docs/observability.md](docs/observability.md) — inspecting a deployment at three depths, and detecting damage.
+- [docs/engineering/hardening-lessons.md](docs/engineering/hardening-lessons.md) — the review method distilled from the audits, race failures and live cloud tests.
+- [docs/engineering/](docs/engineering/) — dated audits, implementation requests, dispositions and verification evidence.
 - [MISTAKES.md](MISTAKES.md) — every bug we hit building this, and what each one taught.
 
 ## Status
