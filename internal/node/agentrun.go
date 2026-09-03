@@ -679,7 +679,7 @@ func (r *agentRun) decide(approval string, d proto.ApprovalDecision) error {
 // to. Killing it (KillWorkspace, `remount s kill`) stops the harness.
 func (r *agentRun) openTranscript() (*session.Session, error) {
 	spec := session.Spec{
-		WS: r.w.ID, Kind: proto.SessionACP, Principal: r.req.Owner, Tenant: r.req.Tenant,
+		WS: r.w.ID, Generation: r.w.Generation, Kind: proto.SessionACP, Principal: r.req.Owner, Tenant: r.req.Tenant,
 		IdempotencyKey: "acp|" + r.key,
 		Run:            &proto.RunInfo{Recipe: r.req.Spec.Recipe, TaskHash: launch.TaskHash(r.req.Spec.Task), Sandbox: r.req.Spec.Sandbox, Auth: r.req.Spec.Auth},
 	}
@@ -839,7 +839,7 @@ func (r *agentRun) spawn() (*exec.Cmd, *acp.Client, error) {
 		return nil, nil, err
 	}
 	spec := session.Spec{
-		WS: r.w.ID, Kind: proto.SessionExec, Program: program, Cwd: ".", Env: r.n.sessionEnv(r.w, extraEnv),
+		WS: r.w.ID, Generation: r.w.Generation, Kind: proto.SessionExec, Program: program, Cwd: ".", Env: r.n.sessionEnv(r.w, extraEnv),
 		Principal: r.req.Owner, Tenant: r.req.Tenant, Stdin: true,
 	}
 	// The redactor learns the workspace's environment as declared, before a
@@ -1000,7 +1000,7 @@ func (r *agentRun) installHarness() error {
 		return nil
 	}
 	spec := session.Spec{
-		WS: r.w.ID, Kind: proto.SessionExec, Program: []string{"/bin/sh", "-c", ". ./.remount/env 2>/dev/null; " + script}, Cwd: ".",
+		WS: r.w.ID, Generation: r.w.Generation, Kind: proto.SessionExec, Program: []string{"/bin/sh", "-c", ". ./.remount/env 2>/dev/null; " + script}, Cwd: ".",
 		Env: r.n.sessionEnv(r.w, extraEnv), Principal: r.req.Owner, Tenant: r.req.Tenant,
 		Timeout: agentInstallTimeout,
 		Run:     &proto.RunInfo{Recipe: recipe.Name, TaskHash: launch.TaskHash(r.req.Spec.Task), Sandbox: r.req.Spec.Sandbox, Auth: r.req.Spec.Auth},
@@ -1680,7 +1680,7 @@ func (h *agentHandler) CreateTerminal(ctx context.Context, req acp.CreateTermina
 		return acp.CreateTerminalResponse{}, proto.Err(proto.CodeResourceExhausted, "run has %d terminals open", count)
 	}
 	spec := session.Spec{
-		WS: r.w.ID, Kind: proto.SessionExec, Program: append([]string{req.Command}, req.Args...), Cwd: cwd,
+		WS: r.w.ID, Generation: r.w.Generation, Kind: proto.SessionExec, Program: append([]string{req.Command}, req.Args...), Cwd: cwd,
 		Env: r.n.sessionEnv(r.w, extra), Principal: r.req.Owner, Tenant: r.req.Tenant,
 	}
 	if err := r.w.handle.Prepare(&spec); err != nil {

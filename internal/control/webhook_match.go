@@ -100,6 +100,7 @@ func payloadValuesAt(value any, path []string) []any {
 		for i := 0; i < rv.Len(); i++ {
 			out = append(out, payloadValuesAt(rv.Index(i).Interface(), path)...)
 		}
+		return out
 	}
 	return nil
 }

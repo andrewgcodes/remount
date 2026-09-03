@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-09-03",
+  "revision": "7e61cdeb32c8ad1c44e5dd71c7c2e17cf82b636c",
+  "host": {
+    "os": "darwin",
+    "arch": "arm64",
+    "kernel": "25.3.0",
+    "go": "go1.27.1"
+  },
+  "scenario": {
+    "test": "TestHandoffScaleAndControlFailover",
+    "nodes": 200,
+    "clients": 200,
+    "workspaces": 2000,
+    "reconnected_peers": 400,
+    "backend": "process",
+    "control_failover_model": "distinct server instance reopening the same durable SQLite store"
+  },
+  "normal": {
+    "command": "go test ./internal/sim -run '^TestHandoffScaleAndControlFailover$' -count=1 -timeout=15m -v",
+    "status": "pass",
+    "elapsed_ms": 20873,
+    "latency": {
+      "claim": { "samples": 2000, "p50_ms": 551.404, "p99_ms": 973.881 },
+      "exec_round_trip": { "samples": 200, "p50_ms": 837.456, "p99_ms": 1649.754 },
+      "move": { "samples": 200, "p50_ms": 1977.110, "p99_ms": 2577.940 },
+      "reattach_after_control_restart": { "samples": 200, "p50_ms": 3454.489, "p99_ms": 4285.776 }
+    },
+    "control_restart_ms": 335.320,
+    "session_output": "byte_exact",
+    "gap_chunks": 0
+  },
+  "repetition": {
+    "command": "go test ./internal/sim -run '^TestHandoffScaleAndControlFailover$' -count=2 -timeout=20m",
+    "status": "pass",
+    "elapsed_ms": 49968
+  },
+  "race": {
+    "command": "go test -race ./internal/sim -run '^TestHandoffScaleAndControlFailover$' -count=1 -timeout=30m -v",
+    "status": "pass",
+    "elapsed_ms": 97806,
+    "latency": {
+      "claim": { "samples": 2000, "p50_ms": 3280.887, "p99_ms": 4897.588 },
+      "exec_round_trip": { "samples": 200, "p50_ms": 5531.803, "p99_ms": 5599.848 },
+      "move": { "samples": 200, "p50_ms": 5881.010, "p99_ms": 6327.859 },
+      "reattach_after_control_restart": { "samples": 200, "p50_ms": 26841.072, "p99_ms": 29142.172 }
+    },
+    "control_restart_ms": 6482.000
+  },
+  "runtime_gates": {
+    "docker": {
+      "runtime_status": "available",
+      "server_version": "29.4.1",
+      "benchmark_status": "unavailable",
+      "reason": "the internal/sim evidence scenario is process-backed; the 200-node Docker scenario has not been run"
+    },
+    "gvisor": {
+      "runtime_status": "unavailable",
+      "benchmark_status": "unavailable",
+      "reason": "runsc is not registered with Docker on this host"
+    }
+  },
+  "residual_limits": [
+    "This is a process-restart test against one durable SQLite store, not replicated control-plane failover.",
+    "It does not establish S3 replication RPO, warm-standby behavior, or multi-writer safety.",
+    "Docker and gVisor p50/p99 remain unavailable until this exact scale is exercised on gated hosts."
+  ]
+}

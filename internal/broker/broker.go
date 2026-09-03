@@ -126,6 +126,11 @@ type Options struct {
 	// resolves there is refused, including cloud metadata endpoints.
 	AllowPrivate []string
 	Audit        func(Audit)
+	// CapabilityVerifier validates non-workspace broker bearers for every
+	// request and returns their authenticated principal. The workspace token
+	// is still local and attributed to Principal; session tokens are verified
+	// against control-plane revocation and assignment authority.
+	CapabilityVerifier func(context.Context, string) (string, error)
 	// Approval crosses to the control plane before an approve-mode request is
 	// released. Nil fails closed for such rules.
 	Approval      func(context.Context, proto.EgressApprovalReq) (*proto.EgressApprovalRes, error)
@@ -362,6 +367,12 @@ func (b *Broker) Start() (string, error) {
 // BaseURL returns the listener URL after Start.
 func (b *Broker) BaseURL() string { return b.base }
 
+// BaseURLForCapability returns the reverse-proxy URL for a transient session
+// capability without retaining the bearer in Broker state.
+func (b *Broker) BaseURLForCapability(capability string) string {
+	return b.baseForCapability(capability)
+}
+
 // ProxyURL returns an authenticated URL suitable for HTTP_PROXY and
 // HTTPS_PROXY. BaseURL is the capability-bearing reverse-proxy endpoint.
 func (b *Broker) ProxyURL() string { return b.proxyBase }
@@ -441,18 +452,35 @@ func Placeholder(l proto.BindingLease) string {
 // EnvFor returns the environment variables a workspace should receive so
 // harnesses reach their providers through the broker.
 func (b *Broker) EnvFor() []string {
+	return b.EnvForCapability(b.token)
+}
+
+// EnvForCapability returns broker variables scoped to capability. Session
+// bearers are transient process environment and never written to .remount.
+func (b *Broker) EnvForCapability(capability string) []string {
 	noProxy := b.NoProxy()
+	base := b.baseForCapability(capability)
+	proxy := b.proxyForCapability(capability)
 	return []string{
-		"REMOUNT_BROKER=" + b.base,
-		"REMOUNT_PACKAGE_CONNECTOR=" + b.PackageURL(),
-		"REMOUNT_GIT_CONNECTOR=" + b.GitURL(),
-		"HTTP_PROXY=" + b.proxyBase,
-		"HTTPS_PROXY=" + b.proxyBase,
-		"http_proxy=" + b.proxyBase,
-		"https_proxy=" + b.proxyBase,
+		"REMOUNT_BROKER=" + base,
+		"REMOUNT_PACKAGE_CONNECTOR=" + base + "/package",
+		"REMOUNT_GIT_CONNECTOR=" + base + "/git",
+		"HTTP_PROXY=" + proxy,
+		"HTTPS_PROXY=" + proxy,
+		"http_proxy=" + proxy,
+		"https_proxy=" + proxy,
 		"NO_PROXY=" + noProxy,
 		"no_proxy=" + noProxy,
 	}
+}
+
+func (b *Broker) baseForCapability(capability string) string {
+	return "http://" + b.advertised + "/c/" + url.PathEscape(capability)
+}
+
+func (b *Broker) proxyForCapability(capability string) string {
+	proxyURL := &url.URL{Scheme: "http", Host: b.advertised, User: url.UserPassword(capability, "")}
+	return proxyURL.String()
 }
 
 // NoProxy returns the NO_PROXY value a workspace needs so that a
@@ -490,7 +518,7 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case b.requestSlots <- struct{}{}:
 		defer func() { <-b.requestSlots }()
 	default:
-		audit := b.auditFor(r.Method, "", r.Host, r.URL.Path)
+		audit := b.auditFor(r, "", r.Host, r.URL.Path)
 		audit.Decision, audit.Reason = DecisionLimitExceeded, "concurrent request limit exhausted"
 		b.emit(audit)
 		http.Error(w, "remount broker: concurrent request limit exhausted", http.StatusTooManyRequests)
@@ -500,24 +528,19 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	suspended := b.suspended
 	b.mu.RUnlock()
 	if suspended {
-		audit := b.auditFor(r.Method, "", r.Host, r.URL.Path)
+		audit := b.auditFor(r, "", r.Host, r.URL.Path)
 		audit.Decision, audit.Reason = DecisionDenied, "workspace is quiesced"
 		b.emit(audit)
 		http.Error(w, "remount broker: workspace is quiesced", http.StatusServiceUnavailable)
 		return
 	}
 	proxyRequest := r.Method == http.MethodConnect || r.URL.IsAbs()
-	if proxyRequest {
-		if !b.validProxyAuthorization(r.Header.Get("Proxy-Authorization")) {
-			b.rejectUnauthenticated(w, r, true)
-			return
-		}
-	} else if !b.consumeCapabilityPath(r) {
-		b.rejectUnauthenticated(w, r, false)
+	if !b.authenticateRequest(r, proxyRequest) {
+		b.rejectUnauthenticated(w, r, proxyRequest)
 		return
 	}
 	if b.typedPolicyEnabled() && ambiguousPolicyPath(r.URL.EscapedPath()) {
-		audit := b.auditFor(r.Method, "", r.Host, r.URL.Path)
+		audit := b.auditFor(r, "", r.Host, r.URL.Path)
 		audit.Decision, audit.Reason = DecisionDenied, "ambiguous encoded path is not permitted by typed policy"
 		b.emit(audit)
 		http.Error(w, "remount broker: ambiguous encoded path", http.StatusBadRequest)
@@ -576,7 +599,7 @@ func (b *Broker) selfAddressed(u *url.URL) bool {
 func (b *Broker) serveSelfAddressed(w http.ResponseWriter, r *http.Request) {
 	r.URL.Scheme, r.URL.Host, r.URL.User = "", "", nil
 	r.Header.Del("Proxy-Authorization")
-	if !b.consumeCapabilityPath(r) {
+	if !b.authenticateRequest(r, false) {
 		b.rejectUnauthenticated(w, r, false)
 		return
 	}
@@ -612,38 +635,73 @@ func ambiguousPolicyPath(escapedPath string) bool {
 		strings.Contains(escapedPath, "%25")
 }
 
-func (b *Broker) consumeCapabilityPath(r *http.Request) bool {
-	prefix := "/c/" + b.token
-	if !strings.HasPrefix(r.URL.Path, prefix) {
-		return false
+type principalContextKey struct{}
+
+func (b *Broker) authenticateRequest(r *http.Request, proxyRequest bool) bool {
+	var token string
+	if proxyRequest {
+		token = proxyAuthorizationToken(r.Header.Get("Proxy-Authorization"))
+	} else {
+		const prefix = "/c/"
+		if !strings.HasPrefix(r.URL.Path, prefix) {
+			return false
+		}
+		remainder := strings.TrimPrefix(r.URL.Path, prefix)
+		cut := strings.IndexByte(remainder, '/')
+		if cut < 0 {
+			token, remainder = remainder, ""
+		} else {
+			token, remainder = remainder[:cut], remainder[cut:]
+		}
+		if token == "" {
+			return false
+		}
+		if decoded, err := url.PathUnescape(token); err == nil {
+			token = decoded
+		} else {
+			return false
+		}
+		if remainder == "" {
+			remainder = "/"
+		}
+		r.URL.Path, r.URL.RawPath = remainder, ""
 	}
-	rest := strings.TrimPrefix(r.URL.Path, prefix)
-	if rest != "" && !strings.HasPrefix(rest, "/") {
-		return false
+	principal := b.opts.Principal
+	if subtle.ConstantTimeCompare([]byte(token), []byte(b.token)) != 1 {
+		if b.opts.CapabilityVerifier == nil {
+			return false
+		}
+		verified, err := b.opts.CapabilityVerifier(r.Context(), token)
+		if err != nil || verified == "" {
+			return false
+		}
+		principal = verified
 	}
-	if rest == "" {
-		rest = "/"
-	}
-	r.URL.Path = rest
-	r.URL.RawPath = ""
+	*r = *r.WithContext(context.WithValue(r.Context(), principalContextKey{}, principal))
 	return true
 }
 
-func (b *Broker) validProxyAuthorization(value string) bool {
+func proxyAuthorizationToken(value string) string {
 	if len(value) < 6 || !strings.EqualFold(value[:6], "basic ") {
-		return false
+		return ""
 	}
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value[6:]))
 	if err != nil {
-		return false
+		return ""
 	}
 	got := string(raw)
 	got = strings.TrimSuffix(got, ":")
-	return subtle.ConstantTimeCompare([]byte(got), []byte(b.token)) == 1
+	return got
+}
+
+// validProxyAuthorization is retained for focused compatibility tests of the
+// workspace-local capability.
+func (b *Broker) validProxyAuthorization(value string) bool {
+	return subtle.ConstantTimeCompare([]byte(proxyAuthorizationToken(value)), []byte(b.token)) == 1
 }
 
 func (b *Broker) rejectUnauthenticated(w http.ResponseWriter, r *http.Request, proxyRequest bool) {
-	audit := b.auditFor(r.Method, "", r.Host, r.URL.Path)
+	audit := b.auditFor(r, "", r.Host, r.URL.Path)
 	audit.Decision = DecisionUnauthenticated
 	audit.Reason = "workspace broker capability missing or invalid"
 	b.emit(audit)
@@ -663,10 +721,14 @@ func splitDest(p string) (host, rest string) {
 	return p[:i], p[i:]
 }
 
-func (b *Broker) auditFor(method, protocol, host, requestPath string) Audit {
+func (b *Broker) auditFor(r *http.Request, protocol, host, requestPath string) Audit {
+	principal := b.opts.Principal
+	if authenticated, ok := r.Context().Value(principalContextKey{}).(string); ok && authenticated != "" {
+		principal = authenticated
+	}
 	return Audit{
-		At: time.Now(), WS: b.opts.WS, Generation: b.opts.Generation, Principal: b.opts.Principal,
-		Host: host, Method: strings.ToUpper(method), Protocol: protocol, Path: requestPath,
+		At: time.Now(), WS: b.opts.WS, Generation: b.opts.Generation, Principal: principal,
+		Host: host, Method: strings.ToUpper(r.Method), Protocol: protocol, Path: requestPath,
 	}
 }
 
@@ -1257,7 +1319,7 @@ func (b *Broker) processCredentials(header http.Header, scheme, host string, sub
 // packageProxy invokes the managed package connector. Connector-scoped rules
 // cannot be exercised through proxy(), and generic rules cannot reach here.
 func (b *Broker) packageProxy(w http.ResponseWriter, r *http.Request, host, requestPath, query string) {
-	audit := b.auditFor(r.Method, proto.EgressProtocolHTTPS, host, requestPath)
+	audit := b.auditFor(r, proto.EgressProtocolHTTPS, host, requestPath)
 	audit.Connector = proto.EgressConnectorPackage
 	if r.ContentLength > 0 || len(r.TransferEncoding) != 0 {
 		audit.Decision, audit.Reason = DecisionDenied, "package connector requests cannot carry a body"
@@ -1387,7 +1449,7 @@ func (b *Broker) implicitGitRule(authority string) (proto.EgressRule, bool) {
 // <smart-http endpoint>. The connector decides what a git request is; this
 // method decides which rule (if any) covers the host and releases credentials.
 func (b *Broker) gitProxy(w http.ResponseWriter, r *http.Request, host, requestPath, query string) {
-	audit := b.auditFor(r.Method, proto.EgressProtocolHTTPS, host, requestPath)
+	audit := b.auditFor(r, proto.EgressProtocolHTTPS, host, requestPath)
 	audit.Connector = proto.EgressConnectorGit
 	fail := func(decision, reason string, status int) {
 		audit.Decision, audit.Reason = decision, reason
@@ -1541,7 +1603,7 @@ func (b *Broker) rewritePackageRedirect(header http.Header, source *url.URL) err
 // proxy rewrites and forwards one request.
 func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, path, query string) {
 	scheme = strings.ToLower(scheme)
-	audit := b.auditFor(r.Method, scheme, host, path)
+	audit := b.auditFor(r, scheme, host, path)
 	if scheme != proto.EgressProtocolHTTP && scheme != proto.EgressProtocolHTTPS {
 		audit.Decision, audit.Reason = DecisionDenied, "invalid destination scheme"
 		b.emit(audit)
@@ -1902,7 +1964,7 @@ func (b *Broker) rewriteRedirect(resp *http.Response) error {
 
 // handleConnect tunnels TCP to a permitted host without inspection.
 func (b *Broker) handleConnect(w http.ResponseWriter, r *http.Request) {
-	audit := b.auditFor(r.Method, proto.EgressProtocolConnect, r.Host, "")
+	audit := b.auditFor(r, proto.EgressProtocolConnect, r.Host, "")
 	host, err := normalizeAuthority(r.Host, proto.EgressProtocolConnect)
 	if err != nil {
 		audit.Decision, audit.Reason = DecisionDenied, err.Error()

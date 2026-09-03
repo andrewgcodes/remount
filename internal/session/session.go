@@ -25,15 +25,18 @@ import (
 
 // Spec describes what to run.
 type Spec struct {
-	WS      string
-	Kind    string // proto.SessionExec | SessionPTY | SessionPort
-	Program []string
-	Cwd     string
-	Env     []string // full environment, KEY=VALUE
-	Rows    uint16
-	Cols    uint16
-	Stdin   bool // exec: keep stdin open
-	Timeout time.Duration
+	WS string
+	// Generation fences durable log commits to the workspace assignment that
+	// produced them. It is node/control metadata, never process input.
+	Generation uint64
+	Kind       string // proto.SessionExec | SessionPTY | SessionPort
+	Program    []string
+	Cwd        string
+	Env        []string // full environment, KEY=VALUE
+	Rows       uint16
+	Cols       uint16
+	Stdin      bool // exec: keep stdin open
+	Timeout    time.Duration
 	// Port sessions
 	Host string
 	Port int
@@ -47,6 +50,28 @@ type Spec struct {
 	Tenant string
 	// Run marks a harness launch; carried in the info chunk and to OnExit.
 	Run *proto.RunInfo
+	// Runner is backend-owned and process-local. It is deliberately excluded
+	// from idempotency serialization.
+	Runner Runner `cbor:"-" json:"-"`
+}
+
+// Runner starts a backend-managed process or byte stream. Manager remains the
+// owner of admission, seq 0, logs, input deduplication and the terminal exit.
+type Runner interface {
+	Start(Spec) (Running, error)
+}
+
+// Running is one backend-managed session. Wait joins the producer and its
+// output readers must reach EOF when Wait returns.
+type Running interface {
+	PID() int
+	Stdin() io.WriteCloser
+	Stdout() io.Reader
+	Stderr() io.Reader
+	Resize(rows, cols uint16) error
+	Signal(name string) error
+	CloseWrite() error
+	Wait() proto.ExitInfo
 }
 
 // Session is a running or finished process with its output log.
@@ -65,9 +90,11 @@ type Session struct {
 	ptmx        *os.File
 	cmd         *exec.Cmd
 	conn        net.Conn
+	running     Running
 	lastISeq    uint64
 	exit        *proto.ExitInfo
 	exited      chan struct{}
+	observed    chan struct{} // closed after durable completion callback and OnExit
 	startDone   chan struct{} // closed once process/connection startup has resolved
 	timeout     *time.Timer
 	outputReady chan struct{} // pumps wait until StreamInfo is committed at seq 0
@@ -152,6 +179,7 @@ func (s *Session) Input(iseq uint64, data []byte, eof bool) error {
 	stdin := s.stdin
 	kind := s.Kind
 	conn := s.conn
+	running := s.running
 	s.mu.Unlock()
 	if stdin == nil {
 		return proto.Err(proto.CodeUnsupported, "session has no stdin")
@@ -162,7 +190,11 @@ func (s *Session) Input(iseq uint64, data []byte, eof bool) error {
 		}
 	}
 	if eof {
-		if kind == proto.SessionExec {
+		if running != nil {
+			if err := running.CloseWrite(); err != nil {
+				return proto.Err(proto.CodeClosed, "stdin close: %v", err)
+			}
+		} else if kind == proto.SessionExec {
 			if err := stdin.Close(); err != nil {
 				return proto.Err(proto.CodeClosed, "stdin close: %v", err)
 			}
@@ -210,6 +242,9 @@ func (s *Session) LastInputSeq() uint64 {
 func (s *Session) Resize(rows, cols uint16) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.running != nil {
+		return s.running.Resize(rows, cols)
+	}
 	if s.ptmx == nil {
 		return proto.Err(proto.CodeUnsupported, "not a pty session")
 	}
@@ -222,6 +257,9 @@ func (s *Session) Signal(name string) error {
 	defer s.mu.Unlock()
 	if s.exit != nil {
 		return proto.Err(proto.CodeClosed, "session already exited")
+	}
+	if s.running != nil {
+		return s.running.Signal(name)
 	}
 	if s.Kind == proto.SessionPort {
 		if s.conn != nil {
@@ -326,8 +364,17 @@ type ManagerOptions struct {
 	// back into that Log.
 	BlobStoreForTenant func(tenant string) (artifact.BlobStore, error)
 	CommitLogRecord    func(sessionID, tenant string, record LogRecord) error
-	SegmentBytes       int64
-	MaxLogSegments     int
+	// BlobStoreForSession permits workspace/generation authorization on every
+	// blob operation. It takes precedence over BlobStoreForTenant.
+	BlobStoreForSession func(tenant, workspace string) (artifact.BlobStore, error)
+	// CommitSessionLogRecord receives the immutable session identity together
+	// with each monotonic segment replacement. CompleteSessionLogRecord runs
+	// after the terminal segment is sealed and before retention begins.
+	CommitSessionLogRecord   func(sessionID string, spec Spec, record LogRecord) error
+	CompleteSessionLogRecord func(sessionID string, spec Spec, info proto.SessionInfo, exit proto.ExitInfo, record LogRecord) error
+	OnRecordError            func(sessionID string, err error)
+	SegmentBytes             int64
+	MaxLogSegments           int
 	// MaxSessions includes retained exited sessions; MaxActive bounds processes
 	// and port connections; per-workspace and per-principal limits prevent one
 	// tenant actor from consuming the node-wide retained-session budget. Zero
@@ -351,6 +398,7 @@ type Manager struct {
 	byPrincipal map[string]int
 	active      int
 	closed      bool
+	observers   sync.WaitGroup
 }
 
 // ManagerStats is a point-in-time session-capacity snapshot.
@@ -523,6 +571,35 @@ func (m *Manager) KillWorkspace(ws string) error {
 	return nil
 }
 
+// TerminateWorkspace joins every producer but retains completed logs for late
+// attach and cross-node replay until the configured retention deadline.
+func (m *Manager) TerminateWorkspace(ws, reason string) error {
+	var failed []string
+	for _, s := range m.List(ws) {
+		<-s.startDone
+		if !s.Exited() {
+			s.Terminate(reason)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err := s.Wait(ctx)
+		if err == nil && s.observed != nil {
+			select {
+			case <-s.observed:
+			case <-ctx.Done():
+				err = ctx.Err()
+			}
+		}
+		cancel()
+		if err != nil {
+			failed = append(failed, s.ID)
+		}
+	}
+	if len(failed) != 0 {
+		return fmt.Errorf("sessions did not stop within the deadline: %s", strings.Join(failed, ", "))
+	}
+	return nil
+}
+
 // Close kills everything.
 func (m *Manager) Close() {
 	m.mu.Lock()
@@ -535,6 +612,29 @@ func (m *Manager) Close() {
 	for _, s := range all {
 		m.Remove(s.ID, true)
 	}
+	m.observers.Wait()
+}
+
+// Shutdown joins live producers while preserving durable log references. It
+// is used for node process shutdown; retention remains control-plane owned.
+func (m *Manager) Shutdown() {
+	m.mu.Lock()
+	m.closed = true
+	all := make([]*Session, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		all = append(all, s)
+	}
+	m.mu.Unlock()
+	for _, s := range all {
+		<-s.startDone
+		if !s.Exited() {
+			s.Terminate("node shutdown")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, _ = s.Wait(ctx)
+		cancel()
+	}
+	m.observers.Wait()
 }
 
 // Open starts a session. If spec.IdempotencyKey names an existing session it
@@ -591,18 +691,31 @@ func (m *Manager) OpenOrReplay(spec Spec) (s *Session, created bool, err error) 
 		spillPath = filepath.Join(m.opts.SpillDir, id+".log")
 	}
 	var blobStore artifact.BlobStore
-	if m.opts.BlobStoreForTenant != nil {
+	if m.opts.BlobStoreForSession != nil {
+		blobStore, err = m.opts.BlobStoreForSession(spec.Tenant, spec.WS)
+		if err != nil {
+			if m.opts.OnRecordError != nil {
+				m.opts.OnRecordError(id, fmt.Errorf("session artifact store: %w", err))
+			}
+			blobStore, err = nil, nil
+		}
+	} else if m.opts.BlobStoreForTenant != nil {
 		blobStore, err = m.opts.BlobStoreForTenant(spec.Tenant)
+	}
+	if blobStore != nil || (m.opts.BlobStoreForTenant != nil && m.opts.BlobStoreForSession == nil) {
 		if err != nil {
 			m.mu.Unlock()
 			return nil, false, fmt.Errorf("session artifact store for tenant: %w", err)
 		}
-		if m.opts.CommitLogRecord == nil {
+		if m.opts.CommitSessionLogRecord == nil && m.opts.CommitLogRecord == nil {
 			m.mu.Unlock()
 			return nil, false, errors.New("session: CommitLogRecord required with BlobStoreForTenant")
 		}
 	}
 	commitRecord := func(record LogRecord) error {
+		if m.opts.CommitSessionLogRecord != nil {
+			return m.opts.CommitSessionLogRecord(id, spec, record)
+		}
 		return m.opts.CommitLogRecord(id, spec.Tenant, record)
 	}
 	if blobStore == nil {
@@ -618,7 +731,7 @@ func (m *Manager) OpenOrReplay(spec Spec) (s *Session, created bool, err error) 
 		return nil, false, err
 	}
 	s = &Session{
-		ID: id, WS: spec.WS, Kind: spec.Kind, Log: log, exited: make(chan struct{}), startDone: make(chan struct{}), outputReady: make(chan struct{}), Principal: spec.Principal, Tenant: spec.Tenant,
+		ID: id, WS: spec.WS, Kind: spec.Kind, Log: log, exited: make(chan struct{}), observed: make(chan struct{}), startDone: make(chan struct{}), outputReady: make(chan struct{}), Principal: spec.Principal, Tenant: spec.Tenant,
 		Info: proto.SessionInfo{ID: id, WS: spec.WS, Kind: spec.Kind, Program: spec.Program, OpenedAt: time.Now().UnixMilli(), Run: spec.Run},
 	}
 	s.onFinish = func() { m.markInactive(id, s) }
@@ -631,18 +744,21 @@ func (m *Manager) OpenOrReplay(spec Spec) (s *Session, created bool, err error) 
 		m.byIdem[spec.IdempotencyKey] = idemSession{id: id, fingerprint: fingerprint}
 	}
 	m.mu.Unlock()
-	go m.observe(s)
+	m.observers.Add(1)
+	go m.observe(s, spec)
 	defer close(s.startDone)
 
 	var startErr error
-	switch spec.Kind {
-	case proto.SessionExec:
+	switch {
+	case spec.Runner != nil:
+		startErr = s.startRunner(spec)
+	case spec.Kind == proto.SessionExec:
 		startErr = s.startExec(spec)
-	case proto.SessionPTY:
+	case spec.Kind == proto.SessionPTY:
 		startErr = s.startPTY(spec)
-	case proto.SessionPort:
+	case spec.Kind == proto.SessionPort:
 		startErr = s.startPort(spec)
-	case proto.SessionACP:
+	case spec.Kind == proto.SessionACP:
 		// Record-only: the agent runner appends protocol frames and ends it.
 	default:
 		startErr = proto.Err(proto.CodeBadRequest, "unknown session kind %q", spec.Kind)
@@ -689,15 +805,70 @@ func sessionPrincipalKey(tenant, principal string) string {
 func sessionFingerprint(spec Spec) [32]byte {
 	copySpec := spec
 	copySpec.IdempotencyKey = ""
+	copySpec.Runner = nil
 	return sha256.Sum256(proto.MustMarshal(copySpec))
 }
 
-func (m *Manager) observe(s *Session) {
+func (m *Manager) observe(s *Session, spec Spec) {
+	defer m.observers.Done()
+	defer close(s.observed)
 	<-s.exited
+	info := *s.ExitInfo()
+	if m.opts.CompleteSessionLogRecord != nil {
+		if err := m.opts.CompleteSessionLogRecord(s.ID, spec, s.Info, info, s.Log.Record()); err != nil && m.opts.OnRecordError != nil {
+			m.opts.OnRecordError(s.ID, err)
+		}
+	}
 	if m.opts.OnExit != nil {
-		m.opts.OnExit(s, *s.ExitInfo())
+		m.opts.OnExit(s, info)
 	}
 	m.scheduleReap(s)
+}
+
+// RestoreArchived installs a complete remote-only session record for attach
+// after a node restart or workspace handoff. It consumes retained-session
+// capacity but never active-process capacity.
+func (m *Manager) RestoreArchived(record proto.SessionLogRecord, store artifact.BlobStore) (*Session, error) {
+	if !record.Complete || record.Session == "" || record.Workspace == "" || record.Principal == "" || record.Info.ID != record.Session || record.Info.WS != record.Workspace {
+		return nil, errors.New("session: incomplete archived record")
+	}
+	segments := make([]SegmentRef, len(record.Segments))
+	for i, segment := range record.Segments {
+		segments[i] = SegmentRef{First: segment.First, Next: segment.Next, Artifact: segment.Artifact, Bytes: segment.Bytes}
+	}
+	log, err := OpenArchivedLog(store, LogRecord{Version: logRecordVersion, MaxChunk: record.MaxChunk, Segments: segments})
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing := m.sessions[record.Session]; existing != nil {
+		return existing, nil
+	}
+	if m.closed || len(m.sessions) >= m.opts.MaxSessions || m.byWS[record.Workspace] >= m.opts.MaxSessionsPerWorkspace || m.byPrincipal[sessionPrincipalKey(record.Tenant, record.Principal)] >= m.opts.MaxSessionsPerPrincipal {
+		return nil, proto.Err(proto.CodeResourceExhausted, "retained session capacity is exhausted")
+	}
+	exited := make(chan struct{})
+	close(exited)
+	started := make(chan struct{})
+	close(started)
+	outputReady := make(chan struct{})
+	close(outputReady)
+	exit := record.Exit
+	s := &Session{
+		ID: record.Session, WS: record.Workspace, Kind: record.Kind, Info: record.Info,
+		Log: log, Principal: record.Principal, Tenant: record.Tenant, exit: &exit,
+		exited: exited, observed: exited, startDone: started, outputReady: outputReady,
+	}
+	m.sessions[s.ID] = s
+	m.byWS[s.WS]++
+	m.byPrincipal[sessionPrincipalKey(s.Tenant, s.Principal)]++
+	if record.ExpiresAt > 0 {
+		m.scheduleReapAt(s, time.UnixMilli(record.ExpiresAt))
+	} else {
+		m.scheduleReap(s)
+	}
+	return s, nil
 }
 
 func (m *Manager) markInactive(id string, s *Session) {
@@ -715,7 +886,16 @@ func (m *Manager) scheduleReap(s *Session) {
 			retention = configured
 		}
 	}
-	time.AfterFunc(retention, func() { m.reap(s.ID) })
+	m.scheduleReapAt(s, time.Now().Add(retention))
+
+}
+
+func (m *Manager) scheduleReapAt(s *Session, at time.Time) {
+	delay := time.Until(at)
+	if delay < 0 {
+		delay = 0
+	}
+	time.AfterFunc(delay, func() { m.reap(s.ID) })
 }
 
 func (m *Manager) reap(id string) {
@@ -734,6 +914,45 @@ func (m *Manager) reap(id string) {
 }
 
 // ---- runners ----
+
+func (s *Session) startRunner(spec Spec) error {
+	if spec.Kind != proto.SessionExec && spec.Kind != proto.SessionPTY && spec.Kind != proto.SessionPort {
+		return proto.Err(proto.CodeUnsupported, "backend runner does not support session kind %q", spec.Kind)
+	}
+	running, err := spec.Runner.Start(spec)
+	if err != nil {
+		return err
+	}
+	if running == nil {
+		return errors.New("session: backend runner returned nil")
+	}
+	s.mu.Lock()
+	s.running = running
+	s.stdin = running.Stdin()
+	s.Info.PID = running.PID()
+	s.mu.Unlock()
+
+	var pumps sync.WaitGroup
+	pumpStream := func(stream uint8, reader io.Reader) {
+		if reader == nil {
+			return
+		}
+		pumps.Add(1)
+		go func() {
+			defer pumps.Done()
+			<-s.outputReady
+			s.recordLogError(pump(s.Log, stream, reader))
+		}()
+	}
+	pumpStream(proto.StreamStdout, running.Stdout())
+	pumpStream(proto.StreamStderr, running.Stderr())
+	go func() {
+		info := running.Wait()
+		pumps.Wait()
+		s.finish(info)
+	}()
+	return nil
+}
 
 func (s *Session) startExec(spec Spec) error {
 	if len(spec.Program) == 0 {
@@ -811,7 +1030,13 @@ func (s *Session) startPTY(spec Spec) error {
 	s.mu.Unlock()
 	go func() {
 		<-s.outputReady
-		s.recordLogError(pump(s.Log, proto.StreamStdout, ptmx))
+		logErr := pump(s.Log, proto.StreamStdout, ptmx)
+		// Linux PTY masters report EIO, rather than EOF, after the slave has
+		// closed. Treat that terminal condition as a cleanly drained stream.
+		if isPTYEOF(logErr) {
+			logErr = nil
+		}
+		s.recordLogError(logErr)
 		err := cmd.Wait()
 		_ = ptmx.Close()
 		s.finish(exitInfo(err, cmd))

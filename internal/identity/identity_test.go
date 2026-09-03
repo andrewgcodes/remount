@@ -55,7 +55,7 @@ func TestPrincipalTokensExpireRefreshAndRevoke(t *testing.T) {
 		t.Fatal("revoked token authenticated")
 	}
 	events := store.Events()
-	if len(events) != 1 || events[0].Type != "identity.revoked" || events[0].Subject != "alice" {
+	if len(events) != 2 || events[1].Type != "identity.revoked" || events[1].Subject != "alice" {
 		t.Fatalf("durable events = %+v", events)
 	}
 	now = now.Add(2 * time.Minute)
@@ -234,6 +234,60 @@ func TestSQLiteEnrollmentConcurrentDifferentNodesHasOneWinner(t *testing.T) {
 	wg.Wait()
 	if successes.Load() != 1 {
 		t.Fatalf("successful enrollments = %d, want 1", successes.Load())
+	}
+}
+
+func TestSQLiteMaintenanceIsBoundedAndObservable(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	sqlite, err := eventlog.OpenSQLite(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := eventlog.New(sqlite)
+	t.Cleanup(func() { _ = log.Close() })
+	store, err := NewSQLiteStore(sqlite.DB(), log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	manager, err := New(Options{PrivateKey: key, Store: store, AccessTTL: time.Minute, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	access, _, err := manager.IssueTokens(context.Background(), "alice", "tenant-a", []string{RoleAgent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Revoke(context.Background(), access); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.IssueEnrollment(context.Background(), "pool", "tenant-a", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Minute)
+	first, err := store.CollectExpired(context.Background(), now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Revocations+first.Enrollments != 1 {
+		t.Fatalf("first maintenance=%+v", first)
+	}
+	second, err := store.CollectExpired(context.Background(), now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Revocations+second.Enrollments != 1 {
+		t.Fatalf("second maintenance=%+v", second)
+	}
+	var revocations, enrollments int
+	if err := sqlite.DB().QueryRow(`SELECT count(*) FROM identity_revocations`).Scan(&revocations); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlite.DB().QueryRow(`SELECT count(*) FROM identity_enrollments`).Scan(&enrollments); err != nil {
+		t.Fatal(err)
+	}
+	if revocations != 0 || enrollments != 0 {
+		t.Fatalf("retained revocations=%d enrollments=%d", revocations, enrollments)
 	}
 }
 

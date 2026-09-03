@@ -692,7 +692,6 @@ func (l *Log) Read(from uint64, max int) ([]Chunk, error) {
 			chunk := l.chunks[i]
 			chunk.Data = append([]byte(nil), chunk.Data...)
 			out = append(out, chunk)
-			from = chunk.Seq + 1
 			i++
 		}
 		l.mu.Unlock()

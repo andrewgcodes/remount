@@ -6,6 +6,14 @@ statements that the described controls already exist.
 
 ## Documents
 
+### [Codex continuation handoff — 2026-09-03](./handoff-2026-09-03-codex-wrap.md)
+
+The current continuation ledger for the Phase 2–6 implementation pass. It
+records completed code and tests, integration/CI incidents, the exact remaining
+local and external gates, and a safe ownership/verification order. Start here
+for work after the quota-bounded Codex implementation session, then consult the
+original build handoff for the full requirements.
+
 ### [Build handoff — 2026-09-03](./handoff-2026-09-03.md)
 
 The current status document for the build plan: what Remount is, what the

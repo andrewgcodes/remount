@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"remount.dev/remount/internal/artifact"
+	"remount.dev/remount/internal/artifact/encrypted"
 	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/eventlog"
 	"remount.dev/remount/internal/identity"
@@ -33,6 +35,7 @@ import (
 	"remount.dev/remount/internal/provision"
 	"remount.dev/remount/internal/relay"
 	"remount.dev/remount/internal/secretsource"
+	"remount.dev/remount/internal/tenant"
 	"remount.dev/remount/internal/transport"
 	webui "remount.dev/remount/web"
 )
@@ -52,6 +55,19 @@ type Options struct {
 	// concurrent staging. Defaults are 64 GiB and 100,000 objects.
 	MaxArtifactStoreBytes int64
 	MaxArtifactObjects    int
+	// TenantArtifacts resolves the authenticated tenant to an isolated logical
+	// artifact namespace. Production modes require a resolver that asserts
+	// encryption at rest; standalone explicitly falls back to the legacy shared
+	// directory store.
+	TenantArtifacts artifact.TenantResolver
+	// ArtifactStartupTimeout bounds the resolver readiness probe. Zero selects
+	// 30 seconds. A probe that cannot run makes production startup unavailable.
+	ArtifactStartupTimeout time.Duration
+	// NodeArtifactAuthorizer validates a node's signed workspace-generation
+	// assignment proof for each artifact transfer. Client credentials are
+	// authorized through Authorizer. Production node requests fail closed when
+	// this hook is absent; a tenant header is never accepted as authority.
+	NodeArtifactAuthorizer NodeArtifactAuthorizer
 	// ArtifactGracePeriod protects uploads while a workspace operation commits
 	// its reference. ArtifactGCInterval controls reference-aware collection.
 	// Negative intervals disable the background collector (primarily for tests).
@@ -75,6 +91,12 @@ type Options struct {
 	Mode          string
 	Authenticator control.Authenticator
 	Authorizer    control.Authorizer
+	// PrincipalAuthority backs production onboarding and short-lived token
+	// issuance. The built-in identity manager is used when nil.
+	PrincipalAuthority control.PrincipalAuthority
+	// SessionCapabilityTTL controls short-lived signed broker proofs. The
+	// node keeps the process-visible handle stable and rotates proofs early.
+	SessionCapabilityTTL time.Duration
 	// NodeAuthenticator atomically enrolls or verifies node keys. Production
 	// modes require it and do not accept a shared node token.
 	NodeAuthenticator control.NodeAuthenticator
@@ -133,6 +155,26 @@ type Options struct {
 	PoolEnrollmentSource nodepool.EnrollmentSource
 	PoolBootstrap        control.PoolBootstrap
 	PoolOptions          nodepool.Options
+	// Replication enables fenced active/passive control-plane durability. Its
+	// coordinator must already hold the writer lease; a standby restores first.
+	Replication *ReplicationOptions
+}
+
+const (
+	// ArtifactWorkspaceHeader identifies the workspace in a signed node
+	// artifact assignment proof. The value is not authority by itself.
+	ArtifactWorkspaceHeader = proto.ArtifactWorkspaceHeader
+	// ArtifactGenerationHeader identifies the generation in a signed node
+	// artifact assignment proof.
+	ArtifactGenerationHeader = proto.ArtifactGenerationHeader
+	// ArtifactProofHeader carries the control-plane-signed assignment proof.
+	ArtifactProofHeader = proto.ArtifactProofHeader
+)
+
+// NodeArtifactAuthorizer revalidates live assignment after node credential
+// authentication. It must not derive Tenant from an HTTP header.
+type NodeArtifactAuthorizer interface {
+	AuthorizeNodeArtifact(ctx context.Context, node, tenant, workspace string, generation uint64, method, artifactID, proof string) error
 }
 
 const (
@@ -143,16 +185,18 @@ const (
 
 // Server is a running Remount server.
 type Server struct {
-	opts     Options
-	Control  *control.Control
-	Identity *identity.Manager
-	Relay    *relay.Relay
-	Store    *artifact.Store
-	Log      *eventlog.Log
-	db       *sql.DB
-	http     *http.Server
-	ln       net.Listener
-	logger   *slog.Logger
+	opts      Options
+	Control   *control.Control
+	Identity  *identity.Manager
+	Tenants   *tenant.Store
+	Relay     *relay.Relay
+	Store     *artifact.Store
+	artifacts artifact.TenantResolver
+	Log       *eventlog.Log
+	db        *sql.DB
+	http      *http.Server
+	ln        net.Listener
+	logger    *slog.Logger
 
 	mu          sync.RWMutex
 	ready       chan struct{}
@@ -176,6 +220,7 @@ type Server struct {
 	notifierDLQ     *notifier.SQLiteDeadLetterStore
 	notifierTenants []string
 	console         http.Handler
+	replication     *controlReplication
 }
 
 // New builds a server. Call Serve or Handler.
@@ -187,7 +232,7 @@ func New(opts Options) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("server: %w", err)
 	}
-	if opts.MaxArtifactBytes < 0 || opts.MaxArtifactStoreBytes < 0 || opts.MaxArtifactObjects < 0 || opts.MaxEvents < 0 {
+	if opts.MaxArtifactBytes < 0 || opts.MaxArtifactStoreBytes < 0 || opts.MaxArtifactObjects < 0 || opts.MaxEvents < 0 || opts.ArtifactStartupTimeout < 0 {
 		return nil, errors.New("server: artifact and event limits must not be negative")
 	}
 	if opts.MaxConcurrentRequests < 0 || opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 || opts.MaxMutationRecords < 0 ||
@@ -260,6 +305,12 @@ func New(opts Options) (*Server, error) {
 	if opts.Mode == "" {
 		opts.Mode = ModeStandalone
 	}
+	if opts.ArtifactStartupTimeout == 0 {
+		opts.ArtifactStartupTimeout = 30 * time.Second
+	}
+	if opts.Mode != ModeStandalone && (opts.TenantArtifacts == nil || !opts.TenantArtifacts.EncryptedAtRest()) {
+		return nil, errors.New("server: production mode requires encrypted tenant artifact storage")
+	}
 	dbPath := ":memory:"
 	artDir := ""
 	if opts.DataDir != "" {
@@ -291,7 +342,38 @@ func New(opts Options) (*Server, error) {
 		}
 		return nil, err
 	}
+	if opts.TenantArtifacts == nil {
+		opts.TenantArtifacts, err = artifact.NewSharedTenantResolver(store)
+		if err != nil {
+			_ = sq.Close()
+			if opts.DataDir == "" {
+				_ = os.RemoveAll(artDir)
+			}
+			return nil, err
+		}
+	}
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), opts.ArtifactStartupTimeout)
+	err = opts.TenantArtifacts.Ready(readyCtx)
+	readyCancel()
+	if err != nil {
+		_ = sq.Close()
+		if opts.DataDir == "" {
+			_ = os.RemoveAll(artDir)
+		}
+		return nil, fmt.Errorf("server: tenant artifact storage unavailable: %w", err)
+	}
 	log := eventlog.New(sq)
+	var tenantStore *tenant.Store
+	if opts.Mode == ModeProductionMultiTenant {
+		tenantStore, err = tenant.NewStore(sq.DB(), log, tenant.Options{})
+		if err != nil {
+			_ = log.Close()
+			if opts.DataDir == "" {
+				_ = os.RemoveAll(artDir)
+			}
+			return nil, err
+		}
+	}
 	var identityManager *identity.Manager
 	if opts.Mode == ModeProductionSingleTenant || opts.Mode == ModeProductionMultiTenant {
 		configured := opts.Authenticator != nil || opts.Authorizer != nil || opts.NodeAuthenticator != nil
@@ -320,7 +402,7 @@ func New(opts Options) (*Server, error) {
 				}
 				return nil, err
 			}
-			identityManager, err = identity.New(identity.Options{PrivateKey: identityKey, Store: identityStore})
+			identityManager, err = identity.New(identity.Options{PrivateKey: identityKey, Store: identityStore, SessionTTL: opts.SessionCapabilityTTL})
 			if err != nil {
 				_ = log.Close()
 				if opts.DataDir == "" {
@@ -378,14 +460,46 @@ func New(opts Options) (*Server, error) {
 		}
 		poolReconciler = reconciler
 	}
+	var legacyControlArtifacts control.ArtifactStore = store
+	if opts.Mode != ModeStandalone {
+		legacyControlArtifacts = nil
+	}
+	var sessionCapabilities control.SessionCapabilityAuthority
+	var principalRevocations control.PrincipalRevocationAuthority
+	principalAuthority := opts.PrincipalAuthority
+	if identityManager != nil {
+		sessionCapabilities = identityManager
+		principalRevocations = identityManager
+		principalAuthority = identityManager
+	}
+	var authority control.ControllerAuthority
+	controllerRole := "active"
+	var recoveryState *control.RecoveryState
+	if opts.Replication != nil {
+		authority = opts.Replication.Coordinator
+		if opts.Replication.Recovery != nil {
+			controllerRole = "promoted"
+			recovery := opts.Replication.Recovery
+			recoveryState = &control.RecoveryState{
+				PreviousEpoch: recovery.PreviousEpoch, RestoredEventSeq: recovery.Manifest.SourceEventSeq,
+				LastReplicatedAt: recovery.LastReplicatedAt, PromotedAt: recovery.PromotedAt, LostWindow: recovery.LostWindow,
+			}
+		}
+	}
 	ctrl, err := control.New(control.Options{DB: sq.DB(), Log: log, Token: opts.Token,
-		Bindings: opts.Bindings, SecretResolver: opts.SecretResolver, LeaseSec: opts.LeaseSec, Logger: opts.Logger, Artifacts: store,
+		Bindings: opts.Bindings, SecretResolver: opts.SecretResolver, LeaseSec: opts.LeaseSec, Logger: opts.Logger,
+		Artifacts: legacyControlArtifacts, TenantArtifacts: opts.TenantArtifacts,
 		Authenticator: opts.Authenticator, Authorizer: opts.Authorizer, NodeAuthenticator: opts.NodeAuthenticator, ApprovedNodes: opts.ApprovedNodes,
+		SessionCapabilities: sessionCapabilities, PrincipalRevocations: principalRevocations,
+		Principals:           principalAuthority,
+		SessionCapabilityTTL: opts.SessionCapabilityTTL,
+		Tenants:              tenantStore,
 		SecurityProfileFloor: floor, MaxWorkspacesPerTenant: opts.MaxWorkspacesPerTenant,
 		MaxWorkspacesPerSubject: opts.MaxWorkspacesPerSubject, MaxMutationRecords: opts.MaxMutationRecords,
 		MaxTimers: opts.MaxTimers, MaxTimersPerWorkspace: opts.MaxTimersPerWorkspace,
 		MaxConcurrentRequests: opts.MaxConcurrentRequests, MaxEvents: opts.MaxEvents, PublicURL: opts.PublicURL,
-		PoolReconciler: poolReconciler, PoolBootstrap: opts.PoolBootstrap})
+		PoolReconciler: poolReconciler, PoolBootstrap: opts.PoolBootstrap,
+		ControllerAuthority: authority, ControllerRole: controllerRole, Recovery: recoveryState})
 	if err != nil {
 		_ = log.Close()
 		if opts.DataDir == "" {
@@ -393,12 +507,46 @@ func New(opts Options) (*Server, error) {
 		}
 		return nil, err
 	}
+	if opts.NodeArtifactAuthorizer == nil {
+		opts.NodeArtifactAuthorizer = ctrl
+	}
 	r := relay.New(ctrl)
 	ctrl.Attach(r)
 	ctrl.Start()
+	replication, err := newControlReplication(sq.DB(), dbPath, opts.DataDir, log, ctrl, opts.Replication)
+	if err != nil {
+		r.Close()
+		ctrl.Stop()
+		_ = log.Close()
+		if opts.DataDir == "" {
+			_ = os.RemoveAll(artDir)
+		}
+		return nil, err
+	}
+	if replication != nil && recoveryState == nil {
+		shipCtx, shipCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err = replication.initialShip(shipCtx)
+		shipCancel()
+		if err != nil {
+			replication.close()
+			r.Close()
+			ctrl.Stop()
+			_ = log.Close()
+			if opts.DataDir == "" {
+				_ = os.RemoveAll(artDir)
+			}
+			return nil, fmt.Errorf("server: initial control replication failed: %w", err)
+		}
+	}
+	if replication != nil {
+		replication.startKeepAlive()
+		if recoveryState == nil {
+			replication.startShipping()
+		}
+	}
 	s := &Server{
-		opts: opts, Control: ctrl, Identity: identityManager, Relay: r, Store: store, Log: log, db: sq.DB(), logger: opts.Logger,
-		ready: make(chan struct{}), console: console,
+		opts: opts, Control: ctrl, Identity: identityManager, Tenants: tenantStore, Relay: r, Store: store, Log: log, db: sq.DB(), logger: opts.Logger,
+		artifacts: opts.TenantArtifacts, ready: make(chan struct{}), console: console, replication: replication,
 	}
 	if opts.DataDir == "" {
 		s.tempArtDir = artDir
@@ -658,6 +806,15 @@ func (s *Server) recordGCLoop(ctx context.Context) {
 // workspace or fleet-operation record.
 func (s *Server) CollectArtifacts(now time.Time) (artifact.GCResult, error) {
 	var result artifact.GCResult
+	if collector, ok := s.artifacts.(artifact.TenantCollector); ok {
+		err := s.Control.WithTenantArtifactReferences(func(references []artifact.TenantReference) error {
+			var err error
+			result, err = collector.CollectTenants(s.lifetime, references, now, now.Add(-s.opts.ArtifactGracePeriod))
+			return err
+		})
+		metrics.ArtifactGCRuns.Inc()
+		return result, err
+	}
 	err := s.Control.WithArtifactReferences(func(references []string) error {
 		var err error
 		result, err = s.Store.Collect(references, now.Add(-s.opts.ArtifactGracePeriod))
@@ -782,6 +939,7 @@ func (s *Server) Handler() http.Handler {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
 	s.apiRoutes(mux)
+	s.identityRoutes(mux)
 	return s.cors(mux)
 }
 
@@ -821,6 +979,13 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 	s.serving = true
 	s.mu.Unlock()
 	s.readyOnce.Do(func() { close(s.ready) })
+	if s.Control.RecoveryPending() {
+		s.gcWG.Add(1)
+		go func() {
+			defer s.gcWG.Done()
+			s.reconcileController(s.lifetime)
+		}()
+	}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -838,6 +1003,31 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 	}
 	s.mu.Unlock()
 	return err
+}
+
+func (s *Server) reconcileController(ctx context.Context) {
+	for ctx.Err() == nil && s.Control.RecoveryPending() {
+		if err := s.Control.ReconcileRecovery(ctx); err != nil {
+			s.logger.Warn("controller recovery reconciliation deferred", "err", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(250 * time.Millisecond):
+			}
+			continue
+		}
+		if s.replication != nil {
+			shipCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			err := s.replication.initialShip(shipCtx)
+			cancel()
+			if err != nil {
+				s.replication.fail(fmt.Errorf("publish reconciled controller state: %w", err))
+				return
+			}
+			s.replication.markRecovered()
+			s.replication.startShipping()
+		}
+	}
 }
 
 // Addr returns the bound address after Serve.
@@ -893,6 +1083,9 @@ func (s *Server) Close() error {
 		}
 		s.Relay.Close()
 		s.Control.Stop()
+		if s.replication != nil {
+			s.replication.close()
+		}
 		errs = append(errs, s.Log.Close())
 		if s.tempArtDir != "" {
 			errs = append(errs, os.RemoveAll(s.tempArtDir))
@@ -922,6 +1115,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 	dbErr := s.db.PingContext(r.Context())
 	ready := !closed && dbErr == nil && (!serveCalled || serving)
+	var replicationErr error
+	if s.replication != nil {
+		replicationErr = s.replication.ready()
+		ready = ready && replicationErr == nil && !s.Control.RecoveryPending()
+	}
 	w.Header().Set("Content-Type", "application/json")
 	if !ready {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -929,6 +1127,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	body := map[string]any{"ok": ready, "peers": len(s.Relay.Peers()), "serving": serving, "security_mode": s.opts.Mode, "security_ready": ready}
 	if dbErr != nil {
 		body["database"] = dbErr.Error()
+	}
+	if replicationErr != nil {
+		body["replication"] = replicationErr.Error()
+	}
+	if s.Control.RecoveryPending() {
+		body["recovery"] = "reconciling"
 	}
 	_ = json.NewEncoder(w).Encode(body)
 }
@@ -960,7 +1164,8 @@ func (s *Server) authed(r *http.Request) bool {
 }
 
 func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(r) {
+	subject, legacy, ok := s.artifactSubject(r)
+	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -969,42 +1174,114 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	action := control.ActionRead
+	if r.Method == http.MethodPut {
+		action = control.ActionWrite
+	}
+	if !legacy {
+		if hasRole(subject.Roles, identity.RoleNode) {
+			generation, err := strconv.ParseUint(r.Header.Get(ArtifactGenerationHeader), 10, 64)
+			if err != nil || generation == 0 || s.opts.NodeArtifactAuthorizer == nil ||
+				s.opts.NodeArtifactAuthorizer.AuthorizeNodeArtifact(r.Context(), subject.ID, subject.Tenant,
+					r.Header.Get(ArtifactWorkspaceHeader), generation, r.Method, id, r.Header.Get(ArtifactProofHeader)) != nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+		} else if s.opts.Authorizer != nil {
+			resource := control.Resource{Kind: "artifact", ID: id, Tenant: subject.Tenant, Owner: subject.ID}
+			if err := s.opts.Authorizer.Check(r.Context(), subject, action, resource); err != nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+		}
+	}
+	store, err := s.artifacts.ResolveTenant(subject.Tenant)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
 	switch r.Method {
 	case http.MethodPut:
 		if r.ContentLength > s.opts.MaxArtifactBytes {
 			http.Error(w, artifact.ErrTooLarge.Error(), http.StatusRequestEntityTooLarge)
 			return
 		}
-		n, err := s.Store.PutExpected(id, r.Body, s.opts.MaxArtifactBytes)
+		n, err := store.PutExpected(id, r.Body, s.opts.MaxArtifactBytes)
 		if err != nil {
 			status := http.StatusInternalServerError
 			switch {
-			case errors.Is(err, artifact.ErrTooLarge):
+			case errors.Is(err, artifact.ErrTooLarge), errors.Is(err, encrypted.ErrTooLarge):
 				status = http.StatusRequestEntityTooLarge
-			case errors.Is(err, artifact.ErrStoreFull):
+			case errors.Is(err, artifact.ErrStoreFull), errors.Is(err, encrypted.ErrStagingFull), errors.Is(err, encrypted.ErrPhysicalStoreFull):
 				status = http.StatusInsufficientStorage
 			case errors.Is(err, artifact.ErrDigestMismatch):
 				status = http.StatusBadRequest
 			}
-			http.Error(w, err.Error(), status)
+			http.Error(w, http.StatusText(status), status)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "bytes": n})
-	case http.MethodGet, http.MethodHead:
-		rc, size, err := s.Store.Open(id)
+	case http.MethodHead:
+		size, err := store.Head(id)
 		if err != nil {
-			http.Error(w, "not found", http.StatusNotFound)
+			writeArtifactReadError(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/gzip")
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	case http.MethodGet:
+		rc, size, err := store.Open(id)
+		if err != nil {
+			writeArtifactReadError(w, err)
 			return
 		}
 		defer rc.Close()
 		w.Header().Set("Content-Type", "application/gzip")
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-		if r.Method == http.MethodHead {
-			return
-		}
 		_, _ = io.Copy(w, rc)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func writeArtifactReadError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	if errors.Is(err, fs.ErrNotExist) {
+		status = http.StatusNotFound
+	} else if errors.Is(err, encrypted.ErrKeyUnavailable) {
+		status = http.StatusServiceUnavailable
+	}
+	http.Error(w, http.StatusText(status), status)
+}
+
+func (s *Server) artifactSubject(r *http.Request) (control.Subject, bool, bool) {
+	token, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !bearer || token == "" {
+		if s.opts.Mode != ModeStandalone || s.opts.Token != "" || s.opts.Authenticator != nil {
+			return control.Subject{}, false, false
+		}
+		subject := control.Subject{ID: "local-user", Tenant: "local", Roles: []string{"admin"}}
+		return subject, true, subject.Tenant != ""
+	}
+	if s.opts.Token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.opts.Token)) == 1 {
+		return control.Subject{ID: "legacy-node", Tenant: "local", Roles: []string{identity.RoleNode}}, true, true
+	}
+	if s.opts.Authenticator == nil {
+		return control.Subject{}, false, false
+	}
+	subject, err := s.opts.Authenticator.Authenticate(r.Context(), control.Credential{Token: token})
+	if err != nil || subject.ID == "" || subject.Tenant == "" || subject.Tenant == "*" {
+		return control.Subject{}, false, false
+	}
+	return subject, false, true
+}
+
+func hasRole(roles []string, want string) bool {
+	for _, role := range roles {
+		if role == want {
+			return true
+		}
+	}
+	return false
 }

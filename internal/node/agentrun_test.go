@@ -503,10 +503,10 @@ func TestAgentRunFilesystemStaysInJail(t *testing.T) {
 	if !bytes.Contains(tr, []byte("read=two outside:denied escape:denied")) {
 		t.Fatalf("fs round trip: %s", tr)
 	}
-	if _, err := os.Stat(filepath.Join(f.w.handle.FS().Root(), "notes", "a.txt")); err != nil {
+	if _, err := os.Stat(filepath.Join(mustHostFS(t, f.w.handle).Root(), "notes", "a.txt")); err != nil {
 		t.Fatalf("file not written inside the jail: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(f.w.handle.FS().Root(), "..", "escaped.txt")); err == nil {
+	if _, err := os.Stat(filepath.Join(mustHostFS(t, f.w.handle).Root(), "..", "escaped.txt")); err == nil {
 		t.Fatal("harness wrote outside the jail")
 	}
 	_ = f.n.agentRunCancel(&proto.AgentRunCancelReq{Agent: req.Agent, Run: req.Run})

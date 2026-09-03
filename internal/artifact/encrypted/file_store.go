@@ -303,6 +303,41 @@ func (s *FileStore) List(_ context.Context, prefix string) ([]string, error) {
 	return out, err
 }
 
+// Tenants inventories tenant directories while validating every retained
+// physical object name.
+func (s *FileStore) Tenants(_ context.Context) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	set := make(map[string]struct{})
+	err := filepath.WalkDir(s.dir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() {
+			return walkErr
+		}
+		if filepath.Dir(path) == s.dir && strings.HasPrefix(entry.Name(), ".create-") {
+			return nil
+		}
+		rel, err := filepath.Rel(s.dir, path)
+		if err != nil {
+			return err
+		}
+		tenant, _, _, err := parseObjectKey(filepath.ToSlash(rel))
+		if err != nil {
+			return fmt.Errorf("encrypted artifact: unexpected file-store entry %q", rel)
+		}
+		set[tenant] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	tenants := make([]string, 0, len(set))
+	for tenant := range set {
+		tenants = append(tenants, tenant)
+	}
+	sort.Strings(tenants)
+	return tenants, nil
+}
+
 func (s *FileStore) path(key string) (string, error) {
 	if _, _, _, err := parseObjectKey(key); err != nil {
 		return "", err

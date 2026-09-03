@@ -10,8 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"remount.dev/remount/internal/netns"
 	"remount.dev/remount/internal/node"
 	"remount.dev/remount/internal/workspace"
+	"remount.dev/remount/internal/workspace/firecracker"
 	"remount.dev/remount/internal/workspace/gvisor"
 )
 
@@ -39,6 +41,16 @@ type nodeResourceOptions struct {
 	maxMutationRecords        int
 	maxConcurrentSnapshots    int
 	snapshotMinInterval       time.Duration
+	firecracker               firecrackerNodeOptions
+}
+
+type firecrackerNodeOptions struct {
+	kernel, rootfs, binary, jailer, guestManifest, chroot string
+	uid, gid, maxWorkspaces, maxImages                    int
+	imageBytes                                            int64
+	cgroupVersion                                         int
+	cgroupParent                                          string
+	cgroups                                               []string
 }
 
 func buildNode(data, nodeID string, c common, labels map[string]string, backends, image string, allow, allowPrivate []string, resources nodeResourceOptions) (*node.Node, error) {
@@ -74,6 +86,56 @@ func buildNode(data, nodeID string, c common, labels map[string]string, backends
 				return nil, fmt.Errorf("gvisor backend unavailable: %w", err)
 			}
 			list = append(list, g)
+		case "firecracker":
+			fc := resources.firecracker
+			if fc.kernel == "" || fc.rootfs == "" || fc.guestManifest == "" {
+				return nil, errors.New("firecracker backend requires --firecracker-kernel, --firecracker-rootfs, and --firecracker-guest-manifest")
+			}
+			factory, err := firecracker.NewJailerFactory(firecracker.JailerOptions{
+				Firecracker: fc.binary, Jailer: fc.jailer, ChrootBase: fc.chroot, UID: fc.uid, GID: fc.gid,
+				CgroupVersion: fc.cgroupVersion, CgroupParent: fc.cgroupParent, Cgroups: fc.cgroups,
+				MaxMachines: fc.maxWorkspaces,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("firecracker jailer: %w", err)
+			}
+			images, err := firecracker.NewReflinkStore(firecracker.ReflinkStoreOptions{
+				Dir: filepath.Join(data, "firecracker", "images"), MaxImages: fc.maxImages,
+				MaxLogicalBytes: fc.imageBytes, OwnerUID: fc.uid, OwnerGID: fc.gid,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("firecracker images: %w", err)
+			}
+			networks, err := firecracker.NewSystemNetworkProvider(context.Background(), firecracker.NetworkOptions{
+				Dir: filepath.Join(data, "firecracker", "networks"), Manager: netns.NewSystemManager(), UID: fc.uid, GID: fc.gid,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("firecracker network: %w", err)
+			}
+			guest, err := firecracker.NewGuestBridge(firecracker.GuestOptions{Manifest: fc.guestManifest})
+			if err != nil {
+				return nil, fmt.Errorf("firecracker guest: %w", err)
+			}
+			binary := fc.binary
+			if binary == "" {
+				binary = "firecracker"
+			}
+			volumes, err := firecracker.NewCoWVolumeProvider(firecracker.CoWVolumeOptions{
+				Dir: filepath.Join(data, "firecracker", "snapshots"), Images: images, Firecracker: binary,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("firecracker volumes: %w", err)
+			}
+			probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			backend, err := firecracker.New(probeCtx, firecracker.Options{
+				Dir: filepath.Join(data, "firecracker"), KernelImage: fc.kernel, BaseRootFS: fc.rootfs,
+				Machines: factory, Networks: networks, Volumes: volumes, Guest: guest, MaxWorkspaces: fc.maxWorkspaces,
+			})
+			cancel()
+			if err != nil {
+				return nil, fmt.Errorf("firecracker backend unavailable: %w", err)
+			}
+			list = append(list, backend)
 		case "":
 		default:
 			return nil, fmt.Errorf("unknown backend %q", b)

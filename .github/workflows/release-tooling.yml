@@ -1,0 +1,62 @@
+name: release tooling
+
+on:
+  pull_request:
+    paths:
+      - install.sh
+      - bench/**
+      - docs/benchmarks.md
+      - docs/security-profiles.md
+      - packaging/**
+      - scripts/release/**
+      - scripts/security-profiles/**
+      - .github/workflows/release*.yml
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+      - bench/**
+      - docs/benchmarks.md
+      - docs/security-profiles.md
+      - packaging/**
+      - scripts/release/**
+      - scripts/security-profiles/**
+      - .github/workflows/release*.yml
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.27.1"
+      - name: Unit and generator checks
+        run: |
+          sh -n install.sh scripts/release/reproducible.sh scripts/release/test_install.sh
+          go test ./bench ./scripts/security-profiles
+          go run ./scripts/security-profiles --check
+          python3 -m unittest scripts/release/test_release.py bench/test_tools.py
+          sh scripts/release/test_install.sh
+      - name: Bounded correctness benchmark smoke
+        run: |
+          python3 bench/run.py --count 1 --iterations 1 \
+            --output "$RUNNER_TEMP/benchmark.json" \
+            --markdown "$RUNNER_TEMP/benchmark.md"
+          test -s "$RUNNER_TEMP/benchmark.json"
+          test -s "$RUNNER_TEMP/benchmark.md"
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build scratch runtime image without publishing
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags='-s -w -X main.version=v0.0.0-ci' \
+            -o dist/remount-linux-amd64 ./cmd/remount
+          docker buildx build --platform linux/amd64 \
+            --build-arg VERSION=v0.0.0-ci \
+            --output "type=oci,dest=$RUNNER_TEMP/remount.oci.tar" \
+            --file packaging/container/Dockerfile .
+          test -s "$RUNNER_TEMP/remount.oci.tar"

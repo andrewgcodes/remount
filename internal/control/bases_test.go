@@ -3,13 +3,26 @@ package control
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/proto"
 )
+
+func putTestSnapshot(t *testing.T, store artifact.BlobStore, content string) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "body"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := artifact.SnapshotToStore(store, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
 
 // TestBasesSurviveRestartAndReplayOutlivesRemoval: a base is durable state,
 // so it must be re-pinned after a restart; and a `ws create --base` replay
@@ -20,10 +33,7 @@ func TestBasesSurviveRestartAndReplayOutlivesRemoval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pinned, _, err := store.Put(strings.NewReader("golden image"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	pinned := putTestSnapshot(t, store, "golden image")
 	path := filepath.Join(t.TempDir(), "bases.db")
 	withStore := func(opts *Options) { opts.Artifacts = store }
 	f1 := newControlFixture(t, path, withStore)
@@ -85,10 +95,7 @@ func TestBaseQuotaIsPerTenant(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	art, _, err := store.Put(strings.NewReader("small"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	art := putTestSnapshot(t, store, "small")
 	f := newControlFixture(t, "", func(opts *Options) { opts.Artifacts = store; opts.MaxBasesPerTenant = 1 })
 	ctx := context.Background()
 	a := Subject{ID: "alice", Tenant: "tenant-a"}

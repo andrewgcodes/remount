@@ -732,11 +732,19 @@ func (s *Store) Collect(referenced []string, cutoff time.Time) (GCResult, error)
 // ---------------------------------------------------------------------------
 
 // Excluded reports whether rel (slash-separated, no leading slash) matches
-// any exclude pattern. Patterns match against the full relative path and
-// against each path component, so "node_modules" excludes it anywhere and
-// "build/*.o" matches only under build.
+// any exclude pattern. A leading slash is a literal, root-anchored tree path;
+// this form is used for mount points because glob interpretation could either
+// capture mounted bytes or discard an unrelated same-named subtree. Other
+// patterns retain the historical glob behavior.
 func Excluded(rel string, excludes []string) bool {
 	for _, pat := range excludes {
+		if strings.HasPrefix(pat, "/") {
+			literal := strings.TrimPrefix(path.Clean(pat), "/")
+			if rel == literal || strings.HasPrefix(rel, literal+"/") {
+				return true
+			}
+			continue
+		}
 		pat = strings.TrimPrefix(pat, "/")
 		if ok, _ := path.Match(pat, rel); ok {
 			return true

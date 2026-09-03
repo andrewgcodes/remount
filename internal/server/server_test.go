@@ -18,6 +18,7 @@ import (
 	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/secretsource"
+	"remount.dev/remount/internal/tenant"
 )
 
 type allowAuthorizer struct{}
@@ -333,7 +334,7 @@ func TestArtifactAuthorizationAcceptsConfiguredNodeOrClientCredential(t *testing
 }
 
 func TestProductionModeBuildsDurableIdentityByDefault(t *testing.T) {
-	s, err := New(Options{DataDir: t.TempDir(), Mode: ModeProductionMultiTenant})
+	s, err := New(Options{DataDir: t.TempDir(), Mode: ModeProductionMultiTenant, TenantArtifacts: testEncryptedResolver(t, nil)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,6 +359,42 @@ func TestProductionModeBuildsDurableIdentityByDefault(t *testing.T) {
 	s.Handler().ServeHTTP(authenticated, req)
 	if authenticated.Code != http.StatusOK {
 		t.Fatalf("authenticated production artifact status = %d body=%s", authenticated.Code, authenticated.Body.String())
+	}
+}
+
+func TestProductionBootstrapAndPublicTenantOIDCConfig(t *testing.T) {
+	s, err := New(Options{DataDir: t.TempDir(), Mode: ModeProductionMultiTenant, TenantArtifacts: testEncryptedResolver(t, nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	token, _, err := s.BootstrapOperator(context.Background(), "root@example.test", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject, err := s.Identity.Authenticate(context.Background(), control.Credential{Token: token, Role: proto.RoleClient})
+	if err != nil || subject.Tenant != "*" || len(subject.Roles) != 1 || subject.Roles[0] != "operator" {
+		t.Fatalf("subject=%+v err=%v", subject, err)
+	}
+	if _, _, err := s.BootstrapOperator(context.Background(), "root@example.test", time.Minute); err == nil {
+		t.Fatal("bootstrap repeated")
+	}
+	_, err = s.Tenants.Create(context.Background(), "tenant-a", tenant.Policy{OIDC: tenant.OIDC{
+		Issuer: "https://issuer.example", ClientID: "client_123", Scopes: []string{"openid"}, GroupRoles: map[string][]string{"admins": {"operator"}},
+	}}, tenant.Mutation{OperationID: "tenant-create", Actor: "root@example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/v1/identity/oidc?tenant=tenant-a", nil)
+	s.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), "admins") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	missing := httptest.NewRecorder()
+	s.Handler().ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/v1/identity/oidc?tenant=tenant-b", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing status=%d body=%s", missing.Code, missing.Body.String())
 	}
 }
 
