@@ -1,0 +1,50 @@
+name: firecracker-kvm
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kvm:
+    runs-on: [self-hosted, linux, kvm]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - name: Require the real host gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+            echo "::error::unavailable: /dev/kvm is not readable and writable"
+            exit 1
+          fi
+          for binary in firecracker jailer; do
+            if ! command -v "$binary" >/dev/null; then
+              echo "::error::unavailable: $binary is not installed"
+              exit 1
+            fi
+            "$binary" --version
+          done
+          if [[ -z ${REMOUNT_FIRECRACKER_KERNEL:-} || ! -f ${REMOUNT_FIRECRACKER_KERNEL} ]]; then
+            echo "::error::unavailable: REMOUNT_FIRECRACKER_KERNEL is not an explicit kernel artifact"
+            exit 1
+          fi
+          if [[ -z ${REMOUNT_FIRECRACKER_ROOTFS:-} || ! -f ${REMOUNT_FIRECRACKER_ROOTFS} ]]; then
+            echo "::error::unavailable: REMOUNT_FIRECRACKER_ROOTFS is not an explicit base rootfs artifact"
+            exit 1
+          fi
+      - name: Run deterministic lifecycle proofs
+        run: |
+          set -euo pipefail
+          go vet ./internal/workspace/firecracker
+          go test -race -count=10 ./internal/workspace/firecracker
+      - name: Require integrated host adapters
+        shell: bash
+        run: |
+          echo "::error::unavailable: enable this lane only after the node-owned TAP, coherent CoW volume, jailed API, and guest-executor adapters are integrated"
+          exit 1
