@@ -271,6 +271,34 @@ func TestExecEndToEnd(t *testing.T) {
 			t.Errorf("missing event %s in %v", want, types)
 		}
 	}
+	// Session events carry their session id as a first-class field, and the
+	// opened/exited pair of one command agree, so `events --session` needs no
+	// payload parsing.
+	opened := map[string]int{}
+	for _, e := range evs {
+		switch e.Type {
+		case proto.EvSOpened, proto.EvSExited:
+			if e.Session == "" {
+				t.Errorf("%s seq %d lacks session", e.Type, e.Seq)
+			}
+			var payload struct {
+				S string `cbor:"s"`
+			}
+			if err := proto.Unmarshal(e.Payload, &payload); err != nil || payload.S != e.Session {
+				t.Errorf("%s session %q payload %q err %v", e.Type, e.Session, payload.S, err)
+			}
+			opened[e.Session]++
+		default:
+			if e.Session != "" {
+				t.Errorf("%s seq %d attributed to session %q", e.Type, e.Seq, e.Session)
+			}
+		}
+	}
+	for sid, n := range opened {
+		if n != 2 {
+			t.Errorf("session %s has %d s.* events, want opened+exited", sid, n)
+		}
+	}
 	// Node status and lists.
 	nodes, _ := c.ListNodes(ctx)
 	if len(nodes) != 1 || !nodes[0].Online || len(nodes[0].Workspaces) != 1 {
@@ -800,6 +828,13 @@ func TestSecretBlindWorkspace(t *testing.T) {
 		switch e.Type {
 		case proto.EvCredUsed:
 			used++
+			var payload struct {
+				Status int    `cbor:"status"`
+				Error  string `cbor:"error"`
+			}
+			if err := proto.Unmarshal(e.Payload, &payload); err != nil || payload.Status != 200 || payload.Error != "" {
+				t.Errorf("cred.used records upstream outcome: %+v %v", payload, err)
+			}
 		case proto.EvEgressDenied:
 			denied++
 		}

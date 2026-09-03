@@ -394,7 +394,8 @@ func OpenSQLite(path string) (*SQLite, error) {
 		workspace TEXT NOT NULL DEFAULT '',
 		generation INTEGER NOT NULL DEFAULT 0,
 		operation_id TEXT NOT NULL DEFAULT '',
-		producer_seq INTEGER NOT NULL DEFAULT 0
+		producer_seq INTEGER NOT NULL DEFAULT 0,
+		session TEXT NOT NULL DEFAULT ''
 	); CREATE INDEX IF NOT EXISTS events_stream ON events(stream, seq);
 	CREATE TABLE IF NOT EXISTS event_producers (
 		node TEXT PRIMARY KEY,
@@ -411,6 +412,7 @@ func OpenSQLite(path string) (*SQLite, error) {
 		{"actor", "TEXT NOT NULL DEFAULT ''"}, {"tenant", "TEXT NOT NULL DEFAULT ''"},
 		{"workspace", "TEXT NOT NULL DEFAULT ''"}, {"generation", "INTEGER NOT NULL DEFAULT 0"},
 		{"operation_id", "TEXT NOT NULL DEFAULT ''"}, {"producer_seq", "INTEGER NOT NULL DEFAULT 0"},
+		{"session", "TEXT NOT NULL DEFAULT ''"},
 	}
 	rows, err := db.Query(`PRAGMA table_info(events)`)
 	if err != nil {
@@ -458,10 +460,10 @@ func (s *SQLite) Append(ctx context.Context, e *proto.Event) error {
 	defer s.mu.Unlock()
 	res, err := s.db.ExecContext(ctx, `INSERT INTO events(
 		at, stream, principal, node, type, payload, cause, event_id, received_at,
-		observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq
-	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq, session
+	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		e.At, e.Stream, e.Principal, e.Node, e.Type, e.Payload, e.Cause, e.EventID, e.ReceivedAt,
-		e.ObservedAt, e.Origin, e.Actor, e.Tenant, e.Workspace, e.Generation, e.OperationID, e.ProducerSeq)
+		e.ObservedAt, e.Origin, e.Actor, e.Tenant, e.Workspace, e.Generation, e.OperationID, e.ProducerSeq, e.Session)
 	if err != nil {
 		return err
 	}
@@ -481,11 +483,11 @@ func (s *SQLite) Read(ctx context.Context, from uint64, stream string, limit int
 	var err error
 	if stream == "" {
 		rows, err = s.db.QueryContext(ctx, `SELECT seq, at, stream, principal, node, type, payload, cause,
-			event_id, received_at, observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq
+			event_id, received_at, observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq, session
 			FROM events WHERE seq >= ? ORDER BY seq LIMIT ?`, from, limit)
 	} else {
 		rows, err = s.db.QueryContext(ctx, `SELECT seq, at, stream, principal, node, type, payload, cause,
-			event_id, received_at, observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq
+			event_id, received_at, observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq, session
 			FROM events WHERE seq >= ? AND stream = ? ORDER BY seq LIMIT ?`, from, stream, limit)
 	}
 	if err != nil {
@@ -498,7 +500,7 @@ func (s *SQLite) Read(ctx context.Context, from uint64, stream string, limit int
 		if err := rows.Scan(
 			&e.Seq, &e.At, &e.Stream, &e.Principal, &e.Node, &e.Type, &e.Payload, &e.Cause,
 			&e.EventID, &e.ReceivedAt, &e.ObservedAt, &e.Origin, &e.Actor, &e.Tenant,
-			&e.Workspace, &e.Generation, &e.OperationID, &e.ProducerSeq,
+			&e.Workspace, &e.Generation, &e.OperationID, &e.ProducerSeq, &e.Session,
 		); err != nil {
 			return nil, err
 		}

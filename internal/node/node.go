@@ -376,7 +376,7 @@ func New(opts Options) (*Node, error) {
 		MaxSessions: opts.MaxSessions, MaxActive: opts.MaxActiveSessions, MaxSessionsPerWorkspace: opts.MaxSessionsPerWorkspace,
 		MaxSessionsPerPrincipal: opts.MaxSessionsPerPrincipal,
 		OnExit: func(s *session.Session, info proto.ExitInfo) {
-			n.emit(proto.EvSExited, s.WS, s.Principal, map[string]any{"s": s.ID, "code": info.Code, "signal": info.Signal})
+			n.emitSession(proto.EvSExited, s.WS, s.Principal, s.ID, map[string]any{"s": s.ID, "code": info.Code, "signal": info.Signal})
 		},
 	})
 	return n, nil
@@ -722,7 +722,13 @@ func loadIdentity(path string) (string, ed25519.PrivateKey, error) {
 
 // emit records an event locally and forwards it to the control plane.
 func (n *Node) emit(typ, stream, principal string, payload any) {
-	e := &proto.Event{Type: typ, Stream: stream, Principal: principal, Node: n.id, Origin: "node", Actor: n.id}
+	n.emitSession(typ, stream, principal, "", payload)
+}
+
+// emitSession records an event attributed to one session so a reader can
+// follow a single command's history without parsing payloads.
+func (n *Node) emitSession(typ, stream, principal, session string, payload any) {
+	e := &proto.Event{Type: typ, Stream: stream, Principal: principal, Session: session, Node: n.id, Origin: "node", Actor: n.id}
 	if payload != nil {
 		e.Payload = proto.MustMarshal(payload)
 	}
@@ -2348,7 +2354,7 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 	if err != nil {
 		return nil, err
 	}
-	n.emit(proto.EvSOpened, w.ID, claims.Principal, map[string]any{"s": s.ID, "kind": req.Kind, "program": req.Program, "client": client})
+	n.emitSession(proto.EvSOpened, w.ID, claims.Principal, s.ID, map[string]any{"s": s.ID, "kind": req.Kind, "program": req.Program, "client": client})
 	if !req.NoSubscribe {
 		n.subscribe(p, client, s, 0)
 	}
@@ -2613,7 +2619,7 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 				"rule": a.Rule, "protocol": a.Protocol, "shared_state": a.SharedState,
 				"connector": a.Connector, "digest": a.Digest, "cached": a.Cached,
 				"host": a.Host, "method": a.Method, "path": a.Path, "reason": a.Reason,
-				"status": a.Status, "request_bytes": a.RequestBytes, "response_bytes": a.ResponseBytes,
+				"status": a.Status, "error": a.Error, "request_bytes": a.RequestBytes, "response_bytes": a.ResponseBytes,
 			})
 		},
 	}

@@ -517,11 +517,16 @@ log is the canonical audit and subscription history.
 
 ```
 Event { event_id, seq, received_at, observed_at, origin, actor, tenant,
-        workspace, generation, operation_id, producer_seq,
+        workspace, generation, session, operation_id, producer_seq,
         stream, principal, node, type, payload, cause }
 ```
 
 `stream` is a workspace or node id, so a workspace's whole history is one filter.
+`session` is set by the node on every event attributed to one session
+(`s.opened`, `s.exited`, and any later `s.*` type) so one command's history is
+a second filter that needs no payload parsing. The control plane clears a
+client-supplied `session`; only the node that runs a session may attribute to
+it.
 
 `seq` is assigned by the control plane and is the only total order.
 `received_at`, authenticated `origin`/`actor`, tenant, workspace and generation
@@ -540,6 +545,14 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `peer.gone`, `ws.fenced`, `ws.state_changed`, `event.producer_gap`,
 `fleet.quarantine.requested`, `fleet.quarantine.target`, and
 `fleet.quarantine.completed`.
+
+`cred.used` is the record of what a released credential bought. The node
+emits it once per released binding after the upstream outcome is known: the
+payload's `status` is the upstream response status when headers arrived, or
+`0` with `error` set to a failure class (`dns`, `connection_refused`,
+`connection_reset`, `timeout`, `tls`, `canceled`, `eof`, `redirect_rejected`,
+`response_limit`, `non_public_address`, `connector`, `upstream`) when they did
+not. `error` is a class, never the transport's error text.
 
 `POST /v1/events` appends an event out of band. This is how a webhook wakes a
 sleeping workspace.

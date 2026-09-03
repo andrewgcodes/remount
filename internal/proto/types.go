@@ -470,6 +470,7 @@ type Event struct {
 	Tenant      string `cbor:"tenant,omitempty" json:"tenant,omitempty"`
 	Workspace   string `cbor:"workspace,omitempty" json:"workspace,omitempty"`
 	Generation  uint64 `cbor:"generation,omitempty" json:"generation,omitempty"`
+	Session     string `cbor:"session,omitempty" json:"session,omitempty"` // session id for s.* events
 	OperationID string `cbor:"operation_id,omitempty" json:"operation_id,omitempty"`
 	ProducerSeq uint64 `cbor:"producer_seq,omitempty" json:"producer_seq,omitempty"`
 	Type        string `cbor:"type" json:"type"`
