@@ -56,14 +56,25 @@ type Enrollment struct {
 	ExpiresAt time.Time
 }
 
-// Store owns revocation and enrollment durability. ConsumeEnrollment must
-// atomically return and remove one hash so concurrent node hellos cannot both
-// enroll with the same token.
+// NodeBinding is the durable identity created by consuming an enrollment.
+// PubKey is copied at every Store boundary.
+type NodeBinding struct {
+	NodeID     string
+	PubKey     []byte
+	Pool       string
+	Tenant     string
+	Labels     map[string]string
+	EnrolledAt time.Time
+}
+
+// Store owns revocation, enrollment and node-key durability. EnrollNode must
+// atomically consume a live enrollment, bind the candidate key and append its
+// event; concurrent hellos cannot both enroll with the same token.
 type Store interface {
-	Revoked(context.Context, string) (bool, error)
+	Revoked(context.Context, string, time.Time) (bool, error)
 	Revoke(context.Context, string, time.Time, Event) error
 	PutEnrollment(context.Context, [32]byte, Enrollment, Event) error
-	ConsumeEnrollment(context.Context, [32]byte, time.Time) (Enrollment, bool, error)
+	EnrollNode(context.Context, [32]byte, time.Time, NodeBinding, Event) (NodeBinding, bool, bool, error)
 }
 
 // Event records identity state changes without exposing bearer material.
@@ -201,20 +212,29 @@ func (m *Manager) Issue(ctx context.Context, pool, tenant string, ttl time.Durat
 	return m.IssueEnrollment(ctx, pool, tenant, ttl)
 }
 
-// ConsumeEnrollment atomically exchanges a one-time token for its authority.
-func (m *Manager) ConsumeEnrollment(ctx context.Context, token string) (Enrollment, error) {
-	if !strings.HasPrefix(token, "enroll_") {
-		return Enrollment{}, proto.Err(proto.CodeUnauthorized, "invalid enrollment token")
+// AuthenticateNode implements control.NodeAuthenticator. An already-bound
+// node reconnects by proving possession of the same key; its enrollment token
+// may have been consumed and is never consulted again. A first connection
+// consumes and binds the enrollment in one Store transaction.
+func (m *Manager) AuthenticateNode(ctx context.Context, nodeID, token string, pubKey []byte) (control.NodeIdentity, error) {
+	if !strings.HasPrefix(nodeID, "n_") || len(pubKey) != ed25519.PublicKeySize {
+		return control.NodeIdentity{}, proto.Err(proto.CodeUnauthorized, "invalid node identity")
 	}
-	hash := sha256.Sum256([]byte(token))
-	enrollment, ok, err := m.store.ConsumeEnrollment(ctx, hash, m.now())
+	var hash [32]byte
+	if strings.HasPrefix(token, "enroll_") {
+		hash = sha256.Sum256([]byte(token))
+	}
+	candidate := NodeBinding{NodeID: nodeID, PubKey: append([]byte(nil), pubKey...), EnrolledAt: m.now()}
+	binding, fresh, ok, err := m.store.EnrollNode(ctx, hash, m.now(), candidate, Event{
+		Type: proto.EvNodeEnrolled, ID: nodeID,
+	})
 	if err != nil {
-		return Enrollment{}, err
+		return control.NodeIdentity{}, err
 	}
-	if !ok {
-		return Enrollment{}, proto.Err(proto.CodeUnauthorized, "invalid or expired enrollment token")
+	if !ok || subtle.ConstantTimeCompare(binding.PubKey, pubKey) != 1 {
+		return control.NodeIdentity{}, proto.Err(proto.CodeUnauthorized, "invalid or expired node enrollment")
 	}
-	return enrollment, nil
+	return control.NodeIdentity{Tenant: binding.Tenant, Pool: binding.Pool, Labels: cloneLabels(binding.Labels), Fresh: fresh}, nil
 }
 
 // Check implements control.Authorizer with tenant isolation as the first
@@ -258,7 +278,7 @@ func (m *Manager) verify(ctx context.Context, token, kind string) (Claims, error
 	if err != nil || claims.Kind != kind || claims.Expires <= m.now().Unix() || claims.IssuedAt > m.now().Add(time.Minute).Unix() {
 		return Claims{}, errors.New("identity: invalid token")
 	}
-	revoked, err := m.store.Revoked(ctx, claims.ID)
+	revoked, err := m.store.Revoked(ctx, claims.ID, m.now())
 	if err != nil || revoked {
 		return Claims{}, errors.New("identity: revoked token")
 	}
@@ -269,6 +289,18 @@ func (m *Manager) parseAndVerify(token string) (Claims, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return Claims{}, errors.New("identity: malformed token")
+	}
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return Claims{}, errors.New("identity: malformed header")
+	}
+	var header struct {
+		Algorithm string `json:"alg"`
+		Type      string `json:"typ"`
+		Issuer    string `json:"iss"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil || header.Algorithm != "EdDSA" || header.Type != "RMT" || header.Issuer != m.issuer {
+		return Claims{}, errors.New("identity: invalid header")
 	}
 	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil || len(signature) != ed25519.SignatureSize || !ed25519.Verify(m.key.Public().(ed25519.PublicKey), []byte(parts[0]+"."+parts[1]), signature) {
@@ -336,25 +368,34 @@ type MemoryStore struct {
 	mu          sync.Mutex
 	revoked     map[string]time.Time
 	enrollments map[[32]byte]Enrollment
+	nodes       map[string]NodeBinding
 	events      []Event
 }
 
 // NewMemoryStore returns an empty identity store.
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{revoked: map[string]time.Time{}, enrollments: map[[32]byte]Enrollment{}}
+	return &MemoryStore{revoked: map[string]time.Time{}, enrollments: map[[32]byte]Enrollment{}, nodes: map[string]NodeBinding{}}
 }
 
 // Revoked reports whether a token id is currently revoked.
-func (s *MemoryStore) Revoked(_ context.Context, id string) (bool, error) {
+func (s *MemoryStore) Revoked(_ context.Context, id string, now time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, ok := s.revoked[id]
+	expires, ok := s.revoked[id]
+	if ok && !expires.After(now) {
+		delete(s.revoked, id)
+		ok = false
+	}
 	return ok, nil
 }
 
 // Revoke records a token id until its natural expiry.
 func (s *MemoryStore) Revoke(_ context.Context, id string, expires time.Time, event Event) error {
 	s.mu.Lock()
+	if existing, ok := s.revoked[id]; ok && !expires.After(existing) {
+		s.mu.Unlock()
+		return nil
+	}
 	s.revoked[id] = expires
 	s.events = append(s.events, event)
 	s.mu.Unlock()
@@ -373,21 +414,36 @@ func (s *MemoryStore) PutEnrollment(_ context.Context, hash [32]byte, enrollment
 	return nil
 }
 
-// ConsumeEnrollment atomically removes and returns one live enrollment.
-func (s *MemoryStore) ConsumeEnrollment(_ context.Context, hash [32]byte, now time.Time) (Enrollment, bool, error) {
+// EnrollNode atomically verifies an existing binding or consumes one live
+// enrollment and creates the binding with its event.
+func (s *MemoryStore) EnrollNode(_ context.Context, hash [32]byte, now time.Time, candidate NodeBinding, event Event) (NodeBinding, bool, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if existing, ok := s.nodes[candidate.NodeID]; ok {
+		return cloneBinding(existing), false, true, nil
+	}
+	if candidate.NodeID == "" || len(candidate.PubKey) != ed25519.PublicKeySize {
+		return NodeBinding{}, false, false, nil
+	}
 	enrollment, ok := s.enrollments[hash]
 	if !ok {
-		return Enrollment{}, false, nil
+		return NodeBinding{}, false, false, nil
 	}
 	delete(s.enrollments, hash)
 	if !enrollment.ExpiresAt.After(now) {
 		s.events = append(s.events, Event{Type: "identity.enrollment_expired", ID: enrollment.ID, Pool: enrollment.Pool, Tenant: enrollment.Tenant})
-		return Enrollment{}, false, nil
+		return NodeBinding{}, false, false, nil
 	}
-	s.events = append(s.events, Event{Type: "identity.enrollment_consumed", ID: enrollment.ID, Pool: enrollment.Pool, Tenant: enrollment.Tenant})
-	return enrollment, true, nil
+	candidate.Pool, candidate.Tenant = enrollment.Pool, enrollment.Tenant
+	candidate.Labels = cloneLabels(candidate.Labels)
+	if candidate.Labels == nil {
+		candidate.Labels = map[string]string{}
+	}
+	candidate.Labels["pool"], candidate.Labels["tenant"] = candidate.Pool, candidate.Tenant
+	s.nodes[candidate.NodeID] = cloneBinding(candidate)
+	event.Pool, event.Tenant = candidate.Pool, candidate.Tenant
+	s.events = append(s.events, event)
+	return cloneBinding(candidate), true, true, nil
 }
 
 // Events returns a copy of the state-change audit records committed by this
@@ -400,3 +456,21 @@ func (s *MemoryStore) Events() []Event {
 
 var _ control.Authenticator = (*Manager)(nil)
 var _ control.Authorizer = (*Manager)(nil)
+var _ control.NodeAuthenticator = (*Manager)(nil)
+
+func cloneLabels(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func cloneBinding(in NodeBinding) NodeBinding {
+	in.PubKey = append([]byte(nil), in.PubKey...)
+	in.Labels = cloneLabels(in.Labels)
+	return in
+}
