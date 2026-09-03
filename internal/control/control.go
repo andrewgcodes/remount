@@ -194,6 +194,9 @@ type Options struct {
 	MaxAgentsPerTenant int
 	// MaxApprovalsPerAgent bounds parked approvals per agent. Zero selects 64.
 	MaxApprovalsPerAgent int
+	// MaxExportCursorsPerTenant bounds durable destination progress records.
+	// Zero selects 256.
+	MaxExportCursorsPerTenant int
 	// MaxTranscriptBytesPerAgent bounds the transcript mirror kept per agent;
 	// oldest records are evicted past it and readers see a gap. Zero selects
 	// proto.MaxTranscriptBytesPerAgent.
@@ -329,7 +332,7 @@ func New(opts Options) (*Control, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	if opts.MaxConcurrentRequests < 0 || opts.MaxEvents < 0 || opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 || opts.MaxBasesPerTenant < 0 || opts.MaxQueuesPerTenant < 0 ||
+	if opts.MaxConcurrentRequests < 0 || opts.MaxEvents < 0 || opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 || opts.MaxBasesPerTenant < 0 || opts.MaxQueuesPerTenant < 0 || opts.MaxExportCursorsPerTenant < 0 ||
 		opts.MaxMutationRecords < 0 || opts.MaxTimers < 0 || opts.MaxTimersPerWorkspace < 0 {
 		return nil, errors.New("control: resource limits must not be negative")
 	}
@@ -362,6 +365,9 @@ func New(opts Options) (*Control, error) {
 	}
 	if opts.MaxApprovalsPerAgent <= 0 {
 		opts.MaxApprovalsPerAgent = 64
+	}
+	if opts.MaxExportCursorsPerTenant <= 0 {
+		opts.MaxExportCursorsPerTenant = 256
 	}
 	if opts.MaxTranscriptBytesPerAgent <= 0 {
 		opts.MaxTranscriptBytesPerAgent = proto.MaxTranscriptBytesPerAgent
@@ -499,6 +505,14 @@ CREATE TABLE IF NOT EXISTS pools (tenant TEXT NOT NULL, name TEXT NOT NULL, data
 CREATE TABLE IF NOT EXISTS queues (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, data BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS export_cursors (
+  tenant TEXT NOT NULL,
+  name TEXT NOT NULL,
+  next INTEGER NOT NULL,
+  revision INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(tenant, name)
+);
 CREATE TABLE IF NOT EXISTS transcripts (
 	agent TEXT NOT NULL,
 	idx INTEGER NOT NULL,

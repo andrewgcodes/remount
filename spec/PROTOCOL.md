@@ -1011,7 +1011,7 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `agent.tool_call`, `agent.waiting`, `agent.cancelled`, `agent.slept`,
 `agent.woken`, `agent.forked`, `agent.failed`, `agent.finished`,
 `agent.destroyed`, `agent.child.finished`, `approval.pending`,
-`approval.decided` and `approval.expired`.
+`approval.decided`, `approval.expired` and `export.cursor.advanced`.
 
 Agent events are on the workspace stream and every one carries `agent`.
 `agent.created` carries `ws`, `owns_ws`, `recipe`, `mode`, `task_hash`,
@@ -1042,6 +1042,11 @@ the workspace stream and neither carries a task's text.
 `pool.provision_failed` carries a sanitized reason and `retry_at`; it never
 carries a credential, enrollment token, provider response body or bootstrap
 environment.
+
+`export.cursor.advanced` carries a destination name, previous/next sequence
+and revision. It commits with the tenant-scoped cursor row only after the
+destination accepts the bounded batch; a retry may duplicate but never skip a
+canonical event.
 
 `repo.cloned` carries `repo` (canonical URL), `ref`, `depth`, `commit` and
 `backend`; it never carries the binding, its placeholder or the broker URL.
