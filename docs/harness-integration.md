@@ -199,20 +199,23 @@ install above used the second path for `registry.npmjs.org` and the first for
 
 ## Writing your own loop
 
-The Go SDK lives in `internal/client`. It is importable from any package in this
-module, and `examples/agentloop` is a complete program built on it. The
-signatures below are the real ones.
+The supported Go SDK is `remount.dev/remount/client`; its stable resource model
+and error codes are in `remount.dev/remount/api`. Consumers never import a
+Remount `internal/` package. `examples/agentloop` is a complete program and
+`make public-api` compiles this surface from a separate module.
 
-Connect with a dialer to the relay. The client connects lazily and reconnects
-by itself.
+Give the client the HTTP(S) server URL. It constructs the WebSocket link,
+connects lazily and reconnects by itself.
 
 ```go
-c := client.New(client.Options{
-	Dialer: transport.DialFunc(func(ctx context.Context) (transport.Conn, error) {
-		return transport.DialWS(ctx, "ws://127.0.0.1:7443/v1/link", nil)
-	}),
-	Token:     os.Getenv("REMOUNT_TOKEN"),
-	Principal: "a_my_agent",
+import (
+	"remount.dev/remount/api"
+	"remount.dev/remount/client"
+)
+
+c, err := client.New(client.Options{
+	Server: "https://remount.example",
+	Token:  os.Getenv("REMOUNT_TOKEN"),
 })
 defer c.Close()
 ```
@@ -221,7 +224,7 @@ Create a workspace and wait until a node has it ready. `WaitClaimed` returns
 only once the node reports the filesystem is restored and serving.
 
 ```go
-ws, err := c.CreateWorkspace(ctx, proto.WorkspaceSpec{
+ws, err := c.CreateWorkspace(ctx, api.WorkspaceSpec{
 	Name:     "my-agent",
 	Bindings: []string{"b_openai"},
 	Env: map[string]string{
@@ -236,15 +239,15 @@ Run a command and read its output as sequenced chunks. The channel closes after
 the exit chunk, and `Exit` then holds the code.
 
 ```go
-s, err := c.Exec(ctx, proto.SOpenReq{
+s, err := c.Exec(ctx, api.SessionOpenRequest{
 	WS:             ws.ID,
-	Kind:           proto.SessionExec,
+	Kind:           api.SessionExec,
 	Program:        []string{"sh", "-c", "make test 2>&1"},
 	IdempotencyKey: "build-42",
 })
 for ch := range s.Chunks() {
 	switch ch.Stream {
-	case proto.StreamStdout, proto.StreamStderr:
+	case api.StreamStdout, api.StreamStderr:
 		os.Stdout.Write(ch.Data)
 	}
 }
@@ -265,7 +268,7 @@ applies every replacement or none.
 err = c.WriteFile(ctx, ws.ID, "src/main.go", src, 0o644)
 data, err := c.ReadFile(ctx, ws.ID, "src/main.go")
 res, err := c.Search(ctx, ws.ID, "/", `TODO\(`, "*.go", 200)
-n, err := c.Edit(ctx, ws.ID, "src/main.go", []proto.FSEdit{
+n, err := c.Edit(ctx, ws.ID, "src/main.go", []api.FileEdit{
 	{Old: "return nil", New: "return errors.New(\"todo\")"},
 })
 ```
@@ -275,23 +278,24 @@ re-queues the workspace with its last snapshot; the SDK drops its cached grant
 so the next call reaches the new node.
 
 ```go
-snap, err := c.Snapshot(ctx, ws.ID, true)
-ws, err = c.MoveWorkspace(ctx, ws.ID, &proto.Requires{CPU: 32}, nil)
+live, err := c.Snapshot(ctx, ws.ID, true) // labeled live; not failover state
+checkpoint, err := c.Checkpoint(ctx, ws.ID) // quiesced and authoritative
+ws, err = c.MoveWorkspace(ctx, ws.ID, &api.Requires{CPU: 32}, nil)
 ws, err = c.WaitClaimed(ctx, ws.ID)
 
-timer, err := c.SleepWorkspace(ctx, proto.WSSleepReq{ID: ws.ID, OnEvent: "github.pr.merged"})
+timer, err := c.SleepWorkspace(ctx, api.SleepRequest{ID: ws.ID, OnEvent: "github.pr.merged"})
 ```
 
 ## What a harness gets for free
 
-Lossless reconnect. Every output chunk carries a sequence number, the node
+Truthful bounded replay. Every output chunk carries a sequence number, the node
 keeps a bounded ring plus a spill file per session, and a client resumes from
 the last sequence it delivered. If the client's connection drops mid-command,
 the SDK redials, reattaches, and the caller's channel simply continues. If the
 gap is genuinely unrecoverable, the stream carries an explicit gap marker
 rather than silently splicing.
 
-Idempotent exec. An `IdempotencyKey` on `SOpenReq` makes a retried open return
+Idempotent exec. An `IdempotencyKey` on `api.SessionOpenRequest` makes a retried open return
 the session that already exists instead of starting a second process. Input
 carries a client sequence too, so a retried keystroke is dropped rather than
 typed twice.
@@ -303,4 +307,4 @@ machine, with the output replayed.
 An audit log you did not have to write. Every session open, exit, file write,
 edit, removal, credential substitution and denied egress is an event on the
 canonical log, attributed to the workspace's principal. `remount events --ws
-$WS --follow` is the whole observability story for version zero.
+$WS --follow` is the whole observability story for protocol v1.

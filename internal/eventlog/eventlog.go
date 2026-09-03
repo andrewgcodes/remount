@@ -1,6 +1,6 @@
-// Package eventlog is the canonical, append-only record of everything that
-// happens in Remount. State elsewhere is a cache of this log
-// (docs/adr/0004-log-is-truth.md).
+// Package eventlog is the canonical ordered audit and observation history.
+// Transactional resource rows, rather than replay of this log, own lifecycle
+// authority (docs/adr/0016-transactional-lifecycle-state.md).
 //
 // Two stores: Memory (nodes, tests, --standalone without persistence) and
 // SQLite (control plane). Both expose the same Append/Read/Subscribe API.
@@ -33,6 +33,9 @@ type Store interface {
 	Last(ctx context.Context) (uint64, error)
 	// Prune removes at most limit events older than beforeMillis.
 	Prune(ctx context.Context, beforeMillis int64, limit int) (int64, error)
+	// PruneSize removes an oldest contiguous prefix until at most max events
+	// remain. At most limit rows are removed in one resumable transaction.
+	PruneSize(ctx context.Context, max, limit int) (int64, error)
 	Close() error
 }
 
@@ -112,6 +115,18 @@ func (l *Log) Prune(ctx context.Context, beforeMillis int64, limit int) (int64, 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	n, err := l.store.Prune(ctx, beforeMillis, limit)
+	if n > 0 {
+		metrics.EventsPruned.Add(uint64(n))
+	}
+	return n, err
+}
+
+// PruneSize bounds event count while preserving the same contiguous-prefix
+// and subscriber-eviction semantics as age-based retention.
+func (l *Log) PruneSize(ctx context.Context, max, limit int) (int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n, err := l.store.PruneSize(ctx, max, limit)
 	if n > 0 {
 		metrics.EventsPruned.Add(uint64(n))
 	}
@@ -314,6 +329,24 @@ func (m *Memory) Prune(_ context.Context, beforeMillis int64, limit int) (int64,
 	}
 	if remove == 0 {
 		return 0, nil
+	}
+	m.events = append([]proto.Event(nil), m.events[remove:]...)
+	m.first += uint64(remove)
+	return int64(remove), nil
+}
+
+func (m *Memory) PruneSize(_ context.Context, max, limit int) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if max < 0 {
+		return 0, errors.New("eventlog: maximum event count cannot be negative")
+	}
+	remove := len(m.events) - max
+	if remove <= 0 {
+		return 0, nil
+	}
+	if limit > 0 && remove > limit {
+		remove = limit
 	}
 	m.events = append([]proto.Event(nil), m.events[remove:]...)
 	m.first += uint64(remove)
@@ -549,6 +582,53 @@ func (s *SQLite) Prune(ctx context.Context, beforeMillis int64, limit int) (int6
 	}
 	committed = true
 	return n, nil
+}
+
+func (s *SQLite) PruneSize(ctx context.Context, max, limit int) (int64, error) {
+	if max < 0 {
+		return 0, errors.New("eventlog: maximum event count cannot be negative")
+	}
+	if limit <= 0 {
+		limit = 10_000
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO event_producers(node, producer_seq)
+		SELECT node, MAX(producer_seq) FROM events
+		WHERE origin='node' AND node != '' AND producer_seq > 0 GROUP BY node
+		ON CONFLICT(node) DO UPDATE SET producer_seq=MAX(producer_seq, excluded.producer_seq)`); err != nil {
+		return 0, err
+	}
+	var count int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM events`).Scan(&count); err != nil {
+		return 0, err
+	}
+	remove := count - int64(max)
+	if remove <= 0 {
+		return 0, tx.Commit()
+	}
+	if remove > int64(limit) {
+		remove = int64(limit)
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM events WHERE seq IN (
+		SELECT seq FROM events ORDER BY seq LIMIT ?
+	)`, remove)
+	if err != nil {
+		return 0, err
+	}
+	removed, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return removed, nil
 }
 
 func (s *SQLite) Close() error { return s.db.Close() }

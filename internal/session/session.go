@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -237,6 +238,8 @@ type ManagerOptions struct {
 	SpillDir   string // where spill files live; "" disables spilling
 	MemBytes   int
 	SpillBytes int64
+	MaxChunk   int
+	MaxChunks  int
 	// Retention keeps finished sessions (and their logs) for late attachers.
 	Retention time.Duration
 	// MaxSessions includes retained exited sessions; MaxActive bounds processes
@@ -396,11 +399,20 @@ func (m *Manager) Remove(id string, kill bool) bool {
 	return true
 }
 
-// KillWorkspace terminates every session of a workspace and forgets them.
-func (m *Manager) KillWorkspace(ws string) {
+// KillWorkspace terminates every session of a workspace and forgets it. An
+// error means at least one managed process could not be confirmed stopped, so
+// callers must not describe a following snapshot as quiesced.
+func (m *Manager) KillWorkspace(ws string) error {
+	var failed []string
 	for _, s := range m.List(ws) {
-		m.Remove(s.ID, true)
+		if !m.Remove(s.ID, true) {
+			failed = append(failed, s.ID)
+		}
 	}
+	if len(failed) != 0 {
+		return fmt.Errorf("sessions did not stop within the deadline: %s", strings.Join(failed, ", "))
+	}
+	return nil
 }
 
 // Close kills everything.
@@ -463,7 +475,10 @@ func (m *Manager) Open(spec Spec) (*Session, error) {
 	if m.opts.SpillDir != "" {
 		spillPath = filepath.Join(m.opts.SpillDir, id+".log")
 	}
-	log, err := NewLog(LogOptions{MemBytes: m.opts.MemBytes, SpillBytes: m.opts.SpillBytes, SpillPath: spillPath})
+	log, err := NewLog(LogOptions{
+		MemBytes: m.opts.MemBytes, SpillBytes: m.opts.SpillBytes, SpillPath: spillPath,
+		MaxChunk: m.opts.MaxChunk, MaxChunks: m.opts.MaxChunks,
+	})
 	if err != nil {
 		m.mu.Unlock()
 		return nil, err

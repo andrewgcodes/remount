@@ -137,6 +137,9 @@ type Options struct {
 	// MaxConcurrentRequests bounds request handlers independently of relay
 	// connection count. Zero selects 128.
 	MaxConcurrentRequests int
+	// MaxEvents is reported for capacity diagnostics; retention enforcement is
+	// owned by the server around this control plane.
+	MaxEvents int
 	// Workspace quotas count every non-destroyed workspace. Zero selects 1,000
 	// per tenant and 100 per owning subject.
 	MaxWorkspacesPerTenant  int
@@ -173,16 +176,15 @@ type Control struct {
 	nodes                 map[string]*nodeState
 	clients               map[string]*proto.Hello
 	subjects              map[string]Subject
-	idem                  map[string]string
 	bindings              map[string]Binding
 	tails                 map[string]map[string]*tailState // requester -> subscription -> tail
-	lifecycle             map[string]*sync.Mutex           // serializes long-running mutations per workspace
+	lifecycle             map[string]*keyedMutex           // serializes long-running mutations per workspace
 	proofs                map[string]int64                 // recently accepted node proof -> expiry
 	producerSeq           map[string]uint64                // authenticated node -> last accepted event seq
-	producerLocks         map[string]*sync.Mutex           // serialize batches from one node
+	producerLocks         map[string]*keyedMutex           // serialize batches from one node
 	mutationLocks         map[string]*keyedMutex           // serialize duplicate logical mutations
 	fleetOps              map[string]*proto.FleetOperation
-	fleetLocks            map[string]*sync.Mutex
+	fleetLocks            map[string]*keyedMutex
 	fleetWake             chan struct{}
 	timerReservations     int
 	timerReservationsByWS map[string]int
@@ -218,8 +220,12 @@ type keyedMutex struct {
 
 // RecordPruneResult reports one resumable control-record retention pass.
 type RecordPruneResult struct {
-	Mutations int64
-	Timers    int64
+	Mutations       int64
+	Timers          int64
+	Workspaces      int64
+	FleetOperations int64
+	Assignments     int64
+	LegacyIdem      int64
 }
 
 type mutationWorkspaceResult struct {
@@ -247,7 +253,7 @@ func New(opts Options) (*Control, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	if opts.MaxConcurrentRequests < 0 || opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 ||
+	if opts.MaxConcurrentRequests < 0 || opts.MaxEvents < 0 || opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 ||
 		opts.MaxMutationRecords < 0 || opts.MaxTimers < 0 || opts.MaxTimersPerWorkspace < 0 {
 		return nil, errors.New("control: resource limits must not be negative")
 	}
@@ -280,11 +286,11 @@ func New(opts Options) (*Control, error) {
 	c := &Control{
 		opts: opts, db: opts.DB, log: opts.Log, logger: opts.Logger, now: opts.Now,
 		workspaces: map[string]*proto.Workspace{}, timers: map[string]*proto.Timer{},
-		nodes: map[string]*nodeState{}, clients: map[string]*proto.Hello{}, subjects: map[string]Subject{}, idem: map[string]string{},
+		nodes: map[string]*nodeState{}, clients: map[string]*proto.Hello{}, subjects: map[string]Subject{},
 		bindings: map[string]Binding{}, tails: map[string]map[string]*tailState{},
-		lifecycle: map[string]*sync.Mutex{}, proofs: map[string]int64{}, producerSeq: map[string]uint64{},
-		producerLocks: map[string]*sync.Mutex{}, mutationLocks: map[string]*keyedMutex{},
-		fleetOps: map[string]*proto.FleetOperation{}, fleetLocks: map[string]*sync.Mutex{}, fleetWake: make(chan struct{}, 1),
+		lifecycle: map[string]*keyedMutex{}, proofs: map[string]int64{}, producerSeq: map[string]uint64{},
+		producerLocks: map[string]*keyedMutex{}, mutationLocks: map[string]*keyedMutex{},
+		fleetOps: map[string]*proto.FleetOperation{}, fleetLocks: map[string]*keyedMutex{}, fleetWake: make(chan struct{}, 1),
 		timerReservationsByWS: map[string]int{},
 		requestSlots:          make(chan struct{}, opts.MaxConcurrentRequests), overloadSlots: make(chan struct{}, overloadLimit),
 		requestCtx: requestCtx, requestCancel: requestCancel, acceptRequests: true,
@@ -400,7 +406,11 @@ func (c *Control) load() error {
 	if err != nil {
 		return err
 	}
-	var repairs []*proto.Workspace
+	type repair struct {
+		workspace *proto.Workspace
+		from      string
+	}
+	var repairs []repair
 	type assignment struct {
 		workspace  string
 		generation uint64
@@ -423,6 +433,7 @@ func (c *Control) load() error {
 		// the workspace as pending here can hand an empty/stale snapshot to a
 		// different node before the only node with current bytes reconnects.
 		changed := false
+		originalState := ws.State
 		if ws.Tenant == "" {
 			ws.Tenant = "local"
 			ws.Owner = ws.Spec.Principal
@@ -435,20 +446,41 @@ func (c *Control) load() error {
 		}
 		switch ws.State {
 		case proto.WSClaimed, proto.WSClaiming:
-			ws.State = proto.WSClaiming
+			next, transitionErr := transitionWorkspace(&ws, lifecycleTransition{
+				operation: transitionRecover, actor: actorRecovery, to: proto.WSClaiming,
+			})
+			if transitionErr != nil {
+				rows.Close()
+				return transitionErr
+			}
+			ws = next
 			ws.LeaseUntil = c.now().Add(time.Duration(c.opts.RecoveryGraceSec) * time.Second).UnixMilli()
 			changed = true
 		case proto.WSQuiescing, proto.WSCheckpointing, proto.WSDestroying:
 			// Without a persisted operation result we cannot safely infer that
 			// either destruction or resumption completed. Keep it terminal and
 			// operator-visible instead of reviving or deleting data.
-			ws.State = proto.WSFailed
+			next, transitionErr := transitionWorkspace(&ws, lifecycleTransition{
+				operation: transitionRecover, actor: actorRecovery, to: proto.WSFailed,
+			})
+			if transitionErr != nil {
+				rows.Close()
+				return transitionErr
+			}
+			ws = next
 			ws.LeaseUntil = 0
 			changed = true
 		case proto.WSReleased:
 			// The release checkpoint was committed before WSReleased became
 			// durable. It is safe to re-offer from that snapshot after restart.
-			ws.State = proto.WSPending
+			next, transitionErr := transitionWorkspace(&ws, lifecycleTransition{
+				operation: transitionRecover, actor: actorRecovery, to: proto.WSPending,
+			})
+			if transitionErr != nil {
+				rows.Close()
+				return transitionErr
+			}
+			ws = next
 			ws.Node = ""
 			ws.LeaseUntil = 0
 			ws.Spec.RestoreFrom = ws.LastSnapshot
@@ -459,7 +491,7 @@ func (c *Control) load() error {
 			assignments = append(assignments, assignment{ws.ID, ws.Generation, ws.Node, ws.Tenant})
 		}
 		if changed {
-			repairs = append(repairs, &ws)
+			repairs = append(repairs, repair{workspace: &ws, from: originalState})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -469,9 +501,14 @@ func (c *Control) load() error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
-	for _, ws := range repairs {
-		if err := c.persistWS(ws); err != nil {
-			return fmt.Errorf("persist recovered workspace %s: %w", ws.ID, err)
+	for _, repair := range repairs {
+		if err := c.persistWS(repair.workspace); err != nil {
+			return fmt.Errorf("persist recovered workspace %s: %w", repair.workspace.ID, err)
+		}
+		if repair.from != repair.workspace.State {
+			c.emitWorkspaceTransition(context.Background(), repair.from, *repair.workspace, lifecycleTransition{
+				operation: transitionRecover, actor: actorRecovery, to: repair.workspace.State,
+			})
 		}
 	}
 	for _, a := range assignments {
@@ -543,23 +580,6 @@ func (c *Control) load() error {
 		_ = proto.Unmarshal(b, &st)
 		st.Online = false
 		c.nodes[id] = &nodeState{Status: st, PubKey: pub}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	rows, err = c.db.Query(`SELECT key, ws FROM idem`)
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var k, w string
-		if err := rows.Scan(&k, &w); err == nil {
-			c.idem[k] = w
-		}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -659,10 +679,12 @@ func (c *Control) WithArtifactReferences(fn func([]string) error) error {
 	return fn(references)
 }
 
-// PruneRecords removes completed idempotency results and fired timers older
-// than before. Pending timers and mutation intents are never eligible. The
-// bounded pass is safe to resume after interruption because the database and
-// in-memory timer index change only after the transaction commits.
+// PruneRecords removes completed idempotency results, fired timers, terminal
+// fleet operations, unreferenced destroyed tombstones, superseded assignment
+// history older than before, and drains legacy idempotency rows that have no
+// timestamp and are no longer read. Pending authority is never eligible. The
+// bounded pass is safe to resume after interruption because database and
+// in-memory indexes change only after the transaction commits.
 func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int) (RecordPruneResult, error) {
 	if limit <= 0 {
 		limit = 10_000
@@ -671,10 +693,23 @@ func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int)
 		id string
 		at int64
 	}
+	type workspaceCandidate struct {
+		id string
+		at int64
+	}
+	type fleetCandidate struct {
+		id string
+		at int64
+	}
+	type assignmentKey struct {
+		workspace  string
+		generation uint64
+		node       string
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	candidates := make([]timerCandidate, 0)
 	cutoff := before.UnixMilli()
+	timerCandidates := make([]timerCandidate, 0)
 	for _, timer := range c.timers {
 		if !timer.Fired {
 			continue
@@ -685,17 +720,74 @@ func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int)
 			at = timer.CreatedAt
 		}
 		if at < cutoff {
-			candidates = append(candidates, timerCandidate{id: timer.ID, at: at})
+			timerCandidates = append(timerCandidates, timerCandidate{id: timer.ID, at: at})
 		}
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].at == candidates[j].at {
-			return candidates[i].id < candidates[j].id
+	sort.Slice(timerCandidates, func(i, j int) bool {
+		if timerCandidates[i].at == timerCandidates[j].at {
+			return timerCandidates[i].id < timerCandidates[j].id
 		}
-		return candidates[i].at < candidates[j].at
+		return timerCandidates[i].at < timerCandidates[j].at
 	})
-	if len(candidates) > limit {
-		candidates = candidates[:limit]
+	if len(timerCandidates) > limit {
+		timerCandidates = timerCandidates[:limit]
+	}
+
+	fleetCandidates := make([]fleetCandidate, 0)
+	prunedFleet := make(map[string]struct{})
+	for id, operation := range c.fleetOps {
+		terminal := operation.State == proto.FleetStateCompleted ||
+			(operation.State == proto.FleetStatePartial && !fleetHasPending(operation))
+		if terminal && operation.UpdatedAt < cutoff {
+			fleetCandidates = append(fleetCandidates, fleetCandidate{id: id, at: operation.UpdatedAt})
+		}
+	}
+	sort.Slice(fleetCandidates, func(i, j int) bool {
+		if fleetCandidates[i].at == fleetCandidates[j].at {
+			return fleetCandidates[i].id < fleetCandidates[j].id
+		}
+		return fleetCandidates[i].at < fleetCandidates[j].at
+	})
+	if len(fleetCandidates) > limit {
+		fleetCandidates = fleetCandidates[:limit]
+	}
+	for _, candidate := range fleetCandidates {
+		prunedFleet[candidate.id] = struct{}{}
+	}
+
+	protectedWorkspaces := make(map[string]struct{})
+	protectedAssignments := make(map[assignmentKey]struct{})
+	for id, operation := range c.fleetOps {
+		if _, pruning := prunedFleet[id]; pruning {
+			continue
+		}
+		for _, target := range operation.Results {
+			protectedWorkspaces[target.Workspace] = struct{}{}
+			if target.Node != "" && target.Generation != 0 {
+				protectedAssignments[assignmentKey{target.Workspace, target.Generation, target.Node}] = struct{}{}
+			}
+		}
+	}
+	workspaceCandidates := make([]workspaceCandidate, 0)
+	for id, workspace := range c.workspaces {
+		if workspace.Node != "" && workspace.Generation != 0 {
+			protectedAssignments[assignmentKey{id, workspace.Generation, workspace.Node}] = struct{}{}
+		}
+		if workspace.State != proto.WSDestroyed || workspace.UpdatedAt >= cutoff {
+			continue
+		}
+		if _, protected := protectedWorkspaces[id]; !protected {
+			workspaceCandidates = append(workspaceCandidates, workspaceCandidate{id: id, at: workspace.UpdatedAt})
+		}
+	}
+	sort.Slice(workspaceCandidates, func(i, j int) bool {
+		if workspaceCandidates[i].at == workspaceCandidates[j].at {
+			return workspaceCandidates[i].id < workspaceCandidates[j].id
+		}
+		return workspaceCandidates[i].at < workspaceCandidates[j].at
+	})
+	if len(workspaceCandidates) > limit {
+		workspaceCandidates = workspaceCandidates[:limit]
 	}
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -707,8 +799,18 @@ func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int)
 			_ = tx.Rollback()
 		}
 	}()
-	for _, candidate := range candidates {
+	for _, candidate := range timerCandidates {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM timers WHERE id=?`, candidate.id); err != nil {
+			return RecordPruneResult{}, err
+		}
+	}
+	for _, candidate := range fleetCandidates {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM fleet_operations WHERE id=?`, candidate.id); err != nil {
+			return RecordPruneResult{}, err
+		}
+	}
+	for _, candidate := range workspaceCandidates {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM workspaces WHERE id=?`, candidate.id); err != nil {
 			return RecordPruneResult{}, err
 		}
 	}
@@ -722,19 +824,113 @@ func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int)
 	if err != nil {
 		return RecordPruneResult{}, err
 	}
+	type assignmentCandidate struct {
+		assignmentKey
+		rowid int64
+	}
+	// Put the small live-authority set in a temporary table and let SQLite
+	// exclude it before applying LIMIT. Merely over-fetching a fixed multiple
+	// can permanently starve old deletable rows behind protected assignments.
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS prune_protected_assignments (
+		workspace TEXT NOT NULL,
+		generation INTEGER NOT NULL,
+		node TEXT NOT NULL,
+		PRIMARY KEY(workspace, generation, node)
+	) WITHOUT ROWID`); err != nil {
+		return RecordPruneResult{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM prune_protected_assignments`); err != nil {
+		return RecordPruneResult{}, err
+	}
+	protect, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO prune_protected_assignments(workspace, generation, node) VALUES(?,?,?)`)
+	if err != nil {
+		return RecordPruneResult{}, err
+	}
+	for assignment := range protectedAssignments {
+		if _, err := protect.ExecContext(ctx, assignment.workspace, assignment.generation, assignment.node); err != nil {
+			protect.Close()
+			return RecordPruneResult{}, err
+		}
+	}
+	if err := protect.Close(); err != nil {
+		return RecordPruneResult{}, err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT a.rowid, a.workspace, a.generation, a.node
+		FROM assignments AS a
+		WHERE a.created_at < ? AND NOT EXISTS (
+			SELECT 1 FROM prune_protected_assignments AS p
+			WHERE p.workspace=a.workspace AND p.generation=a.generation AND p.node=a.node
+		)
+		ORDER BY a.created_at, a.rowid LIMIT ?`, cutoff, limit)
+	if err != nil {
+		return RecordPruneResult{}, err
+	}
+	assignmentCandidates := make([]assignmentCandidate, 0, limit)
+	for rows.Next() {
+		var candidate assignmentCandidate
+		if err := rows.Scan(&candidate.rowid, &candidate.workspace, &candidate.generation, &candidate.node); err != nil {
+			rows.Close()
+			return RecordPruneResult{}, err
+		}
+		if _, protected := protectedAssignments[candidate.assignmentKey]; !protected {
+			assignmentCandidates = append(assignmentCandidates, candidate)
+			if len(assignmentCandidates) == limit {
+				break
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return RecordPruneResult{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return RecordPruneResult{}, err
+	}
+	for _, candidate := range assignmentCandidates {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM assignments WHERE rowid=?`, candidate.rowid); err != nil {
+			return RecordPruneResult{}, err
+		}
+	}
+	legacyResult, err := tx.ExecContext(ctx, `DELETE FROM idem WHERE rowid IN (SELECT rowid FROM idem LIMIT ?)`, limit)
+	if err != nil {
+		return RecordPruneResult{}, err
+	}
+	legacyIdem, err := legacyResult.RowsAffected()
+	if err != nil {
+		return RecordPruneResult{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return RecordPruneResult{}, err
 	}
 	committed = true
-	for _, candidate := range candidates {
+	for _, candidate := range timerCandidates {
 		delete(c.timers, candidate.id)
 	}
-	result := RecordPruneResult{Mutations: mutations, Timers: int64(len(candidates))}
+	for _, candidate := range fleetCandidates {
+		delete(c.fleetOps, candidate.id)
+	}
+	for _, candidate := range workspaceCandidates {
+		delete(c.workspaces, candidate.id)
+	}
+	result := RecordPruneResult{
+		Mutations: mutations, Timers: int64(len(timerCandidates)),
+		Workspaces: int64(len(workspaceCandidates)), FleetOperations: int64(len(fleetCandidates)),
+		Assignments: int64(len(assignmentCandidates)), LegacyIdem: legacyIdem,
+	}
 	if result.Mutations > 0 {
 		metrics.MutationsPruned.Add(uint64(result.Mutations))
 	}
 	if result.Timers > 0 {
 		metrics.TimersPruned.Add(uint64(result.Timers))
+	}
+	if result.Workspaces > 0 {
+		metrics.WorkspacesPruned.Add(uint64(result.Workspaces))
+	}
+	if result.FleetOperations > 0 {
+		metrics.FleetOperationsPruned.Add(uint64(result.FleetOperations))
+	}
+	if result.Assignments > 0 {
+		metrics.AssignmentsPruned.Add(uint64(result.Assignments))
 	}
 	return result, nil
 }
@@ -786,24 +982,6 @@ func (c *Control) assignmentTenant(workspace string, generation uint64, node str
 		return "", false, err
 	}
 	return tenant, true, nil
-}
-
-func (c *Control) persistWorkspaceAndTimer(ws *proto.Workspace, timer *proto.Timer) error {
-	ws.UpdatedAt = c.now().UnixMilli()
-	tx, err := c.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err != nil {
-		return err
-	}
-	if timer != nil {
-		if _, err := tx.Exec(`INSERT OR REPLACE INTO timers(id, data) VALUES(?,?)`, timer.ID, proto.MustMarshal(timer)); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
 }
 
 func (c *Control) persistWSAndMutation(ws *proto.Workspace, scope, key, op string, request, result any) error {
@@ -862,18 +1040,6 @@ func (c *Control) persistWorkspaceTimersAndMutation(ws *proto.Workspace, timers 
 		return err
 	}
 	return tx.Commit()
-}
-
-func (c *Control) saveWS(ws *proto.Workspace) {
-	if err := c.persistWS(ws); err != nil {
-		c.logger.Error("save workspace", "err", err)
-	}
-}
-
-func (c *Control) saveTimer(t *proto.Timer) {
-	if _, err := c.db.Exec(`INSERT OR REPLACE INTO timers(id, data) VALUES(?,?)`, t.ID, proto.MustMarshal(t)); err != nil {
-		c.logger.Error("save timer", "err", err)
-	}
 }
 
 func (c *Control) saveNode(id string, n *nodeState) {
@@ -936,7 +1102,11 @@ func (c *Control) emitFleetEvent(ctx context.Context, typ, stream, node string, 
 
 // Authenticate checks the token and assigns/validates the peer id.
 func (c *Control) Authenticate(ctx context.Context, h *proto.Hello) (string, *proto.HelloOK, error) {
-	ok := &proto.HelloOK{Caps: []string{"v1"}, Server: "remount", Now: c.now().UnixMilli(), PubKey: c.PublicKey(), LeaseSec: c.opts.LeaseSec}
+	caps, err := proto.NegotiateCapabilities(h.Caps)
+	if err != nil {
+		return "", nil, err
+	}
+	ok := &proto.HelloOK{Caps: caps, Server: "remount", Now: c.now().UnixMilli(), PubKey: c.PublicKey(), LeaseSec: c.opts.LeaseSec}
 	switch h.Role {
 	case proto.RoleNode:
 		if c.opts.Token != "" && subtle.ConstantTimeCompare([]byte(h.Token), []byte(c.opts.Token)) != 1 {
@@ -1072,19 +1242,35 @@ func (c *Control) PeerGone(ctx context.Context, id string) {
 		// WSClaimed. Clients waiting on a workspace therefore wait for the
 		// node that will actually answer them.
 		var demoted []string
+		var transitions []proto.Workspace
 		for _, ws := range c.workspaces {
 			if ws.Node == id && ws.State == proto.WSClaimed {
-				next := *ws
-				next.State = proto.WSClaiming
+				next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+					operation: transitionReconnect, actor: actorControl, to: proto.WSClaiming,
+					expectGeneration: true, generation: ws.Generation,
+					expectNode: true, node: id,
+				})
+				if transitionErr != nil {
+					c.logger.Error("validate node-offline demotion", "ws", ws.ID, "err", transitionErr)
+					continue
+				}
 				if err := c.persistWS(&next); err != nil {
 					c.logger.Error("persist node-offline demotion", "ws", ws.ID, "err", err)
 					continue
 				}
 				*ws = next
 				demoted = append(demoted, ws.ID)
+				transitions = append(transitions, next)
 			}
 		}
 		c.mu.Unlock()
+		for _, next := range transitions {
+			c.emitWorkspaceTransition(ctx, proto.WSClaimed, next, lifecycleTransition{
+				operation: transitionReconnect, actor: actorControl, to: proto.WSClaiming,
+				expectGeneration: true, generation: next.Generation,
+				expectNode: true, node: id,
+			})
+		}
 		c.emit(ctx, proto.EvNodeOffline, id, "", id, map[string]any{"workspaces": demoted})
 		return
 	}
@@ -1607,19 +1793,6 @@ func (c *Control) wsGet(id string) (*proto.Workspace, error) {
 	return ws, nil
 }
 
-func (c *Control) wsList() *proto.WSListRes {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := &proto.WSListRes{}
-	for _, ws := range c.workspaces {
-		if ws.State != proto.WSDestroyed {
-			out.Workspaces = append(out.Workspaces, *ws)
-		}
-	}
-	sort.Slice(out.Workspaces, func(i, j int) bool { return out.Workspaces[i].ID < out.Workspaces[j].ID })
-	return out
-}
-
 func (c *Control) wsListAuthorized(ctx context.Context, from string) (*proto.WSListRes, error) {
 	subject, err := c.subjectOf(from)
 	if err != nil {
@@ -1644,27 +1817,32 @@ func (c *Control) wsListAuthorized(ctx context.Context, from string) (*proto.WSL
 }
 
 func (c *Control) lockLifecycle(id string) func() {
-	c.mu.Lock()
-	lock := c.lifecycle[id]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		c.lifecycle[id] = lock
-	}
-	c.mu.Unlock()
-	lock.Lock()
-	return lock.Unlock
+	return c.lockKeyed(c.lifecycle, id)
 }
 
 func (c *Control) lockProducer(id string) func() {
+	return c.lockKeyed(c.producerLocks, id)
+}
+
+func (c *Control) lockKeyed(locks map[string]*keyedMutex, id string) func() {
 	c.mu.Lock()
-	lock := c.producerLocks[id]
+	lock := locks[id]
 	if lock == nil {
-		lock = &sync.Mutex{}
-		c.producerLocks[id] = lock
+		lock = &keyedMutex{}
+		locks[id] = lock
 	}
+	lock.refs++
 	c.mu.Unlock()
-	lock.Lock()
-	return lock.Unlock
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		c.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 && locks[id] == lock {
+			delete(locks, id)
+		}
+		c.mu.Unlock()
+	}
 }
 
 func (c *Control) lockMutation(scope, key string) func() {
@@ -1899,12 +2077,21 @@ func (c *Control) abortPreparedRelease(ctx context.Context, id, node string, gen
 		c.mu.Unlock()
 		return errors.Join(cause, abortErr, proto.Err(proto.CodeConflict, "workspace changed during release abort: %s", state))
 	}
-	next := *ws
+	to := proto.WSFailed
 	if abortErr == nil {
-		next.State = proto.WSClaimed
+		to = proto.WSClaimed
+	}
+	next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+		operation: transitionReleaseAbort, actor: actorControl, to: to,
+		expectGeneration: true, generation: gen, expectNode: true, node: node,
+	})
+	if transitionErr != nil {
+		c.mu.Unlock()
+		return errors.Join(cause, abortErr, transitionErr)
+	}
+	if abortErr == nil {
 		next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
 	} else {
-		next.State = proto.WSFailed
 		next.LeaseUntil = 0
 	}
 	if err := c.persistWS(&next); err != nil {
@@ -1913,6 +2100,10 @@ func (c *Control) abortPreparedRelease(ctx context.Context, id, node string, gen
 	}
 	*ws = next
 	c.mu.Unlock()
+	c.emitWorkspaceTransition(ctx, expectedState, next, lifecycleTransition{
+		operation: transitionReleaseAbort, actor: actorControl, to: next.State,
+		expectGeneration: true, generation: gen, expectNode: true, node: node,
+	})
 	if abortErr != nil {
 		return errors.Join(cause, fmt.Errorf("release abort was not acknowledged; source fenced for reconciliation: %w", abortErr))
 	}
@@ -1948,16 +2139,31 @@ func (c *Control) wsDestroy(ctx context.Context, principal, id, idem string) err
 	}
 	node, gen := ws.Node, ws.Generation
 	wasHeld := held(ws.State)
+	beforeDestroy := ws.State
+	var destroying proto.Workspace
 	if wasHeld {
-		next := *ws
-		next.State = proto.WSDestroying
+		next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+			operation: transitionDestroyBegin, actor: actorControl, to: proto.WSDestroying,
+			expectGeneration: true, generation: gen, expectNode: true, node: node,
+		})
+		if transitionErr != nil {
+			c.mu.Unlock()
+			return transitionErr
+		}
 		if err := c.persistWS(&next); err != nil {
 			c.mu.Unlock()
 			return err
 		}
 		*ws = next
+		destroying = next
 	}
 	c.mu.Unlock()
+	if wasHeld {
+		c.emitWorkspaceTransition(ctx, beforeDestroy, destroying, lifecycleTransition{
+			operation: transitionDestroyBegin, actor: actorControl, to: proto.WSDestroying,
+			expectGeneration: true, generation: gen, expectNode: true, node: node,
+		})
+	}
 	var prepared proto.WSReleasedReq
 	if node != "" && c.send != nil && c.send.Online(node) {
 		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -1978,8 +2184,14 @@ func (c *Control) wsDestroy(ctx context.Context, principal, id, idem string) err
 		c.mu.Unlock()
 		return proto.Err(proto.CodeConflict, "workspace changed during destroy: %s", state)
 	}
-	destroyed := *ws
-	destroyed.State = proto.WSDestroyed
+	destroyed, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+		operation: transitionDestroyCommit, actor: actorControl, to: proto.WSDestroyed,
+		expectGeneration: true, generation: gen,
+	})
+	if transitionErr != nil {
+		c.mu.Unlock()
+		return transitionErr
+	}
 	destroyed.Node = ""
 	destroyed.LeaseUntil = 0
 	var timerUpdates []*proto.Timer
@@ -2045,14 +2257,24 @@ func (c *Control) release(ctx context.Context, id string, snapshot bool, reason 
 		}
 	}
 	node, gen := ws.Node, ws.Generation
-	next := *ws
-	next.State = proto.WSQuiescing
+	next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+		operation: transitionReleaseBegin, actor: actorControl, to: proto.WSQuiescing,
+		expectGeneration: true, generation: gen, expectNode: true, node: node,
+	})
+	if transitionErr != nil {
+		c.mu.Unlock()
+		return "", transitionErr
+	}
 	if err := c.persistWS(&next); err != nil {
 		c.mu.Unlock()
 		return "", err
 	}
 	*ws = next
 	c.mu.Unlock()
+	c.emitWorkspaceTransition(ctx, proto.WSClaimed, next, lifecycleTransition{
+		operation: transitionReleaseBegin, actor: actorControl, to: proto.WSQuiescing,
+		expectGeneration: true, generation: gen, expectNode: true, node: node,
+	})
 	var res proto.WSReleasedReq
 	rctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
@@ -2083,12 +2305,18 @@ func (c *Control) release(ctx context.Context, id string, snapshot bool, reason 
 		c.mu.Unlock()
 		return "", proto.Err(proto.CodeConflict, "workspace changed during release: %s", state)
 	}
-	committed := *ws
+	committed, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+		operation: transitionReleaseCommit, actor: actorControl, to: proto.WSReleased,
+		expectGeneration: true, generation: gen, expectNode: true, node: node,
+	})
+	if transitionErr != nil {
+		c.mu.Unlock()
+		return "", transitionErr
+	}
 	if res.Snapshot != "" {
 		committed.LastSnapshot = res.Snapshot
 		committed.Spec.RestoreFrom = res.Snapshot
 	}
-	committed.State = proto.WSReleased
 	last := committed.LastSnapshot
 	if err := c.persistWS(&committed); err != nil {
 		c.mu.Unlock()
@@ -2151,7 +2379,14 @@ func (c *Control) wsMove(ctx context.Context, principal string, req *proto.WSMov
 		c.mu.Unlock()
 		return nil, proto.Err(proto.CodeConflict, "workspace changed during move: %s", state)
 	}
-	next := *ws
+	next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+		operation: transitionMove, actor: actorControl, to: proto.WSPending,
+		expectGeneration: true, generation: current.Generation,
+	})
+	if transitionErr != nil {
+		c.mu.Unlock()
+		return nil, transitionErr
+	}
 	if req.Requires != nil {
 		next.Spec.Requires = *req.Requires
 	}
@@ -2159,7 +2394,6 @@ func (c *Control) wsMove(ctx context.Context, principal string, req *proto.WSMov
 		next.Spec.Placement = *req.Placement
 	}
 	next.Spec.RestoreFrom = snap
-	next.State = proto.WSPending
 	next.Node = ""
 	next.LeaseUntil = 0
 	if err := c.persistWSAndMutation(&next, scope, req.IdempotencyKey, proto.OpWSMove, req, &next); err != nil {
@@ -2231,9 +2465,15 @@ func (c *Control) wsSleep(ctx context.Context, principal string, req *proto.WSSl
 		c.mu.Unlock()
 		return nil, proto.Err(proto.CodeConflict, "workspace changed during sleep: %s", state)
 	}
-	next := *ws
+	next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+		operation: transitionSleep, actor: actorControl, to: proto.WSPaused,
+		expectGeneration: true, generation: current.Generation,
+	})
+	if transitionErr != nil {
+		c.mu.Unlock()
+		return nil, transitionErr
+	}
 	next.Spec.RestoreFrom = snap
-	next.State = proto.WSPaused
 	next.Node = ""
 	next.LeaseUntil = 0
 	if err := c.persistWorkspaceTimerAndMutation(&next, t, scope, req.IdempotencyKey, proto.OpWSSleep, req, t); err != nil {
@@ -2285,9 +2525,17 @@ func (c *Control) wsWake(ctx context.Context, principal, id, timerID, idem strin
 		nextTimer = &copyTimer
 	}
 	next := *ws
-	resumed := next.State == proto.WSPaused
+	resumed := ws.State == proto.WSPaused
 	if resumed {
-		next.State = proto.WSPending
+		var transitionErr error
+		next, transitionErr = transitionWorkspace(ws, lifecycleTransition{
+			operation: transitionWake, actor: actorControl, to: proto.WSPending,
+			expectGeneration: true, generation: ws.Generation,
+		})
+		if transitionErr != nil {
+			c.mu.Unlock()
+			return nil, transitionErr
+		}
 	}
 	if !resumed && (nextTimer == nil || c.timers[timerID].Fired) {
 		cp := next
@@ -2326,8 +2574,16 @@ func (c *Control) wsClaim(ctx context.Context, node, id string) (*proto.WSClaimR
 		// Re-adoption: the same node reconnecting still holds this workspace.
 		// Keep the generation so the client's outstanding grants stay valid,
 		// but go back through claiming so waiters do not race the restore.
-		next := *ws
-		next.State = proto.WSClaiming
+		before := ws.State
+		next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+			operation: transitionClaim, actor: actorNode, to: proto.WSClaiming,
+			expectGeneration: true, generation: ws.Generation,
+			expectNode: true, node: node,
+		})
+		if transitionErr != nil {
+			c.mu.Unlock()
+			return nil, transitionErr
+		}
 		next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
 		if err := c.persistClaim(&next); err != nil {
 			c.mu.Unlock()
@@ -2335,6 +2591,11 @@ func (c *Control) wsClaim(ctx context.Context, node, id string) (*proto.WSClaimR
 		}
 		*ws = next
 		c.mu.Unlock()
+		c.emitWorkspaceTransition(ctx, before, next, lifecycleTransition{
+			operation: transitionClaim, actor: actorNode, to: proto.WSClaiming,
+			expectGeneration: true, generation: next.Generation,
+			expectNode: true, node: node,
+		})
 		return &proto.WSClaimRes{Workspace: next, LeaseSec: c.opts.LeaseSec}, nil
 	}
 	if ws.State != proto.WSPending {
@@ -2354,13 +2615,23 @@ func (c *Control) wsClaim(ctx context.Context, node, id string) (*proto.WSClaimR
 	// The compare-and-swap: state was pending under the lock; now it's ours.
 	// It becomes WSClaimed only once the node reports ws.ready, so a client
 	// never talks to a node that is still restoring the filesystem.
-	next := *ws
+	next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+		operation: transitionClaim, actor: actorNode, to: proto.WSClaiming,
+		expectGeneration: true, generation: ws.Generation,
+	})
+	if transitionErr != nil {
+		c.mu.Unlock()
+		return nil, transitionErr
+	}
 	if next.Spec.Requires.Backend == "" {
 		next.Spec.Requires.Backend = backend
 	}
-	next.State = proto.WSClaiming
 	next.Node = node
-	next.Generation++
+	next.Generation, transitionErr = nextWorkspaceGeneration(next.Generation)
+	if transitionErr != nil {
+		c.mu.Unlock()
+		return nil, transitionErr
+	}
 	next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
 	if err := c.persistClaim(&next); err != nil {
 		c.mu.Unlock()
@@ -2386,7 +2657,15 @@ func (c *Control) wsReady(ctx context.Context, node string, req *proto.WSReadyRe
 		return proto.Err(proto.CodeConflict, "stale ready for %s", req.ID)
 	}
 	if ws.State == proto.WSClaimed {
-		next := *ws
+		next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+			operation: transitionReady, actor: actorNode, to: proto.WSClaimed,
+			expectGeneration: true, generation: req.Gen,
+			expectNode: true, node: node,
+		})
+		if transitionErr != nil {
+			c.mu.Unlock()
+			return transitionErr
+		}
 		next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
 		if err := c.persistWS(&next); err != nil {
 			c.mu.Unlock()
@@ -2401,8 +2680,15 @@ func (c *Control) wsReady(ctx context.Context, node string, req *proto.WSReadyRe
 		c.mu.Unlock()
 		return proto.Err(proto.CodeConflict, "workspace %s cannot become ready from %s", req.ID, state)
 	}
-	next := *ws
-	next.State = proto.WSClaimed
+	next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+		operation: transitionReady, actor: actorNode, to: proto.WSClaimed,
+		expectGeneration: true, generation: req.Gen,
+		expectNode: true, node: node,
+	})
+	if transitionErr != nil {
+		c.mu.Unlock()
+		return transitionErr
+	}
 	next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
 	if err := c.persistWS(&next); err != nil {
 		c.mu.Unlock()
@@ -2468,7 +2754,11 @@ func (c *Control) wsSnapshotCommit(ctx context.Context, node string, req *proto.
 		c.mu.Unlock()
 		return proto.Err(proto.CodeNotFound, "workspace %s", req.ID)
 	}
-	if ws.Node != node || ws.Generation != req.Gen || !held(ws.State) {
+	// Client-initiated authoritative checkpoints are only valid while the
+	// workspace is steadily claimed. Once a release, fleet checkpoint, or
+	// destroy transition begins, that lifecycle operation owns the next
+	// authoritative snapshot and a concurrent client commit must lose.
+	if ws.Node != node || ws.Generation != req.Gen || ws.State != proto.WSClaimed {
 		c.mu.Unlock()
 		return proto.Err(proto.CodeConflict, "stale snapshot commit for %s", req.ID)
 	}
@@ -2510,7 +2800,16 @@ func (c *Control) wsReleased(ctx context.Context, node string, req *proto.WSRele
 		next.Spec.RestoreFrom = req.Snapshot
 	}
 	if held(next.State) {
-		next.State = proto.WSPending
+		var transitionErr error
+		next, transitionErr = transitionWorkspace(ws, lifecycleTransition{
+			operation: transitionNodeReleased, actor: actorNode, to: proto.WSPending,
+			expectGeneration: true, generation: req.Gen,
+			expectNode: true, node: node,
+		})
+		if transitionErr != nil {
+			c.mu.Unlock()
+			return transitionErr
+		}
 	}
 	next.Node = ""
 	next.LeaseUntil = 0
@@ -2893,15 +3192,7 @@ func (c *Control) signalFleet() {
 }
 
 func (c *Control) lockFleet(id string) func() {
-	c.mu.Lock()
-	lock := c.fleetLocks[id]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		c.fleetLocks[id] = lock
-	}
-	c.mu.Unlock()
-	lock.Lock()
-	return lock.Unlock
+	return c.lockKeyed(c.fleetLocks, id)
 }
 
 func (c *Control) fleetLoop() {
@@ -3032,6 +3323,8 @@ func (c *Control) processFleetTarget(ctx context.Context, operationID string, in
 		return
 	}
 
+	var fleetTransition *proto.Workspace
+	var fleetTransitionFrom string
 	c.mu.Lock()
 	ws := c.workspaces[target.Workspace]
 	if ws == nil {
@@ -3081,18 +3374,42 @@ func (c *Control) processFleetTarget(ctx context.Context, operationID string, in
 			next.QuarantinedAt = c.now().UnixMilli()
 		}
 		if target.Node == "" {
-			next.Generation++
+			finalState := proto.WSFailed
+			authorityErr := canAdvanceWorkspaceAuthority(ws)
+			if operation.Action == proto.FleetActionDestroy && authorityErr == nil {
+				finalState = proto.WSDestroyed
+			}
+			var transitionErr error
+			next, transitionErr = transitionWorkspace(ws, lifecycleTransition{
+				operation: transitionFleetComplete, actor: actorControl, to: finalState,
+				expectGeneration: true, generation: ws.Generation,
+			})
+			if transitionErr != nil {
+				c.logger.Error("validate offline fleet transition", "ws", ws.ID, "err", transitionErr)
+				c.mu.Unlock()
+				return
+			}
+			next.QuarantineOperation = operationID
+			if next.QuarantinedAt == 0 {
+				next.QuarantinedAt = c.now().UnixMilli()
+			}
+			if authorityErr == nil {
+				next.Generation++
+				next.AuthzRevision++
+			}
 			next.LeaseUntil = 0
-			next.AuthzRevision++
-			if operation.Action == proto.FleetActionDestroy {
-				next.State = proto.WSDestroyed
+			if finalState == proto.WSDestroyed {
 				next.Node = ""
-			} else {
-				next.State = proto.WSFailed
 			}
 			target.Snapshot = ws.LastSnapshot
-			target.Fenced, target.Acknowledged = true, true
-			target.State = proto.FleetTargetAcknowledged
+			target.Fenced = true
+			if authorityErr != nil {
+				target.State = proto.FleetTargetFailed
+				target.Error = authorityErr.Error() + "; workspace left failed for operator reconciliation"
+			} else {
+				target.Acknowledged = true
+				target.State = proto.FleetTargetAcknowledged
+			}
 			target.UpdatedAt = c.now().UnixMilli()
 			operation.Results[index] = target
 			if err := c.persistWorkspaceAndFleetOperation(&next, operation); err != nil {
@@ -3107,18 +3424,42 @@ func (c *Control) processFleetTarget(ctx context.Context, operationID string, in
 				map[string]any{"operation": operationID, "action": operation.Action, "acknowledged": true})
 			return
 		}
-		next.State = proto.WSQuiescing
+		var transitionErr error
+		fleetTransitionFrom = ws.State
+		next, transitionErr = transitionWorkspace(ws, lifecycleTransition{
+			operation: transitionFleetBegin, actor: actorControl, to: proto.WSQuiescing,
+			expectGeneration: true, generation: ws.Generation,
+			expectNode: true, node: target.Node,
+		})
+		if transitionErr != nil {
+			c.logger.Error("validate fleet quarantine transition", "ws", ws.ID, "err", transitionErr)
+			c.mu.Unlock()
+			return
+		}
+		next.QuarantineOperation = operationID
+		if next.QuarantinedAt == 0 {
+			next.QuarantinedAt = c.now().UnixMilli()
+		}
 		operation.Results[index] = target
 		if err := c.persistWorkspaceAndFleetOperation(&next, operation); err != nil {
 			c.mu.Unlock()
 			return
 		}
 		*ws = next
+		transitionCopy := next
+		fleetTransition = &transitionCopy
 		c.fleetOps[operationID] = operation
 	}
 	exclude := append([]string(nil), ws.Spec.Exclude...)
 	security := ws.Spec.Security
 	c.mu.Unlock()
+	if fleetTransition != nil {
+		c.emitWorkspaceTransition(ctx, fleetTransitionFrom, *fleetTransition, lifecycleTransition{
+			operation: transitionFleetBegin, actor: actorControl, to: proto.WSQuiescing,
+			expectGeneration: true, generation: fleetTransition.Generation,
+			expectNode: true, node: target.Node,
+		})
+	}
 
 	var response proto.WSQuarantineRes
 	request := proto.WSQuarantineReq{
@@ -3152,13 +3493,9 @@ func (c *Control) processFleetTarget(ctx context.Context, operationID string, in
 		return
 	}
 	target = operation.Results[index]
-	next := *ws
-	if next.Generation == target.Generation {
-		next.Generation++
-		next.AuthzRevision++
-	}
-	next.State = proto.WSFailed
-	next.LeaseUntil = 0
+	advanceAuthority := ws.Generation == target.Generation
+	finalState := proto.WSFailed
+	committedSnapshot := ""
 	target.UpdatedAt = c.now().UnixMilli()
 	if requestErr != nil {
 		target.Error = requestErr.Error()
@@ -3192,14 +3529,12 @@ func (c *Control) processFleetTarget(ctx context.Context, operationID string, in
 				}
 			}
 			if target.State != proto.FleetTargetFailed {
-				next.LastSnapshot = response.Snapshot
-				next.Spec.RestoreFrom = response.Snapshot
+				committedSnapshot = response.Snapshot
 			}
 		}
 		if target.State == proto.FleetTargetPending {
 			if operation.Action == proto.FleetActionDestroy {
-				next.State = proto.WSDestroyed
-				next.Node = ""
+				finalState = proto.WSDestroyed
 				target.Error = "fenced and checkpointed; destruction acknowledgement pending"
 			} else {
 				target.Acknowledged = true
@@ -3207,6 +3542,36 @@ func (c *Control) processFleetTarget(ctx context.Context, operationID string, in
 				target.Error = ""
 			}
 		}
+	}
+	if advanceAuthority {
+		if authorityErr := canAdvanceWorkspaceAuthority(ws); authorityErr != nil {
+			advanceAuthority = false
+			finalState = proto.WSFailed
+			target.State = proto.FleetTargetFailed
+			target.Acknowledged = false
+			target.Error = authorityErr.Error() + "; workspace left failed for operator reconciliation"
+		}
+	}
+	next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+		operation: transitionFleetComplete, actor: actorControl, to: finalState,
+		expectGeneration: true, generation: ws.Generation,
+	})
+	if transitionErr != nil {
+		c.logger.Error("validate fleet completion transition", "ws", ws.ID, "err", transitionErr)
+		c.mu.Unlock()
+		return
+	}
+	if advanceAuthority {
+		next.Generation++
+		next.AuthzRevision++
+	}
+	next.LeaseUntil = 0
+	if committedSnapshot != "" {
+		next.LastSnapshot = committedSnapshot
+		next.Spec.RestoreFrom = committedSnapshot
+	}
+	if finalState == proto.WSDestroyed {
+		next.Node = ""
 	}
 	operation.Results[index] = target
 	if err := c.persistWorkspaceAndFleetOperation(&next, operation); err != nil {
@@ -3728,6 +4093,9 @@ func VerifyGrant(pub ed25519.PublicKey, g *proto.Grant, now time.Time) error {
 	if g == nil {
 		return proto.Err(proto.CodeUnauthorized, "missing grant")
 	}
+	if len(pub) != ed25519.PublicKeySize || len(g.Signature) != ed25519.SignatureSize {
+		return proto.Err(proto.CodeUnauthorized, "malformed grant key or signature")
+	}
 	if !ed25519.Verify(pub, proto.MustMarshal(g.Claims), g.Signature) {
 		return proto.Err(proto.CodeUnauthorized, "bad grant signature")
 	}
@@ -3735,17 +4103,6 @@ func VerifyGrant(pub ed25519.PublicKey, g *proto.Grant, now time.Time) error {
 		return proto.Err(proto.CodeUnauthorized, "grant expired")
 	}
 	return nil
-}
-
-func (c *Control) timerList() *proto.TimerListRes {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := &proto.TimerListRes{}
-	for _, t := range c.timers {
-		out.Timers = append(out.Timers, *t)
-	}
-	sort.Slice(out.Timers, func(i, j int) bool { return out.Timers[i].ID < out.Timers[j].ID })
-	return out
 }
 
 func (c *Control) timerListAuthorized(ctx context.Context, from string) (*proto.TimerListRes, error) {
@@ -3795,7 +4152,11 @@ func (c *Control) loop() {
 // an injected clock).
 func (c *Control) Tick(ctx context.Context) {
 	now := c.now().UnixMilli()
-	var expired []*proto.Workspace
+	type leaseExpiry struct {
+		workspace proto.Workspace
+		error     string
+	}
+	var expired []leaseExpiry
 	var fire []*proto.Timer
 	c.mu.Lock()
 	for _, ws := range c.workspaces {
@@ -3806,12 +4167,30 @@ func (c *Control) Tick(ctx context.Context) {
 		if leaseManaged && ws.LeaseUntil > 0 && ws.LeaseUntil < now {
 			// Advancing the authoritative generation revokes every grant made
 			// under the expired assignment before another node may claim.
-			next := *ws
-			next.Generation++
-			next.State = proto.WSPending
-			next.Spec.RestoreFrom = next.LastSnapshot
+			nextGeneration, generationErr := nextWorkspaceGeneration(ws.Generation)
+			operation, targetState := transitionLeaseExpired, proto.WSPending
+			if generationErr != nil {
+				// Never wrap a fence. A terminal failed workspace cannot be
+				// reassigned until an operator creates a fresh identity.
+				operation, targetState = transitionAuthorityExhausted, proto.WSFailed
+			}
+			next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+				operation: operation, actor: actorControl, to: targetState,
+				expectGeneration: true, generation: ws.Generation,
+				expectNode: true, node: ws.Node,
+			})
+			if transitionErr != nil {
+				c.logger.Error("validate lease expiry transition", "ws", ws.ID, "err", transitionErr)
+				continue
+			}
+			if generationErr == nil {
+				next.Generation = nextGeneration
+				next.Spec.RestoreFrom = next.LastSnapshot
+			}
 			lost := ws.Node
-			next.Node = ""
+			if generationErr == nil {
+				next.Node = ""
+			}
 			next.LeaseUntil = 0
 			if err := c.persistWS(&next); err != nil {
 				c.logger.Error("persist lease expiry", "ws", ws.ID, "err", err)
@@ -3820,7 +4199,11 @@ func (c *Control) Tick(ctx context.Context) {
 			*ws = next
 			cp := next
 			cp.Node = lost
-			expired = append(expired, &cp)
+			expiry := leaseExpiry{workspace: cp}
+			if generationErr != nil {
+				expiry.error = generationErr.Error()
+			}
+			expired = append(expired, expiry)
 		}
 	}
 	for _, t := range c.timers {
@@ -3830,9 +4213,12 @@ func (c *Control) Tick(ctx context.Context) {
 	}
 	c.mu.Unlock()
 	// lint:locks-ok expired holds per-iteration copies, not shared workspaces
-	for _, ws := range expired {
+	for _, expiry := range expired {
 		metrics.WSLeaseExpired.Inc()
-		c.emit(ctx, proto.EvWSLeaseExpired, ws.ID, "", ws.Node, map[string]any{"restore_from": ws.Spec.RestoreFrom})
+		c.emit(ctx, proto.EvWSLeaseExpired, expiry.workspace.ID, "", expiry.workspace.Node, map[string]any{
+			"restore_from": expiry.workspace.Spec.RestoreFrom,
+			"state":        expiry.workspace.State, "error": expiry.error,
+		})
 	}
 	for _, t := range fire {
 		c.fireTimer(ctx, t)

@@ -170,7 +170,8 @@ gap:
 ## 6. A second machine, and a move
 
 On another computer, enroll it as a node. Only outbound access to the server is
-needed; nothing listens. Labels are how you address groups of machines later.
+needed; the node exposes no inbound listener. Labels are how you address groups
+of machines later.
 
 ```sh
 ./remount up --server http://server.example:7443 --label zone=gpu --label owner=you
@@ -224,6 +225,21 @@ node is refused.
 
 `ws move` also accepts `--cpu`, `--mem`, `--backend` and `--node` to pin to a
 specific node id.
+
+You can capture the tree without moving it. The default is intentionally a live
+snapshot: concurrent writes may be observed and the artifact does not replace
+failover state. Request an authoritative checkpoint when recovery must use it.
+
+```sh
+./remount ws snapshot $WS
+# ... consistency=live, authoritative=false
+
+./remount ws snapshot $WS --authoritative
+# ... consistency=quiesced, authoritative=true
+```
+
+The authoritative path fences Remount-managed execution, uploads the blob, and
+commits the digest for the current generation before it reports success.
 
 ## 7. Sleep and wake
 
@@ -356,8 +372,8 @@ key. The audit for all three requests is in the event log.
 
 ## 9. Watch everything
 
-The event log is the source of truth. Workspace state, audit and replay are all
-derived from it. Follow it live:
+Transactional resource rows are the source of lifecycle/recovery truth. The
+event log is the ordered audit and observation history. Follow it live:
 
 ```sh
 ./remount events --follow --ws $WS

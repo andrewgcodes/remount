@@ -1,6 +1,11 @@
 # 4. The event log is the truth; state is a cache
 
-**Status:** accepted
+**Status:** superseded by [ADR 16](./0016-transactional-lifecycle-state.md)
+
+ADR 16 narrows this decision: transactional resource rows own lifecycle
+authority, while the event log remains the canonical ordered audit and
+observation history. The text below is retained as the original decision
+record and must not be read as a recovery algorithm for current code.
 
 ## Context
 

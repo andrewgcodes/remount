@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/fsops"
@@ -44,32 +45,80 @@ type Caps struct {
 	DeviceIsolation    bool
 }
 
-// Backend creates workspaces.
-type Backend interface {
+// Describer reports a backend's identity and evidence-bearing capabilities.
+type Describer interface {
 	Name() string
 	Caps() Caps
+}
+
+// Provisioner creates a fresh materialization.
+type Provisioner interface {
 	// Create materializes a workspace. If restore is non-nil it is a tar.gz
 	// snapshot to extract into the fresh filesystem.
 	Create(ctx context.Context, id string, spec proto.WorkspaceSpec, restore io.Reader) (Handle, error)
+}
+
+// Adopter reattaches to a materialization retained across a node restart.
+type Adopter interface {
 	// Adopt reattaches to a workspace that already exists on disk (node
 	// restart). Returns proto.CodeNotFound if there is nothing to adopt.
 	Adopt(ctx context.Context, id string) (Handle, error)
 }
 
-// Handle is one live workspace.
-type Handle interface {
+// Backend is the explicit set of responsibilities every registered backend
+// must implement. Splitting the contracts lets implementations and conformance
+// tests reason about each security-sensitive responsibility independently.
+type Backend interface {
+	Describer
+	Provisioner
+	Adopter
+}
+
+// Identity identifies one materialization.
+type Identity interface {
 	ID() string
 	Backend() string
+}
+
+// Filesystem exposes the backend's jailed host-side filesystem adapter.
+type Filesystem interface {
 	// FS returns the jailed filesystem view.
 	FS() *fsops.FS
+}
+
+// SessionPreparer turns a portable session request into a backend-specific
+// process specification.
+type SessionPreparer interface {
 	// Prepare rewrites a session spec so it runs inside the workspace:
 	// cwd is resolved, env is merged with the workspace baseline, and for
 	// container backends the program is wrapped in an exec.
 	Prepare(spec *session.Spec) error
+}
+
+// Checkpointer owns snapshot consistency. Snapshot is explicitly live and may
+// observe concurrent workspace writes. Checkpoint must freeze backend-managed
+// execution until the archive is complete; the node additionally excludes its
+// direct filesystem mutation surface while calling it.
+type Checkpointer interface {
 	// Snapshot streams a tar.gz of the filesystem.
 	Snapshot(ctx context.Context, excludes []string, w io.Writer) error
+	// Checkpoint streams a quiesced tar.gz suitable for authoritative failover.
+	Checkpoint(ctx context.Context, excludes []string, w io.Writer) error
+}
+
+// Destroyer permanently removes one materialization.
+type Destroyer interface {
 	// Destroy removes everything.
 	Destroy(ctx context.Context) error
+}
+
+// Handle is one live workspace composed from explicit responsibilities.
+type Handle interface {
+	Identity
+	Filesystem
+	SessionPreparer
+	Checkpointer
+	Destroyer
 }
 
 // NetworkEndpoint identifies the generation-specific broker that an enforced
@@ -220,6 +269,13 @@ func (h *processHandle) Prepare(spec *session.Spec) error {
 }
 
 func (h *processHandle) Snapshot(ctx context.Context, excludes []string, w io.Writer) error {
+	return artifact.Snapshot(h.root, excludes, w)
+}
+
+func (h *processHandle) Checkpoint(ctx context.Context, excludes []string, w io.Writer) error {
+	// The process backend has no independent runtime. Its only managed writers
+	// are sessions, which the node fences and joins before entering this call.
+	// Host processes are outside the local/unisolated backend's trust boundary.
 	return artifact.Snapshot(h.root, excludes, w)
 }
 
@@ -399,6 +455,23 @@ func (h *dockerHandle) Prepare(spec *session.Spec) error {
 }
 
 func (h *dockerHandle) Snapshot(ctx context.Context, excludes []string, w io.Writer) error {
+	return artifact.Snapshot(h.root, excludes, w)
+}
+
+func (h *dockerHandle) Checkpoint(ctx context.Context, excludes []string, w io.Writer) (err error) {
+	out, err := exec.CommandContext(ctx, h.bin, "pause", h.name).CombinedOutput()
+	if err != nil {
+		return proto.Err(proto.CodeInternal, "docker pause: %s", strings.TrimSpace(string(out)))
+	}
+	defer func() {
+		resumeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		out, resumeErr := exec.CommandContext(resumeCtx, h.bin, "unpause", h.name).CombinedOutput()
+		if resumeErr != nil {
+			resumeErr = proto.Err(proto.CodeInternal, "docker unpause: %s", strings.TrimSpace(string(out)))
+			err = errors.Join(err, resumeErr)
+		}
+	}()
 	return artifact.Snapshot(h.root, excludes, w)
 }
 

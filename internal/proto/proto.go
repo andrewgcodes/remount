@@ -27,8 +27,14 @@ import (
 	"github.com/fxamacker/cbor/v2"
 )
 
-// Version is the protocol version carried in every frame.
+// Version is the only protocol version this release accepts. A peer must
+// negotiate CapabilityV1 during hello before either side exchanges requests.
 const Version = 1
+
+// CapabilityV1 identifies the complete v1 semantic contract. Capabilities
+// are exact, case-sensitive identifiers; an empty list does not mean a
+// wildcard or implicit compatibility.
+const CapabilityV1 = "v1"
 
 // Well-known peer names.
 const (
@@ -152,13 +158,16 @@ func HelloProofBytes(h Hello) []byte {
 // EncodeFrame serializes a frame. The transport prefixes its own length.
 func EncodeFrame(f *Frame) ([]byte, error) {
 	if f.V == 0 {
-		f.V = Version
+		copyFrame := *f
+		copyFrame.V = Version
+		return encMode.Marshal(&copyFrame)
 	}
 	return encMode.Marshal(f)
 }
 
-// DecodeFrame parses a frame. It rejects frames whose version is newer than
-// ours only if the kind is unknown; otherwise it is lenient by design.
+// DecodeFrame parses a frame. Unknown fields remain forward-compatible within
+// a negotiated version, but frames from any other version fail closed before
+// their kind or body can be interpreted.
 func DecodeFrame(b []byte) (*Frame, error) {
 	var f Frame
 	if err := decMode.Unmarshal(b, &f); err != nil {
@@ -167,7 +176,32 @@ func DecodeFrame(b []byte) (*Frame, error) {
 	if f.T == "" {
 		return nil, errors.New("proto: frame has no kind")
 	}
+	if f.V != Version {
+		return nil, fmt.Errorf("proto: unsupported frame version %d (supported: %d)", f.V, Version)
+	}
 	return &f, nil
+}
+
+// NegotiateCapabilities returns the ordered intersection required for a v1
+// connection. v1 is a semantic baseline rather than an optional extension,
+// so peers that do not offer it are rejected explicitly.
+func NegotiateCapabilities(offered []string) ([]string, error) {
+	for _, capability := range offered {
+		if capability == CapabilityV1 {
+			return []string{CapabilityV1}, nil
+		}
+	}
+	return nil, Err(CodeUnsupported, "peer does not offer required capability %q", CapabilityV1)
+}
+
+// HasCapability reports whether capabilities contains the exact identifier.
+func HasCapability(capabilities []string, required string) bool {
+	for _, capability := range capabilities {
+		if capability == required {
+			return true
+		}
+	}
+	return false
 }
 
 // Body decodes f.Body into v.

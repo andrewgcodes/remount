@@ -45,6 +45,16 @@ func (n *Node) Diag(ctx context.Context) *proto.NodeDiag {
 	d.SessionsActiveMax = sessionStats.MaxActive
 	d.SessionsPerWorkspaceMax = sessionStats.MaxSessionsPerWorkspace
 	d.SessionsPerPrincipalMax = sessionStats.MaxSessionsPerPrincipal
+	d.SessionMemoryBytes = n.opts.SessionMemoryBytes
+	d.SessionSpillBytes = n.opts.SessionSpillBytes
+	d.SessionMemoryChunks = n.opts.SessionMaxMemoryChunks
+	d.SessionChunkBytes = n.opts.SessionMaxChunkBytes
+	d.RequestsActiveMax = n.opts.MaxConcurrentRequests
+	d.ConnectorMaxBytes = n.opts.MaxConnectorCacheBytes
+	d.ConnectorScopeMaxBytes = n.opts.MaxConnectorWorkspaceBytes
+	d.ConnectorObjectMaxBytes = n.opts.MaxConnectorObjectBytes
+	d.ConnectorMaxObjects = n.opts.MaxConnectorObjects
+	d.ConnectorScopeMaxObjects = n.opts.MaxConnectorWorkspaceObjects
 	n.mutationMu.Lock()
 	d.MutationRecords = len(n.mutations)
 	n.mutationMu.Unlock()

@@ -28,6 +28,19 @@ func TestCallerSuppliedIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestAppendWithinLimit(t *testing.T) {
+	destination := []byte("ab")
+	if !appendWithinLimit(&destination, []byte("cd"), 2, 4) || string(destination) != "abcd" {
+		t.Fatalf("boundary append = %q", destination)
+	}
+	if appendWithinLimit(&destination, []byte("e"), 4, 4) || string(destination) != "abcd" {
+		t.Fatalf("over-limit append mutated output: %q", destination)
+	}
+	if appendWithinLimit(&destination, []byte("x"), 5, 4) {
+		t.Fatal("invalid current size was accepted")
+	}
+}
+
 func TestSessionDeliveryReordersWithoutTransportBlocking(t *testing.T) {
 	c := New(Options{})
 	s := c.newSession("s_test", "ws_test", proto.SessionExec)

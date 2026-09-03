@@ -288,9 +288,12 @@ func TestArtifactGCTracksWorkspaceReferencesAcrossDestroy(t *testing.T) {
 	if err := c.WriteFile(ctx, ws.ID, "keep.txt", []byte("referenced snapshot"), 0); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := c.Snapshot(ctx, ws.ID, true, client.WithIdempotencyKey("gc-snapshot"))
+	snapshot, err := c.Checkpoint(ctx, ws.ID, client.WithIdempotencyKey("gc-snapshot"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !snapshot.Authoritative || snapshot.Consistency != proto.SnapshotConsistencyQuiesced {
+		t.Fatalf("checkpoint contract = %+v", snapshot)
 	}
 	orphan, _, err := w.srv.Store.Put(strings.NewReader("unreferenced artifact"))
 	if err != nil {
@@ -316,6 +319,91 @@ func TestArtifactGCTracksWorkspaceReferencesAcrossDestroy(t *testing.T) {
 	}
 	if w.srv.Store.Has(snapshot.Artifact) || result.Removed != 1 {
 		t.Fatalf("post-destroy GC = %+v, referenced=%t", result, w.srv.Store.Has(snapshot.Artifact))
+	}
+}
+
+func TestLiveSnapshotIsNeverCommittedAsFailoverState(t *testing.T) {
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("snapshot-contract")
+	ws := mustWS(t, c, proto.WorkspaceSpec{Name: "snapshot-contract"})
+	ctx := ctxT(t, 60*time.Second)
+	if err := c.WriteFile(ctx, ws.ID, "state.txt", []byte("one"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	live, err := c.Snapshot(ctx, ws.ID, true, client.WithIdempotencyKey("live-snapshot"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live.Authoritative || live.Consistency != proto.SnapshotConsistencyLive {
+		t.Fatalf("live snapshot contract = %+v", live)
+	}
+	current, err := c.GetWorkspace(ctx, ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.LastSnapshot != "" {
+		t.Fatalf("live snapshot became authoritative: %q", current.LastSnapshot)
+	}
+
+	// The node's explicit snapshot admission policy intentionally rate-limits
+	// both live and authoritative archive construction.
+	time.Sleep(1100 * time.Millisecond)
+	checkpoint, err := c.Checkpoint(ctx, ws.ID, client.WithIdempotencyKey("authoritative-checkpoint"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !checkpoint.Authoritative || checkpoint.Consistency != proto.SnapshotConsistencyQuiesced {
+		t.Fatalf("checkpoint contract = %+v", checkpoint)
+	}
+	current, err = c.GetWorkspace(ctx, ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.LastSnapshot != checkpoint.Artifact {
+		t.Fatalf("last snapshot = %q, want %q", current.LastSnapshot, checkpoint.Artifact)
+	}
+}
+
+func TestAuthoritativeCheckpointFencesManagedProcessWriters(t *testing.T) {
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("checkpoint-fencing")
+	ws := mustWS(t, c, proto.WorkspaceSpec{Name: "checkpoint-fencing"})
+	ctx := ctxT(t, 60*time.Second)
+	session, err := c.Exec(ctx, proto.SOpenReq{
+		WS: ws.ID, Kind: proto.SessionExec,
+		Program:        []string{"sh", "-c", "while :; do printf x >> changing.txt; sleep 0.01; done"},
+		IdempotencyKey: "continuous-writer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Wait for the replayable info header, which proves the process has
+	// started before checkpoint fencing begins.
+	select {
+	case chunk := <-session.Chunks():
+		if chunk.Stream != proto.StreamInfo {
+			t.Fatalf("first session chunk stream = %d", chunk.Stream)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	checkpoint, err := c.Checkpoint(ctx, ws.ID, client.WithIdempotencyKey("fenced-checkpoint"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !checkpoint.Authoritative || checkpoint.Consistency != proto.SnapshotConsistencyQuiesced {
+		t.Fatalf("checkpoint = %+v", checkpoint)
+	}
+	sessions, err := c.ListSessions(ctx, ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("process writer survived checkpoint: %+v", sessions)
 	}
 }
 
@@ -557,7 +645,7 @@ func TestSleepAndWake(t *testing.T) {
 	if _, err := c.ReadFile(ctx, ws.ID, "memo.txt"); err == nil {
 		t.Fatal("paused workspace should not be reachable")
 	}
-	got, err = c.WaitClaimed(ctx, ws.ID)
+	_, err = c.WaitClaimed(ctx, ws.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -915,7 +1003,7 @@ func TestGrantsAreEnforced(t *testing.T) {
 	// Raw peer without any grant.
 	conn, _ := w.dialer("raw").Dial(ctx)
 	p := transport.NewPeer(conn, nil)
-	if _, err := transport.Hello(ctx, p, proto.Hello{Role: proto.RoleClient, Token: "tok"}); err != nil {
+	if _, err := transport.Hello(ctx, p, proto.Hello{Role: proto.RoleClient, Token: "tok", Caps: []string{proto.CapabilityV1}}); err != nil {
 		t.Fatal(err)
 	}
 	var res proto.FSReadRes
@@ -933,7 +1021,7 @@ func TestGrantsAreEnforced(t *testing.T) {
 	// Bad token at hello.
 	conn2, _ := w.dialer("raw2").Dial(ctx)
 	p2 := transport.NewPeer(conn2, nil)
-	if _, err := transport.Hello(ctx, p2, proto.Hello{Role: proto.RoleClient, Token: "wrong"}); err == nil {
+	if _, err := transport.Hello(ctx, p2, proto.Hello{Role: proto.RoleClient, Token: "wrong", Caps: []string{proto.CapabilityV1}}); err == nil {
 		t.Fatal("bad token accepted")
 	}
 	// Unknown workspace -> not found.

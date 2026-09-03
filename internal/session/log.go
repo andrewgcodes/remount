@@ -85,7 +85,6 @@ type Log struct {
 	spillBytes int64
 	spillIndex []spillEntry // (seq, offset) every indexStride chunks
 
-	oldest uint64 // oldest seq available anywhere (memory or spill)
 }
 
 type spillEntry struct {

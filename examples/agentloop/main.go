@@ -21,9 +21,8 @@ import (
 	"strings"
 	"time"
 
-	"remount.dev/remount/internal/client"
-	"remount.dev/remount/internal/proto"
-	"remount.dev/remount/internal/transport"
+	"remount.dev/remount/api"
+	"remount.dev/remount/client"
 )
 
 const system = `You are an agent operating a Unix shell. Reply with exactly one line, either:
@@ -43,18 +42,16 @@ func main() {
 
 	// One connection to the relay; the client redials on its own.
 	server := envOr("REMOUNT_SERVER", "http://127.0.0.1:7443")
-	link := strings.Replace(strings.Replace(server, "https://", "wss://", 1), "http://", "ws://", 1) + "/v1/link"
-	c := client.New(client.Options{
-		Dialer: transport.DialFunc(func(ctx context.Context) (transport.Conn, error) {
-			return transport.DialWS(ctx, link, nil)
-		}),
+	c, err := client.New(client.Options{
+		Server:    server,
 		Token:     os.Getenv("REMOUNT_TOKEN"),
 		Principal: "a_agentloop",
 	})
+	must(err)
 	defer c.Close()
 
 	// The workspace holds a reference to the binding, never the secret.
-	ws, err := c.CreateWorkspace(ctx, proto.WorkspaceSpec{
+	ws, err := c.CreateWorkspace(ctx, api.WorkspaceSpec{
 		Name:     "agentloop",
 		Bindings: []string{"b_openai"},
 		Env: map[string]string{
@@ -94,9 +91,9 @@ func main() {
 		// Run the command in the workspace. IdempotencyKey means a retry
 		// after a dropped connection resumes this exact process rather than
 		// starting a second one.
-		s, err := c.Exec(ctx, proto.SOpenReq{
+		s, err := c.Exec(ctx, api.SessionOpenRequest{
 			WS:             ws.ID,
-			Kind:           proto.SessionExec,
+			Kind:           api.SessionExec,
 			Program:        []string{"sh", "-c", cmd},
 			TimeoutSec:     60,
 			IdempotencyKey: fmt.Sprintf("agentloop-%s-%d", ws.ID, step),
@@ -104,7 +101,7 @@ func main() {
 		must(err)
 		var out strings.Builder
 		for ch := range s.Chunks() {
-			if ch.Stream == proto.StreamStdout || ch.Stream == proto.StreamStderr {
+			if ch.Stream == api.StreamStdout || ch.Stream == api.StreamStderr {
 				out.Write(ch.Data)
 			}
 		}

@@ -20,11 +20,11 @@ import modal
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / "dist" / "remount-linux-amd64"
-APP_NAME = os.environ.get("REMOUNT_MODAL_APP", "remount-demo-claude")
+APP_NAME = os.environ.get("REMOUNT_MODAL_APP", "remount-demo")
 VOLUME_NAME = os.environ.get("REMOUNT_MODAL_VOLUME", APP_NAME + "-data")
 SECRET_NAME = os.environ.get("REMOUNT_MODAL_SECRET", "remount-control")
 
-if not BINARY.is_file():
+if modal.is_local() and not BINARY.is_file():
     raise RuntimeError(f"missing {BINARY}; run `make modal-binary` first")
 
 image = (
@@ -32,6 +32,11 @@ image = (
     # Python runtime Modal functions require without changing Node/npm.
     modal.Image.from_registry("node:22.14.0-bookworm-slim", add_python="3.12")
     .apt_install("ca-certificates", "curl", "procps")
+    # Function source is imported again inside a container, where the local
+    # deployment environment is absent. Bake only the non-secret deployed app
+    # name so smoke can resolve the persistent endpoint instead of its
+    # ephemeral `modal run` app.
+    .env({"REMOUNT_DEPLOYED_APP": APP_NAME})
     .add_local_file(str(BINARY), "/usr/local/bin/remount", copy=True)
     .run_commands("chmod +x /usr/local/bin/remount")
 )
@@ -76,11 +81,17 @@ def _shutdown() -> None:
         except subprocess.TimeoutExpired:
             child.kill()
             child.wait(timeout=5)
-    try:
-        volume.commit()
-    except Exception:
-        # Modal also commits the volume periodically and at container exit.
-        pass
+
+
+def _decode_nodes(raw: bytes) -> list[dict[str, object]]:
+    """Accept the CLI's JSON array and tolerate an empty/null startup read."""
+    decoded = json.loads(raw)
+    if isinstance(decoded, list):
+        return [node for node in decoded if isinstance(node, dict)]
+    # Compatibility with an older experimental CLI shape.
+    if isinstance(decoded, dict) and isinstance(decoded.get("nodes"), list):
+        return [node for node in decoded["nodes"] if isinstance(node, dict)]
+    return []
 
 
 atexit.register(_shutdown)
@@ -143,7 +154,7 @@ def control():
                 "/usr/local/bin/remount", "nodes",
                 "--server", "http://127.0.0.1:7443", "--json",
             ])
-            if json.loads(raw).get("nodes"):
+            if _decode_nodes(raw):
                 return
         except (subprocess.CalledProcessError, json.JSONDecodeError):
             pass
@@ -154,7 +165,11 @@ def control():
 @app.function(image=image, secrets=[control_secret], timeout=120)
 def smoke() -> dict[str, object]:
     """Exercise the deployed HTTPS endpoint and authenticated CLI surface."""
-    url = control.get_web_url()
+    # `modal run` creates an ephemeral copy of this source app. Resolve the
+    # named deployment explicitly so smoke cannot accidentally test that copy.
+    deployed_app = os.environ.get("REMOUNT_DEPLOYED_APP", APP_NAME)
+    deployed_control = modal.Function.from_name(deployed_app, "control")
+    url = deployed_control.get_web_url()
     if not url:
         raise RuntimeError("control web URL is unavailable; deploy the app first")
     with urllib.request.urlopen(url + "/healthz", timeout=30) as response:
@@ -162,7 +177,7 @@ def smoke() -> dict[str, object]:
     raw = subprocess.check_output([
         "/usr/local/bin/remount", "nodes", "--server", url, "--json",
     ], timeout=30)
-    nodes = json.loads(raw).get("nodes", [])
+    nodes = _decode_nodes(raw)
     if not nodes or not any(node.get("online") for node in nodes):
         raise RuntimeError("deployed control plane has no online node")
     return {"url": url, "health": health, "online_nodes": len(nodes)}

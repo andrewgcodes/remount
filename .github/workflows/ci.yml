@@ -1,5 +1,8 @@
 name: ci
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -13,11 +16,11 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.27'
-          check-latest: true
+          go-version: '1.27.1'
+          check-latest: false
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - name: vet
@@ -27,7 +30,7 @@ jobs:
       - name: lock discipline
         run: ./scripts/lint-locks.sh .
       - name: test
-        run: go test -count=1 -timeout 600s ./...
+        run: make test
       # The failure model lives in internal/sim and is where races would show.
       - name: race
         run: go test -race -count=1 -timeout 1200s ./...
@@ -35,13 +38,47 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.27'
+          go-version: '1.27.1'
       - name: cross-compile every platform
         run: make dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: remount-binaries
           path: dist/
+
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.1'
+      - name: module integrity
+        run: |
+          go mod verify
+          go mod tidy -diff
+      - name: install pinned analyzers
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+      - name: staticcheck
+        run: staticcheck ./...
+      - name: vulnerability scan
+        run: govulncheck ./...
+      - name: seeded fuzz corpus
+        run: go test ./... -run='^Fuzz'
+
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.1'
+      - name: hostile-workspace conformance
+        run: make conformance
+      - name: bounded fuzzing
+        run: make fuzz FUZZTIME=10s

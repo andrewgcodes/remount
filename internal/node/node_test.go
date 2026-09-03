@@ -60,13 +60,24 @@ func TestCorruptIdentityIsNotSilentlyReplaced(t *testing.T) {
 
 func TestNewRejectsNegativeResourceLimits(t *testing.T) {
 	tests := map[string]func(*Options){
-		"sessions":              func(o *Options) { o.MaxSessions = -1 },
-		"active sessions":       func(o *Options) { o.MaxActiveSessions = -1 },
-		"workspace sessions":    func(o *Options) { o.MaxSessionsPerWorkspace = -1 },
-		"principal sessions":    func(o *Options) { o.MaxSessionsPerPrincipal = -1 },
-		"concurrent requests":   func(o *Options) { o.MaxConcurrentRequests = -1 },
-		"concurrent snapshots":  func(o *Options) { o.MaxConcurrentSnapshots = -1 },
-		"snapshot min interval": func(o *Options) { o.SnapshotMinInterval = -1 },
+		"sessions":                func(o *Options) { o.MaxSessions = -1 },
+		"active sessions":         func(o *Options) { o.MaxActiveSessions = -1 },
+		"workspace sessions":      func(o *Options) { o.MaxSessionsPerWorkspace = -1 },
+		"principal sessions":      func(o *Options) { o.MaxSessionsPerPrincipal = -1 },
+		"concurrent requests":     func(o *Options) { o.MaxConcurrentRequests = -1 },
+		"concurrent snapshots":    func(o *Options) { o.MaxConcurrentSnapshots = -1 },
+		"snapshot min interval":   func(o *Options) { o.SnapshotMinInterval = -1 },
+		"artifact retention":      func(o *Options) { o.ArtifactRetention = -1 },
+		"artifact gc interval":    func(o *Options) { o.ArtifactGCInterval = -1 },
+		"connector total bytes":   func(o *Options) { o.MaxConnectorCacheBytes = -1 },
+		"connector scope bytes":   func(o *Options) { o.MaxConnectorWorkspaceBytes = -1 },
+		"connector object bytes":  func(o *Options) { o.MaxConnectorObjectBytes = -1 },
+		"connector objects":       func(o *Options) { o.MaxConnectorObjects = -1 },
+		"connector scope objects": func(o *Options) { o.MaxConnectorWorkspaceObjects = -1 },
+		"session memory":          func(o *Options) { o.SessionMemoryBytes = -1 },
+		"session spill":           func(o *Options) { o.SessionSpillBytes = -1 },
+		"session chunk":           func(o *Options) { o.SessionMaxChunkBytes = -1 },
+		"session chunk count":     func(o *Options) { o.SessionMaxMemoryChunks = -1 },
 	}
 	for name, configure := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -76,6 +87,66 @@ func TestNewRejectsNegativeResourceLimits(t *testing.T) {
 				t.Fatalf("New error = %v, want negative-limit validation", err)
 			}
 		})
+	}
+}
+
+func TestNewRemovesOnlyOwnedOrphanSpillFiles(t *testing.T) {
+	directory := t.TempDir()
+	spillDirectory := filepath.Join(directory, "spill")
+	if err := os.MkdirAll(spillDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(spillDirectory, "s_orphan.log")
+	keep := filepath.Join(spillDirectory, "operator-note.txt")
+	if err := os.WriteFile(orphan, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keep, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n, err := New(Options{DataDir: directory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.sessions.Close()
+	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan spill remains: %v", err)
+	}
+	if body, err := os.ReadFile(keep); err != nil || string(body) != "keep" {
+		t.Fatalf("unowned file changed: %q, %v", body, err)
+	}
+}
+
+func TestNodeArtifactGCIsReferenceAware(t *testing.T) {
+	n := newTestNode(t, func(options *Options) { options.ArtifactRetention = time.Hour })
+	referenced, _, err := n.store.Put(strings.NewReader("referenced"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, _, err := n.store.Put(strings.NewReader("orphan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	for _, id := range []string{referenced, orphan} {
+		digest := strings.TrimPrefix(id, artifact.Prefix)
+		path := filepath.Join(n.opts.DataDir, "artifacts", digest[:2], digest)
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n.workspaces["ws_ref"] = &ws{Workspace: proto.Workspace{ID: "ws_ref", LastSnapshot: referenced}}
+	result, err := n.CollectArtifacts(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !n.store.Has(referenced) || n.store.Has(orphan) || result.Removed != 1 {
+		t.Fatalf("collection = %+v, referenced=%t orphan=%t", result, n.store.Has(referenced), n.store.Has(orphan))
+	}
+	delete(n.workspaces, "ws_ref")
+	result, err = n.CollectArtifacts(time.Now())
+	if err != nil || n.store.Has(referenced) || result.Removed != 1 {
+		t.Fatalf("post-release collection = %+v, retained=%t, err=%v", result, n.store.Has(referenced), err)
 	}
 }
 
@@ -135,6 +206,9 @@ func (h *failingHandle) Backend() string             { return "test" }
 func (h *failingHandle) FS() *fsops.FS               { return h.fs }
 func (h *failingHandle) Prepare(*session.Spec) error { return nil }
 func (h *failingHandle) Snapshot(context.Context, []string, io.Writer) error {
+	return h.snapshotErr
+}
+func (h *failingHandle) Checkpoint(context.Context, []string, io.Writer) error {
 	return h.snapshotErr
 }
 func (h *failingHandle) Destroy(context.Context) error {
@@ -200,9 +274,11 @@ func TestReleaseSnapshotFailureRestoresSourceWithoutDestroy(t *testing.T) {
 	n.mu.Lock()
 	restored := n.workspaces[w.ID]
 	_, prepared := n.prepared[w.ID]
+	deadline, deadlinePresent := n.deadlines[w.ID]
 	n.mu.Unlock()
-	if restored != w || prepared || h.destroyed.Load() != 0 {
-		t.Fatalf("source was not restored: workspace=%p prepared=%v destroyed=%d", restored, prepared, h.destroyed.Load())
+	if restored != w || prepared || !deadlinePresent || !deadline.After(time.Now()) || h.destroyed.Load() != 0 {
+		t.Fatalf("source was not restored: workspace=%p prepared=%v deadline=%v present=%t destroyed=%d",
+			restored, prepared, deadline, deadlinePresent, h.destroyed.Load())
 	}
 }
 
@@ -238,6 +314,211 @@ func TestSnapshotAdmissionBoundsExplicitWorkWithoutBlockingLifecycle(t *testing.
 		t.Fatalf("lifecycle snapshot admission = %v", err)
 	}
 	lifecycle()
+}
+
+func TestAuthoritativeCheckpointRequiresControlPlaneArtifactStore(t *testing.T) {
+	n := newTestNode(t, nil)
+	w := &ws{Workspace: proto.Workspace{ID: "ws_checkpoint"}}
+	_, err := n.snapshotExplicit(context.Background(), w, true, true, nil)
+	if !errors.Is(err, &proto.Error{Code: proto.CodeUnsupported}) {
+		t.Fatalf("authoritative checkpoint without artifact store = %v", err)
+	}
+}
+
+func TestAuthoritativeCheckpointHoldsTreeUntilControlCommit(t *testing.T) {
+	upload := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upload.Close()
+	n := newTestNode(t, func(options *Options) {
+		options.ArtifactURL = upload.URL
+		options.HTTPClient = upload.Client()
+		options.SnapshotMinInterval = time.Nanosecond
+	})
+	root := t.TempDir()
+	fs, err := fsops.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &ws{
+		Workspace: proto.Workspace{ID: "ws_checkpoint", Generation: 1},
+		handle:    &failingHandle{id: "ws_checkpoint", fs: fs},
+	}
+	n.workspaces[w.ID] = w
+	commitEntered := make(chan struct{})
+	allowCommit := make(chan struct{})
+	checkpointDone := make(chan error, 1)
+	go func() {
+		_, err := n.snapshotExplicit(context.Background(), w, true, true, func(string) error {
+			close(commitEntered)
+			<-allowCommit
+			return nil
+		})
+		checkpointDone <- err
+	}()
+	select {
+	case <-commitEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("checkpoint did not reach control commit")
+	}
+
+	operationEntered := make(chan struct{})
+	go func() {
+		w.treeMu.RLock()
+		close(operationEntered)
+		w.treeMu.RUnlock()
+	}()
+	select {
+	case <-operationEntered:
+		t.Fatal("filesystem operation crossed the archive-to-commit boundary")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(allowCommit)
+	if err := <-checkpointDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-operationEntered:
+	case <-time.After(time.Second):
+		t.Fatal("filesystem operation was not released after commit")
+	}
+}
+
+func TestWorkspaceTreeLockRejectsOperationQueuedBeforeRemoval(t *testing.T) {
+	n := newTestNode(t, nil)
+	w := &ws{Workspace: proto.Workspace{ID: "ws_race", Generation: 1}}
+	n.workspaces[w.ID] = w
+
+	// Model an operation that passed grant authorization and then queued behind
+	// a lifecycle writer. Removing the workspace before the operation acquires
+	// treeMu must make the post-lock check fail without touching its handle.
+	w.treeMu.Lock()
+	started := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		close(started)
+		unlock, err := n.lockWorkspaceTree(w, false)
+		if unlock != nil {
+			unlock()
+		}
+		result <- err
+	}()
+	<-started
+	n.mu.Lock()
+	delete(n.workspaces, w.ID)
+	n.mu.Unlock()
+	w.treeMu.Unlock()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, &proto.Error{Code: proto.CodeConflict}) {
+			t.Fatalf("queued operation = %v, want conflict", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued operation did not finish")
+	}
+}
+
+func TestAuthoritativeCheckpointRevalidatesAfterLifecycleRemoval(t *testing.T) {
+	upload := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upload.Close()
+	n := newTestNode(t, func(options *Options) {
+		options.ArtifactURL = upload.URL
+		options.HTTPClient = upload.Client()
+		options.SnapshotMinInterval = time.Nanosecond
+	})
+	fs, err := fsops.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &ws{
+		Workspace: proto.Workspace{ID: "ws_checkpoint_race", Generation: 2},
+		handle:    &failingHandle{id: "ws_checkpoint_race", fs: fs},
+	}
+	n.workspaces[w.ID] = w
+
+	w.treeMu.Lock()
+	committed := atomic.Bool{}
+	done := make(chan error, 1)
+	go func() {
+		_, err := n.snapshotExplicit(context.Background(), w, true, true, func(string) error {
+			committed.Store(true)
+			return nil
+		})
+		done <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		n.mu.Lock()
+		checkpointing := w.checkpointing
+		n.mu.Unlock()
+		if checkpointing {
+			break
+		}
+		if time.Now().After(deadline) {
+			w.treeMu.Unlock()
+			t.Fatal("checkpoint did not publish its fence")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	n.mu.Lock()
+	delete(n.workspaces, w.ID)
+	n.mu.Unlock()
+	w.treeMu.Unlock()
+
+	if err := <-done; !errors.Is(err, &proto.Error{Code: proto.CodeConflict}) {
+		t.Fatalf("checkpoint after removal = %v, want conflict", err)
+	}
+	if committed.Load() {
+		t.Fatal("removed workspace committed an authoritative checkpoint")
+	}
+}
+
+func TestReleaseRejectsConcurrentAuthoritativeCheckpoint(t *testing.T) {
+	n := newTestNode(t, nil)
+	w := &ws{Workspace: proto.Workspace{ID: "ws_checkpointing", Generation: 3}, checkpointing: true}
+	n.workspaces[w.ID] = w
+	if _, err := n.release(context.Background(), &proto.WSReleaseReq{WS: w.ID, Gen: w.Generation}); !errors.Is(err, &proto.Error{Code: proto.CodeConflict}) {
+		t.Fatalf("release during checkpoint = %v, want conflict", err)
+	}
+	if n.workspaces[w.ID] != w || n.prepared[w.ID] != nil {
+		t.Fatal("rejected release changed node ownership")
+	}
+}
+
+func TestStopWorkspaceSessionsCatchesStartupAlreadyInsideTreeBoundary(t *testing.T) {
+	n := newTestNode(t, nil)
+	w := &ws{Workspace: proto.Workspace{ID: "ws_starting", Generation: 1}}
+
+	// Model sOpen after its post-lock authority check but before Manager.Open.
+	// The lifecycle stop must wait for that boundary and then observe/kill the
+	// newly registered process rather than taking an earlier empty snapshot.
+	w.treeMu.RLock()
+	stopped := make(chan error, 1)
+	go func() { stopped <- n.stopWorkspaceSessions(w) }()
+	s, err := n.sessions.Open(session.Spec{
+		WS: w.ID, Kind: proto.SessionExec, Program: []string{"sh", "-c", "sleep 30"},
+	})
+	if err != nil {
+		w.treeMu.RUnlock()
+		t.Fatal(err)
+	}
+	w.treeMu.RUnlock()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("lifecycle stop did not drain session startup")
+	}
+	if !s.Exited() {
+		t.Fatal("session created inside the drained boundary survived fencing")
+	}
 }
 
 func TestEnforcedGatewayRequiresConcreteNetworkController(t *testing.T) {

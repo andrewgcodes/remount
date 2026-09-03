@@ -24,6 +24,8 @@ func (c *Control) Diag(ctx context.Context) *proto.ControlDiag {
 		MutationRecordsMax:      c.opts.MaxMutationRecords,
 		WorkspacesPerTenantMax:  c.opts.MaxWorkspacesPerTenant,
 		WorkspacesPerSubjectMax: c.opts.MaxWorkspacesPerSubject,
+		EventsMax:               c.opts.MaxEvents,
+		RequestsActiveMax:       c.opts.MaxConcurrentRequests,
 	}
 	if seq, err := c.log.Last(ctx); err == nil {
 		d.EventSeq = seq
