@@ -1077,11 +1077,15 @@ func cmdExec(ctx context.Context, args []string, pty bool) error {
 	cwd := fs.String("cwd", "", "working directory inside the workspace")
 	env := kvFlag{}
 	fs.Var(env, "env", "extra env K=V (repeatable)")
-	timeout := fs.Duration("timeout", 0, "kill after duration")
+	timeout := fs.Duration("timeout", 0, "server-side session timeout; the node kills the process after this (0 = none)")
 	stdin := fs.Bool("stdin", false, "forward stdin (exec)")
+	killOnInterrupt := fs.Bool("kill-on-interrupt", false, "Ctrl-C sends SIGINT to the remote process instead of detaching")
 	parse(fs, args)
-	if fs.NArg() < 1 {
-		return errors.New("exec WS -- cmd args… | sh WS [cmd]")
+	if err := arity(fs, 1, -1, "exec WS -- cmd args… | sh WS [cmd]"); err != nil {
+		return err
+	}
+	if *timeout < 0 {
+		return errors.New("--timeout must not be negative")
 	}
 	wsID := fs.Arg(0)
 	program := fs.Args()[1:]
@@ -1109,7 +1113,7 @@ func cmdExec(ctx context.Context, args []string, pty bool) error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "session %s\n", s.ID)
-	return drive(ctx, s, pty, *stdin || pty)
+	return drive(ctx, s, driveOptions{WS: wsID, Session: s.ID, Raw: pty, ForwardStdin: *stdin || pty, KillOnInterrupt: *killOnInterrupt})
 }
 
 func cmdAttach(ctx context.Context, args []string) error {
@@ -1117,6 +1121,7 @@ func cmdAttach(ctx context.Context, args []string) error {
 	var c common
 	c.flags(fs)
 	from := fs.Uint64("from", 0, "replay from seq")
+	killOnInterrupt := fs.Bool("kill-on-interrupt", false, "Ctrl-C sends SIGINT to the remote process instead of detaching")
 	parse(fs, args)
 	if err := arity(fs, 2, 2, "attach WS SESSION [--from N]"); err != nil {
 		return err
@@ -1127,51 +1132,164 @@ func cmdAttach(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return drive(ctx, s, term.IsTerminal(int(os.Stdin.Fd())), true)
+	return drive(ctx, s, driveOptions{WS: fs.Arg(0), Session: fs.Arg(1), Raw: term.IsTerminal(int(os.Stdin.Fd())), ForwardStdin: true, KillOnInterrupt: *killOnInterrupt})
+}
+
+// liveSession is what drive needs from a client session. client.Session
+// satisfies it; tests substitute a fake.
+type liveSession interface {
+	Chunks() <-chan client.Chunk
+	Exit() *proto.ExitInfo
+	Input(ctx context.Context, data []byte, eof bool) error
+	Signal(ctx context.Context, sig string) error
+	Close(ctx context.Context, kill bool) error
+	Resize(ctx context.Context, rows, cols uint16) error
+}
+
+type driveOptions struct {
+	WS, Session     string
+	Raw             bool // put the local terminal in raw mode (pty sessions)
+	ForwardStdin    bool
+	KillOnInterrupt bool // SIGINT forwards to the remote process instead of detaching
+
+	// Test seams; nil means the real terminal and process signals.
+	stdin      io.Reader
+	stdout     io.Writer
+	stderr     io.Writer
+	interrupts <-chan os.Signal
 }
 
 // drive pumps a session to the terminal, forwarding stdin and resizes.
-func drive(ctx context.Context, s *client.Session, raw, forwardStdin bool) error {
+//
+// The session outlives this client on purpose: a Ctrl-C detaches and the
+// process keeps running on the node, because an agent's long build should
+// not die with the operator's terminal. --kill-on-interrupt opts into the
+// conventional behaviour. In raw (pty) mode Ctrl-C is a byte the remote
+// shell sees, so no signal arrives here.
+func drive(ctx context.Context, s liveSession, o driveOptions) error {
+	stdin, stdout, stderr := o.stdin, o.stdout, o.stderr
+	if stdin == nil {
+		stdin = os.Stdin
+	}
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	// The process-wide context is cancelled by the same SIGINT we handle
+	// here; session calls must survive it or the detach itself fails.
+	sctx := context.WithoutCancel(ctx)
+	interrupts := o.interrupts
+	if interrupts == nil {
+		ch := make(chan os.Signal, 2)
+		signal.Notify(ch, os.Interrupt)
+		defer signal.Stop(ch)
+		interrupts = ch
+	}
 	var restore func()
-	if raw && term.IsTerminal(int(os.Stdin.Fd())) {
+	if o.Raw && term.IsTerminal(int(os.Stdin.Fd())) {
 		old, err := term.MakeRaw(int(os.Stdin.Fd()))
 		if err == nil {
 			restore = func() { _ = term.Restore(int(os.Stdin.Fd()), old) }
 			defer restore()
 		}
-		go watchResize(ctx, s)
+		go watchResize(sctx, s)
 	}
-	if forwardStdin {
+	if o.ForwardStdin {
 		go func() {
 			buf := make([]byte, 4096)
 			for {
-				n, err := os.Stdin.Read(buf)
+				n, err := stdin.Read(buf)
 				if n > 0 {
-					if ierr := s.Input(ctx, append([]byte(nil), buf[:n]...), false); ierr != nil {
+					if ierr := s.Input(sctx, append([]byte(nil), buf[:n]...), false); ierr != nil {
 						return
 					}
 				}
 				if err != nil {
-					_ = s.Input(ctx, nil, true)
+					_ = s.Input(sctx, nil, true)
 					return
 				}
 			}
 		}()
 	}
-	exit := client.Copy(s, os.Stdout, os.Stderr)
+	chunks := s.Chunks()
+	for chunks != nil {
+		select {
+		case ch, ok := <-chunks:
+			if !ok {
+				chunks = nil
+				continue
+			}
+			writeChunk(ch, stdout, stderr)
+		case <-interrupts:
+			if o.KillOnInterrupt {
+				// Forward once; a second Ctrl-C detaches so a process that
+				// ignores SIGINT cannot trap the operator.
+				if err := s.Signal(sctx, "INT"); err != nil {
+					fmt.Fprintln(stderr, "remount: signal:", err)
+				}
+				o.KillOnInterrupt = false
+				continue
+			}
+			// Output that already arrived belongs on the terminal before
+			// the detach notice.
+		drain:
+			for {
+				select {
+				case ch, ok := <-chunks:
+					if !ok {
+						chunks = nil
+						break drain
+					}
+					writeChunk(ch, stdout, stderr)
+				default:
+					break drain
+				}
+			}
+			if chunks == nil {
+				continue // it exited under us; report the exit, not a detach
+			}
+			if restore != nil {
+				restore()
+			}
+			cctx, cancel := context.WithTimeout(sctx, 5*time.Second)
+			err := s.Close(cctx, false)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("detach: %w (the session is still running; reattach with: remount attach %s %s)", err, o.WS, o.Session)
+			}
+			fmt.Fprintf(stderr, "\ndetached; reattach with: remount attach %s %s\n", o.WS, o.Session)
+			return nil
+		}
+	}
 	if restore != nil {
 		restore()
 	}
+	exit := s.Exit()
 	if exit == nil {
 		return errors.New("session ended without an exit record")
 	}
 	if exit.Error != "" {
-		fmt.Fprintln(os.Stderr, "remount:", exit.Error)
+		fmt.Fprintln(stderr, "remount:", exit.Error)
 	}
 	if exit.Code != 0 {
 		return exitError(exit.Code)
 	}
 	return nil
+}
+
+func writeChunk(ch client.Chunk, stdout, stderr io.Writer) {
+	switch ch.Stream {
+	case proto.StreamStdout:
+		_, _ = stdout.Write(ch.Data)
+	case proto.StreamStderr:
+		_, _ = stderr.Write(ch.Data)
+	case proto.StreamGap:
+		var gap proto.Gap
+		_ = proto.Unmarshal(ch.Data, &gap)
+		fmt.Fprintf(stderr, "\n[remount: output seq %d-%d elided]\n", gap.From, gap.To)
+	}
 }
 
 // ---------------------------------------------------------------------------
