@@ -803,6 +803,36 @@ the app and removed its unique volume and secret.
 readiness chain. Provider source code, an ephemeral invocation, an HTTP socket
 and a persistent deployment are four different things.
 
+## 40. A reconnected client was told it had gone
+
+**Symptom.** `TestReconnectMidStreamIsLossless` failed on macOS CI only: after
+two connection cuts the client held 5,074 of 18,890 bytes and the session then
+finished normally. Hundreds of Linux runs under `-race` never reproduced it.
+
+**Cause.** A cut and the redial it triggers are one event seen from two relay
+goroutines. The new hello could authenticate, register the client's subject
+and report `PeerConnected` before the old connection's `Serve` noticed its peer
+had closed. That stale teardown then called `PeerGone`, which deleted the
+subject the new connection had just registered, and sent `peer.gone` to the
+node, which cancelled any subscription the reconnected client had already
+re-established. Both failures were silent: control calls returned
+`unauthorized` until the SDK's retries ran out, or the stream simply stopped.
+The relay's own tables were guarded against this (`r.peers[id] != peer`); the
+controller and the correspondents were not.
+
+**Fix.** `internal/relay/relay.go`. Connect and disconnect bookkeeping for one
+peer id run under a per-id lock, from `Authenticate` through `PeerConnected`
+and around the whole of `remove` including the `peer.gone` sends
+(ADR 0059). A regression test holds the second hello open inside
+`Authenticate` while the first connection dies and asserts the controller
+never sees `gone` after the new `connected`.
+
+**Lesson.** A replacement rule has to cover every observer of the thing being
+replaced, not only the table that stores it. When two goroutines start from
+the same event, name the order the rest of the system depends on and enforce
+it with a lock, not a hope about scheduling. A platform-only failure is a
+scheduling-order failure until proven otherwise.
+
 ---
 
 The smaller fixes from the same hardening pass—error shadowing in persistence
@@ -813,7 +843,7 @@ closure](docs/engineering/implementation-closure-2026-09-03.md#additional-defect
 Their reusable implications are folded into the [hardening
 playbook](docs/engineering/hardening-lessons.md).
 
-That playbook is also the cross-cutting pattern analysis for mistakes 23-39:
+That playbook is also the cross-cutting pattern analysis for mistakes 23-40:
 truth must survive asynchronous boundaries, authorization must be revalidated
 at use, destructive work waits for durable commit, every retained structure is
 bounded, and verification must distinguish success from work that never ran.
