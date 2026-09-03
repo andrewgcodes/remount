@@ -5,10 +5,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"remount.dev/remount/internal/session"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -975,5 +977,76 @@ func TestAgentReporterBoundsQueueAndPlacesGapInOrder(t *testing.T) {
 	}
 	if len(q3[1].Chunks) != 1 || q3[1].Chunks[0].Stream != proto.StreamGap || q3[1].Chunks[0].Seq != 3 {
 		t.Fatalf("gap-only transcript report = %+v", q3[1].Chunks)
+	}
+}
+
+// A soft agent.run.cancel that lands while the recipe is still installing
+// ends the run then, not when the install script gives up. The install has
+// no ACP turn to cancel, so it is the run's own cancel that has to reach it.
+func TestAgentRunCancelInterruptsInstall(t *testing.T) {
+	f := newAgentFixture(t)
+	req := f.request(t, "echo", "hello")
+	req.Spec = proto.AgentSpec{Recipe: "inst", RecipeYAML: installRecipe(t, "echo", `echo installing >&2; sleep 60`)}
+	if _, err := f.n.agentRunStart(context.Background(), nil, &req); err != nil {
+		t.Fatal(err)
+	}
+	f.next(t, proto.AgentReportStarted)
+	time.Sleep(200 * time.Millisecond)
+	begin := time.Now()
+	if err := f.n.agentRunCancel(&proto.AgentRunCancelReq{Agent: req.Agent, Run: req.Run, Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	fin := f.next(t, proto.AgentReportFinished)
+	if took := time.Since(begin); took > 10*time.Second {
+		t.Fatalf("cancel waited on the install script for %s", took)
+	}
+	if !fin.Cancelled {
+		t.Fatalf("finished after cancel during install = %+v", fin)
+	}
+	f.waitDone(t)
+	if _, err := f.w.handle.FS().Read(".remount/launch/inst.installed", 0, 0); err == nil {
+		t.Fatal("a cancelled install left a marker")
+	}
+}
+
+// harnessExit is bounded: a harness that closed its stdout and lingers, or
+// whose children hold the group open, is killed and then abandoned rather
+// than pinning the run slot for as long as the tree lives.
+func TestHarnessExitIsBounded(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "exec >/dev/null 2>&1; trap '' TERM; sleep 60 & wait")
+	session.ConfigureProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	begin := time.Now()
+	code := harnessExit(cmd, 300*time.Millisecond)
+	if took := time.Since(begin); took > 5*time.Second {
+		t.Fatalf("harnessExit blocked for %s", took)
+	}
+	if code == 0 {
+		t.Fatalf("exit code = %d for a harness that had to be killed", code)
+	}
+	if cmd.ProcessState == nil {
+		t.Fatal("process not reaped after the bound")
+	}
+	// The orphaned child is a zombie until init reaps it; give that a moment.
+	gone := false
+	for i := 0; i < 200 && !gone; i++ {
+		gone = syscall.Kill(-cmd.Process.Pid, 0) != nil
+		if !gone {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if !gone {
+		t.Fatal("the harness process group is still alive after harnessExit")
+	}
+
+	quick := exec.Command("/bin/sh", "-c", "exit 7")
+	session.ConfigureProcessGroup(quick)
+	if err := quick.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if code := harnessExit(quick, 5*time.Second); code != 7 {
+		t.Fatalf("exit code = %d, want the harness's own 7", code)
 	}
 }

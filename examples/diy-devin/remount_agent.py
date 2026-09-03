@@ -133,9 +133,10 @@ def watch(agent, start=0, show_thoughts=False):
                             return a
                         event, data = None, []
         except urllib.error.HTTPError as e:
-            # A status is an answer, not an outage: only a server-side 5xx is
-            # worth retrying; 401/403/404 would loop forever.
-            if e.code < 500:
+            # A status is an answer, not an outage: only a server-side 5xx or
+            # a 429 from the server's bounded client pool is worth retrying;
+            # 401/403/404 would loop forever.
+            if e.code < 500 and e.code != 429:
                 try:
                     err = json.loads(e.read())["error"]
                 except Exception:

@@ -22,14 +22,15 @@ request authenticates one of three ways:
 |---|---|
 | `Authorization: Bearer <credential>` | everywhere; the normal form |
 | WebSocket subprotocol `remount.bearer.<base64url(credential)>` | WebSocket routes, for browsers that cannot set a header on a socket |
-| cookie `remount_session` | the preview proxy (`/v1/agents/{id}/ports/...`) and the stable link `GET /a/{id}` only |
+| cookie `remount_session` | the preview proxy (`/v1/agents/{id}/ports/...`) only |
 
 The credential is the same token or capability the CLI uses (§4 of the
 protocol). A cookie is minted by `POST /v1/session` with a header credential
 and cleared by `DELETE /v1/session`; it is `HttpOnly`, `SameSite=Strict`,
 `Secure` over TLS, and lives twelve hours. It exists so a browser can open a
-preview link or `/a/{id}` by navigation; it authenticates nothing else. In
-particular the terminal, filesystem, diff, transcript and agent routes take a
+preview link by navigation; it authenticates nothing else. In particular the
+terminal, filesystem, diff, transcript and agent routes, and the JSON form of
+the stable link `GET /a/{id}` (the redirect form needs no credential), take a
 header or WebSocket subprotocol only, because a preview page is served from
 this API's origin and is written by the untrusted program in the workspace: a
 cookie honoured on those routes would let that page act as the operator on

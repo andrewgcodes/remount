@@ -833,6 +833,41 @@ the same event, name the order the rest of the system depends on and enforce
 it with a lock, not a hope about scheduling. A platform-only failure is a
 scheduling-order failure until proven otherwise.
 
+## 41. Three waits with no bound, one cookie with too much reach
+
+**Symptom.** The second review round found three places where the Agent
+lifecycle waited on something it did not control. `harnessExit` called
+`cmd.Wait()` with no deadline, so a harness that closed its stdout and lingered
+(or whose children kept the group alive) pinned the run slot, the transcript
+and the node's capacity for as long as the tree lived, and every later run for
+that Agent got `conflict`. A policy sleep the node refused was retried on the
+very next reconcile, and the completion path kicked reconcile again, so one
+refusal became a hot loop against the same node. A soft `agent.run.cancel`
+that arrived during a cold recipe install was not seen until the install
+finished or hit its fifteen-minute timeout, with the binding environment live
+the whole time. Separately, the JSON fallback of `GET /a/{id}` accepted the
+preview session cookie, so same-origin preview content could read the Agent
+record (task, recipe, inbox text, owner).
+
+**Fix.** `internal/node/agentrun.go`: `harnessExit(cmd, grace)` waits in a
+goroutine, kills the group after `grace`, and abandons the tree with
+`harnessExitCode` after a second `grace`; the run gets a `softCtx` that
+`requestCancel` ends, and the install session waits on it.
+`internal/control/agents.go`: a failed policy sleep or wake calls `deferAgent`,
+and the sleep and wake decisions check `agentRetry` like launch already did.
+`internal/server/api.go`: the `/a/{id}` JSON form is header-only (ADR 0060);
+the cookie is accepted by the preview proxy alone. Regression tests:
+`TestHarnessExitIsBounded`, `TestAgentRunCancelInterruptsInstall`,
+`TestAgentPolicySleepFailureBacksOff`, and the cookie-only route list in
+`internal/sim/agent_http_test.go`.
+
+**Lesson.** Every wait on a process, a peer or a retry needs a bound and an
+observable outcome when the bound is hit, and a cancel has to reach every phase
+of a run, including the ones before the thing being cancelled exists. A
+browser credential's reach is the set of routes that accept it; add a route
+that returns data and you have widened the credential, whether or not that was
+the intent.
+
 ---
 
 The smaller fixes from the same hardening pass—error shadowing in persistence
@@ -843,7 +878,7 @@ closure](docs/engineering/implementation-closure-2026-09-03.md#additional-defect
 Their reusable implications are folded into the [hardening
 playbook](docs/engineering/hardening-lessons.md).
 
-That playbook is also the cross-cutting pattern analysis for mistakes 23-40:
+That playbook is also the cross-cutting pattern analysis for mistakes 23-41:
 truth must survive asynchronous boundaries, authorization must be revalidated
 at use, destructive work waits for durable commit, every retained structure is
 bounded, and verification must distinguish success from work that never ran.
