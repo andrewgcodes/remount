@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "as_of": "2026-09-03",
+  "currency": "USD",
+  "prices": [
+    {
+      "provider": "openai",
+      "model": "gpt-4o-mini",
+      "input_micros_per_million_tokens": 150000,
+      "output_micros_per_million_tokens": 600000,
+      "approximate": true,
+      "source": "https://developers.openai.com/api/docs/models/gpt-4o-mini"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4",
+      "input_micros_per_million_tokens": 3000000,
+      "output_micros_per_million_tokens": 15000000,
+      "approximate": true,
+      "source": "https://docs.anthropic.com/en/docs/about-claude/pricing"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-2.5-flash",
+      "input_micros_per_million_tokens": 300000,
+      "output_micros_per_million_tokens": 2500000,
+      "approximate": true,
+      "source": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    {
+      "provider": "openrouter",
+      "model": "openai/gpt-4o-mini",
+      "input_micros_per_million_tokens": 150000,
+      "output_micros_per_million_tokens": 600000,
+      "approximate": true,
+      "source": "https://openrouter.ai/docs/faq"
+    }
+  ]
+}
