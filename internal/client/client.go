@@ -607,23 +607,31 @@ func (c *Client) ReadEvents(ctx context.Context, from uint64, ws string) ([]prot
 	cursor := from
 	var all []proto.Event
 	for {
-		var res proto.EventPost
-		if err := c.call(ctx, proto.PeerControl, proto.OpEventsTail, proto.EventsTailReq{From: cursor, WS: ws}, &res); err != nil {
+		events, err := c.ReadEventPage(ctx, cursor, ws)
+		if err != nil {
 			return nil, err
 		}
-		if len(res.Events) == 0 {
+		if len(events) == 0 {
 			return all, nil
 		}
-		all = append(all, res.Events...)
-		next := res.Events[len(res.Events)-1].Seq + 1
+		all = append(all, events...)
+		next := events[len(events)-1].Seq + 1
 		if next <= cursor {
 			return nil, proto.Err(proto.CodeInternal, "event pagination did not advance")
 		}
 		cursor = next
-		if len(res.Events) < 1000 {
+		if len(events) < 1000 {
 			return all, nil
 		}
 	}
+}
+
+// ReadEventPage returns at most one control-plane page of historical events.
+// Exporters use it to avoid retaining the complete audit history in memory.
+func (c *Client) ReadEventPage(ctx context.Context, from uint64, ws string) ([]proto.Event, error) {
+	var response proto.EventPost
+	err := c.call(ctx, proto.PeerControl, proto.OpEventsTail, proto.EventsTailReq{From: from, WS: ws}, &response)
+	return response.Events, err
 }
 
 // TailEvents streams events on the returned channel until ctx ends.
