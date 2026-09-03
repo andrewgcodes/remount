@@ -94,6 +94,7 @@ Check your own change against every line here before calling it done.
 | Input is deduplicated by `iseq`; a retried keystroke is never applied twice. | `session.Input` |
 | A grant is bound to a workspace generation and refused after a move. | `node.authorize`, `control.VerifyGrant` |
 | A placeholder sent to a host its binding does not cover is blocked and recorded as `leak_blocked`. | `broker.proxy` |
+| Approve-mode egress releases no upstream byte before a durable, generation-bound request fingerprint is allowed; timeout remains a retryable durable approval. | `broker.awaitApproval`, `control.egressApproval` |
 | `ws.ready` gates `claimed`; a client never talks to a node that is still restoring. | `control.wsClaim`, `control.wsReady`, `node.materialize` |
 | A node renews its leases at no more than one third of the lease interval, including while materializing. | `node.renewLoop`, `node.renew` |
 | Every mutating request carries an idempotency key and a replay is a no-op. | `client`, `control.wsCreate`, `session.Manager.Open` |

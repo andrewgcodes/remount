@@ -218,8 +218,10 @@ func usage() {
   remount agent ls | get ID | open ID [--ui] | message ID [--steer] -- TEXT | cancel ID | fork ID | sleep ID | wake ID | destroy ID
   remount agent watch ID [--from N] [--no-follow] [--raw]                 the transcript as a conversation; on a terminal, type to reply
   remount agent diff ID [--wake] | approvals ID | approve APPROVAL
-  remount approvals [--agent ID] [--status pending|decided|expired|all]   what an Agent is waiting on a human for
-  remount approve ID [--option X | --deny | --content JSON]              answer one; no flag picks the first allow option
+  remount approvals ls [--agent ID] [--kind egress] [--status S]         list durable human decisions
+  remount approvals approve ID [--remember none|host|rule]               allow a pending request
+  remount approvals deny ID                                               deny a pending request
+  remount approve ID [--option X | --deny | --content JSON]              compatibility shorthand
   remount nodes | events [--follow] [--ws WS] | timers
 
 Inspection, at three depths. All take --json.

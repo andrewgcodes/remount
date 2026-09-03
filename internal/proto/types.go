@@ -194,6 +194,9 @@ const (
 
 	NetworkDefaultDeny  = "deny"
 	NetworkDefaultAllow = "allow"
+	EgressModeAllow     = "allow"
+	EgressModeDeny      = "deny"
+	EgressModeApprove   = "approve"
 
 	EgressProtocolHTTP    = "http"
 	EgressProtocolHTTPS   = "https"
@@ -232,6 +235,7 @@ type NetworkPolicy struct {
 // EgressRule constrains one outbound HTTP, HTTPS, or CONNECT capability.
 type EgressRule struct {
 	ID               string   `cbor:"id" json:"id"`
+	Mode             string   `cbor:"mode,omitempty" json:"mode,omitempty"` // allow | deny | approve; empty normalizes to allow
 	Connector        string   `cbor:"connector,omitempty" json:"connector,omitempty"`
 	Protocol         string   `cbor:"protocol" json:"protocol"`
 	Hosts            []string `cbor:"hosts,omitempty" json:"hosts,omitempty"`
@@ -330,6 +334,7 @@ const (
 	OpEventsStop       = "events.stop"        // EventsStopReq -> {}; stops one event subscription
 	OpEventsPost       = "events.post"        // EventPost -> {} (node -> control; also webhook wake)
 	OpBindingLease     = "binding.lease"      // node: BindingLeaseReq -> BindingLeaseRes
+	OpEgressApproval   = "egress.approval"    // node: EgressApprovalReq -> EgressApprovalRes
 	OpGrant            = "grant"              // client: GrantReq -> Grant (permission to talk to a node about a ws)
 	OpTimerList        = "timer.list"         // -> TimerListRes
 	OpDiag             = "diag"               // -> ControlDiag (control-plane health and integrity)
@@ -1478,9 +1483,11 @@ const (
 	EvFSRemove       = "fs.remove"
 	EvFSRename       = "fs.rename"
 	EvCredUsed       = "cred.used"
+	EvEgressPending  = "egress.pending"
 	EvEgressAllowed  = "egress.allowed"
 	EvEgressDenied   = "egress.denied"
 	EvEgressRedacted = "egress.redacted"
+	EvPolicyUpdated  = "policy.updated"
 	EvTimerSet       = "timer.set"
 	EvTimerFired     = "timer.fired"
 	EvPeerGone       = "peer.gone"

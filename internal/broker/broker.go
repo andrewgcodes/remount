@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
@@ -121,6 +122,10 @@ type Options struct {
 	// resolves there is refused, including cloud metadata endpoints.
 	AllowPrivate []string
 	Audit        func(Audit)
+	// Approval crosses to the control plane before an approve-mode request is
+	// released. Nil fails closed for such rules.
+	Approval     func(context.Context, proto.EgressApprovalReq) (*proto.EgressApprovalRes, error)
+	ApprovalWait time.Duration
 	// RootCAs overrides upstream TLS trust (tests).
 	RootCAs *x509.CertPool
 	// Listen address; default 127.0.0.1:0.
@@ -133,6 +138,7 @@ type Options struct {
 	// the full lifetime of CONNECT tunnels and streaming responses.
 	MaxConnections        int
 	MaxConcurrentRequests int
+	MaxPendingApprovals   int
 	// ConnectorStore is the node-owned immutable package cache. Package rules
 	// fail closed when it is unavailable.
 	ConnectorStore *connector.Store
@@ -145,22 +151,23 @@ type Options struct {
 
 // Broker serves one workspace.
 type Broker struct {
-	opts         Options
-	mu           sync.RWMutex
-	leases       []proto.BindingLease
-	srv          *http.Server
-	ln           net.Listener
-	base         string
-	proxyBase    string
-	advertised   string // host:port workspaces dial
-	token        string
-	client       *http.Transport
-	suspended    bool
-	ruleRequests map[string]int64
-	redactors    map[string][]*regexp.Regexp
-	tunnels      map[*brokerTunnel]struct{}
-	requestSlots chan struct{}
-	connectors   map[string]connector.Connector
+	opts          Options
+	mu            sync.RWMutex
+	leases        []proto.BindingLease
+	srv           *http.Server
+	ln            net.Listener
+	base          string
+	proxyBase     string
+	advertised    string // host:port workspaces dial
+	token         string
+	client        *http.Transport
+	suspended     bool
+	ruleRequests  map[string]int64
+	redactors     map[string][]*regexp.Regexp
+	tunnels       map[*brokerTunnel]struct{}
+	requestSlots  chan struct{}
+	approvalSlots chan struct{}
+	connectors    map[string]connector.Connector
 }
 
 type brokerTunnel struct {
@@ -222,6 +229,15 @@ func New(opts Options) *Broker {
 	if opts.MaxConcurrentRequests <= 0 {
 		opts.MaxConcurrentRequests = 64
 	}
+	if opts.ApprovalWait <= 0 {
+		opts.ApprovalWait = 30 * time.Second
+	}
+	if opts.ApprovalWait > 30*time.Second {
+		opts.ApprovalWait = 30 * time.Second
+	}
+	if opts.MaxPendingApprovals <= 0 {
+		opts.MaxPendingApprovals = 32
+	}
 	opts.Leases = cloneLeases(opts.Leases)
 	opts.Allow = append([]string(nil), opts.Allow...)
 	opts.AllowPrivate = append([]string(nil), opts.AllowPrivate...)
@@ -238,7 +254,8 @@ func New(opts Options) *Broker {
 	b := &Broker{
 		opts: opts, leases: cloneLeases(opts.Leases), ruleRequests: map[string]int64{}, redactors: map[string][]*regexp.Regexp{},
 		tunnels: map[*brokerTunnel]struct{}{}, requestSlots: make(chan struct{}, opts.MaxConcurrentRequests),
-		connectors: map[string]connector.Connector{},
+		approvalSlots: make(chan struct{}, opts.MaxPendingApprovals),
+		connectors:    map[string]connector.Connector{},
 	}
 	dialer := &net.Dialer{Timeout: 15 * time.Second, Control: nil}
 	b.client = &http.Transport{
@@ -648,16 +665,18 @@ func (b *Broker) auditFor(method, protocol, host, requestPath string) Audit {
 }
 
 type policyAuthorization struct {
-	enabled bool
-	allowed bool
-	rule    proto.EgressRule
-	reason  string
+	enabled  bool
+	allowed  bool
+	rule     proto.EgressRule
+	reason   string
+	approval bool
 }
 
 var errResponseLimit = errors.New("response body exceeds rule limit")
 var errResponseRedaction = errors.New("response cannot be safely redacted")
 
 const maxRedactedResponseBytes int64 = 16 << 20
+const maxApprovalRequestBytes int64 = 16 << 20
 
 func redactResponse(resp *http.Response, expressions []*regexp.Regexp, configuredLimit int64) (int, int64, error) {
 	if len(expressions) == 0 {
@@ -772,6 +791,36 @@ func bufferRequestBody(body io.ReadCloser, limit int64) (io.ReadCloser, int64, e
 	return io.NopCloser(bytes.NewReader(buffered.Bytes())), n, nil
 }
 
+func digestString(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func (b *Broker) awaitApproval(ctx context.Context, policy policyAuthorization, host, method, requestPath, bodyHash string) (*proto.EgressApprovalRes, error) {
+	if b.opts.Approval == nil {
+		return nil, errors.New("approval authority unavailable")
+	}
+	select {
+	case b.approvalSlots <- struct{}{}:
+		defer func() { <-b.approvalSlots }()
+	default:
+		return nil, proto.Err(proto.CodeResourceExhausted, "pending approval limit exhausted")
+	}
+	pathHash := digestString(requestPath)
+	fingerprint := digestString(strings.Join([]string{
+		b.opts.WS, strconv.FormatUint(b.opts.Generation, 10), b.opts.Principal,
+		policy.rule.ID, host, strings.ToUpper(method), pathHash, bodyHash,
+	}, "\x00"))
+	approvalCtx, cancel := context.WithTimeout(ctx, b.opts.ApprovalWait+5*time.Second)
+	defer cancel()
+	return b.opts.Approval(approvalCtx, proto.EgressApprovalReq{
+		WS: b.opts.WS, Gen: b.opts.Generation, Principal: b.opts.Principal,
+		Rule: policy.rule.ID, Host: host, Method: strings.ToUpper(method),
+		PathHash: pathHash, BodyHash: bodyHash, Fingerprint: fingerprint,
+		WaitMillis: b.opts.ApprovalWait.Milliseconds(),
+	})
+}
+
 var errRequestLimit = errors.New("request body exceeds rule limit")
 
 // authorizePolicy evaluates rules in declaration order and consumes a rule's
@@ -793,8 +842,21 @@ func (b *Broker) authorizePolicy(connectorName, protocol, host, method, requestP
 			continue
 		}
 		authorization.rule = rule
+		mode := rule.Mode
+		if mode == "" {
+			mode = proto.EgressModeAllow
+		}
+		if mode == proto.EgressModeDeny {
+			authorization.reason = "egress rule denies request"
+			return authorization
+		}
 		if rule.SharedState == proto.SharedStateImmutableRead && method != http.MethodGet && method != http.MethodHead {
 			authorization.reason = "immutable-read capability forbids mutating method"
+			return authorization
+		}
+		if mode == proto.EgressModeApprove {
+			authorization.allowed = true
+			authorization.approval = true
 			return authorization
 		}
 		b.mu.Lock()
@@ -819,6 +881,17 @@ func (b *Broker) authorizePolicy(connectorName, protocol, host, method, requestP
 	}
 	authorization.reason = "no typed egress rule matched"
 	return authorization
+}
+
+func (b *Broker) consumeApprovedRule(rule proto.EgressRule) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	used := b.ruleRequests[rule.ID]
+	if rule.MaxRequests > 0 && used >= rule.MaxRequests {
+		return false
+	}
+	b.ruleRequests[rule.ID] = used + 1
+	return true
 }
 
 func destinationPort(host, protocol string) (uint16, bool) {
@@ -1352,7 +1425,71 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 		http.Error(w, "remount broker: egress to "+host+" is not permitted for this workspace", http.StatusForbidden)
 		return
 	}
-	if policy.rule.MaxRequestBytes > 0 {
+	bodyBuffered := false
+	if policy.approval {
+		limit := maxApprovalRequestBytes
+		if policy.rule.MaxRequestBytes > 0 && policy.rule.MaxRequestBytes < limit {
+			limit = policy.rule.MaxRequestBytes
+		}
+		if r.ContentLength > limit {
+			audit.RequestBytes = r.ContentLength
+			audit.Decision, audit.Reason = DecisionLimitExceeded, "request body exceeds approval fingerprint limit"
+			b.emit(audit)
+			http.Error(w, "remount broker: request body exceeds approval fingerprint limit", http.StatusRequestEntityTooLarge)
+			return
+		}
+		body, bodyBytes, bodyErr := bufferRequestBody(r.Body, limit)
+		audit.RequestBytes = bodyBytes
+		if bodyErr != nil {
+			audit.Decision, audit.Reason = DecisionDenied, "cannot fingerprint request body"
+			b.emit(audit)
+			http.Error(w, "remount broker: cannot fingerprint request body", http.StatusBadRequest)
+			return
+		}
+		bodyBuffered = true
+		r.Body, r.ContentLength, r.GetBody = body, bodyBytes, nil
+		bodyBytesRaw, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			http.Error(w, "remount broker: cannot fingerprint request body", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytesRaw))
+		requestTarget := path
+		if query != "" {
+			requestTarget += "?" + query
+		}
+		approval, approvalErr := b.awaitApproval(r.Context(), policy, matchHost, r.Method, requestTarget, digestString(string(bodyBytesRaw)))
+		if approvalErr != nil {
+			audit.Decision, audit.Reason = DecisionDenied, "approval unavailable"
+			b.emit(audit)
+			status := http.StatusServiceUnavailable
+			var pe *proto.Error
+			if errors.As(approvalErr, &pe) && pe.Code == proto.CodeResourceExhausted {
+				status = http.StatusTooManyRequests
+			}
+			http.Error(w, "remount broker: approval unavailable", status)
+			return
+		}
+		if !approval.Allowed {
+			w.Header().Set("X-Remount-Approval", approval.ID)
+			if approval.Status == proto.ApprovalPending {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "remount broker: approval pending", http.StatusForbidden)
+				return
+			}
+			audit.Decision, audit.Reason = DecisionDenied, "approval denied"
+			b.emit(audit)
+			http.Error(w, "remount broker: approval denied", http.StatusForbidden)
+			return
+		}
+		if !b.consumeApprovedRule(policy.rule) {
+			audit.Decision, audit.Reason = DecisionLimitExceeded, "request limit exhausted"
+			b.emit(audit)
+			http.Error(w, "remount broker: request limit exhausted", http.StatusTooManyRequests)
+			return
+		}
+	}
+	if policy.rule.MaxRequestBytes > 0 && !bodyBuffered {
 		if r.ContentLength > policy.rule.MaxRequestBytes {
 			audit.RequestBytes = r.ContentLength
 			audit.Decision, audit.Reason = DecisionLimitExceeded, "request body exceeds rule limit"
@@ -1606,6 +1743,29 @@ func (b *Broker) handleConnect(w http.ResponseWriter, r *http.Request) {
 		b.emit(audit)
 		http.Error(w, "remount broker: CONNECT to "+host+" is not permitted", http.StatusForbidden)
 		return
+	}
+	if policy.approval {
+		approval, approvalErr := b.awaitApproval(r.Context(), policy, host, r.Method, "", digestString(""))
+		if approvalErr != nil {
+			audit.Decision, audit.Reason = DecisionDenied, "approval unavailable"
+			b.emit(audit)
+			http.Error(w, "remount broker: approval unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if !approval.Allowed {
+			w.Header().Set("X-Remount-Approval", approval.ID)
+			if approval.Status == proto.ApprovalPending {
+				w.Header().Set("Retry-After", "1")
+			}
+			http.Error(w, "remount broker: approval required", http.StatusForbidden)
+			return
+		}
+		if !b.consumeApprovedRule(policy.rule) {
+			audit.Decision, audit.Reason = DecisionLimitExceeded, "request limit exhausted"
+			b.emit(audit)
+			http.Error(w, "remount broker: request limit exhausted", http.StatusTooManyRequests)
+			return
+		}
 	}
 	dialer := &net.Dialer{Timeout: 15 * time.Second}
 	up, err := b.dial(r.Context(), dialer, "tcp", host)

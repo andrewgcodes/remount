@@ -3,6 +3,7 @@ package control
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"remount.dev/remount/internal/eventlog"
+	"remount.dev/remount/internal/ids"
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 )
@@ -250,9 +252,27 @@ func (c *Control) expireStaleApprovals(ctx context.Context) {
 	var resends []resend
 	c.mu.Lock()
 	byAgent := map[string][]*proto.Approval{}
+	var egressEvents []*proto.Event
 	for _, ap := range c.approvals {
+		if ap.Kind == proto.ApprovalEgress {
+			if ap.Status == proto.ApprovalPending && ap.ExpiresAt > 0 && c.now().UnixMilli() >= ap.ExpiresAt {
+				ap.Status = proto.ApprovalExpired
+				ap.Decision = &proto.ApprovalDecision{Option: "deny", Denied: true, By: "control", At: c.now().UnixMilli(), Remember: proto.ApprovalRememberNone}
+				c.markApprovalDirty(ap)
+				metrics.ApprovalsExpired.Inc()
+				egressEvents = append(egressEvents, c.approvalEvent(proto.EvEgressDenied, ap, c.workspaces[ap.WS], "control", "", map[string]any{
+					"reason": "approval_timeout", "decision_id": ap.ID,
+				}))
+			}
+			continue
+		}
 		if ap.Status == proto.ApprovalPending || (ap.Status == proto.ApprovalDecided && ap.DeliveredAt == 0) {
 			byAgent[ap.Agent] = append(byAgent[ap.Agent], ap)
+		}
+	}
+	if len(egressEvents) > 0 {
+		if err := c.persistApprovalsOnly(egressEvents); err != nil {
+			c.logger.Error("persist expired egress approvals", "err", err)
 		}
 	}
 	agentIDs := make([]string, 0, len(byAgent))
@@ -331,6 +351,129 @@ func (c *Control) persistApprovalsOnly(events []*proto.Event) error {
 	return err
 }
 
+// egressApproval creates or resolves the durable fence in front of an
+// approve-mode rule. The current workspace holder is the only writer. The
+// short wait is merely an optimization: expiry and decisions live in SQLite.
+func (c *Control) egressApproval(ctx context.Context, node string, req *proto.EgressApprovalReq) (*proto.EgressApprovalRes, error) {
+	if req.WS == "" || req.Gen == 0 || req.Rule == "" || req.Host == "" || req.Method == "" || req.Principal == "" {
+		return nil, proto.Err(proto.CodeBadRequest, "egress approval requires ws, gen, principal, rule, host and method")
+	}
+	if !approvalDigest(req.PathHash) || !approvalDigest(req.BodyHash) || !approvalDigest(req.Fingerprint) {
+		return nil, proto.Err(proto.CodeBadRequest, "egress approval hashes must be lowercase SHA-256")
+	}
+	if len(req.Host) > 512 || len(req.Method) > 32 {
+		return nil, proto.Err(proto.CodeBadRequest, "egress approval host or method is too long")
+	}
+	wait := time.Duration(req.WaitMillis) * time.Millisecond
+	if wait < 0 {
+		return nil, proto.Err(proto.CodeBadRequest, "egress approval wait cannot be negative")
+	}
+	if wait > 30*time.Second {
+		wait = 30 * time.Second
+	}
+
+	c.mu.Lock()
+	ws := c.workspaces[req.WS]
+	leaseable := ws != nil && (ws.State == proto.WSClaimed || ws.State == proto.WSClaiming)
+	if !leaseable || ws.Node != node || ws.Generation != req.Gen {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeDenied, "workspace %s generation %d is not claimed by %s", req.WS, req.Gen, node)
+	}
+	ruleOK := false
+	for _, rule := range ws.Spec.Security.Network.Rules {
+		if rule.ID == req.Rule && rule.Mode == proto.EgressModeApprove {
+			ruleOK = true
+			break
+		}
+	}
+	if !ruleOK {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeDenied, "workspace %s rule %s does not require approval", req.WS, req.Rule)
+	}
+	now := c.now().UnixMilli()
+	var ap *proto.Approval
+	for _, candidate := range c.approvals {
+		if candidate.Kind != proto.ApprovalEgress || candidate.WS != req.WS || candidate.Principal != req.Principal || candidate.ExpiresAt <= now {
+			continue
+		}
+		if candidate.Fingerprint == req.Fingerprint || (candidate.Status == proto.ApprovalDecided && candidate.Decision != nil && !candidate.Decision.Denied &&
+			((candidate.Decision.Remember == proto.ApprovalRememberHost && candidate.Host == req.Host) ||
+				(candidate.Decision.Remember == proto.ApprovalRememberRule && candidate.Rule == req.Rule))) {
+			ap = candidate
+			break
+		}
+	}
+	if ap == nil {
+		pending := 0
+		for _, candidate := range c.approvals {
+			if candidate.Tenant == ws.Tenant && candidate.Kind == proto.ApprovalEgress && candidate.Status == proto.ApprovalPending && candidate.ExpiresAt > now {
+				pending++
+			}
+		}
+		if pending >= c.opts.MaxPendingEgressApprovals {
+			tenant := ws.Tenant
+			c.mu.Unlock()
+			metrics.ApprovalQuotaRejected.Inc()
+			return nil, proto.Err(proto.CodeResourceExhausted, "tenant %s has %d pending egress approvals", tenant, pending)
+		}
+		ap = &proto.Approval{
+			ID: ids.New("ap"), Tenant: ws.Tenant, Owner: ws.Owner, WS: ws.ID, Kind: proto.ApprovalEgress,
+			Title: "Egress to " + req.Host, Principal: req.Principal, Rule: req.Rule, Host: req.Host,
+			Method: strings.ToUpper(req.Method), PathHash: req.PathHash, BodyHash: req.BodyHash, Fingerprint: req.Fingerprint,
+			Status: proto.ApprovalPending, CreatedAt: now, UpdatedAt: now,
+			ExpiresAt: now + c.opts.ApprovalTimeout.Milliseconds(),
+		}
+		c.approvals[ap.ID] = ap
+		c.markApprovalDirty(ap)
+		event := c.approvalEvent(proto.EvEgressPending, ap, ws, req.Principal, node, map[string]any{
+			"host": ap.Host, "method": ap.Method, "rule": ap.Rule, "path_hash": ap.PathHash, "body_hash": ap.BodyHash,
+		})
+		if err := c.persistApprovalsOnly([]*proto.Event{event}); err != nil {
+			delete(c.approvals, ap.ID)
+			delete(c.dirtyApprovals, ap.ID)
+			c.mu.Unlock()
+			return nil, err
+		}
+		metrics.ApprovalsPending.Inc()
+	}
+	id := ap.ID
+	c.mu.Unlock()
+
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		current, err := c.approvalCopy(id)
+		if err != nil {
+			return nil, err
+		}
+		result := &proto.EgressApprovalRes{ID: current.ID, Status: current.Status, ExpiresAt: current.ExpiresAt}
+		if current.Status != proto.ApprovalPending {
+			result.Allowed = current.Status == proto.ApprovalDecided && current.Decision != nil && !current.Decision.Denied
+			return result, nil
+		}
+		if wait == 0 {
+			return result, nil
+		}
+		select {
+		case <-ctx.Done():
+			return result, nil
+		case <-deadline.C:
+			return result, nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func approvalDigest(value string) bool {
+	if len(value) != 64 || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
 // ---------------------------------------------------------------------------
 // approval.list / approval.get / approval.decide
 // ---------------------------------------------------------------------------
@@ -357,6 +500,9 @@ func (c *Control) approvalList(ctx context.Context, subject Subject, req *proto.
 	all := make([]*proto.Approval, 0, len(c.approvals))
 	for _, ap := range c.approvals {
 		if req.Agent != "" && ap.Agent != req.Agent {
+			continue
+		}
+		if req.Kind != "" && ap.Kind != req.Kind {
 			continue
 		}
 		if req.Status != "" && ap.Status != req.Status {
@@ -452,6 +598,10 @@ func (c *Control) approvalDecide(ctx context.Context, subject Subject, req *prot
 		return nil, proto.Err(proto.CodeConflict, "approval %s is %s", ap.ID, status)
 	}
 	decision := proto.ApprovalDecision{Option: req.Option, Denied: req.Denied, By: subject.ID, At: c.now().UnixMilli()}
+	if live.Kind != proto.ApprovalEgress && req.Remember != "" {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeBadRequest, "remember is only valid for egress approvals")
+	}
 	switch live.Kind {
 	case proto.ApprovalToolCall:
 		if !req.Denied {
@@ -504,6 +654,16 @@ func (c *Control) approvalDecide(ctx context.Context, subject Subject, req *prot
 		} else {
 			decision.Option = "allow"
 		}
+		decision.Remember = req.Remember
+		if decision.Remember == "" {
+			decision.Remember = proto.ApprovalRememberNone
+		}
+		switch decision.Remember {
+		case proto.ApprovalRememberNone, proto.ApprovalRememberHost, proto.ApprovalRememberRule:
+		default:
+			c.mu.Unlock()
+			return nil, proto.Err(proto.CodeBadRequest, "unknown egress remember scope %q", decision.Remember)
+		}
 	default:
 		kind := live.Kind
 		c.mu.Unlock()
@@ -511,11 +671,23 @@ func (c *Control) approvalDecide(ctx context.Context, subject Subject, req *prot
 	}
 	live.Status = proto.ApprovalDecided
 	live.Decision = &decision
+	if live.Kind == proto.ApprovalEgress {
+		live.ExpiresAt = decision.At + c.opts.ApprovalDecisionTTL.Milliseconds()
+	}
 	c.markApprovalDirty(live)
 	a := c.agents[live.Agent]
 	ws := c.workspaces[live.WS]
-	events := []*proto.Event{c.approvalEvent(proto.EvApprovalDecided, live, ws, subject.ID, "", map[string]any{
+	eventType := proto.EvApprovalDecided
+	if live.Kind == proto.ApprovalEgress {
+		if decision.Denied {
+			eventType = proto.EvEgressDenied
+		} else {
+			eventType = proto.EvEgressAllowed
+		}
+	}
+	events := []*proto.Event{c.approvalEvent(eventType, live, ws, subject.ID, "", map[string]any{
 		"option": decision.Option, "denied": decision.Denied, "by": subject.ID, "run": live.Run,
+		"approved_by": subject.ID, "decision_id": live.ID, "remember": decision.Remember, "reason": "approval_decision",
 	})}
 	var send *proto.AgentApprovalDecidedReq
 	node := ""
@@ -536,9 +708,31 @@ func (c *Control) approvalDecide(ctx context.Context, subject Subject, req *prot
 			return nil, err
 		}
 	} else {
-		if err := c.persistApprovalsOnly(events); err != nil {
+		var nextWS *proto.Workspace
+		if live.Kind == proto.ApprovalEgress && !decision.Denied && decision.Remember == proto.ApprovalRememberHost && ws != nil {
+			next := *ws
+			security, normalizeErr := proto.NormalizeSecurity(ws.Spec.Security)
+			if normalizeErr != nil {
+				c.mu.Unlock()
+				return nil, normalizeErr
+			}
+			next.Spec = ws.Spec
+			next.Spec.Security = security
+			remembered := proto.EgressRule{
+				ID: "approved-" + live.ID, Mode: proto.EgressModeAllow, Protocol: ruleProtocol(next.Spec.Security.Network.Rules, live.Rule), Hosts: []string{live.Host},
+			}
+			next.Spec.Security.Network.Rules = append([]proto.EgressRule{remembered}, next.Spec.Security.Network.Rules...)
+			nextWS = &next
+			events = append(events, c.approvalEvent(proto.EvPolicyUpdated, live, &next, subject.ID, "", map[string]any{
+				"rule": live.Rule, "host": live.Host, "decision_id": live.ID,
+			}))
+		}
+		if err := c.persistEgressDecision(nextWS, scope, req, events); err != nil {
 			c.mu.Unlock()
 			return nil, err
+		}
+		if nextWS != nil {
+			c.workspaces[nextWS.ID] = nextWS
 		}
 	}
 	cp := copyApproval(live)
@@ -548,6 +742,44 @@ func (c *Control) approvalDecide(ctx context.Context, subject Subject, req *prot
 		go c.sendDecision(context.WithoutCancel(ctx), node, *send)
 	}
 	return cp, nil
+}
+
+func ruleProtocol(rules []proto.EgressRule, id string) string {
+	for _, rule := range rules {
+		if rule.ID == id {
+			return rule.Protocol
+		}
+	}
+	return proto.EgressProtocolHTTPS
+}
+
+// persistEgressDecision commits the decision, optional remembered policy,
+// mutation record and their events together. Caller holds c.mu.
+func (c *Control) persistEgressDecision(ws *proto.Workspace, scope string, req *proto.ApprovalDecideReq, events []*proto.Event) error {
+	dirty := make([]*proto.Approval, 0, len(c.dirtyApprovals))
+	for _, ap := range c.dirtyApprovals {
+		dirty = append(dirty, ap)
+	}
+	err := c.transact(func(tx *eventlog.Tx) error {
+		for _, ap := range dirty {
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO approvals(id, data) VALUES(?,?)`, ap.ID, proto.MustMarshal(ap)); err != nil {
+				return err
+			}
+		}
+		if ws != nil {
+			ws.UpdatedAt = c.now().UnixMilli()
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err != nil {
+				return err
+			}
+		}
+		return c.insertMutationTx(tx.Tx, scope, req.IdempotencyKey, proto.OpApprovalDecide, req, struct{}{})
+	}, events)
+	if err == nil {
+		for id := range c.dirtyApprovals {
+			delete(c.dirtyApprovals, id)
+		}
+	}
+	return err
 }
 
 // isJSONObject reports whether valid JSON is an object, which is the only

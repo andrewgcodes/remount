@@ -418,6 +418,15 @@ func normalizeEgressRule(rule *EgressRule, seen map[string]struct{}) error {
 		return Err(CodeBadRequest, "duplicate egress rule id %q", rule.ID)
 	}
 	seen[rule.ID] = struct{}{}
+	rule.Mode = strings.ToLower(strings.TrimSpace(rule.Mode))
+	if rule.Mode == "" {
+		rule.Mode = EgressModeAllow
+	}
+	switch rule.Mode {
+	case EgressModeAllow, EgressModeDeny, EgressModeApprove:
+	default:
+		return Err(CodeBadRequest, "egress rule %q has unsupported mode %q", rule.ID, rule.Mode)
+	}
 	rule.Protocol = strings.ToLower(strings.TrimSpace(rule.Protocol))
 	rule.Connector = strings.ToLower(strings.TrimSpace(rule.Connector))
 	switch rule.Connector {

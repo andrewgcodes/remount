@@ -310,14 +310,21 @@ func ValidateAgentMessage(text string) error {
 // request, an ACP elicitation, or an egress decision. One list, one CLI, one
 // wake path.
 type Approval struct {
-	ID     string `cbor:"id" json:"id"`
-	Tenant string `cbor:"tenant" json:"tenant"`
-	Owner  string `cbor:"owner" json:"owner"`
-	Agent  string `cbor:"agent,omitempty" json:"agent,omitempty"`
-	WS     string `cbor:"ws,omitempty" json:"ws,omitempty"`
-	Run    string `cbor:"run,omitempty" json:"run,omitempty"`
-	Kind   string `cbor:"kind" json:"kind"` // ApprovalToolCall | ApprovalElicitation | ApprovalEgress
-	Title  string `cbor:"title,omitempty" json:"title,omitempty"`
+	ID          string `cbor:"id" json:"id"`
+	Tenant      string `cbor:"tenant" json:"tenant"`
+	Owner       string `cbor:"owner" json:"owner"`
+	Agent       string `cbor:"agent,omitempty" json:"agent,omitempty"`
+	WS          string `cbor:"ws,omitempty" json:"ws,omitempty"`
+	Run         string `cbor:"run,omitempty" json:"run,omitempty"`
+	Principal   string `cbor:"principal,omitempty" json:"principal,omitempty"`
+	Rule        string `cbor:"rule,omitempty" json:"rule,omitempty"`
+	Host        string `cbor:"host,omitempty" json:"host,omitempty"`
+	Method      string `cbor:"method,omitempty" json:"method,omitempty"`
+	PathHash    string `cbor:"path_hash,omitempty" json:"path_hash,omitempty"`
+	BodyHash    string `cbor:"body_hash,omitempty" json:"body_hash,omitempty"`
+	Fingerprint string `cbor:"fingerprint,omitempty" json:"fingerprint,omitempty"`
+	Kind        string `cbor:"kind" json:"kind"` // ApprovalToolCall | ApprovalElicitation | ApprovalEgress
+	Title       string `cbor:"title,omitempty" json:"title,omitempty"`
 	// ToolCall is the harness's tool call id the request belongs to.
 	ToolCall  string           `cbor:"tool_call,omitempty" json:"tool_call,omitempty"`
 	ToolKind  string           `cbor:"tool_kind,omitempty" json:"tool_kind,omitempty"`
@@ -335,6 +342,7 @@ type Approval struct {
 	DeliveredAt int64 `cbor:"delivered_at,omitempty" json:"delivered_at,omitempty"`
 	CreatedAt   int64 `cbor:"created_at" json:"created_at"`
 	UpdatedAt   int64 `cbor:"updated_at" json:"updated_at"`
+	ExpiresAt   int64 `cbor:"expires_at,omitempty" json:"expires_at,omitempty"`
 }
 
 // ApprovalOption is one answer the harness offered.
@@ -351,9 +359,10 @@ type ApprovalDecision struct {
 	Option string `cbor:"option,omitempty" json:"option,omitempty"`
 	Denied bool   `cbor:"denied,omitempty" json:"denied,omitempty"`
 	// Content answers an elicitation: the form fields as the schema asked.
-	Content json.RawMessage `cbor:"content,omitempty" json:"content,omitempty"`
-	By      string          `cbor:"by" json:"by"`
-	At      int64           `cbor:"at" json:"at"`
+	Content  json.RawMessage `cbor:"content,omitempty" json:"content,omitempty"`
+	By       string          `cbor:"by" json:"by"`
+	At       int64           `cbor:"at" json:"at"`
+	Remember string          `cbor:"remember,omitempty" json:"remember,omitempty"` // none | host | rule (egress only)
 }
 
 // Approval.Kind values.
@@ -370,6 +379,13 @@ const (
 	// ApprovalExpired: the run that asked ended before a decision. ACP has no
 	// replay for pending permissions; the harness asks again next turn.
 	ApprovalExpired = "expired"
+)
+
+// Egress approval remember scopes.
+const (
+	ApprovalRememberNone = "none"
+	ApprovalRememberHost = "host"
+	ApprovalRememberRule = "rule"
 )
 
 // ---------------------------------------------------------------------------
@@ -548,6 +564,7 @@ const (
 // ApprovalListReq filters approvals.
 type ApprovalListReq struct {
 	Agent  string `cbor:"agent,omitempty" json:"agent,omitempty"`
+	Kind   string `cbor:"kind,omitempty" json:"kind,omitempty"`
 	Status string `cbor:"status,omitempty" json:"status,omitempty"`
 }
 
@@ -567,7 +584,32 @@ type ApprovalDecideReq struct {
 	Option         string          `cbor:"option,omitempty" json:"option,omitempty"`
 	Denied         bool            `cbor:"denied,omitempty" json:"denied,omitempty"`
 	Content        json.RawMessage `cbor:"content,omitempty" json:"content,omitempty"`
+	Remember       string          `cbor:"remember,omitempty" json:"remember,omitempty"`
 	IdempotencyKey string          `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// EgressApprovalReq asks the control plane to create or resolve a durable
+// approval for one exact outbound request. Only the workspace's current node
+// may issue it.
+type EgressApprovalReq struct {
+	WS          string `cbor:"ws" json:"ws"`
+	Gen         uint64 `cbor:"gen" json:"gen"`
+	Principal   string `cbor:"principal" json:"principal"`
+	Rule        string `cbor:"rule" json:"rule"`
+	Host        string `cbor:"host" json:"host"`
+	Method      string `cbor:"method" json:"method"`
+	PathHash    string `cbor:"path_hash" json:"path_hash"`
+	BodyHash    string `cbor:"body_hash" json:"body_hash"`
+	Fingerprint string `cbor:"fingerprint" json:"fingerprint"`
+	WaitMillis  int64  `cbor:"wait_ms,omitempty" json:"wait_ms,omitempty"`
+}
+
+// EgressApprovalRes reports whether the request may cross the broker edge.
+type EgressApprovalRes struct {
+	ID        string `cbor:"id" json:"id"`
+	Status    string `cbor:"status" json:"status"`
+	Allowed   bool   `cbor:"allowed,omitempty" json:"allowed,omitempty"`
+	ExpiresAt int64  `cbor:"expires_at,omitempty" json:"expires_at,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

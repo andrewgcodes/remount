@@ -2825,6 +2825,19 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 		WS: w.ID, Generation: w.Generation, Principal: w.Spec.Principal, Tenant: w.Tenant, Leases: leases,
 		Network: w.Spec.Security.Network, Allow: n.opts.Allow, AllowPrivate: n.opts.AllowPrivate,
 		RootCAs: n.opts.BrokerRootCAs, ConnectorStore: n.connectors, Repo: w.Spec.Repo,
+		Approval: func(ctx context.Context, req proto.EgressApprovalReq) (*proto.EgressApprovalRes, error) {
+			n.mu.Lock()
+			p := n.peer
+			n.mu.Unlock()
+			if p == nil {
+				return nil, proto.Err(proto.CodeUnreachable, "control connection lost before egress approval")
+			}
+			var res proto.EgressApprovalRes
+			if err := p.Call(ctx, proto.PeerControl, proto.OpEgressApproval, req, &res); err != nil {
+				return nil, err
+			}
+			return &res, nil
+		},
 		Audit: func(a broker.Audit) {
 			typ := proto.EvEgressAllowed
 			switch a.Decision {

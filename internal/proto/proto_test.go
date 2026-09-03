@@ -304,6 +304,7 @@ func TestNormalizeSecurityRejectsUnenforceableEgressRules(t *testing.T) {
 		{"unclean path", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"example.com"}, PathPrefixes: []string{"/ok/../admin"}}},
 		{"encoded path", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"example.com"}, PathPrefixes: []string{"/ok%2fadmin"}}},
 		{"negative limit", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"example.com"}, MaxRequests: -1}},
+		{"unknown mode", EgressRule{ID: "x", Mode: "promptish", Protocol: "https", Hosts: []string{"example.com"}}},
 		{"unknown shared state", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"example.com"}, SharedState: "mystery"}},
 		{"connect byte claim", EgressRule{ID: "x", Protocol: "connect", Hosts: []string{"example.com"}, MaxResponseBytes: 1}},
 		{"connect shared state", EgressRule{ID: "x", Protocol: "connect", Hosts: []string{"example.com"}, SharedState: SharedStateGlobalWrite}},

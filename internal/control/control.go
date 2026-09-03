@@ -194,6 +194,12 @@ type Options struct {
 	MaxAgentsPerTenant int
 	// MaxApprovalsPerAgent bounds parked approvals per agent. Zero selects 64.
 	MaxApprovalsPerAgent int
+	// MaxPendingEgressApprovals bounds durable undecided egress requests per
+	// tenant. ApprovalTimeout defaults to ten minutes; ApprovalDecisionTTL to
+	// one hour.
+	MaxPendingEgressApprovals int
+	ApprovalTimeout           time.Duration
+	ApprovalDecisionTTL       time.Duration
 	// MaxExportCursorsPerTenant bounds durable destination progress records.
 	// Zero selects 256.
 	MaxExportCursorsPerTenant int
@@ -365,6 +371,15 @@ func New(opts Options) (*Control, error) {
 	}
 	if opts.MaxApprovalsPerAgent <= 0 {
 		opts.MaxApprovalsPerAgent = 64
+	}
+	if opts.MaxPendingEgressApprovals <= 0 {
+		opts.MaxPendingEgressApprovals = 1024
+	}
+	if opts.ApprovalTimeout <= 0 {
+		opts.ApprovalTimeout = 10 * time.Minute
+	}
+	if opts.ApprovalDecisionTTL <= 0 {
+		opts.ApprovalDecisionTTL = time.Hour
 	}
 	if opts.MaxExportCursorsPerTenant <= 0 {
 		opts.MaxExportCursorsPerTenant = 256
@@ -2011,6 +2026,15 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return c.bindingLease(ctx, f.From, req.WS, req.Gen)
+	case proto.OpEgressApproval:
+		if !c.isNode(f.From) {
+			return nil, proto.Err(proto.CodeUnauthorized, "only nodes request egress approvals")
+		}
+		req, err := decode[proto.EgressApprovalReq](f)
+		if err != nil {
+			return nil, err
+		}
+		return c.egressApproval(ctx, f.From, req)
 	case proto.OpGrant:
 		req, err := decode[proto.GrantReq](f)
 		if err != nil {
