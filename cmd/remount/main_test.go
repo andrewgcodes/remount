@@ -59,6 +59,30 @@ func TestParseAllowsFlagsAfterPositionals(t *testing.T) {
 	}
 }
 
+func TestAbsFlagPathResolvesRelativeAndNamesFlag(t *testing.T) {
+	dir := t.TempDir()
+	wd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+	got, err := absFlagPath("data", "./remount-data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := filepath.EvalSymlinks(dir)
+	gotReal, _ := filepath.EvalSymlinks(filepath.Dir(got))
+	if !filepath.IsAbs(got) || gotReal != want || filepath.Base(got) != "remount-data" {
+		t.Fatalf("got %q want under %q", got, want)
+	}
+	if _, err := absFlagPath("data", "  "); err == nil || !strings.Contains(err.Error(), "--data") {
+		t.Fatalf("empty path error must name the flag: %v", err)
+	}
+	if _, err := buildNode("relative/node", common{}, nil, "process", "", nil, nil, nodeResourceOptions{}); err == nil || !strings.Contains(err.Error(), "absolute") {
+		t.Fatalf("buildNode accepted a relative root: %v", err)
+	}
+}
+
 func TestWorkspaceCreateRejectsClientSelectedPrincipalBeforeDial(t *testing.T) {
 	err := cmdWS(context.Background(), []string{"create", "--principal", "a_attacker", "--wait=false"})
 	if err == nil || !strings.Contains(err.Error(), "caller identity is authoritative") {
