@@ -1,0 +1,65 @@
+name: Remount agent
+description: Run a repository task on a hosted Remount control plane
+inputs:
+  server:
+    description: HTTPS Remount control-plane base URL
+    required: true
+  token:
+    description: Remount bearer token stored as a GitHub Actions secret
+    required: true
+  repo-binding:
+    description: Server-side binding ID restricted to this repository
+    required: true
+  task:
+    description: Task passed to the selected Remount recipe
+    required: true
+  recipe:
+    description: Built-in Remount recipe
+    required: false
+    default: opencode
+  model:
+    description: Optional model override
+    required: false
+    default: ""
+  repository:
+    description: GitHub owner/repository; defaults to the current repository
+    required: false
+    default: ""
+  ref:
+    description: Git ref or SHA; defaults to the triggering commit
+    required: false
+    default: ""
+  remount-binary:
+    description: Path to an already installed remount binary
+    required: false
+    default: remount
+  allow-insecure-http:
+    description: Allow an http control-plane URL for local testing only
+    required: false
+    default: "false"
+outputs:
+  agent-id:
+    description: Durable Remount Agent ID
+    value: ${{ steps.run.outputs.agent-id }}
+  workspace-id:
+    description: Durable Remount workspace ID
+    value: ${{ steps.run.outputs.workspace-id }}
+runs:
+  using: composite
+  steps:
+    - id: run
+      name: Start Remount agent
+      shell: bash
+      env:
+        REMOUNT_SERVER: ${{ inputs.server }}
+        REMOUNT_TOKEN: ${{ inputs.token }}
+        REMOUNT_ACTION_BINDING: ${{ inputs.repo-binding }}
+        REMOUNT_ACTION_TASK: ${{ inputs.task }}
+        REMOUNT_ACTION_RECIPE: ${{ inputs.recipe }}
+        REMOUNT_ACTION_MODEL: ${{ inputs.model }}
+        REMOUNT_ACTION_REPOSITORY: ${{ inputs.repository || github.repository }}
+        REMOUNT_ACTION_REF: ${{ inputs.ref || github.sha }}
+        REMOUNT_ACTION_GITHUB_SERVER: ${{ github.server_url }}
+        REMOUNT_ACTION_BINARY: ${{ inputs.remount-binary }}
+        REMOUNT_ACTION_ALLOW_HTTP: ${{ inputs.allow-insecure-http }}
+      run: "$GITHUB_ACTION_PATH/run.sh"

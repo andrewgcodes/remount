@@ -1,0 +1,157 @@
+name: Examples
+
+on:
+  push:
+    paths:
+      - "examples/**"
+      - "sdk/**"
+      - ".github/workflows/examples.yml"
+  pull_request:
+    paths:
+      - "examples/**"
+      - "sdk/**"
+      - ".github/workflows/examples.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  temporal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.1"
+          cache-dependency-path: examples/temporal/go.sum
+      - name: Test Activity restart and reattach
+        working-directory: examples/temporal
+        run: go test -race -count=1 ./...
+
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            sdk/python/pyproject.toml
+            examples/langgraph/requirements.txt
+      - name: Install generated SDK and LangGraph
+        run: python -m pip install -e sdk/python -r examples/langgraph/requirements.txt
+      - name: Agent API smoke
+        env:
+          PYTHONPATH: examples/agent-api
+        run: python -m unittest -v examples/agent-api/test_python_example.py
+      - name: LangGraph smoke
+        env:
+          PYTHONPATH: examples/langgraph
+        run: python -m unittest discover -v -s examples/langgraph/tests
+      - name: OpenHands recipe smoke
+        env:
+          PYTHONPATH: examples/openhands
+        run: python -m unittest discover -v -s examples/openhands/tests
+
+  typescript:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            sdk/typescript/package-lock.json
+            examples/agent-api/package-lock.json
+      - name: Build generated SDK
+        working-directory: sdk/typescript
+        run: npm ci && npm run build
+      - name: Agent API typecheck and smoke
+        working-directory: examples/agent-api
+        run: npm ci && npm run check && npm test
+
+  github-action:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate command and secret boundary
+        run: examples/github-action/tests/smoke.sh
+
+  temporal-cloud:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      TEMPORAL_ADDRESS: ${{ secrets.TEMPORAL_ADDRESS }}
+      TEMPORAL_NAMESPACE: ${{ secrets.TEMPORAL_NAMESPACE }}
+      TEMPORAL_API_KEY: ${{ secrets.LAKESIDE_TEMPORAL_API_KEY || secrets.NEW_LAKESIDE_TEMPORAL_API_KEY }}
+      REMOUNT_SERVER: ${{ secrets.REMOUNT_TEMPORAL_SERVER }}
+      REMOUNT_TOKEN: ${{ secrets.REMOUNT_TEMPORAL_TOKEN }}
+      REMOUNT_TEST_WORKSPACE: ${{ secrets.REMOUNT_TEMPORAL_TEST_WORKSPACE }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.1"
+          cache-dependency-path: examples/temporal/go.sum
+      - name: Run worker-restart smoke or explain skip
+        working-directory: examples/temporal
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in TEMPORAL_ADDRESS TEMPORAL_NAMESPACE TEMPORAL_API_KEY REMOUNT_SERVER REMOUNT_TOKEN REMOUNT_TEST_WORKSPACE; do
+            if [[ -z "${!name:-}" ]]; then missing+=("$name"); fi
+          done
+          if (( ${#missing[@]} )); then
+            echo "::notice::Temporal Cloud smoke skipped: missing ${missing[*]}"
+            exit 0
+          fi
+
+          go build -o "$RUNNER_TEMP/remount-temporal-worker" ./cmd/worker
+          go build -o "$RUNNER_TEMP/remount-temporal-start" ./cmd/start
+          worker_one=""
+          worker_two=""
+          starter=""
+          cleanup() {
+            for pid in "$starter" "$worker_one" "$worker_two"; do
+              if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; fi
+            done
+          }
+          trap cleanup EXIT
+
+          "$RUNNER_TEMP/remount-temporal-worker" >"$RUNNER_TEMP/worker-one.log" 2>&1 &
+          worker_one=$!
+          workflow="remount-example-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          "$RUNNER_TEMP/remount-temporal-start" -workflow "$workflow" -workspace "$REMOUNT_TEST_WORKSPACE" -- \
+            /bin/sh -c 'printf temporal-started; sleep 30; printf temporal-finished' \
+            >"$RUNNER_TEMP/starter.log" 2>&1 &
+          starter=$!
+
+          ready=false
+          for _ in $(seq 1 90); do
+            if grep -Fq 'reattached=false' "$RUNNER_TEMP/worker-one.log"; then ready=true; break; fi
+            if ! kill -0 "$worker_one" 2>/dev/null; then cat "$RUNNER_TEMP/worker-one.log"; exit 1; fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            echo "first worker never opened the Remount session" >&2
+            cat "$RUNNER_TEMP/worker-one.log"
+            exit 1
+          fi
+
+          kill -KILL "$worker_one"
+          wait "$worker_one" 2>/dev/null || true
+          worker_one=""
+          "$RUNNER_TEMP/remount-temporal-worker" >"$RUNNER_TEMP/worker-two.log" 2>&1 &
+          worker_two=$!
+          wait "$starter"
+          starter=""
+          grep -Fq 'reattached=true' "$RUNNER_TEMP/worker-two.log"
+          grep -Eq '^session=s_[^ ]+ next=[0-9]+ exit=0 ' "$RUNNER_TEMP/starter.log"
