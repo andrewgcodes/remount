@@ -1,8 +1,10 @@
 # Plan B: repository-executable path to the agent-computer standard — 2026-09-03
 
-**Status:** Proposed  
+**Status:** Proposed
+
 **Scope:** implementation, tests, fixtures, simulations, packaging, and
-documentation that can be completed from this repository  
+documentation that can be completed from this repository
+
 **Preferred reference path:** E2B whole-node provisioning, OpenCode, and OpenAI
 through the Remount broker
 
