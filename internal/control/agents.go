@@ -385,10 +385,14 @@ func (c *Control) agentCreate(ctx context.Context, subject Subject, req *proto.A
 		if spec.Repo.URL != "" && spec.Repo.Branch == "" {
 			spec.Repo.Branch = "agent/" + id
 		}
-		if spec.Labels == nil {
-			spec.Labels = map[string]string{}
+		// The request is fingerprinted for idempotency after this point, so
+		// the label goes on a copy, never through the caller's map.
+		labels := make(map[string]string, len(spec.Labels)+1)
+		for k, v := range spec.Labels {
+			labels[k] = v
 		}
-		spec.Labels["remount.agent"] = id
+		labels["remount.agent"] = id
+		spec.Labels = labels
 		created, err := c.wsCreate(ctx, subject, &proto.WSCreateReq{Spec: spec, IdempotencyKey: derivedIdem(req.IdempotencyKey, "ws")})
 		if err != nil {
 			return nil, err
@@ -1176,6 +1180,7 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 	now := c.now().UnixMilli()
 	var events []*proto.Event
 	payload := map[string]any{"run": run.ID, "node": node}
+	stopRun := ""
 	switch rep.Kind {
 	case proto.AgentReportStarted:
 		run.State = proto.AgentRunActive
@@ -1238,6 +1243,9 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 				a.Inbox = a.Inbox[:0]
 				events = append(events, c.agentEvent(proto.EvAgentFinished, a, ws, "", node, map[string]any{"reason": a.StatusReason}))
 				metrics.AgentsFinished.Inc()
+				// The harness would otherwise idle on the node forever; its
+				// finished report closes the run and lands the exit chunk.
+				stopRun = run.ID
 			}
 		}
 	case proto.AgentReportToolCall:
@@ -1299,9 +1307,13 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 		return err
 	}
 	needKick := run.State == proto.AgentRunDone && len(a.Inbox) > 0 && !agentTerminal(a.Status)
+	agentID := a.ID
 	c.mu.Unlock()
 	if needKick {
 		c.kickAgents()
+	}
+	if stopRun != "" && c.send != nil {
+		go c.cancelRun(context.WithoutCancel(ctx), node, &proto.AgentRunCancelReq{Agent: agentID, Run: stopRun, Reason: "finished"})
 	}
 	return nil
 }

@@ -397,3 +397,95 @@ func TestAgentEndToEndTranscriptNeverHoldsCredentials(t *testing.T) {
 	}
 	_ = ws
 }
+
+// TestAgentMaxTurnsStopsHarnessAndMirrorsExit: finishing by policy is not
+// just a status flip. The harness the node keeps up for follow-ups is
+// stopped, its run closes with a finished report, and the durable mirror
+// ends with the exit chunk so a reader that never saw the node knows the
+// conversation ended. Before this the harness idled on the node until the
+// workspace was destroyed.
+func TestAgentMaxTurnsStopsHarnessAndMirrorsExit(t *testing.T) {
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("c1")
+	ctx := ctxT(t, 90*time.Second)
+	a, err := c.CreateAgent(ctx, proto.AgentCreateReq{
+		Name:           "bounded",
+		Workspace:      &proto.WorkspaceSpec{Name: "bounded-ws", Labels: map[string]string{"team": "sim"}},
+		Spec:           proto.AgentSpec{Recipe: "custom", Task: "only turn", ACPCommand: fakeACPCommand(t, "echo")},
+		Policy:         proto.AgentPolicy{Approve: proto.ApproveNever, MaxTurns: 1},
+		IdempotencyKey: "bounded-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The label map on the request is fingerprinted for idempotency; the
+	// control plane must not write its own label through it.
+	again, err := c.CreateAgent(ctx, proto.AgentCreateReq{
+		Name:           "bounded",
+		Workspace:      &proto.WorkspaceSpec{Name: "bounded-ws", Labels: map[string]string{"team": "sim"}},
+		Spec:           proto.AgentSpec{Recipe: "custom", Task: "only turn", ACPCommand: fakeACPCommand(t, "echo")},
+		Policy:         proto.AgentPolicy{Approve: proto.ApproveNever, MaxTurns: 1},
+		IdempotencyKey: "bounded-1",
+	})
+	if err != nil || again.ID != a.ID {
+		t.Fatalf("idempotent create = %+v, %v", again, err)
+	}
+	done := waitAgent(t, ctx, c, a.ID, "finished with the run closed", func(a *proto.Agent) bool {
+		return a.Status == proto.AgentFinished && len(a.Runs) == 1 && a.Runs[0].State == proto.AgentRunDone
+	})
+	if done.Turns != 1 || done.StatusReason != "max_turns 1 reached" {
+		t.Fatalf("finished agent = %+v", done)
+	}
+	types := eventTypes(t, ctx, c, a.WS)
+	if types[proto.EvAgentFinished] != 1 || types[proto.EvAgentRunFinished] != 1 {
+		t.Fatalf("events = %v", types)
+	}
+	// The harness's transcript session has exited on the node and the mirror
+	// holds that exit as its last record.
+	if s, err := c.Attach(ctx, a.WS, done.TranscriptSession, 0); err == nil {
+		var exited bool
+		deadline := time.After(5 * time.Second)
+	read:
+		for {
+			select {
+			case ch, ok := <-s.Chunks():
+				if !ok {
+					break read
+				}
+				if ch.Stream == proto.StreamExit {
+					exited = true
+					break read
+				}
+			case <-deadline:
+				break read
+			}
+		}
+		s.Close(context.Background(), false)
+		if !exited {
+			t.Fatal("transcript session still open after max_turns")
+		}
+	}
+	var last *proto.TranscriptRecord
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		page, err := c.Transcript(ctx, a.ID, 0, proto.MaxTranscriptPage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := len(page.Records); n > 0 && page.Records[n-1].Stream == proto.StreamExit {
+			last = &page.Records[n-1]
+			if !page.Done {
+				t.Fatal("mirror has the exit but is not done")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("mirror never received the exit chunk: %d records", len(page.Records))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	var exit proto.ExitInfo
+	if err := proto.Unmarshal(last.Data, &exit); err != nil || exit.Reason != "cancelled" {
+		t.Fatalf("mirrored exit = %+v, %v", exit, err)
+	}
+}

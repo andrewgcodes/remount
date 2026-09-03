@@ -220,3 +220,24 @@ func (b Binding) SessionEnv() map[string]string {
 		b.Preset.BaseURLEnv: "${REMOUNT_BROKER}" + b.BaseURLPath(),
 	}
 }
+
+// BindingsFromLabels reads the bindings a launch recorded on a workspace
+// (LabelBindings) so a later session resolves the same placeholders.
+func BindingsFromLabels(labels map[string]string) ([]Binding, error) {
+	raw := labels[LabelBindings]
+	if raw == "" {
+		return nil, nil
+	}
+	var out []Binding
+	for _, spec := range strings.Split(raw, ",") {
+		if spec == "" {
+			continue
+		}
+		b, err := ParseBinding(spec)
+		if err != nil {
+			return nil, fmt.Errorf("workspace binding label: %w", err)
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
