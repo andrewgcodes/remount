@@ -82,7 +82,10 @@ export function Terminal({ api, workspace, session, replayMinutes, initialNext }
     const observer = new ResizeObserver(sendResize);
     observer.observe(host.current);
     return () => { disposed = true; window.clearTimeout(retryTimer); observer.disconnect(); input.dispose(); socket?.close(); term.dispose(); };
-  }, [api, workspace, session, replayMinutes, initialNext]);
+  // initialNext seeds this selected session. Polling can advance the server's
+  // summary while the socket is live; remounting for that change would throw
+  // away the more precise cursor learned from delivered chunks.
+  }, [api, workspace, session, replayMinutes]);
 
   return <section class="terminal-panel" aria-label={`Terminal session ${session}`}>
     <div class="terminal-bar"><span class={`live-dot ${connection}`} /> <code>{session}</code><span>{connection}</span></div>
