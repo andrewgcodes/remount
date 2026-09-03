@@ -212,6 +212,49 @@ redirects to it. A sleeping agent is woken first (`agent.woken{by:
 preview}`). `remount agent open ID --ui` runs the recipe's `ui` command in
 the workspace and prints this URL.
 
+## Webhooks
+
+`POST /v1/events` takes `{type, stream?, payload?, agent?}` and appends the
+event. Authenticate with a bearer, or sign the raw body with the server's
+`--webhook-secret` (`X-Remount-Signature: sha256=<hex>`; GitHub's
+`X-Hub-Signature-256` is accepted as is). The optional `agent` block acts on
+the event:
+
+```json
+{"type": "github.issues",
+ "payload": {"action": "labeled", "issue": {"number": 42, "title": "…", "body": "…"}},
+ "agent": {"idempotency_key": "gh-{{.issue.number}}",
+           "create": {"name": "issue-{{.issue.number}}",
+                      "workspace": {"name": "issue-{{.issue.number}}", "bindings": ["github"]},
+                      "spec": {"recipe": "codex", "task": "Fix #{{.issue.number}}: {{.issue.title}}\n\n{{.issue.body}}"}}}}
+```
+
+`{"wake": "ag_…", "message": "{{.comment.body}}"}` sends a follow-up to an
+existing agent instead; `"wake": "name:issue-{{.issue.number}}"` names the
+one live agent with that name (`404` for none, `409` for several), so a
+comment payload that only knows the issue still finds the agent the label
+created. Templates are Go `text/template` over the payload; a missing key is
+a `400`, never an empty prompt. `examples/diy-devin/github/` is a GitHub
+Actions workflow that posts both. A signed request acts as
+`--webhook-token`; without that flag signed requests may only append. The
+response is `202 {"accepted": true, "agent": "ag_…", "ws": "ws_…", "status":
+"…"}`. Redelivering the same webhook (same rendered `idempotency_key`)
+returns the same agent.
+
+## Scheduling and children
+
+`policy.start_at` (Unix milliseconds) holds the first run until that time:
+the agent is `scheduled`, its workspace is ready, and messages queue. The CLI
+takes `--at 09:00`, `--at 90m` or an RFC 3339 instant; `remount run
+--sleep-until 02:00` on an ACP recipe is the same policy.
+
+`POST /v1/agents` with `parent` creates a child that inherits the parent's
+providers, sandbox, bindings and security profile unless it names a subset;
+anything wider is `403`. When the child ends, the parent receives a `kind:
+child` inbox message carrying `{child, name, status, reason, turns, ws, url}`
+and an `agent.child.finished` event. `GET /v1/agents?parent=ID` lists a
+parent's children.
+
 ## Bounds
 
 | What | Bound |

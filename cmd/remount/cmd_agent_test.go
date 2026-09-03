@@ -337,3 +337,24 @@ func textBlocks(text string) []acp.ContentBlock {
 	_ = json.Unmarshal(raw, &b)
 	return []acp.ContentBlock{b}
 }
+
+func TestParseStartAt(t *testing.T) {
+	now := time.Date(2026, 9, 3, 17, 0, 0, 0, time.UTC)
+	cases := map[string]time.Time{
+		"90m":                  now.Add(90 * time.Minute),
+		"09:00":                time.Date(2026, 9, 4, 9, 0, 0, 0, time.UTC),
+		"18:30":                time.Date(2026, 9, 3, 18, 30, 0, 0, time.UTC),
+		"2026-09-05T08:00:00Z": time.Date(2026, 9, 5, 8, 0, 0, 0, time.UTC),
+	}
+	for in, want := range cases {
+		got, err := parseStartAt(in, now)
+		if err != nil || !got.Equal(want) {
+			t.Errorf("parseStartAt(%q) = %v, %v; want %v", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "yesterday", "-5m", "0s", "2026-09-01T00:00:00Z", "25:00"} {
+		if _, err := parseStartAt(in, now); err == nil {
+			t.Errorf("parseStartAt(%q) accepted", in)
+		}
+	}
+}

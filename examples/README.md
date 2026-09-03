@@ -14,6 +14,12 @@ export REMOUNT_SERVER=http://127.0.0.1:7443
 is read from `$OPENAI_API_KEY` on the server. Workspaces reference it as
 `ref:b_openai` and never see the value.
 
+## diy-devin
+
+Reference clients for the Agent HTTP API — a Python CLI, a TypeScript client,
+a static web page and a GitHub Actions trigger — in
+[diy-devin/](diy-devin/README.md).
+
 ## agentloop
 
 A complete agent harness in one file. It creates a workspace, asks the model

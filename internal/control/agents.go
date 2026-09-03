@@ -2,11 +2,14 @@ package control
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"remount.dev/remount/internal/eventlog"
 	"remount.dev/remount/internal/ids"
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
@@ -139,7 +142,7 @@ func agentTerminal(status string) bool {
 
 // deriveAgentStatus is the one place status comes from. It reads the agent's
 // own durable state and the workspace's; the node never sets it directly.
-func deriveAgentStatus(a *proto.Agent, ws *proto.Workspace) string {
+func deriveAgentStatus(a *proto.Agent, ws *proto.Workspace, now int64) string {
 	if agentTerminal(a.Status) {
 		return a.Status
 	}
@@ -148,6 +151,9 @@ func deriveAgentStatus(a *proto.Agent, ws *proto.Workspace) string {
 	}
 	if a.PendingApprovals > 0 {
 		return proto.AgentWaitingApproval
+	}
+	if a.Policy.StartAt > now && liveRun(a) == nil && ws.State != proto.WSFailed {
+		return proto.AgentScheduled
 	}
 	switch ws.State {
 	case proto.WSPaused, proto.WSQuiescing, proto.WSCheckpointing:
@@ -185,7 +191,7 @@ func deriveAgentStatus(a *proto.Agent, ws *proto.Workspace) string {
 // the change implies. Caller holds c.mu.
 func (c *Control) refreshAgentStatusLocked(a *proto.Agent, principal string) ([]*proto.Event, error) {
 	ws := c.workspaces[a.WS]
-	next := deriveAgentStatus(a, ws)
+	next := deriveAgentStatus(a, ws, c.now().UnixMilli())
 	if next == a.Status {
 		return nil, nil
 	}
@@ -240,7 +246,62 @@ func validateAgentPolicy(p proto.AgentPolicy) error {
 	if p.MaxTurns < 0 {
 		return proto.Err(proto.CodeBadRequest, "policy.max_turns must not be negative")
 	}
+	if p.StartAt < 0 {
+		return proto.Err(proto.CodeBadRequest, "policy.start_at must not be negative")
+	}
 	return nil
+}
+
+// maxAgentStartDelay bounds how far ahead a schedule may reach. A year is
+// past any plausible use and stops a typo in seconds-vs-millis from parking
+// an agent (and its workspace) for decades.
+const maxAgentStartDelay = 366 * 24 * time.Hour
+
+// inheritFromParent fills what a child leaves empty from its parent and
+// refuses anything the parent does not itself have: providers, workspace
+// bindings, sandbox. A child never holds a credential its parent could not
+// reach (E22).
+func inheritFromParent(req *proto.AgentCreateReq, parent *proto.Agent, parentWS *proto.Workspace) error {
+	if len(req.Spec.Providers) == 0 {
+		req.Spec.Providers = append([]string(nil), parent.Spec.Providers...)
+		if req.Spec.Primary == "" {
+			req.Spec.Primary = parent.Spec.Primary
+		}
+	} else if extra := subtractSet(req.Spec.Providers, parent.Spec.Providers); len(extra) > 0 {
+		return proto.Err(proto.CodeDenied, "spec.providers %v are not among the parent's", extra)
+	}
+	if req.Spec.Primary != "" && !slices.Contains(req.Spec.Providers, req.Spec.Primary) {
+		return proto.Err(proto.CodeBadRequest, "spec.primary %q is not in spec.providers", req.Spec.Primary)
+	}
+	if req.Spec.Sandbox == "" {
+		req.Spec.Sandbox = parent.Spec.Sandbox
+	}
+	if req.WS != "" || parentWS == nil {
+		return nil
+	}
+	if req.Workspace == nil {
+		req.Workspace = &proto.WorkspaceSpec{}
+	}
+	if len(req.Workspace.Bindings) == 0 {
+		req.Workspace.Bindings = append([]string(nil), parentWS.Spec.Bindings...)
+	} else if extra := subtractSet(req.Workspace.Bindings, parentWS.Spec.Bindings); len(extra) > 0 {
+		return proto.Err(proto.CodeDenied, "workspace.bindings %v are not among the parent workspace's", extra)
+	}
+	if req.Workspace.Security.Profile == "" && req.Workspace.Security.MinIsolation == "" {
+		req.Workspace.Security = parentWS.Spec.Security
+	}
+	return nil
+}
+
+// subtractSet returns the members of a that are not in b, in order.
+func subtractSet(a, b []string) []string {
+	var out []string
+	for _, x := range a {
+		if !slices.Contains(b, x) {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // approveAutoAllowed: auto-approval hands the harness every permission it
@@ -333,6 +394,9 @@ func (c *Control) agentCreate(ctx context.Context, subject Subject, req *proto.A
 		return nil, proto.Err(proto.CodeBadRequest, "acp_session_id is longer than 256 bytes")
 	}
 	policy := normalizeAgentPolicy(req.Policy)
+	if policy.StartAt > 0 && time.UnixMilli(policy.StartAt).After(c.now().Add(maxAgentStartDelay)) {
+		return nil, proto.Err(proto.CodeBadRequest, "policy.start_at is more than a year away")
+	}
 	var parent *proto.Agent
 	if req.Parent != "" {
 		p, err := c.agentCopy(req.Parent)
@@ -345,7 +409,19 @@ func (c *Control) agentCreate(ctx context.Context, subject Subject, req *proto.A
 		if agentTerminal(p.Status) {
 			return nil, proto.Err(proto.CodeConflict, "parent agent %s is %s", p.ID, p.Status)
 		}
+		if p.Parent != "" {
+			if gp, err := c.agentCopy(p.Parent); err == nil && gp.Parent != "" {
+				return nil, proto.Err(proto.CodeDenied, "agent trees are at most three deep")
+			}
+		}
 		if err := policyWithin(policy, p.Policy); err != nil {
+			return nil, err
+		}
+		pws, _ := c.wsGet(p.WS)
+		if err := inheritFromParent(req, p, pws); err != nil {
+			return nil, err
+		}
+		if err := validateAgentSpec(&req.Spec); err != nil {
 			return nil, err
 		}
 		parent = p
@@ -448,7 +524,7 @@ func (c *Control) agentCreate(ctx context.Context, subject Subject, req *proto.A
 		metrics.AgentQuotaRejected.Inc()
 		return nil, proto.Err(proto.CodeResourceExhausted, "tenant agent limit %d reached", limit)
 	}
-	a.Status = deriveAgentStatus(a, current)
+	a.Status = deriveAgentStatus(a, current, now)
 	wsCopy := *current
 	payload := map[string]any{
 		"ws": a.WS, "owns_ws": ownsWS, "recipe": a.Spec.Recipe, "mode": a.Mode,
@@ -1086,7 +1162,7 @@ func (c *Control) agentFork(ctx context.Context, subject Subject, req *proto.Age
 		metrics.AgentQuotaRejected.Inc()
 		return nil, proto.Err(proto.CodeResourceExhausted, "tenant agent limit %d reached", limit)
 	}
-	a.Status = deriveAgentStatus(a, current)
+	a.Status = deriveAgentStatus(a, current, now)
 	wsCopy := *current
 	events := []*proto.Event{
 		c.agentEvent(proto.EvAgentForked, a, &wsCopy, subject.ID, "", map[string]any{"from": src.ID, "from_ws": src.WS, "snapshot": snapshot, "task_hash": proto.AgentTaskHash(req.Task)}),
@@ -1384,6 +1460,9 @@ func (c *Control) agentReconcile(ctx context.Context) {
 	for _, id := range keys {
 		a := c.agents[id]
 		if agentTerminal(a.Status) {
+			if a.Parent != "" && !a.ParentNotified {
+				c.notifyParentLocked(a, now)
+			}
 			continue
 		}
 		ws := c.workspaces[a.WS]
@@ -1415,6 +1494,8 @@ func (c *Control) agentReconcile(ctx context.Context) {
 		}
 		if ws != nil && !agentTerminal(a.Status) {
 			switch {
+			case a.Policy.StartAt > now.UnixMilli() && run == nil:
+				// Scheduled: hold the inbox, do not launch, do not wake.
 			case run == nil && len(a.Inbox) > 0 && ws.State == proto.WSClaimed && c.send.Online(ws.Node) && !c.agentRetry[a.ID].After(now):
 				attempt := 1
 				if n := len(a.Runs); n > 0 {
@@ -1475,6 +1556,64 @@ func (c *Control) agentReconcile(ctx context.Context) {
 			c.logger.Warn("agent policy sleep", "agent", id, "err", err)
 		}
 	}
+}
+
+// notifyParentLocked tells a live parent that its child reached a terminal
+// status: one agent.child.finished event on the parent's stream and one
+// AgentMessageChild in the parent's inbox, which the next turn delivers as a
+// prompt so the harness itself learns the outcome. The child's row records
+// the notification so a restart does not repeat it; both rows and the event
+// commit together. A full inbox retries next tick. A parent that is gone or
+// terminal is marked notified without a message. Caller holds c.mu.
+func (c *Control) notifyParentLocked(child *proto.Agent, now time.Time) {
+	parent := c.agents[child.Parent]
+	if parent == nil || agentTerminal(parent.Status) {
+		child.ParentNotified = true
+		if err := c.persistAgent(child); err != nil {
+			c.logger.Error("persist child", "agent", child.ID, "err", err)
+		}
+		return
+	}
+	if len(parent.Inbox) >= proto.MaxAgentInbox {
+		return
+	}
+	summary, err := json.Marshal(proto.ChildSummary{Child: child.ID, Name: child.Name, Status: child.Status, Reason: child.StatusReason, Turns: child.Turns, WS: child.WS, URL: child.URL})
+	if err != nil {
+		c.logger.Error("child summary", "agent", child.ID, "err", err)
+		return
+	}
+	msg := proto.AgentMessage{ID: ids.New("m"), Kind: proto.AgentMessageChild, Text: string(summary), By: "agent:" + child.ID, At: now.UnixMilli()}
+	pws := c.workspaces[parent.WS]
+	prevStatus, prevUpdated := parent.Status, parent.UpdatedAt
+	parent.Inbox = append(parent.Inbox, msg)
+	parent.UpdatedAt = now.UnixMilli()
+	child.ParentNotified = true
+	events := []*proto.Event{c.agentEvent(proto.EvAgentChildDone, parent, pws, "", "", map[string]any{
+		"child": child.ID, "status": child.Status, "reason": child.StatusReason, "turns": child.Turns, "message": msg.ID,
+	})}
+	if more, err := c.refreshAgentStatusLocked(parent, ""); err == nil {
+		events = append(events, more...)
+	} else {
+		c.logger.Error("agent status", "agent", parent.ID, "err", err)
+	}
+	err = c.transact(func(tx *eventlog.Tx) error {
+		for _, a := range []*proto.Agent{parent, child} {
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO agents(id, data) VALUES(?,?)`, a.ID, proto.MustMarshal(a)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, events)
+	if err != nil {
+		// Undo the in-memory append so the next tick retries from the durable
+		// truth rather than from a message the database never saw.
+		parent.Inbox = parent.Inbox[:len(parent.Inbox)-1]
+		parent.Status, parent.UpdatedAt = prevStatus, prevUpdated
+		child.ParentNotified = false
+		c.logger.Error("notify parent", "agent", parent.ID, "child", child.ID, "err", err)
+		return
+	}
+	metrics.AgentChildrenFinished.Inc()
 }
 
 // nodeGone reports whether a node has been offline past the lease: an

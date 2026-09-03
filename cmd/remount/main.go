@@ -491,6 +491,8 @@ func cmdServer(ctx context.Context, args []string) error {
 	agentUI := fs.String("agent-ui", envOr("REMOUNT_AGENT_UI", ""), "operator UI URL that /a/{id} redirects to; {id} is replaced, else appended")
 	cors := fs.String("cors", envOr("REMOUNT_CORS", ""), "comma-separated browser origins allowed to call the HTTP API (\"*\" for any, without credentials)")
 	maxAPIClients := fs.Int("max-api-clients", 256, "maximum distinct HTTP API credentials with a live in-process client")
+	webhookSecret := fs.String("webhook-secret", os.Getenv("REMOUNT_WEBHOOK_SECRET"), "HMAC-SHA256 secret that signs POST /v1/events (X-Remount-Signature / X-Hub-Signature-256)")
+	webhookToken := fs.String("webhook-token", os.Getenv("REMOUNT_WEBHOOK_TOKEN"), "credential signed webhooks act as when they create or wake agents (default: append-only)")
 	parse(fs, args)
 	if *publicURL != "" {
 		u, err := url.Parse(*publicURL)
@@ -523,6 +525,7 @@ func cmdServer(ctx context.Context, args []string) error {
 		MaxMutationRecords: *maxMutationRecords, MaxTimers: *maxTimers, MaxTimersPerWorkspace: *maxWorkspaceTimers,
 		MaxConcurrentRequests: *maxConcurrentRequests,
 		PublicURL:             *publicURL, AgentURLBase: *agentUI, CORSOrigins: splitList(*cors), MaxAPIClients: *maxAPIClients,
+		WebhookSecret: *webhookSecret, WebhookToken: *webhookToken,
 	})
 	if err != nil {
 		return err

@@ -66,6 +66,9 @@ type Agent struct {
 	// Failures counts consecutive runs that ended in error. One is retried
 	// (with session/load); the second fails the agent.
 	Failures int `cbor:"failures,omitempty" json:"failures,omitempty"`
+	// ParentNotified is set once a finished child has been reported to its
+	// parent (agent.child.finished plus an inbox message).
+	ParentNotified bool `cbor:"parent_notified,omitempty" json:"parent_notified,omitempty"`
 }
 
 // Agent.Mode values.
@@ -78,6 +81,7 @@ const (
 // through them; sleeping, failed, finished and destroyed are the exits.
 const (
 	AgentCreating        = "creating"         // workspace not yet claimed
+	AgentScheduled       = "scheduled"        // Policy.StartAt is in the future; nothing runs before it
 	AgentRunning         = "running"          // a prompt is in flight or queued
 	AgentWaitingInput    = "waiting_input"    // end_turn with an empty inbox; the harness is alive and waiting
 	AgentIdle            = "idle"             // no harness process and nothing queued; a message starts a new run
@@ -122,6 +126,10 @@ type AgentPolicy struct {
 	// MaxTurns finishes the agent after that many prompt turns; zero is
 	// unlimited.
 	MaxTurns int `cbor:"max_turns,omitempty" json:"max_turns,omitempty"`
+	// StartAt (Unix ms) holds every run until then: the agent is created,
+	// its workspace provisioned, and its inbox kept, but the harness is not
+	// launched before StartAt. Zero starts immediately.
+	StartAt int64 `cbor:"start_at,omitempty" json:"start_at,omitempty"`
 }
 
 // AgentPolicy.Approve values.
@@ -153,7 +161,21 @@ const (
 	// mid-turn steering, so it is queued as a follow-up and the response says
 	// degraded.
 	AgentMessageSteer = "steer"
+	// AgentMessageChild is the control plane's summary of a finished child
+	// agent, delivered to the parent as a prompt turn. By is "agent:<id>".
+	AgentMessageChild = "child"
 )
+
+// ChildSummary is the JSON text of an AgentMessageChild message.
+type ChildSummary struct {
+	Child  string `json:"child"`
+	Name   string `json:"name,omitempty"`
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+	Turns  int    `json:"turns"`
+	WS     string `json:"ws"`
+	URL    string `json:"url,omitempty"`
+}
 
 // AgentRun is one launch of the harness process. A run spans many turns; it
 // ends when the process exits, is cancelled, or is lost with its node.
@@ -656,22 +678,23 @@ const (
 // ---------------------------------------------------------------------------
 
 const (
-	EvAgentCreated     = "agent.created"      // payload {agent, ws, recipe, mode, task_hash, parent}
-	EvAgentRunStarted  = "agent.run.started"  // payload {agent, run, attempt, node, transcript}
-	EvAgentRunFinished = "agent.run.finished" // payload {agent, run, stop_reason, error, cancelled, turns}
-	EvAgentTurn        = "agent.turn"         // payload {agent, run, message, stop_reason, tokens}
-	EvAgentWaiting     = "agent.waiting"      // payload {agent, kind: input|approval}
-	EvAgentSlept       = "agent.slept"        // payload {agent, ws, timer}
-	EvAgentWoken       = "agent.woken"        // payload {agent, ws, by: message|approval|timer|request|preview|diff}
-	EvAgentForked      = "agent.forked"       // payload {agent, from, snapshot}
-	EvAgentFailed      = "agent.failed"       // payload {agent, reason}
-	EvAgentFinished    = "agent.finished"     // payload {agent, reason}
-	EvAgentDestroyed   = "agent.destroyed"    // payload {agent, ws}
-	EvAgentCancelled   = "agent.cancelled"    // payload {agent, run, dropped, by}
-	EvAgentToolCall    = "agent.tool_call"    // payload {agent, run, tool_call, kind, title, status, locations}
-	EvAgentSession     = "agent.session"      // payload {agent, run, acp_session_id, loaded, capabilities}
-	EvAgentMessage     = "agent.message"      // payload {agent, message, kind, text_hash, degraded}
-	EvApprovalPending  = "approval.pending"   // payload {approval, agent, kind, title}
-	EvApprovalDecided  = "approval.decided"   // payload {approval, agent, option, denied, by}
-	EvApprovalExpired  = "approval.expired"   // payload {approval, agent, run}
+	EvAgentCreated     = "agent.created"        // payload {agent, ws, recipe, mode, task_hash, parent}
+	EvAgentRunStarted  = "agent.run.started"    // payload {agent, run, attempt, node, transcript}
+	EvAgentRunFinished = "agent.run.finished"   // payload {agent, run, stop_reason, error, cancelled, turns}
+	EvAgentTurn        = "agent.turn"           // payload {agent, run, message, stop_reason, tokens}
+	EvAgentWaiting     = "agent.waiting"        // payload {agent, kind: input|approval}
+	EvAgentSlept       = "agent.slept"          // payload {agent, ws, timer}
+	EvAgentWoken       = "agent.woken"          // payload {agent, ws, by: message|approval|timer|request|preview|diff}
+	EvAgentForked      = "agent.forked"         // payload {agent, from, snapshot}
+	EvAgentFailed      = "agent.failed"         // payload {agent, reason}
+	EvAgentFinished    = "agent.finished"       // payload {agent, reason}
+	EvAgentDestroyed   = "agent.destroyed"      // payload {agent, ws}
+	EvAgentCancelled   = "agent.cancelled"      // payload {agent, run, dropped, by}
+	EvAgentToolCall    = "agent.tool_call"      // payload {agent, run, tool_call, kind, title, status, locations}
+	EvAgentSession     = "agent.session"        // payload {agent, run, acp_session_id, loaded, capabilities}
+	EvAgentMessage     = "agent.message"        // payload {agent, message, kind, text_hash, degraded}
+	EvAgentChildDone   = "agent.child.finished" // payload {agent, child, status, reason, turns} on the parent's stream
+	EvApprovalPending  = "approval.pending"     // payload {approval, agent, kind, title}
+	EvApprovalDecided  = "approval.decided"     // payload {approval, agent, option, denied, by}
+	EvApprovalExpired  = "approval.expired"     // payload {approval, agent, run}
 )

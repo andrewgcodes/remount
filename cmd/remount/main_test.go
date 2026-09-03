@@ -473,7 +473,11 @@ func TestRunQueueFlagsValidateBeforeDialing(t *testing.T) {
 		want string
 	}{
 		{"sleep needs queue or agent", []string{"custom", "--sleep-after", "1h", "--", "true"}, "needs --queue"},
-		{"sleep until needs queue", []string{"opencode", "--binding", "b_openai", "--sleep-until", "09:00", "--", "x"}, "needs --queue"},
+		{"sleep until needs queue or agent", []string{"custom", "--sleep-until", "09:00", "--", "true"}, "needs --queue"},
+		{"agent sleep until is at", []string{"opencode", "--binding", "b_openai", "--sleep-until", "09:00", "--at", "1h", "--", "x"}, "pass one"},
+		{"parent needs agent", []string{"custom", "--parent", "ag_1", "--", "true"}, "apply to agents"},
+		{"at needs agent", []string{"opencode", "--binding", "b_openai", "--pty", "--at", "1h", "--", "x"}, "apply to agents"},
+		{"at in the past", []string{"opencode", "--binding", "b_openai", "--at", "2001-01-01T00:00:00Z", "--", "x"}, "in the past"},
 		{"max turns needs agent", []string{"custom", "--max-turns", "2", "--", "true"}, "--max-turns"},
 		{"agent timeout", []string{"opencode", "--binding", "b_openai", "--timeout", "1h", "--", "x"}, "--timeout applies to sessions"},
 		{"agent negative sleep", []string{"opencode", "--binding", "b_openai", "--sleep-after", "-1s", "--", "x"}, "negative"},

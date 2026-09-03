@@ -3,6 +3,7 @@ package sim
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -647,4 +648,128 @@ func mirrorRecords(t *testing.T, ctx context.Context, c *client.Client, agent st
 
 func agentTerminalStatus(s string) bool {
 	return s == proto.AgentFailed || s == proto.AgentFinished || s == proto.AgentDestroyed
+}
+
+// A child agent inherits its parent's caps and never exceeds them; when it
+// finishes, the parent hears about it as a prompt turn and an event (1A.8,
+// E22 with the fake harness).
+func TestAgentChildReportsToParent(t *testing.T) {
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("c1")
+	ctx := ctxT(t, 120*time.Second)
+	parent, err := c.CreateAgent(ctx, proto.AgentCreateReq{
+		Name:      "parent",
+		Workspace: &proto.WorkspaceSpec{Name: "parent-ws"},
+		Spec:      proto.AgentSpec{Recipe: "custom", Task: "coordinate", ACPCommand: fakeACPCommand(t, "echo"), Sandbox: "read-only"},
+		Policy:    proto.AgentPolicy{Approve: proto.ApproveNever, MaxTurns: 4},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitAgent(t, ctx, c, parent.ID, "parent waiting", func(a *proto.Agent) bool { return a.Status == proto.AgentWaitingInput })
+
+	// A child may not hold what the parent does not: providers, workspace
+	// bindings, a looser policy.
+	for name, req := range map[string]proto.AgentCreateReq{
+		"providers": {Parent: parent.ID, Workspace: &proto.WorkspaceSpec{}, Spec: proto.AgentSpec{Recipe: "custom", Task: "x", ACPCommand: fakeACPCommand(t, "echo"), Providers: []string{"openai"}}},
+		"bindings":  {Parent: parent.ID, Workspace: &proto.WorkspaceSpec{Bindings: []string{"b_secret"}}, Spec: proto.AgentSpec{Recipe: "custom", Task: "x", ACPCommand: fakeACPCommand(t, "echo")}},
+		"turns":     {Parent: parent.ID, Workspace: &proto.WorkspaceSpec{}, Spec: proto.AgentSpec{Recipe: "custom", Task: "x", ACPCommand: fakeACPCommand(t, "echo")}, Policy: proto.AgentPolicy{MaxTurns: 10}},
+		"approve":   {Parent: parent.ID, Workspace: &proto.WorkspaceSpec{}, Spec: proto.AgentSpec{Recipe: "custom", Task: "x", ACPCommand: fakeACPCommand(t, "echo")}, Policy: proto.AgentPolicy{Approve: proto.ApproveOnRequest, MaxTurns: 1}},
+	} {
+		if _, err := c.CreateAgent(ctx, req); !errors.Is(err, &proto.Error{Code: proto.CodeDenied}) {
+			t.Fatalf("%s: child create error = %v, want denied", name, err)
+		}
+	}
+
+	child, err := c.CreateAgent(ctx, proto.AgentCreateReq{
+		Name:      "child",
+		Parent:    parent.ID,
+		Workspace: &proto.WorkspaceSpec{Name: "child-ws"},
+		Spec:      proto.AgentSpec{Recipe: "custom", Task: "do one thing", ACPCommand: fakeACPCommand(t, "echo")},
+		Policy:    proto.AgentPolicy{Approve: proto.ApproveNever, MaxTurns: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.Parent != parent.ID || child.Spec.Sandbox != "read-only" || child.WS == parent.WS {
+		t.Fatalf("child = %+v", child)
+	}
+	waitAgent(t, ctx, c, child.ID, "child finished", func(a *proto.Agent) bool { return a.Status == proto.AgentFinished })
+
+	// The parent's next turn is the child's summary, and only once.
+	p := waitAgent(t, ctx, c, parent.ID, "parent consumed the child summary", func(a *proto.Agent) bool {
+		return a.Turns == 2 && len(a.Inbox) == 0
+	})
+	text := string(mirrorBytes(t, ctx, c, parent.ID, 0))
+	if !strings.Contains(text, child.ID) || !strings.Contains(text, `\"status\":\"finished\"`) && !strings.Contains(text, `"status":"finished"`) {
+		t.Fatalf("parent transcript lacks the child summary: %s", text)
+	}
+	types := eventTypes(t, ctx, c, p.WS)
+	if types[proto.EvAgentChildDone] != 1 {
+		t.Fatalf("parent events = %v", types)
+	}
+	got := waitAgent(t, ctx, c, child.ID, "child marked notified", func(a *proto.Agent) bool { return a.ParentNotified })
+	if got.Status != proto.AgentFinished {
+		t.Fatalf("child = %+v", got)
+	}
+	// A restart of the reconciler does not notify twice.
+	time.Sleep(1500 * time.Millisecond)
+	if again, _ := c.GetAgent(ctx, parent.ID); again.Turns != 2 || len(again.Inbox) != 0 {
+		t.Fatalf("parent notified twice: %+v", again)
+	}
+	kids, err := c.ListAgents(ctx, proto.AgentListReq{Parent: parent.ID})
+	if err != nil || len(kids) != 1 || kids[0].ID != child.ID {
+		t.Fatalf("children = %+v, %v", kids, err)
+	}
+}
+
+// A scheduled agent provisions its workspace and holds the inbox until
+// Policy.StartAt, then runs; messages before the start are kept, not
+// delivered (1A.8).
+func TestAgentScheduledStartHoldsUntilDue(t *testing.T) {
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("c1")
+	ctx := ctxT(t, 90*time.Second)
+	startAt := time.Now().Add(4 * time.Second)
+	a, err := c.CreateAgent(ctx, proto.AgentCreateReq{
+		Name:      "later",
+		Workspace: &proto.WorkspaceSpec{Name: "later-ws"},
+		Spec:      proto.AgentSpec{Recipe: "custom", Task: "first", ACPCommand: fakeACPCommand(t, "echo")},
+		Policy:    proto.AgentPolicy{Approve: proto.ApproveNever, StartAt: startAt.UnixMilli()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CreateAgent(ctx, proto.AgentCreateReq{
+		Workspace: &proto.WorkspaceSpec{}, Spec: proto.AgentSpec{Recipe: "custom", Task: "x", ACPCommand: fakeACPCommand(t, "echo")},
+		Policy: proto.AgentPolicy{StartAt: time.Now().Add(400 * 24 * time.Hour).UnixMilli()},
+	}); !errors.Is(err, &proto.Error{Code: proto.CodeBadRequest}) {
+		t.Fatalf("far future start_at error = %v", err)
+	}
+	if _, err := c.WaitClaimed(ctx, a.WS); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.MessageAgent(ctx, proto.AgentMessageReq{ID: a.ID, Text: "second"}); err != nil {
+		t.Fatal(err)
+	}
+	held, err := c.GetAgent(ctx, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.Status != proto.AgentScheduled || len(held.Runs) != 0 || len(held.Inbox) != 2 {
+		t.Fatalf("before start: %+v", held)
+	}
+	// Both messages are delivered in one run, in order, after the start.
+	done := waitAgent(t, ctx, c, a.ID, "both turns after the start", func(a *proto.Agent) bool {
+		return a.Turns == 2 && len(a.Inbox) == 0
+	})
+	if len(done.Runs) != 1 || done.Runs[0].StartedAt < startAt.UnixMilli() {
+		t.Fatalf("run started early: %+v (start_at %d)", done.Runs, startAt.UnixMilli())
+	}
+	text := string(mirrorBytes(t, ctx, c, a.ID, 0))
+	if strings.Index(text, "first") > strings.Index(text, "second") || strings.Index(text, "first") < 0 {
+		t.Fatalf("turn order: %s", text)
+	}
 }

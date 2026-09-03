@@ -56,6 +56,8 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/re
 - [Terminal](https://github.com/remount-dev/remount/blob/main/docs/api.md#terminal): `GET /v1/agents/{id}/terminal` upgrades to a WebSocket that is the xterm.js endpoint.
 - [Files](https://github.com/remount-dev/remount/blob/main/docs/api.md#files): `/v1/agents/{id}/fs/{path}` is the workspace filesystem, jailed by the node (§7).
 - [Preview proxy](https://github.com/remount-dev/remount/blob/main/docs/api.md#preview-proxy): `/v1/agents/{id}/ports/{port}/{rest}` is an authenticated reverse proxy to TCP `{port}` inside the workspace, the same forward `remount port` uses, for HTTP and WebSocket traffic.
+- [Webhooks](https://github.com/remount-dev/remount/blob/main/docs/api.md#webhooks): `POST /v1/events` takes `{type, stream?, payload?, agent?}` and appends the event.
+- [Scheduling and children](https://github.com/remount-dev/remount/blob/main/docs/api.md#scheduling-and-children): `policy.start_at` (Unix milliseconds) holds the first run until that time: the agent is `scheduled`, its workspace is ready, and messages queue.
 - [Bounds](https://github.com/remount-dev/remount/blob/main/docs/api.md#bounds): Every bound is a `4xx`/`5xx` with a stable code, never a truncated success.
 
 ## Optional

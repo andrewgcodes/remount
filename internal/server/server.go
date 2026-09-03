@@ -91,6 +91,12 @@ type Options struct {
 	// 256 and 10 minutes.
 	MaxAPIClients int
 	APIClientIdle time.Duration
+	// WebhookSecret lets POST /v1/events authenticate with an HMAC-SHA256 of
+	// the body (X-Remount-Signature or X-Hub-Signature-256: sha256=<hex>)
+	// instead of a bearer. WebhookToken is the credential a signed request's
+	// agent actions run as; empty leaves signed requests append-only.
+	WebhookSecret string
+	WebhookToken  string
 }
 
 const (
@@ -691,42 +697,4 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
-}
-
-// handleEvents accepts a JSON event and appends it (webhook wake).
-func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var in struct {
-		Type    string          `json:"type"`
-		Stream  string          `json:"stream"`
-		Payload json.RawMessage `json:"payload"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&in); err != nil || in.Type == "" {
-		http.Error(w, "bad event", http.StatusBadRequest)
-		return
-	}
-	var payload any
-	if len(in.Payload) > 0 {
-		_ = json.Unmarshal(in.Payload, &payload)
-	}
-	e := proto.Event{Type: in.Type, Stream: in.Stream, Principal: "webhook"}
-	if payload != nil {
-		e.Payload = proto.MustMarshal(payload)
-	}
-	// Deliberately not r.Context(): the append, the timers it fires and the
-	// offers that follow outlive this HTTP response.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
-	defer cancel()
-	if err := s.Control.PostEvents(ctx, "webhook", []proto.Event{e}); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusAccepted)
 }
