@@ -172,9 +172,13 @@ prefix check an OpenAI SDK performs.
 
 The broker is also an ordinary HTTP forward proxy. Every session in a workspace
 starts with `HTTP_PROXY`, `HTTPS_PROXY` and their lowercase twins set to the
-broker, and `NO_PROXY` set for loopback. Tools that honor those variables, which
-includes npm, pip, curl and git, route through the broker without any
-configuration.
+broker, and `NO_PROXY` set for loopback plus the broker's own advertised host
+(`host.docker.internal` for Docker workspaces). Tools that honor those
+variables, which includes npm, pip, curl and git, route through the broker
+without any configuration, and requests to `${REMOUNT_BROKER}` itself go
+direct rather than through the proxy. A client that ignores `NO_PROXY` and
+forwards a capability URL through the proxy anyway is still served as a direct
+request; the broker never re-originates a request to itself.
 
 Two request forms behave differently.
 

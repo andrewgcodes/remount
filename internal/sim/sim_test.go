@@ -125,12 +125,21 @@ func (w *world) node(name string, labels map[string]string) *node.Node {
 
 func (w *world) nodeWithBrokerRoots(name string, labels map[string]string, roots *x509.CertPool) *node.Node {
 	w.t.Helper()
+	return w.nodeWith(name, func(o *node.Options) { o.Labels, o.BrokerRootCAs = labels, roots })
+}
+
+// nodeWith starts a node after letting the test adjust the default options.
+func (w *world) nodeWith(name string, adjust func(*node.Options)) *node.Node {
+	w.t.Helper()
 	dir := filepath.Join(w.t.TempDir(), name)
-	n, err := node.New(node.Options{
-		DataDir: dir, Dialer: w.dialer(name), Token: "tok", Labels: labels,
+	opts := node.Options{
+		DataDir: dir, Dialer: w.dialer(name), Token: "tok",
 		ArtifactURL: w.http.URL + "/v1/artifacts", Allow: []string{"127.0.0.1"}, AllowPrivate: []string{"127.0.0.1", "localhost"},
-		BrokerRootCAs: roots,
-	})
+	}
+	if adjust != nil {
+		adjust(&opts)
+	}
+	n, err := node.New(opts)
 	if err != nil {
 		w.t.Fatal(err)
 	}
@@ -812,6 +821,61 @@ func TestSecretBlindWorkspace(t *testing.T) {
 	})
 	if found {
 		t.Fatal("secret on workspace disk")
+	}
+}
+
+// D1: a workspace whose broker is not on loopback (Docker's
+// host.docker.internal) still reaches $REMOUNT_BROKER directly when a
+// proxy-honoring client has HTTPS_PROXY set: one substituted cred.used, no
+// leak_blocked. 127.0.0.2 stands in for the container-visible host address.
+func TestProxyHonoringClientReachesNonLoopbackBroker(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.2:0")
+	if err != nil {
+		t.Skipf("127.0.0.2 not bindable: %v", err)
+	}
+	probe.Close()
+	var gotAuth atomic.Value
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth.Store(r.Header.Get("Authorization"))
+		io.WriteString(w, "ok")
+	}))
+	defer up.Close()
+	upHost := strings.TrimPrefix(up.URL, "https://")
+	w := newWorld(t, control.Binding{ID: "b_api", Secret: "sk-REAL-SECRET", Destinations: []string{upHost}, TTLSec: 60})
+	roots := x509.NewCertPool()
+	roots.AddCert(up.Certificate())
+	w.nodeWith("n1", func(o *node.Options) { o.BrokerRootCAs, o.BrokerAdvertiseHost = roots, "127.0.0.2" })
+	c := w.client("c1")
+	ws := mustWS(t, c, proto.WorkspaceSpec{
+		Bindings: []string{"b_api"},
+		Env:      map[string]string{"API_KEY": "ref:b_api", "API_URL": "${REMOUNT_BROKER}/d/" + upHost},
+	})
+	ctx := ctxT(t, 60*time.Second)
+	out, _, _, _ := c.Run(ctx, ws.ID, "sh", "-c", `echo "$REMOUNT_BROKER"; echo "$HTTPS_PROXY"; echo "$NO_PROXY"`)
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 3 || !strings.HasPrefix(lines[0], "http://127.0.0.2:") || !strings.Contains(lines[1], "@127.0.0.2:") || !strings.Contains(","+lines[2]+",", ",127.0.0.2,") {
+		t.Fatalf("env: %q", out)
+	}
+	out, errb, exit, _ := c.Run(ctx, ws.ID, "sh", "-c", `curl -s -H "Authorization: Bearer $API_KEY" "$API_URL/v1/thing"`)
+	if exit.Code != 0 || string(out) != "ok" {
+		t.Fatalf("curl failed: %d %q %q", exit.Code, out, errb)
+	}
+	if gotAuth.Load() != "Bearer sk-REAL-SECRET" {
+		t.Fatalf("upstream saw %v", gotAuth.Load())
+	}
+	time.Sleep(200 * time.Millisecond)
+	evs, _ := c.ReadEvents(ctx, 1, ws.ID)
+	var used, denied int
+	for _, e := range evs {
+		switch e.Type {
+		case proto.EvCredUsed:
+			used++
+		case proto.EvEgressDenied:
+			denied++
+		}
+	}
+	if used != 1 || denied != 0 {
+		t.Fatalf("cred.used=%d egress.denied=%d", used, denied)
 	}
 }
 

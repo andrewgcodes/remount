@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -78,7 +79,11 @@ type Options struct {
 	// BrokerRootCAs augments trust for broker-reoriginated TLS (primarily
 	// private providers and deterministic integration tests).
 	BrokerRootCAs *x509.CertPool
-	Version       string
+	// BrokerAdvertiseHost overrides the host workspaces dial to reach their
+	// broker. Docker workspaces default to host.docker.internal; an IP
+	// literal here is also the address the broker listens on.
+	BrokerAdvertiseHost string
+	Version             string
 	// Caps advertises extra capabilities (display, gpu …).
 	Caps []string
 	// MaxConcurrentRequests bounds request handlers independently of relay
@@ -2612,11 +2617,14 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 			})
 		},
 	}
-	if handle.Backend() == "docker" {
+	if advertise := n.brokerAdvertiseHost(handle.Backend()); advertise != "" {
 		// Containers cannot reach a host loopback listener. The random
 		// per-workspace capability authenticates this host-gateway listener.
 		brokerOpts.Listen = "0.0.0.0:0"
-		brokerOpts.AdvertiseHost = "host.docker.internal"
+		if ip := net.ParseIP(advertise); ip != nil {
+			brokerOpts.Listen = net.JoinHostPort(advertise, "0")
+		}
+		brokerOpts.AdvertiseHost = advertise
 	}
 	entry.broker = broker.New(brokerOpts)
 	if _, err := entry.broker.Start(); err != nil {
@@ -2678,6 +2686,16 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 		return fmt.Errorf("ws.ready: %w", err)
 	}
 	return nil
+}
+
+func (n *Node) brokerAdvertiseHost(backend string) string {
+	if n.opts.BrokerAdvertiseHost != "" {
+		return n.opts.BrokerAdvertiseHost
+	}
+	if backend == "docker" {
+		return "host.docker.internal"
+	}
+	return ""
 }
 
 func (n *Node) fetchArtifact(ctx context.Context, id string) (io.ReadCloser, error) {

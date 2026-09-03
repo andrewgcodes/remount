@@ -121,6 +121,7 @@ type Broker struct {
 	ln           net.Listener
 	base         string
 	proxyBase    string
+	advertised   string // host:port workspaces dial
 	token        string
 	client       *http.Transport
 	suspended    bool
@@ -276,6 +277,7 @@ func (b *Broker) Start() (string, error) {
 		}
 		advertised = net.JoinHostPort(b.opts.AdvertiseHost, port)
 	}
+	b.advertised = advertised
 	raw := "http://" + advertised
 	b.base = raw + "/c/" + b.token
 	proxyURL := &url.URL{Scheme: "http", Host: advertised, User: url.User(b.token)}
@@ -366,6 +368,7 @@ func Placeholder(l proto.BindingLease) string {
 // EnvFor returns the environment variables a workspace should receive so
 // harnesses reach their providers through the broker.
 func (b *Broker) EnvFor() []string {
+	noProxy := b.NoProxy()
 	return []string{
 		"REMOUNT_BROKER=" + b.base,
 		"REMOUNT_PACKAGE_CONNECTOR=" + b.PackageURL(),
@@ -373,9 +376,35 @@ func (b *Broker) EnvFor() []string {
 		"HTTPS_PROXY=" + b.proxyBase,
 		"http_proxy=" + b.proxyBase,
 		"https_proxy=" + b.proxyBase,
-		"NO_PROXY=127.0.0.1,localhost",
-		"no_proxy=127.0.0.1,localhost",
+		"NO_PROXY=" + noProxy,
+		"no_proxy=" + noProxy,
 	}
+}
+
+// NoProxy returns the NO_PROXY value a workspace needs so that a
+// proxy-honoring client (curl, Node, Python, Go) reaches the broker's
+// capability URLs directly. Without the advertised broker host in this list
+// the client would forward-proxy a placeholder-bearing request to the broker
+// itself, which the broker correctly records as a leak.
+func (b *Broker) NoProxy() string {
+	hosts := []string{"127.0.0.1", "localhost"}
+	if host := b.AdvertisedHost(); host != "" && host != "127.0.0.1" && host != "localhost" {
+		hosts = append(hosts, host)
+	}
+	return strings.Join(hosts, ",")
+}
+
+// AdvertisedHost is the host (without port) workspaces use to reach the
+// broker. It is empty before Start.
+func (b *Broker) AdvertisedHost() string {
+	if b.advertised == "" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(b.advertised)
+	if err != nil {
+		return b.advertised
+	}
+	return host
 }
 
 // ---------------------------------------------------------------------------
@@ -429,7 +458,52 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "remount broker: destination userinfo is not permitted", http.StatusBadRequest)
 			return
 		}
+		if b.selfAddressed(r.URL) {
+			// A client that ignored NO_PROXY forwarded a capability URL through
+			// the proxy. Serve it as the direct request it was meant to be
+			// rather than re-originating a placeholder to ourselves.
+			b.serveSelfAddressed(w, r)
+			return
+		}
 		b.proxy(w, r, r.URL.Scheme, r.URL.Host, r.URL.Path, r.URL.RawQuery)
+	case strings.HasPrefix(r.URL.Path, "/d/"):
+		host, rest := splitDest(strings.TrimPrefix(r.URL.Path, "/d/"))
+		b.proxy(w, r, "https", host, rest, r.URL.RawQuery)
+	case strings.HasPrefix(r.URL.Path, "/http/"):
+		host, rest := splitDest(strings.TrimPrefix(r.URL.Path, "/http/"))
+		b.proxy(w, r, "http", host, rest, r.URL.RawQuery)
+	case strings.HasPrefix(r.URL.Path, "/package/"):
+		host, rest := splitDest(strings.TrimPrefix(r.URL.Path, "/package/"))
+		b.packageProxy(w, r, host, rest, r.URL.RawQuery)
+	case r.URL.Path == "/healthz":
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok\n")
+	default:
+		http.Error(w, "remount broker: use /d/<host>/<path>, /http/<host>/<path>, /package/<host>/<path>, or HTTP proxy mode", http.StatusNotFound)
+	}
+}
+
+// selfAddressed reports whether an absolute proxy target names this broker's
+// own advertised listener.
+func (b *Broker) selfAddressed(u *url.URL) bool {
+	if b.advertised == "" || u.Scheme != "http" {
+		return false
+	}
+	host := u.Host
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		host = net.JoinHostPort(host, "80")
+	}
+	return strings.EqualFold(host, b.advertised)
+}
+
+func (b *Broker) serveSelfAddressed(w http.ResponseWriter, r *http.Request) {
+	r.URL.Scheme, r.URL.Host, r.URL.User = "", "", nil
+	r.Header.Del("Proxy-Authorization")
+	if !b.consumeCapabilityPath(r) {
+		b.rejectUnauthenticated(w, r, false)
+		return
+	}
+	switch {
 	case strings.HasPrefix(r.URL.Path, "/d/"):
 		host, rest := splitDest(strings.TrimPrefix(r.URL.Path, "/d/"))
 		b.proxy(w, r, "https", host, rest, r.URL.RawQuery)
