@@ -16,8 +16,6 @@ import (
 	"remount.dev/remount/internal/provision"
 )
 
-const poolLabel = "remount.pool"
-
 // Spec declares one provider-backed pool. A vendor pool is pinned to one
 // tenant; machines from differently scoped pools are never interchangeable.
 type Spec struct {
@@ -47,6 +45,12 @@ type Node struct {
 // audit event before returning the plaintext token.
 type EnrollmentSource interface {
 	Issue(context.Context, string, string, time.Duration) (string, error)
+}
+
+// LabeledEnrollmentSource durably binds scheduler labels to the enrollment
+// authority. Control must not trust the labels self-reported by a new node.
+type LabeledEnrollmentSource interface {
+	IssueWithLabels(context.Context, string, string, map[string]string, time.Duration) (string, error)
 }
 
 // Action is the observable outcome control turns into pool.scaled or
@@ -174,7 +178,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec Spec, nodes []Node, dem
 
 	desired := spec.Min
 	if demand > 0 {
-		desired = min(spec.Max, max(desired, effective+demand))
+		// Demand is a current count, not an edge-trigger. Provider inventory and
+		// pending creates already satisfy that many units; adding demand to the
+		// effective count on every tick would over-scale while a node boots.
+		desired = min(spec.Max, max(desired, demand))
 	}
 	if effective < desired {
 		return r.scaleUp(ctx, driver, spec, st, effective, desired)
@@ -212,8 +219,11 @@ func (s Spec) Validate() error {
 	if s.IdleScaleDown < 0 {
 		return errors.New("pool: idle scale-down must not be negative")
 	}
-	if s.Labels[poolLabel] != "" && s.Labels[poolLabel] != s.Name {
-		return fmt.Errorf("pool: label %q is reserved", poolLabel)
+	if s.Labels[provision.PoolLabel] != "" && s.Labels[provision.PoolLabel] != s.Name {
+		return fmt.Errorf("pool: label %q is reserved", provision.PoolLabel)
+	}
+	if s.Labels[provision.NodeLabel] != "" {
+		return fmt.Errorf("pool: label %q is reserved", provision.NodeLabel)
 	}
 	b := s.Bootstrap
 	b.Backend = s.Backend
@@ -221,17 +231,26 @@ func (s Spec) Validate() error {
 }
 
 func (r *Reconciler) scaleUp(ctx context.Context, driver provision.Driver, spec Spec, st *state, from, desired int) ([]Action, error) {
-	token, err := r.tokens.Issue(ctx, spec.Name, spec.Tenant, r.opts.EnrollmentTTL)
+	labels := cloneMap(spec.Labels)
+	labels[provision.PoolLabel] = spec.Name
+	nodeID := ids.New("n")
+	labels[provision.NodeLabel] = nodeID
+	var token string
+	var err error
+	if source, ok := r.tokens.(LabeledEnrollmentSource); ok {
+		token, err = source.IssueWithLabels(ctx, spec.Name, spec.Tenant, labels, r.opts.EnrollmentTTL)
+	} else {
+		token, err = r.tokens.Issue(ctx, spec.Name, spec.Tenant, r.opts.EnrollmentTTL)
+	}
 	if err != nil {
 		return r.failed(st, ActionCreateFailed, from, "enrollment", err)
 	}
-	labels := cloneMap(spec.Labels)
-	labels[poolLabel] = spec.Name
 	bootstrap := spec.Bootstrap
 	bootstrap.Backend = spec.Backend
 	bootstrap.EnrollmentToken = token
+	bootstrap.NodeID = nodeID
 	req := provision.Request{
-		Name:   spec.Name + "-" + strings.TrimPrefix(ids.New("node"), "node_"),
+		Name:   spec.Name + "-" + strings.TrimPrefix(nodeID, "n_"),
 		Tenant: spec.Tenant, Region: spec.Region, Size: spec.Size, Labels: labels, Bootstrap: bootstrap,
 	}
 	machine, err := driver.Create(ctx, req)
@@ -301,7 +320,7 @@ func ownedNodes(spec Spec, nodes []Node) ([]Node, error) {
 	seen := map[string]struct{}{}
 	for _, node := range nodes {
 		machine := node.Machine
-		if machine.Provider != spec.Vendor || machine.Tenant != spec.Tenant || machine.Labels[poolLabel] != spec.Name {
+		if machine.Provider != spec.Vendor || machine.Tenant != spec.Tenant || machine.Labels[provision.PoolLabel] != spec.Name {
 			continue
 		}
 		if machine.ID == "" {
@@ -318,6 +337,35 @@ func ownedNodes(spec Spec, nodes []Node) ([]Node, error) {
 }
 
 func (s Spec) key() string { return s.Tenant + "\x00" + s.Name }
+
+// Inventory reads provider-owned machines for exactly one tenant and pool.
+// The provider driver applies the boundary and this method verifies it again
+// before control uses the result for irreversible scale-down decisions.
+func (r *Reconciler) Inventory(ctx context.Context, spec Spec) ([]provision.Machine, error) {
+	if err := spec.Validate(); err != nil {
+		return nil, err
+	}
+	driver := r.drivers[spec.Vendor]
+	if driver == nil {
+		return nil, fmt.Errorf("pool: vendor %q is not configured", spec.Vendor)
+	}
+	machines, err := driver.List(ctx, provision.ListOptions{Pool: spec.Name, Tenant: spec.Tenant})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]provision.Machine, 0, len(machines))
+	for _, machine := range machines {
+		if machine.Provider != spec.Vendor || machine.Tenant != spec.Tenant || machine.Labels[provision.PoolLabel] != spec.Name {
+			return nil, errors.New("pool: provider inventory escaped its tenant or pool boundary")
+		}
+		if machine.ID == "" {
+			return nil, errors.New("pool: provider inventory contains an empty machine id")
+		}
+		out = append(out, provision.CloneMachine(machine))
+	}
+	provision.SortMachines(out)
+	return out, nil
+}
 
 func cloneMap(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in)+1)

@@ -155,12 +155,13 @@ func (c *Control) poolRemove(ctx context.Context, subject Subject, req *proto.Po
 		return err
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	current := c.pools[key]
 	if current == nil || current.UpdatedAt != pool.UpdatedAt {
+		c.mu.Unlock()
 		return proto.Err(proto.CodeConflict, "pool %q changed during removal", req.Name)
 	}
 	if current.Current != 0 {
+		c.mu.Unlock()
 		return proto.Err(proto.CodeConflict, "pool %q still owns %d machines", req.Name, current.Current)
 	}
 	if err := c.transact(func(tx *eventlog.Tx) error {
@@ -169,8 +170,13 @@ func (c *Control) poolRemove(ctx context.Context, subject Subject, req *proto.Po
 		}
 		return c.insertMutationTx(tx.Tx, scope, req.IdempotencyKey, proto.OpPoolRemove, req, struct{}{})
 	}, []*proto.Event{c.poolEvent(proto.EvPoolRemoved, pool, subject.ID, map[string]any{"pool": pool.Spec.Name})}); err != nil {
+		c.mu.Unlock()
 		return err
 	}
 	delete(c.pools, key)
+	c.mu.Unlock()
+	if c.opts.PoolReconciler != nil {
+		c.opts.PoolReconciler.Forget(c.poolSpec(pool))
+	}
 	return nil
 }

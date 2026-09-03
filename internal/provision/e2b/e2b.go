@@ -114,6 +114,7 @@ func (d *Driver) Create(ctx context.Context, request provision.Request) (provisi
 			"REMOUNT_BINARY_URL":   request.Bootstrap.BinaryURL,
 			"REMOUNT_BACKEND":      request.Bootstrap.Backend,
 			"REMOUNT_DATA_DIR":     request.Bootstrap.DataDir,
+			"REMOUNT_NODE_ID":      request.Bootstrap.NodeID,
 		},
 	}
 	var response sandbox

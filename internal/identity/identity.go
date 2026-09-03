@@ -54,6 +54,7 @@ type Enrollment struct {
 	Tenant    string
 	IssuedAt  time.Time
 	ExpiresAt time.Time
+	Labels    map[string]string
 }
 
 // NodeBinding is the durable identity created by consuming an enrollment.
@@ -188,6 +189,16 @@ func (m *Manager) Revoke(ctx context.Context, token string) error {
 // Issue implements pool.EnrollmentSource. The random bearer is returned once;
 // only its SHA-256 digest is committed to the Store.
 func (m *Manager) IssueEnrollment(ctx context.Context, pool, tenant string, ttl time.Duration) (string, error) {
+	return m.issueEnrollment(ctx, pool, tenant, nil, ttl)
+}
+
+// IssueWithLabels binds trusted scheduler labels to a one-time enrollment.
+// A node cannot expand or replace them in its hello.
+func (m *Manager) IssueWithLabels(ctx context.Context, pool, tenant string, labels map[string]string, ttl time.Duration) (string, error) {
+	return m.issueEnrollment(ctx, pool, tenant, labels, ttl)
+}
+
+func (m *Manager) issueEnrollment(ctx context.Context, pool, tenant string, labels map[string]string, ttl time.Duration) (string, error) {
 	if pool == "" || tenant == "" || ttl <= 0 || ttl > 10*time.Minute {
 		return "", errors.New("identity: enrollment needs pool, tenant and ttl <= 10m")
 	}
@@ -198,7 +209,7 @@ func (m *Manager) IssueEnrollment(ctx context.Context, pool, tenant string, ttl 
 	token := "enroll_" + base64.RawURLEncoding.EncodeToString(raw)
 	hash := sha256.Sum256([]byte(token))
 	now := m.now()
-	enrollment := Enrollment{ID: ids.New("enr"), Pool: pool, Tenant: tenant, IssuedAt: now, ExpiresAt: now.Add(ttl)}
+	enrollment := Enrollment{ID: ids.New("enr"), Pool: pool, Tenant: tenant, IssuedAt: now, ExpiresAt: now.Add(ttl), Labels: cloneLabels(labels)}
 	if err := m.store.PutEnrollment(ctx, hash, enrollment, Event{
 		Type: "identity.enrollment_issued", ID: enrollment.ID, Pool: pool, Tenant: tenant,
 	}); err != nil {
@@ -441,11 +452,12 @@ func (s *MemoryStore) EnrollNode(_ context.Context, hash [32]byte, now time.Time
 		return NodeBinding{}, false, false, nil
 	}
 	candidate.Pool, candidate.Tenant = enrollment.Pool, enrollment.Tenant
-	candidate.Labels = cloneLabels(candidate.Labels)
+	candidate.Labels = cloneLabels(enrollment.Labels)
 	if candidate.Labels == nil {
 		candidate.Labels = map[string]string{}
 	}
 	candidate.Labels["pool"], candidate.Labels["tenant"] = candidate.Pool, candidate.Tenant
+	candidate.Labels["remount.pool"], candidate.Labels["remount.node"] = candidate.Pool, candidate.NodeID
 	s.nodes[candidate.NodeID] = cloneBinding(candidate)
 	event.Pool, event.Tenant = candidate.Pool, candidate.Tenant
 	s.events = append(s.events, event)

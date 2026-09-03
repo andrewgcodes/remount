@@ -22,6 +22,7 @@ remount server --listen 0.0.0.0:7443 --data /var/lib/remount --token "$REMOUNT_T
 | `--token` | `$REMOUNT_TOKEN` | shared bearer token, required |
 | `--insecure` | off | allow an empty token, for local experiments only |
 | `--bindings` | none | JSON file of secrets the nodes may lease |
+| `--provisioners` | none | provider registry JSON; credentials are named environment references |
 | `--lease` | `30` | claim lease in seconds |
 | `--mode` | `standalone` | `standalone`, `production-single-tenant`, or `production-multi-tenant` |
 | `--max-concurrent-requests` | `128` | active control request handlers; excess work fails with `resource_exhausted` |
@@ -528,3 +529,33 @@ moved: node=n_06g67p19jj05qnj026t5b8z5wm gen=2 restored_from=art_sha256:d57b4606
 $ remount exec $WS -- uname -srm
 Darwin 25.3.0 arm64
 ```
+## Provider-backed node pools
+
+`remount server --provisioners /etc/remount/provisioners.json` enables the
+drivers explicitly listed in that file. Credentials are never literal JSON
+values: each driver names an environment variable such as `token_env`, and
+server startup fails if it is absent. The bootstrap section is deployment-wide;
+the backend, one-time enrollment token, trusted labels, and fixed node id are
+filled per pool machine.
+
+```json
+{
+  "bootstrap": {
+    "server_url": "https://control.example",
+    "binary_url": "https://control.example/remount",
+    "data_dir": "/var/lib/remount"
+  },
+  "drivers": [
+    {"vendor": "e2b", "token_env": "E2B_API_KEY", "template": "remount-node"}
+  ]
+}
+```
+
+Supported entries are `fly`, `e2b`, `modal`, `ix`, and `ssh`; vendor-specific
+fields are validated at startup. Pools require one-time node enrollment, so a
+server refuses provisioners unless a node authenticator and enrollment source
+are configured. `pool.scaled` and `pool.provision_failed` are the durable
+operator record. After a crash, provider inventory is re-read before any new
+mutation. A machine is eligible for idle destruction only when its
+`remount.node` label exactly matches an online control node reporting zero
+workspace assignments.

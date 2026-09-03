@@ -26,7 +26,9 @@ import (
 	"remount.dev/remount/internal/eventlog"
 	"remount.dev/remount/internal/identity"
 	"remount.dev/remount/internal/metrics"
+	nodepool "remount.dev/remount/internal/pool"
 	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/provision"
 	"remount.dev/remount/internal/relay"
 	"remount.dev/remount/internal/secretsource"
 	"remount.dev/remount/internal/transport"
@@ -104,6 +106,13 @@ type Options struct {
 	// agent actions run as; empty leaves signed requests append-only.
 	WebhookSecret string
 	WebhookToken  string
+	// ProvisionDrivers are explicitly configured whole-node providers. Pools
+	// are enabled only with a node authenticator that can consume the minted
+	// one-time enrollment credentials.
+	ProvisionDrivers     []provision.Driver
+	PoolEnrollmentSource nodepool.EnrollmentSource
+	PoolBootstrap        control.PoolBootstrap
+	PoolOptions          nodepool.Options
 }
 
 const (
@@ -278,13 +287,53 @@ func New(opts Options) (*Server, error) {
 		}
 		return nil, err
 	}
+	var poolReconciler control.PoolReconciler
+	if len(opts.ProvisionDrivers) > 0 {
+		if opts.NodeAuthenticator == nil {
+			_ = log.Close()
+			if opts.DataDir == "" {
+				_ = os.RemoveAll(artDir)
+			}
+			return nil, errors.New("server: provision drivers require one-time node enrollment authentication")
+		}
+		source := opts.PoolEnrollmentSource
+		if source == nil {
+			source, _ = opts.NodeAuthenticator.(nodepool.EnrollmentSource)
+		}
+		if source == nil {
+			_ = log.Close()
+			if opts.DataDir == "" {
+				_ = os.RemoveAll(artDir)
+			}
+			return nil, errors.New("server: provision drivers require an enrollment source")
+		}
+		template := provision.Bootstrap{ServerURL: opts.PoolBootstrap.ServerURL, BinaryURL: opts.PoolBootstrap.BinaryURL,
+			Backend: "configured-per-pool", DataDir: opts.PoolBootstrap.DataDir}
+		if err := template.ValidateTemplate(); err != nil {
+			_ = log.Close()
+			if opts.DataDir == "" {
+				_ = os.RemoveAll(artDir)
+			}
+			return nil, fmt.Errorf("server: invalid pool bootstrap: %w", err)
+		}
+		reconciler, err := nodepool.New(opts.ProvisionDrivers, source, opts.PoolOptions)
+		if err != nil {
+			_ = log.Close()
+			if opts.DataDir == "" {
+				_ = os.RemoveAll(artDir)
+			}
+			return nil, err
+		}
+		poolReconciler = reconciler
+	}
 	ctrl, err := control.New(control.Options{DB: sq.DB(), Log: log, Token: opts.Token,
 		Bindings: opts.Bindings, SecretResolver: opts.SecretResolver, LeaseSec: opts.LeaseSec, Logger: opts.Logger, Artifacts: store,
 		Authenticator: opts.Authenticator, Authorizer: opts.Authorizer, NodeAuthenticator: opts.NodeAuthenticator, ApprovedNodes: opts.ApprovedNodes,
 		SecurityProfileFloor: floor, MaxWorkspacesPerTenant: opts.MaxWorkspacesPerTenant,
 		MaxWorkspacesPerSubject: opts.MaxWorkspacesPerSubject, MaxMutationRecords: opts.MaxMutationRecords,
 		MaxTimers: opts.MaxTimers, MaxTimersPerWorkspace: opts.MaxTimersPerWorkspace,
-		MaxConcurrentRequests: opts.MaxConcurrentRequests, MaxEvents: opts.MaxEvents, PublicURL: opts.PublicURL})
+		MaxConcurrentRequests: opts.MaxConcurrentRequests, MaxEvents: opts.MaxEvents, PublicURL: opts.PublicURL,
+		PoolReconciler: poolReconciler, PoolBootstrap: opts.PoolBootstrap})
 	if err != nil {
 		_ = log.Close()
 		if opts.DataDir == "" {

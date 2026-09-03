@@ -48,6 +48,7 @@ type Bootstrap struct {
 	BinaryURL       string
 	Backend         string
 	DataDir         string
+	NodeID          string
 }
 
 // Machine is the non-secret provider state retained by a pool reconciler.
@@ -113,6 +114,9 @@ func (b Bootstrap) ValidateTemplate() error {
 	if strings.TrimSpace(b.DataDir) == "" || !strings.HasPrefix(b.DataDir, "/") {
 		return errors.New("provision: node data directory must be absolute")
 	}
+	if b.NodeID != "" && (!strings.HasPrefix(b.NodeID, "n_") || len(b.NodeID) < 3) {
+		return errors.New("provision: node id must use the n_ prefix")
+	}
 	return nil
 }
 
@@ -121,11 +125,15 @@ func (b Bootstrap) ValidateTemplate() error {
 // environment; putting a one-time credential in argv makes it observable to
 // other processes and provider diagnostics.
 func (b Bootstrap) NodeArgs() []string {
-	return []string{
+	args := []string{
 		"up", "--server", b.ServerURL,
 		"--backend", b.Backend,
 		"--data", b.DataDir,
 	}
+	if b.NodeID != "" {
+		args = append(args, "--node-id", b.NodeID)
+	}
+	return args
 }
 
 // CloneRequest gives an asynchronous driver private maps while preserving the

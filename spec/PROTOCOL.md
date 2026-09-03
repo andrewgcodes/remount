@@ -330,7 +330,9 @@ idle_scale_down_ms?, region?, size?}, tenant, owner, current, created_at,
 updated_at}`. Provider credentials and enrollment tokens are absent. `current`
 is last observed provider inventory, not authority to place a workspace. Pool
 names are unique inside a tenant, `0 <= min <= max`, `max > 0`, and the
-`remount.pool` label is reserved for reconciliation. Removing a pool with
+`remount.pool` and `remount.node` labels are reserved for reconciliation. The
+latter binds provider inventory to the predetermined node id accepted during
+one-time enrollment; it is never trusted from an unauthenticated hello. Removing a pool with
 non-zero inventory returns `conflict`; it never destroys machines implicitly.
 
 ## 6. Control-plane operations
@@ -1056,7 +1058,8 @@ carries `queue`, `index`, `exit`, `signal`, `status` and `cursor`. Both are on
 the workspace stream and neither carries a task's text.
 
 `pool.created` and `pool.removed` contain only non-secret configuration.
-`pool.scaled` carries `pool`, `from`, `to` and `reason`.
+`pool.scaled` carries `pool`, `from`, `to`, `reason` and, for a provider
+mutation, the non-secret provider machine id.
 `pool.provision_failed` carries a sanitized reason and `retry_at`; it never
 carries a credential, enrollment token, provider response body or bootstrap
 environment.

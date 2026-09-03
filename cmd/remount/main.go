@@ -483,6 +483,7 @@ func cmdServer(ctx context.Context, args []string) error {
 	token := fs.String("token", os.Getenv("REMOUNT_TOKEN"), "shared bearer token (required unless --insecure)")
 	insecure := fs.Bool("insecure", false, "allow an empty token")
 	bindings := fs.String("bindings", "", "bindings JSON file")
+	provisioners := fs.String("provisioners", "", "provider driver JSON file (credentials are env references)")
 	lease := fs.Int64("lease", 30, "claim lease seconds")
 	artifactBytes := fs.Int64("artifact-object-bytes", 8<<30, "maximum compressed bytes per artifact")
 	artifactStoreBytes := fs.Int64("artifact-store-bytes", 64<<30, "maximum retained and staging artifact bytes")
@@ -532,6 +533,10 @@ func cmdServer(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	drivers, poolBootstrap, err := loadProvisioners(*provisioners)
+	if err != nil {
+		return err
+	}
 	var secretResolver secretsource.Resolver
 	for _, binding := range b {
 		if binding.Source == "" {
@@ -546,6 +551,7 @@ func cmdServer(ctx context.Context, args []string) error {
 	}
 	srv, err := server.New(server.Options{
 		DataDir: *data, Token: *token, Bindings: b, SecretResolver: secretResolver, LeaseSec: *lease, Logger: slog.Default(), Mode: *mode,
+		ProvisionDrivers: drivers, PoolBootstrap: poolBootstrap,
 		MaxArtifactBytes: *artifactBytes, MaxArtifactStoreBytes: *artifactStoreBytes, MaxArtifactObjects: *artifactObjects,
 		ArtifactGCInterval: *artifactGCInterval, ArtifactGracePeriod: *artifactGrace,
 		EventRetention: *eventRetention, EventGCInterval: *eventGCInterval, MaxEvents: *maxEvents,
@@ -569,6 +575,7 @@ func cmdUp(ctx context.Context, args []string) error {
 	var c common
 	c.flags(fs)
 	data := fs.String("data", envOr("REMOUNT_NODE_DATA", defaultNodeData()), "node data directory")
+	nodeID := fs.String("node-id", os.Getenv("REMOUNT_NODE_ID"), "fixed n_ identity for one-time provisioned nodes")
 	labels := kvFlag{}
 	fs.Var(labels, "label", "node label k=v (repeatable)")
 	backends := fs.String("backend", "process", "comma-separated backends: process,docker,gvisor")
@@ -605,7 +612,7 @@ func cmdUp(ctx context.Context, args []string) error {
 		return err
 	}
 	*data = dataDir
-	n, err := buildNode(*data, c, labels, *backends, *image, allow, allowPrivate, nodeResourceOptions{
+	n, err := buildNode(*data, *nodeID, c, labels, *backends, *image, allow, allowPrivate, nodeResourceOptions{
 		artifactBytes: *artifactBytes, artifactStoreBytes: *artifactStoreBytes, artifactObjects: *artifactObjects,
 		artifactRetention: *artifactRetention, artifactGCInterval: *artifactGCInterval,
 		connectorCacheBytes: *connectorCacheBytes, connectorWorkspaceBytes: *connectorWorkspaceBytes,
@@ -691,7 +698,7 @@ func cmdStandalone(ctx context.Context, args []string) error {
 		return err
 	}
 	c := common{server: "http://" + addr}
-	n, err := buildNode(filepath.Join(*data, "node"), c, map[string]string{"standalone": "true"}, *backends, workspace.DefaultImage(version), allow, []string{"127.0.0.1", "localhost"}, nodeResourceOptions{})
+	n, err := buildNode(filepath.Join(*data, "node"), "", c, map[string]string{"standalone": "true"}, *backends, workspace.DefaultImage(version), allow, []string{"127.0.0.1", "localhost"}, nodeResourceOptions{})
 	if err != nil {
 		return err
 	}

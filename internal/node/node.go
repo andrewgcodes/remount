@@ -44,7 +44,10 @@ import (
 
 // Options configure a node.
 type Options struct {
-	DataDir  string           // identity, workspaces, spill, artifacts
+	DataDir string // identity, workspaces, spill, artifacts
+	// ID pins a freshly provisioned node to the provider inventory identity.
+	// An existing identity must match; changing it would bypass enrollment.
+	ID       string
 	Dialer   transport.Dialer // how to reach the relay (redialed on failure)
 	Token    string
 	Labels   map[string]string
@@ -329,7 +332,7 @@ func New(opts Options) (*Node, error) {
 	if err := cleanupOrphanSpills(filepath.Join(opts.DataDir, "spill")); err != nil {
 		return nil, err
 	}
-	id, priv, err := loadIdentity(filepath.Join(opts.DataDir, "identity.json"))
+	id, priv, err := loadIdentity(filepath.Join(opts.DataDir, "identity.json"), opts.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -697,11 +700,14 @@ type identityFile struct {
 	Priv []byte `json:"priv"`
 }
 
-func loadIdentity(path string) (string, ed25519.PrivateKey, error) {
+func loadIdentity(path, requestedID string) (string, ed25519.PrivateKey, error) {
 	b, err := os.ReadFile(path)
 	if err == nil {
 		var f identityFile
 		if err := json.Unmarshal(b, &f); err == nil && len(f.Priv) == ed25519.PrivateKeySize && strings.HasPrefix(f.ID, "n_") {
+			if requestedID != "" && requestedID != f.ID {
+				return "", nil, fmt.Errorf("node: requested id %q does not match enrolled identity %q", requestedID, f.ID)
+			}
 			return f.ID, ed25519.PrivateKey(f.Priv), nil
 		}
 		return "", nil, fmt.Errorf("node: identity file %s is corrupt; refusing to replace enrolled identity", path)
@@ -713,7 +719,13 @@ func loadIdentity(path string) (string, ed25519.PrivateKey, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	f := identityFile{ID: ids.New("n"), Priv: priv}
+	if requestedID == "" {
+		requestedID = ids.New("n")
+	}
+	if !strings.HasPrefix(requestedID, "n_") || len(requestedID) < 3 {
+		return "", nil, errors.New("node: requested id must use the n_ prefix")
+	}
+	f := identityFile{ID: requestedID, Priv: priv}
 	b, _ = json.Marshal(f)
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".identity-*")
 	if err != nil {

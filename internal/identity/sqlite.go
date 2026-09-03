@@ -46,6 +46,10 @@ CREATE TABLE IF NOT EXISTS identity_enrollments (
   expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS identity_enrollments_expiry ON identity_enrollments(expires_at);
+CREATE TABLE IF NOT EXISTS identity_enrollment_labels (
+  digest BLOB PRIMARY KEY,
+  labels BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS identity_nodes (
   node_id TEXT PRIMARY KEY,
   pubkey BLOB NOT NULL,
@@ -152,6 +156,13 @@ func (s *SQLiteStore) PutEnrollment(ctx context.Context, hash [32]byte, enrollme
 			hash[:], enrollment.ID, enrollment.Pool, enrollment.Tenant, enrollment.IssuedAt.Unix(), enrollment.ExpiresAt.Unix()); err != nil {
 			return fmt.Errorf("identity: store enrollment: %w", err)
 		}
+		labels, err := json.Marshal(enrollment.Labels)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO identity_enrollment_labels(digest,labels) VALUES(?,?)`, hash[:], labels); err != nil {
+			return err
+		}
 		return tx.Emit(identityEvent(enrollment.IssuedAt, event))
 	})
 	return normalizeDrain(err)
@@ -190,7 +201,18 @@ func (s *SQLiteStore) EnrollNode(ctx context.Context, hash [32]byte, now time.Ti
 			return scanErr
 		}
 		enrollment.IssuedAt, enrollment.ExpiresAt = time.Unix(issuedAt, 0), time.Unix(expiresAt, 0)
+		var enrollmentLabels []byte
+		labelsErr := tx.QueryRowContext(ctx, `SELECT labels FROM identity_enrollment_labels WHERE digest=?`, hash[:]).Scan(&enrollmentLabels)
+		if labelsErr != nil && !errors.Is(labelsErr, sql.ErrNoRows) {
+			return labelsErr
+		}
+		if len(enrollmentLabels) > 0 && json.Unmarshal(enrollmentLabels, &enrollment.Labels) != nil {
+			return errors.New("identity: corrupt enrollment labels")
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM identity_enrollments WHERE digest=?`, hash[:]); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM identity_enrollment_labels WHERE digest=?`, hash[:]); err != nil {
 			return err
 		}
 		if !enrollment.ExpiresAt.After(now) {
@@ -198,10 +220,12 @@ func (s *SQLiteStore) EnrollNode(ctx context.Context, hash [32]byte, now time.Ti
 		}
 		binding = cloneBinding(candidate)
 		binding.Pool, binding.Tenant, binding.EnrolledAt = enrollment.Pool, enrollment.Tenant, now
+		binding.Labels = cloneLabels(enrollment.Labels)
 		if binding.Labels == nil {
 			binding.Labels = map[string]string{}
 		}
 		binding.Labels["pool"], binding.Labels["tenant"] = binding.Pool, binding.Tenant
+		binding.Labels["remount.pool"], binding.Labels["remount.node"] = binding.Pool, binding.NodeID
 		labels, err = json.Marshal(binding.Labels)
 		if err != nil {
 			return err
