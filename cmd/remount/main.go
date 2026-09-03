@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -327,6 +328,17 @@ func absFlagPath(flagName, value string) (string, error) {
 	return abs, nil
 }
 
+// splitList splits a comma-separated flag, dropping empty items.
+func splitList(v string) []string {
+	var out []string
+	for _, item := range strings.Split(v, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
 func envOr(k, d string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -468,7 +480,17 @@ func cmdServer(ctx context.Context, args []string) error {
 	maxWorkspaceTimers := fs.Int("max-workspace-timers", 128, "maximum retained durable timers per workspace")
 	maxConcurrentRequests := fs.Int("max-concurrent-requests", 128, "maximum concurrent control-plane requests")
 	mode := fs.String("mode", envOr("REMOUNT_SECURITY_MODE", server.ModeStandalone), "security mode: standalone, production-single-tenant, production-multi-tenant")
+	publicURL := fs.String("public-url", envOr("REMOUNT_PUBLIC_URL", ""), "externally reachable base URL agent links are minted under (https://host)")
+	agentUI := fs.String("agent-ui", envOr("REMOUNT_AGENT_UI", ""), "operator UI URL that /a/{id} redirects to; {id} is replaced, else appended")
+	cors := fs.String("cors", envOr("REMOUNT_CORS", ""), "comma-separated browser origins allowed to call the HTTP API (\"*\" for any, without credentials)")
+	maxAPIClients := fs.Int("max-api-clients", 256, "maximum distinct HTTP API credentials with a live in-process client")
 	parse(fs, args)
+	if *publicURL != "" {
+		u, err := url.Parse(*publicURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("--public-url %q must be an http(s) URL", *publicURL)
+		}
+	}
 	if *token == "" && !*insecure {
 		return errors.New("--token is required (or --insecure for local experiments)")
 	}
@@ -493,6 +515,7 @@ func cmdServer(ctx context.Context, args []string) error {
 		MaxWorkspacesPerTenant: *maxTenantWorkspaces, MaxWorkspacesPerSubject: *maxSubjectWorkspaces,
 		MaxMutationRecords: *maxMutationRecords, MaxTimers: *maxTimers, MaxTimersPerWorkspace: *maxWorkspaceTimers,
 		MaxConcurrentRequests: *maxConcurrentRequests,
+		PublicURL:             *publicURL, AgentURLBase: *agentUI, CORSOrigins: splitList(*cors), MaxAPIClients: *maxAPIClients,
 	})
 	if err != nil {
 		return err

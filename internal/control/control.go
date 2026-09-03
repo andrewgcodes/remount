@@ -1918,6 +1918,16 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return c.agentTranscript(ctx, subject, req)
+	case proto.OpAgentWake:
+		req, err := decode[proto.AgentWakeReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.agentWakeRequest(ctx, subject, req)
 	case proto.OpApprovalList:
 		req, err := decode[proto.ApprovalListReq](f)
 		if err != nil {

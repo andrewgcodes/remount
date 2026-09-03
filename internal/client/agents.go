@@ -67,6 +67,16 @@ func (c *Client) SleepAgent(ctx context.Context, id string, options ...Operation
 	return &a, err
 }
 
+// WakeAgent resumes a sleeping agent's workspace without prompting it. By is
+// AgentWokenByPreview, AgentWokenByDiff or empty for AgentWokenByRequest.
+func (c *Client) WakeAgent(ctx context.Context, id, by string, options ...OperationOption) (*proto.Agent, error) {
+	req := proto.AgentWakeReq{ID: id, By: by}
+	withKey(&req.IdempotencyKey, options)
+	var a proto.Agent
+	err := c.call(ctx, proto.PeerControl, proto.OpAgentWake, req, &a)
+	return &a, err
+}
+
 // ForkAgent snapshots the workspace and starts a child on the copy.
 func (c *Client) ForkAgent(ctx context.Context, req proto.AgentForkReq, options ...OperationOption) (*proto.Agent, error) {
 	withKey(&req.IdempotencyKey, options)
