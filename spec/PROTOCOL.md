@@ -297,6 +297,9 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `ws.sleep` | C | `WSSleepReq{id, after_sec\|at\|on, idem}` → `Timer` |
 | `ws.wake` | C | `WSGetReq{id, idem}` → `Workspace` |
 | `ws.acl` | C | `WSACLReq{id, acl{readers, writers}, idem}` → `Workspace`; owner or admin only; replaces the ACL and advances `authz_revision` (§4.1) |
+| `base.create` | C | `BaseCreateReq{name, artifact, workspace?, idem}` → `Base`; pins an uploaded artifact under a tenant-unique name (§10.1) |
+| `base.list` | C | → `BaseListRes{bases}`; the caller's tenant only, unless admin |
+| `base.remove` | C | `BaseRemoveReq{name, idem}` → `{}`; owner or admin only |
 | `grant` | C | `GrantReq{ws}` → `Grant` |
 | `node.list` | C | → `NodeListRes{nodes}` |
 | `timer.list` | C | → `TimerListRes{timers}` |
@@ -604,6 +607,28 @@ deterministic archive (the reference implementation's `localfs.Pack` honors
 applied with `fs.apply_tar` (§7); a pull is a `ws.snapshot` with `upload:true`
 followed by `GET`.
 
+### 10.1 Bases
+
+A **base** is a named, pinned artifact: `Base{name, tenant, owner, artifact,
+workspace?, bytes, created_at}`. `base.create` verifies the artifact's digest
+and records the pin; `WorkspaceSpec.base` then resolves to
+`restore_from = base.artifact` at `ws.create` time, so the workspace itself
+carries the artifact id and outlives the base. `base` and `restore_from` are
+mutually exclusive in one request.
+
+Names match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` and are unique per tenant;
+two tenants may each own a base called `golden`. Any member of the tenant may
+list a base or create a workspace from it; only its owner or an admin may
+remove it. An implementation bounds the number of pinned bases per tenant and
+refuses the excess with `resource_exhausted`.
+
+A pinned artifact is a GC root: artifact garbage collection must not unlink it
+while the base exists. `base.remove` drops the pin only; workspaces created
+from the base keep their own `restore_from` reference. A `ws.create` replay
+whose idempotency key was first used with `base: NAME` returns the original
+workspace even after that base is removed — the fingerprint covers the request
+as sent, not the resolved artifact.
+
 ## 11. The event log
 
 Every consequential action is an event. Transactionally persisted resource
@@ -639,8 +664,13 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `fs.write`, `fs.edit`, `fs.remove`, `fs.apply_tar`,
 `cred.used`, `egress.allowed`, `egress.denied`, `timer.set`, `timer.fired`,
 `peer.gone`, `ws.fenced`, `ws.state_changed`, `event.producer_gap`,
-`fleet.quarantine.requested`, `fleet.quarantine.target`, and
-`fleet.quarantine.completed`.
+`fleet.quarantine.requested`, `fleet.quarantine.target`,
+`fleet.quarantine.completed`, `base.created`, and `base.removed`.
+
+`base.created` and `base.removed` are tenant-scoped rather than
+workspace-scoped: `stream` is the base name, `tenant` is set, `workspace` is
+empty, and the payload carries `name`, `artifact`, `workspace` (the snapshot's
+source, if any) and `bytes`.
 
 `fs.apply_tar` summarizes one overlay: `artifact`, `files`, `dirs`, `bytes`,
 and `complete:false` when a refusal partway through left some files written.
