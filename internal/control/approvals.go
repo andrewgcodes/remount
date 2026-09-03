@@ -1,6 +1,7 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -470,19 +471,40 @@ func (c *Control) approvalDecide(ctx context.Context, subject Subject, req *prot
 			return nil, proto.Err(proto.CodeBadRequest, "option %q is not one the harness offered", req.Option)
 		}
 	case proto.ApprovalElicitation:
+		if req.Option != "" {
+			c.mu.Unlock()
+			return nil, proto.Err(proto.CodeBadRequest, "an elicitation takes content or denied, not an option")
+		}
 		if !req.Denied && len(req.Content) == 0 {
 			c.mu.Unlock()
 			return nil, proto.Err(proto.CodeBadRequest, "an elicitation needs content or denied")
 		}
-		decision.Content = append(json.RawMessage(nil), req.Content...)
+		if len(req.Content) > 0 && !isJSONObject(req.Content) {
+			c.mu.Unlock()
+			return nil, proto.Err(proto.CodeBadRequest, "elicitation content must be a JSON object of form fields")
+		}
+		if !req.Denied {
+			decision.Content = append(json.RawMessage(nil), req.Content...)
+		}
 	case proto.ApprovalEgress:
-		if req.Option != "" && req.Option != "allow" && req.Option != "deny" {
+		switch {
+		case req.Option == "" || req.Option == "deny" || (req.Option == "allow" && !req.Denied):
+		default:
 			c.mu.Unlock()
 			return nil, proto.Err(proto.CodeBadRequest, "an egress approval takes allow, deny or denied")
 		}
 		if req.Option == "deny" {
 			decision.Denied = true
 		}
+		if decision.Denied {
+			decision.Option = "deny"
+		} else {
+			decision.Option = "allow"
+		}
+	default:
+		kind := live.Kind
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeInternal, "approval %s has unknown kind %q", ap.ID, kind)
 	}
 	live.Status = proto.ApprovalDecided
 	live.Decision = &decision
@@ -523,6 +545,13 @@ func (c *Control) approvalDecide(ctx context.Context, subject Subject, req *prot
 		go c.sendDecision(context.WithoutCancel(ctx), node, *send)
 	}
 	return cp, nil
+}
+
+// isJSONObject reports whether valid JSON is an object, which is the only
+// shape an elicitation's form content can take.
+func isJSONObject(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && trimmed[0] == '{'
 }
 
 func firstAllowOption(opts []proto.ApprovalOption) string {

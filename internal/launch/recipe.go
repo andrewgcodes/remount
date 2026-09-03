@@ -549,6 +549,25 @@ func (r *Recipe) ACPArgv(d Data) ([]string, error) {
 	return out.ACP, nil
 }
 
+// InstallScript renders the recipe's install script, "" when it has none.
+func (r *Recipe) InstallScript(d Data) (string, error) {
+	if r.Install == "" {
+		return "", nil
+	}
+	out, err := r.render(d)
+	if err != nil {
+		return "", err
+	}
+	return out.Install, nil
+}
+
+// InstallMarkerPath is the file the node writes once a recipe's install
+// script has run in a materialization; it holds the workspace generation so
+// a move (new generation, possibly a different image) installs again.
+func (r *Recipe) InstallMarkerPath() string {
+	return LauncherDir + "/" + r.Name + ".installed"
+}
+
 // UIArgv renders the argv of the recipe's web UI bound to d.Port.
 func (r *Recipe) UIArgv(d Data) ([]string, error) {
 	if r.UI == nil {

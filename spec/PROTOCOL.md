@@ -411,6 +411,16 @@ failures fail the agent. `agent.report` is refused with `conflict` for a
 stale generation, `unauthorized` from a node that does not hold the run, and
 is idempotent per `(run, seq)`.
 
+Before it spawns the harness, the node runs the recipe's `install` script
+once per workspace generation (marker `.remount/launch/<recipe>.installed`
+holding the generation), the same step `remount run` performs from the
+client. A move lands on a fresh generation and installs again; a retry on the
+same node does not. The install runs as an exec session with the workspace's
+broker environment, is bounded to fifteen minutes, and its tail is written to
+the run's transcript on the stderr stream. A failed install finishes the run
+with `exit_code: -1` and an error naming the exit status; the marker is not
+written.
+
 `agent.message` kinds are `follow_up` (default) and `steer`. ACP has no
 mid-turn input, so a `steer` is queued as a follow-up and the response says
 `degraded: true`. The inbox is bounded (64) and rejects with
@@ -450,6 +460,17 @@ what it parked (`delivered_at: -1` for an undelivered decision) and the
 harness asks again on its next turn. At most 64 approvals per agent may be
 pending. `detail` is the harness's raw request (bounded to 64 KiB) and
 appears in `approval.get`, never in an event payload.
+
+`approval.decide` validates against the kind. `tool_call`: `option` must be
+one the harness offered; an empty `option` without `denied` picks the first
+`allow_once`/`allow_always` option and is `bad_request` when there is none.
+`elicitation`: `content` must be a JSON object (the form fields) unless
+`denied`, which discards any content; `option` is refused. `egress`: `option`
+is `allow`, `deny` or absent (allow), `denied` also denies, and the recorded
+decision always carries `option: allow|deny`. A node may only park
+`tool_call` and `elicitation`; `egress` rows come from the broker. A second
+decision on any row is `conflict`; a replay with the same idempotency key
+returns the row as decided.
 
 ## 7. Node operations
 
