@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"remount.dev/remount/internal/metrics"
@@ -37,26 +38,64 @@ var (
 	// ErrTooLarge means an input exceeded the configured compressed-byte
 	// limit. At most limit+1 bytes are read before the upload is rejected.
 	ErrTooLarge = errors.New("artifact: compressed data exceeds limit")
+	// ErrStoreFull means publishing another artifact would exceed the store's
+	// configured byte or object budget. Active temporary uploads count toward
+	// both budgets so concurrent callers cannot overcommit the disk.
+	ErrStoreFull = errors.New("artifact: store capacity exhausted")
 )
+
+// StoreOptions bounds one content-addressed artifact store. Zero values mean
+// unlimited; production callers should always configure finite values.
+type StoreOptions struct {
+	MaxBytes   int64
+	MaxObjects int
+}
+
+// StoreStats is a point-in-time view of durable blobs and active staging
+// reservations. Reserved resources are included separately so diagnostics can
+// distinguish retained data from uploads that are still in progress.
+type StoreStats struct {
+	Bytes           int64
+	Objects         int
+	ReservedBytes   int64
+	ReservedObjects int
+	MaxBytes        int64
+	MaxObjects      int
+}
+
+// GCResult describes one resumable garbage-collection pass.
+type GCResult struct {
+	Scanned       int
+	Referenced    int
+	GraceRetained int
+	Removed       int
+	RemovedBytes  int64
+}
 
 // RestoreLimits bounds the resources consumed while expanding an artifact.
 // The compressed size is bounded by the artifact store; these limits protect
 // the node from a small gzip stream expanding until it fills the workspace
 // volume.
 type RestoreLimits struct {
-	MaxExpandedBytes int64
-	MaxEntries       int
-	MaxPathBytes     int
-	MaxDepth         int
+	MaxCompressedBytes  int64
+	MaxExpandedBytes    int64
+	MaxFileBytes        int64
+	MaxEntries          int
+	MaxPathBytes        int
+	MaxDepth            int
+	MaxCompressionRatio int64
 }
 
 // DefaultRestoreLimits are deliberately generous enough for ordinary source
 // trees while still putting a finite ceiling on hostile archives.
 var DefaultRestoreLimits = RestoreLimits{
-	MaxExpandedBytes: 8 << 30,
-	MaxEntries:       1_000_000,
-	MaxPathBytes:     4096,
-	MaxDepth:         256,
+	MaxCompressedBytes:  8 << 30,
+	MaxExpandedBytes:    8 << 30,
+	MaxFileBytes:        2 << 30,
+	MaxEntries:          1_000_000,
+	MaxPathBytes:        4096,
+	MaxDepth:            256,
+	MaxCompressionRatio: 1000,
 }
 
 // ID formats a digest.
@@ -79,19 +118,115 @@ func Digest(id string) (string, error) {
 
 // Store is a directory of blobs named by digest.
 type Store struct {
-	dir string
+	dir  string
+	opts StoreOptions
+
+	mu              sync.Mutex
+	bytes           int64
+	objects         int
+	reservedBytes   int64
+	reservedObjects int
+	pins            map[string]int // digest -> active idempotent readers
 }
 
 // NewStore creates the directory if needed.
 func NewStore(dir string) (*Store, error) {
+	return NewStoreWithOptions(dir, StoreOptions{})
+}
+
+// NewStoreWithOptions opens a store with fleet-wide byte and object budgets.
+// Existing blobs are inventoried before the store becomes available. Private
+// staging files left by a crashed prior process are removed during that scan.
+func NewStoreWithOptions(dir string, opts StoreOptions) (*Store, error) {
+	if opts.MaxBytes < 0 || opts.MaxObjects < 0 {
+		return nil, errors.New("artifact: store limits must not be negative")
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	return &Store{dir: dir}, nil
+	s := &Store{dir: dir, opts: opts, pins: make(map[string]int)}
+	if err := s.inventory(); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 func (s *Store) pathFor(digest string) string {
 	return filepath.Join(s.dir, digest[:2], digest)
+}
+
+func (s *Store) inventory() error {
+	var bytes int64
+	var objects int
+	removedStaging := false
+	err := filepath.WalkDir(s.dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if filepath.Dir(p) == s.dir && strings.HasPrefix(d.Name(), ".put-") {
+			if d.Type()&os.ModeSymlink != 0 {
+				return fmt.Errorf("artifact: staging path %q is a symlink", p)
+			}
+			if err := os.Remove(p); err != nil {
+				return err
+			}
+			removedStaging = true
+			return nil
+		}
+		digest, ok := storedDigest(p)
+		if !ok {
+			return fmt.Errorf("artifact: unexpected store entry %q", p)
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("artifact: blob %q is not a regular file", digest)
+		}
+		if info.Size() < 0 || bytes > int64(^uint64(0)>>1)-info.Size() {
+			return errors.New("artifact: store byte count overflow")
+		}
+		bytes += info.Size()
+		objects++
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if removedStaging {
+		if err := syncDir(s.dir); err != nil {
+			return err
+		}
+	}
+	s.bytes = bytes
+	s.objects = objects
+	return nil
+}
+
+func storedDigest(p string) (string, bool) {
+	digest := filepath.Base(p)
+	if len(digest) != sha256.Size*2 || filepath.Base(filepath.Dir(p)) != digest[:2] {
+		return "", false
+	}
+	if _, err := hex.DecodeString(digest); err != nil || strings.ToLower(digest) != digest {
+		return "", false
+	}
+	return digest, true
+}
+
+// Stats returns durable usage plus in-progress reservations.
+func (s *Store) Stats() StoreStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return StoreStats{
+		Bytes: s.bytes, Objects: s.objects,
+		ReservedBytes: s.reservedBytes, ReservedObjects: s.reservedObjects,
+		MaxBytes: s.opts.MaxBytes, MaxObjects: s.opts.MaxObjects,
+	}
 }
 
 // Put stores the stream and returns its id. Content is hashed while written;
@@ -110,14 +245,69 @@ func (s *Store) PutLimit(r io.Reader, maxBytes int64) (string, int64, error) {
 // for HTTP uploads/downloads: a mismatched body is never made visible and
 // therefore cannot collide with, or prompt deletion of, an existing blob.
 func (s *Store) PutExpected(expected string, r io.Reader, maxBytes int64) (int64, error) {
-	if _, err := Digest(expected); err != nil {
+	digest, err := Digest(expected)
+	if err != nil {
 		return 0, err
+	}
+	if s.pin(digest) {
+		defer s.unpin(digest)
+		if err := s.Verify(expected); err != nil {
+			return 0, fmt.Errorf("artifact: existing object %s failed verification: %w", expected, err)
+		}
+		n, err := verifyExpectedReader(expected, r, maxBytes)
+		return n, err
 	}
 	_, n, err := s.put(r, expected, maxBytes)
 	return n, err
 }
 
+func (s *Store) pin(digest string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := os.Lstat(s.pathFor(digest))
+	if err != nil || !st.Mode().IsRegular() {
+		return false
+	}
+	s.pins[digest]++
+	return true
+}
+
+func (s *Store) unpin(digest string) {
+	s.mu.Lock()
+	if s.pins[digest] <= 1 {
+		delete(s.pins, digest)
+	} else {
+		s.pins[digest]--
+	}
+	s.mu.Unlock()
+}
+
+func verifyExpectedReader(expected string, r io.Reader, maxBytes int64) (int64, error) {
+	h := sha256.New()
+	source := r
+	if maxBytes > 0 {
+		source = &io.LimitedReader{R: r, N: maxBytes + 1}
+	}
+	n, err := io.Copy(h, source)
+	if err != nil {
+		return n, err
+	}
+	if maxBytes > 0 && n > maxBytes {
+		return n, fmt.Errorf("%w: maximum is %d bytes", ErrTooLarge, maxBytes)
+	}
+	if ID(h.Sum(nil)) != expected {
+		return n, fmt.Errorf("%w: body is %s", ErrDigestMismatch, ID(h.Sum(nil)))
+	}
+	return n, nil
+}
+
 func (s *Store) put(r io.Reader, expected string, maxBytes int64) (string, int64, error) {
+	reservation, err := s.reserveObject()
+	if err != nil {
+		metrics.ArtifactQuotaRejected.Inc()
+		return "", 0, err
+	}
+	defer reservation.release()
 	tmp, err := os.CreateTemp(s.dir, ".put-*")
 	if err != nil {
 		return "", 0, err
@@ -125,11 +315,13 @@ func (s *Store) put(r io.Reader, expected string, maxBytes int64) (string, int64
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	h := sha256.New()
+	destination := io.MultiWriter(tmp, h)
+	destination = &reservationWriter{reservation: reservation, writer: destination}
 	source := r
 	if maxBytes > 0 {
 		source = &io.LimitedReader{R: r, N: maxBytes + 1}
 	}
-	n, err := io.Copy(io.MultiWriter(tmp, h), source)
+	n, err := io.Copy(destination, source)
 	if err != nil {
 		_ = tmp.Close()
 		return "", 0, err
@@ -155,13 +347,141 @@ func (s *Store) put(r io.Reader, expected string, maxBytes int64) (string, int64
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return "", 0, err
 	}
-	if _, err := os.Stat(dst); err == nil {
-		return got, n, nil
-	}
-	if err := os.Rename(tmpName, dst); err != nil {
+	created, err := s.publish(tmpName, dst, n, reservation)
+	if err != nil {
 		return "", 0, err
 	}
+	if created {
+		if err := syncDir(filepath.Dir(dst)); err != nil {
+			// The rename is already visible and accounted for. Returning an error
+			// makes the caller retry safely without pretending durability.
+			return "", 0, err
+		}
+	}
 	return got, n, nil
+}
+
+type storeReservation struct {
+	store  *Store
+	bytes  int64
+	object bool
+	done   bool
+}
+
+func (s *Store) reserveObject() (*storeReservation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.opts.MaxObjects > 0 && s.objects+s.reservedObjects+1 > s.opts.MaxObjects {
+		return nil, fmt.Errorf("%w: maximum is %d objects", ErrStoreFull, s.opts.MaxObjects)
+	}
+	s.reservedObjects++
+	return &storeReservation{store: s, object: true}, nil
+}
+
+func (r *storeReservation) addBytes(n int64) error {
+	if n <= 0 {
+		return nil
+	}
+	s := r.store
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r.done {
+		return errors.New("artifact: closed store reservation")
+	}
+	if s.opts.MaxBytes > 0 && s.bytes+s.reservedBytes+n > s.opts.MaxBytes {
+		metrics.ArtifactQuotaRejected.Inc()
+		return fmt.Errorf("%w: maximum is %d bytes", ErrStoreFull, s.opts.MaxBytes)
+	}
+	s.reservedBytes += n
+	r.bytes += n
+	return nil
+}
+
+func (r *storeReservation) releaseBytes(n int64) {
+	if n <= 0 {
+		return
+	}
+	s := r.store
+	s.mu.Lock()
+	if n > r.bytes {
+		n = r.bytes
+	}
+	r.bytes -= n
+	s.reservedBytes -= n
+	s.mu.Unlock()
+}
+
+func (r *storeReservation) release() {
+	if r == nil {
+		return
+	}
+	s := r.store
+	s.mu.Lock()
+	if !r.done {
+		s.reservedBytes -= r.bytes
+		if r.object {
+			s.reservedObjects--
+		}
+		r.bytes = 0
+		r.object = false
+		r.done = true
+	}
+	s.mu.Unlock()
+}
+
+type reservationWriter struct {
+	reservation *storeReservation
+	writer      io.Writer
+}
+
+func (w *reservationWriter) Write(p []byte) (int, error) {
+	if err := w.reservation.addBytes(int64(len(p))); err != nil {
+		return 0, err
+	}
+	n, err := w.writer.Write(p)
+	if n < len(p) {
+		w.reservation.releaseBytes(int64(len(p) - n))
+	}
+	return n, err
+}
+
+func (s *Store) publish(tmpName, dst string, size int64, reservation *storeReservation) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if reservation.done || !reservation.object || reservation.bytes != size {
+		return false, errors.New("artifact: invalid staging reservation")
+	}
+	if st, err := os.Lstat(dst); err == nil {
+		if !st.Mode().IsRegular() || st.Size() != size {
+			return false, fmt.Errorf("artifact: existing blob %q is not the expected immutable object", filepath.Base(dst))
+		}
+		if err := verifyBlobPath(dst, filepath.Base(dst)); err != nil {
+			metrics.ArtifactMiss.Inc()
+			return false, err
+		}
+		s.reservedBytes -= reservation.bytes
+		s.reservedObjects--
+		reservation.bytes = 0
+		reservation.object = false
+		reservation.done = true
+		return false, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return false, err
+	}
+	if err := os.Chmod(tmpName, 0o444); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return false, err
+	}
+	s.bytes += size
+	s.objects++
+	s.reservedBytes -= reservation.bytes
+	s.reservedObjects--
+	reservation.bytes = 0
+	reservation.object = false
+	reservation.done = true
+	return true, nil
 }
 
 // Open returns a reader for id.
@@ -188,13 +508,34 @@ func (s *Store) Has(id string) bool {
 	if err != nil {
 		return false
 	}
-	_, err = os.Stat(s.pathFor(digest))
-	return err == nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := os.Lstat(s.pathFor(digest))
+	return err == nil && st.Mode().IsRegular()
 }
 
 // Verify re-hashes a stored blob.
 func (s *Store) Verify(id string) error {
-	r, _, err := s.Open(id)
+	digest, err := Digest(id)
+	if err != nil {
+		return err
+	}
+	if err := verifyBlobPath(s.pathFor(digest), digest); err != nil {
+		metrics.ArtifactMiss.Inc()
+		return err
+	}
+	return nil
+}
+
+func verifyBlobPath(blobPath, digest string) error {
+	st, err := os.Lstat(blobPath)
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("artifact: blob %q is not a regular file", digest)
+	}
+	r, err := os.Open(blobPath)
 	if err != nil {
 		return err
 	}
@@ -203,8 +544,7 @@ func (s *Store) Verify(id string) error {
 	if _, err := io.Copy(h, r); err != nil {
 		return err
 	}
-	if ID(h.Sum(nil)) != id {
-		metrics.ArtifactMiss.Inc()
+	if hex.EncodeToString(h.Sum(nil)) != digest {
 		return ErrDigestMismatch
 	}
 	return nil
@@ -216,23 +556,130 @@ func (s *Store) Delete(id string) error {
 	if err != nil {
 		return err
 	}
-	return os.Remove(s.pathFor(digest))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.pathFor(digest)
+	if s.pins[digest] > 0 {
+		return fmt.Errorf("artifact: blob %q is in use", digest)
+	}
+	st, err := os.Lstat(p)
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("artifact: blob %q is not a regular file", digest)
+	}
+	if err := os.Remove(p); err != nil {
+		return err
+	}
+	s.bytes -= st.Size()
+	s.objects--
+	return syncDir(filepath.Dir(p))
 }
 
 // List returns all ids.
 func (s *Store) List() ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listLocked()
+}
+
+func (s *Store) listLocked() ([]string, error) {
 	var out []string
 	err := filepath.WalkDir(s.dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || strings.HasPrefix(d.Name(), ".") {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
 			return nil
 		}
-		if len(d.Name()) == 64 {
-			out = append(out, Prefix+d.Name())
+		if filepath.Dir(p) == s.dir && strings.HasPrefix(d.Name(), ".put-") {
+			return nil // an active private upload
 		}
-		return nil
+		if digest, ok := storedDigest(p); ok {
+			out = append(out, Prefix+digest)
+			return nil
+		}
+		return fmt.Errorf("artifact: unexpected store entry %q", p)
 	})
 	sort.Strings(out)
 	return out, err
+}
+
+// Collect removes blobs not present in referenced and older than cutoff.
+// Callers must serialize creation of new durable references across this call;
+// newly uploaded but not-yet-referenced blobs are protected by cutoff. Each
+// unlink is independently durable, so an interrupted pass can be retried.
+func (s *Store) Collect(referenced []string, cutoff time.Time) (GCResult, error) {
+	keep := make(map[string]struct{}, len(referenced))
+	for _, id := range referenced {
+		digest, err := Digest(id)
+		if err != nil {
+			return GCResult{}, fmt.Errorf("artifact: refusing GC with invalid reference %q: %w", id, err)
+		}
+		keep[digest] = struct{}{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var result GCResult
+	var errs []error
+	err := filepath.WalkDir(s.dir, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			errs = append(errs, walkErr)
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		digest, ok := storedDigest(p)
+		if !ok {
+			if filepath.Dir(p) == s.dir && strings.HasPrefix(d.Name(), ".put-") {
+				return nil // an active upload protected by its reservation
+			}
+			errs = append(errs, fmt.Errorf("artifact: unexpected store entry %q", p))
+			return nil
+		}
+		result.Scanned++
+		if _, ok := keep[digest]; ok {
+			result.Referenced++
+			return nil
+		}
+		if s.pins[digest] > 0 {
+			result.GraceRetained++
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			errs = append(errs, err)
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			errs = append(errs, fmt.Errorf("artifact: blob %q is not a regular file", digest))
+			return nil
+		}
+		if !cutoff.IsZero() && !info.ModTime().Before(cutoff) {
+			result.GraceRetained++
+			return nil
+		}
+		if err := os.Remove(p); err != nil {
+			errs = append(errs, err)
+			return nil
+		}
+		s.bytes -= info.Size()
+		s.objects--
+		result.Removed++
+		result.RemovedBytes += info.Size()
+		metrics.ArtifactGCObjects.Inc()
+		metrics.ArtifactGCBytes.Add(uint64(info.Size()))
+		if err := syncDir(filepath.Dir(p)); err != nil {
+			errs = append(errs, err)
+		}
+		return nil
+	})
+	if err != nil {
+		errs = append(errs, err)
+	}
+	return result, errors.Join(errs...)
 }
 
 // ---------------------------------------------------------------------------
@@ -432,8 +879,14 @@ func RestoreWithLimits(root string, r io.Reader, limits RestoreLimits) error {
 
 func normalizeRestoreLimits(l RestoreLimits) RestoreLimits {
 	d := DefaultRestoreLimits
+	if l.MaxCompressedBytes > 0 {
+		d.MaxCompressedBytes = l.MaxCompressedBytes
+	}
 	if l.MaxExpandedBytes > 0 {
 		d.MaxExpandedBytes = l.MaxExpandedBytes
+	}
+	if l.MaxFileBytes > 0 {
+		d.MaxFileBytes = l.MaxFileBytes
 	}
 	if l.MaxEntries > 0 {
 		d.MaxEntries = l.MaxEntries
@@ -444,11 +897,15 @@ func normalizeRestoreLimits(l RestoreLimits) RestoreLimits {
 	if l.MaxDepth > 0 {
 		d.MaxDepth = l.MaxDepth
 	}
+	if l.MaxCompressionRatio > 0 {
+		d.MaxCompressionRatio = l.MaxCompressionRatio
+	}
 	return d
 }
 
 func extract(root string, r io.Reader, limits RestoreLimits) error {
-	gz, err := gzip.NewReader(r)
+	compressed := &boundedCompressedReader{reader: r, limit: limits.MaxCompressedBytes}
+	gz, err := gzip.NewReader(compressed)
 	if err != nil {
 		return err
 	}
@@ -468,6 +925,7 @@ func extract(root string, r io.Reader, limits RestoreLimits) error {
 	seen := make(map[string]struct{})
 	var entries int
 	var expanded int64
+	var expandedWritten int64
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -494,6 +952,9 @@ func extract(root string, r io.Reader, limits RestoreLimits) error {
 		if hdr.Size < 0 || hdr.Size > limits.MaxExpandedBytes-expanded {
 			return fmt.Errorf("artifact: expanded data exceeds %d bytes", limits.MaxExpandedBytes)
 		}
+		if hdr.Size > limits.MaxFileBytes {
+			return fmt.Errorf("artifact: file %q exceeds %d bytes", hdr.Name, limits.MaxFileBytes)
+		}
 		expanded += hdr.Size
 		osName := filepath.FromSlash(name)
 		if err := rejectSymlinkParents(rr, osName); err != nil {
@@ -513,7 +974,11 @@ func extract(root string, r io.Reader, limits RestoreLimits) error {
 			if err != nil {
 				return err
 			}
-			if _, err := io.CopyN(f, tr, hdr.Size); err != nil {
+			destination := &expansionWriter{
+				writer: f, expanded: &expandedWritten, compressed: compressed,
+				ratio: limits.MaxCompressionRatio,
+			}
+			if _, err := io.CopyN(destination, tr, hdr.Size); err != nil {
 				f.Close()
 				return err
 			}
@@ -531,6 +996,9 @@ func extract(root string, r io.Reader, limits RestoreLimits) error {
 				return err
 			}
 		case tar.TypeSymlink:
+			if len(hdr.Linkname) > limits.MaxPathBytes {
+				return fmt.Errorf("artifact: symlink %q target exceeds %d bytes", hdr.Name, limits.MaxPathBytes)
+			}
 			if err := validateSymlinkTarget(name, hdr.Linkname); err != nil {
 				return err
 			}
@@ -543,6 +1011,18 @@ func extract(root string, r io.Reader, limits RestoreLimits) error {
 		default:
 			return fmt.Errorf("artifact: unsupported entry type %d for %q", hdr.Typeflag, hdr.Name)
 		}
+	}
+	// tar stops at its end marker before gzip necessarily verifies the footer.
+	// Drain gzip first for checksum validation, then the underlying stream so
+	// the compressed-size bound also covers trailing input.
+	if _, err := io.Copy(io.Discard, gz); err != nil {
+		return err
+	}
+	if _, err := io.Copy(io.Discard, compressed); err != nil {
+		return err
+	}
+	if err := checkCompressionRatio(expandedWritten, compressed.count, limits.MaxCompressionRatio); err != nil {
+		return err
 	}
 	// Apply directory modes last so read-only dirs don't block extraction.
 	for i := len(dirs) - 1; i >= 0; i-- {
@@ -569,6 +1049,64 @@ func extract(root string, r io.Reader, limits RestoreLimits) error {
 	err = f.Sync()
 	_ = f.Close()
 	return err
+}
+
+type boundedCompressedReader struct {
+	reader io.Reader
+	limit  int64
+	count  int64
+}
+
+type expansionWriter struct {
+	writer     io.Writer
+	expanded   *int64
+	compressed *boundedCompressedReader
+	ratio      int64
+}
+
+func (w *expansionWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	*w.expanded += int64(n)
+	if err == nil {
+		err = checkCompressionRatio(*w.expanded, w.compressed.count, w.ratio)
+	}
+	return n, err
+}
+
+func (r *boundedCompressedReader) Read(p []byte) (int, error) {
+	if r.limit <= 0 {
+		n, err := r.reader.Read(p)
+		r.count += int64(n)
+		return n, err
+	}
+	remaining := r.limit - r.count
+	if remaining <= 0 {
+		var probe [1]byte
+		n, err := r.reader.Read(probe[:])
+		if n > 0 {
+			r.count += int64(n)
+			return 0, fmt.Errorf("%w: maximum is %d bytes", ErrTooLarge, r.limit)
+		}
+		return 0, err
+	}
+	if int64(len(p)) > remaining {
+		p = p[:remaining]
+	}
+	n, err := r.reader.Read(p)
+	r.count += int64(n)
+	return n, err
+}
+
+func checkCompressionRatio(expanded, compressed, ratio int64) error {
+	const grace = int64(1 << 20)
+	if ratio <= 0 || expanded <= grace || compressed <= 0 {
+		return nil
+	}
+	// Division avoids overflowing compressed*ratio for hostile headers.
+	if (expanded-grace+ratio-1)/ratio > compressed {
+		return fmt.Errorf("artifact: expansion ratio exceeds %d:1", ratio)
+	}
+	return nil
 }
 
 func validateArchiveName(name string, limits RestoreLimits) (string, error) {

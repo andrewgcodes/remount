@@ -3,10 +3,12 @@ package session
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,7 +34,13 @@ func (w *failAfterWriter) Close() error { return nil }
 
 func newMgr(t *testing.T) *Manager {
 	t.Helper()
-	m := NewManager(ManagerOptions{SpillDir: t.TempDir(), MemBytes: 1 << 20, SpillBytes: 1 << 20, Retention: time.Hour})
+	// Most tests exercise session semantics rather than admission. Keep their
+	// fixture comfortably above the ordering stress-test count; quota behavior
+	// has dedicated tests below with intentionally small limits.
+	m := NewManager(ManagerOptions{
+		SpillDir: t.TempDir(), MemBytes: 1 << 20, SpillBytes: 1 << 20, Retention: time.Hour,
+		MaxSessions: 256, MaxActive: 256, MaxSessionsPerWorkspace: 256, MaxSessionsPerPrincipal: 256,
+	})
 	t.Cleanup(m.Close)
 	return m
 }
@@ -328,5 +336,131 @@ func TestExecEnvAndCwd(t *testing.T) {
 	got := strings.TrimSpace(string(out))
 	if !strings.HasSuffix(strings.Split(got, "\n")[0], dir[strings.LastIndex(dir, "/"):]) || !strings.HasSuffix(got, "bar") {
 		t.Fatalf("%q", out)
+	}
+}
+
+func TestManagerEnforcesRetainedActiveAndWorkspaceQuotas(t *testing.T) {
+	m := NewManager(ManagerOptions{
+		Retention: time.Hour, MaxSessions: 2, MaxActive: 1, MaxSessionsPerWorkspace: 1,
+	})
+	t.Cleanup(m.Close)
+	s, err := m.Open(Spec{
+		WS: "ws_one", Kind: proto.SessionExec, Program: []string{"sh", "-c", "cat"}, Stdin: true,
+		IdempotencyKey: "same",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := m.Open(Spec{
+		WS: "ws_one", Kind: proto.SessionExec, Program: []string{"sh", "-c", "cat"}, Stdin: true,
+		IdempotencyKey: "same",
+	})
+	if err != nil || replayed != s {
+		t.Fatalf("idempotent open at quota = (%p, %v), want %p", replayed, err, s)
+	}
+	if _, err := m.Open(Spec{WS: "ws_one", Kind: proto.SessionExec, Program: []string{"sh", "-c", "true"}}); !errors.Is(err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+		t.Fatalf("workspace quota error = %v", err)
+	}
+	if _, err := m.Open(Spec{WS: "ws_two", Kind: proto.SessionExec, Program: []string{"sh", "-c", "true"}}); !errors.Is(err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+		t.Fatalf("active quota error = %v", err)
+	}
+	s.Kill()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := s.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for m.Stats().Active != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	second, err := m.Open(Spec{WS: "ws_two", Kind: proto.SessionExec, Program: []string{"sh", "-c", "true"}})
+	if err != nil {
+		t.Fatalf("active quota was not released: %v", err)
+	}
+	if _, err := second.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Open(Spec{WS: "ws_three", Kind: proto.SessionExec, Program: []string{"sh", "-c", "true"}}); !errors.Is(err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+		t.Fatalf("retained-session quota error = %v", err)
+	}
+	if stats := m.Stats(); stats.Sessions != 2 || stats.Active != 0 {
+		t.Fatalf("manager stats = %+v", stats)
+	}
+}
+
+func TestManagerActiveQuotaCannotBeOvercommittedConcurrently(t *testing.T) {
+	const limit = 3
+	m := NewManager(ManagerOptions{
+		Retention: time.Hour, MaxSessions: 32, MaxActive: limit, MaxSessionsPerWorkspace: 32,
+	})
+	t.Cleanup(m.Close)
+	type result struct {
+		s   *Session
+		err error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 20)
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			s, err := m.Open(Spec{WS: "ws", Kind: proto.SessionExec, Program: []string{"sh", "-c", "cat"}, Stdin: true})
+			results <- result{s: s, err: err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	var opened []*Session
+	for result := range results {
+		if result.err == nil {
+			opened = append(opened, result.s)
+			continue
+		}
+		if !errors.Is(result.err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+			t.Fatalf("unexpected concurrent open error: %v", result.err)
+		}
+	}
+	if len(opened) != limit {
+		t.Fatalf("concurrent opens = %d, want %d", len(opened), limit)
+	}
+	if active := m.Stats().Active; active != limit {
+		t.Fatalf("active sessions = %d, want %d", active, limit)
+	}
+	for _, s := range opened {
+		s.Kill()
+	}
+}
+
+func TestManagerEnforcesPrincipalQuotaAcrossWorkspaces(t *testing.T) {
+	m := NewManager(ManagerOptions{
+		Retention: time.Hour, MaxSessions: 4, MaxActive: 4,
+		MaxSessionsPerWorkspace: 4, MaxSessionsPerPrincipal: 1,
+	})
+	t.Cleanup(m.Close)
+	first, err := m.Open(Spec{WS: "ws_one", Tenant: "tenant-a", Principal: "alice", Kind: proto.SessionExec, Program: []string{"sh", "-c", "true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Open(Spec{WS: "ws_two", Tenant: "tenant-a", Principal: "alice", Kind: proto.SessionExec, Program: []string{"sh", "-c", "true"}}); !errors.Is(err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+		t.Fatalf("principal quota error = %v", err)
+	}
+	if _, err := m.Open(Spec{WS: "ws_two", Tenant: "tenant-a", Principal: "bob", Kind: proto.SessionExec, Program: []string{"sh", "-c", "true"}}); err != nil {
+		t.Fatalf("unrelated principal was blocked: %v", err)
+	}
+	if _, err := m.Open(Spec{WS: "ws_three", Tenant: "tenant-b", Principal: "alice", Kind: proto.SessionExec, Program: []string{"sh", "-c", "true"}}); err != nil {
+		t.Fatalf("same principal name in another tenant was blocked: %v", err)
+	}
+}
+
+func TestSessionPrincipalKeyHasNoDelimiterAliases(t *testing.T) {
+	if sessionPrincipalKey("tenant", "a\x00b") == sessionPrincipalKey("tenant\x00a", "b") {
+		t.Fatal("distinct opaque tenant/principal pairs produced the same quota key")
 	}
 }

@@ -194,6 +194,11 @@ func TestDeepVerifyDetectsCorruptedArtifact(t *testing.T) {
 	if blob == "" {
 		t.Skip("artifact store path not discoverable in this configuration")
 	}
+	// Published blobs are intentionally read-only. This test is simulating an
+	// out-of-band storage fault, so explicitly override that protection first.
+	if err := os.Chmod(blob, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	fh, err := os.OpenFile(blob, os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatal(err)

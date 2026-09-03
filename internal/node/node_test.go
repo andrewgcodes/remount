@@ -58,6 +58,27 @@ func TestCorruptIdentityIsNotSilentlyReplaced(t *testing.T) {
 	}
 }
 
+func TestNewRejectsNegativeResourceLimits(t *testing.T) {
+	tests := map[string]func(*Options){
+		"sessions":              func(o *Options) { o.MaxSessions = -1 },
+		"active sessions":       func(o *Options) { o.MaxActiveSessions = -1 },
+		"workspace sessions":    func(o *Options) { o.MaxSessionsPerWorkspace = -1 },
+		"principal sessions":    func(o *Options) { o.MaxSessionsPerPrincipal = -1 },
+		"concurrent requests":   func(o *Options) { o.MaxConcurrentRequests = -1 },
+		"concurrent snapshots":  func(o *Options) { o.MaxConcurrentSnapshots = -1 },
+		"snapshot min interval": func(o *Options) { o.SnapshotMinInterval = -1 },
+	}
+	for name, configure := range tests {
+		t.Run(name, func(t *testing.T) {
+			opts := Options{DataDir: t.TempDir()}
+			configure(&opts)
+			if _, err := New(opts); err == nil || !strings.Contains(err.Error(), "must not be negative") {
+				t.Fatalf("New error = %v, want negative-limit validation", err)
+			}
+		})
+	}
+}
+
 func TestFetchArtifactMismatchCannotDeleteExistingBlob(t *testing.T) {
 	body := "pre-existing body"
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -183,6 +204,40 @@ func TestReleaseSnapshotFailureRestoresSourceWithoutDestroy(t *testing.T) {
 	if restored != w || prepared || h.destroyed.Load() != 0 {
 		t.Fatalf("source was not restored: workspace=%p prepared=%v destroyed=%d", restored, prepared, h.destroyed.Load())
 	}
+}
+
+func TestSnapshotAdmissionBoundsExplicitWorkWithoutBlockingLifecycle(t *testing.T) {
+	n := newTestNode(t, func(opts *Options) {
+		opts.MaxConcurrentSnapshots = 1
+		opts.SnapshotMinInterval = time.Hour
+	})
+	w1 := &ws{Workspace: proto.Workspace{ID: "ws_one"}}
+	w2 := &ws{Workspace: proto.Workspace{ID: "ws_two"}}
+	release, err := n.acquireSnapshot(context.Background(), w1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second, err := n.acquireSnapshot(context.Background(), w2, true); second != nil || !errors.Is(err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+		if second != nil {
+			second()
+		}
+		release()
+		t.Fatalf("concurrent snapshot admission = (%v, %v)", second != nil, err)
+	}
+	release()
+	if retry, err := n.acquireSnapshot(context.Background(), w1, true); retry != nil || !errors.Is(err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+		if retry != nil {
+			retry()
+		}
+		t.Fatalf("snapshot frequency admission = (%v, %v)", retry != nil, err)
+	}
+	// Safety-critical move/sleep/release checkpoints share the concurrency
+	// budget but must not be rejected by the user-facing frequency window.
+	lifecycle, err := n.acquireSnapshot(context.Background(), w1, false)
+	if err != nil {
+		t.Fatalf("lifecycle snapshot admission = %v", err)
+	}
+	lifecycle()
 }
 
 func TestEnforcedGatewayRequiresConcreteNetworkController(t *testing.T) {
@@ -499,6 +554,44 @@ func TestMutationJournalWritesIntentBeforeEffectAndReplaysDurableResult(t *testi
 		return nil, nil
 	}); err == nil {
 		t.Fatal("same key with a different fingerprint was accepted")
+	}
+}
+
+func TestMutationJournalQuotaAndCompletedRecordRetention(t *testing.T) {
+	n := newTestNode(t, func(opts *Options) {
+		opts.MaxMutationRecords = 1
+		opts.MutationRetention = time.Hour
+	})
+	if _, err := n.runMutation(context.Background(), "old", "request", func() ([]byte, error) {
+		return []byte("old-result"), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.runMutation(context.Background(), "full", "request", func() ([]byte, error) {
+		return []byte("must-not-run"), nil
+	}); !errors.Is(err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+		t.Fatalf("mutation quota error = %v", err)
+	}
+	n.mutationMu.Lock()
+	n.mutations["old"].CompletedAt = time.Now().Add(-2 * time.Hour).UnixMilli()
+	if err := n.persistMutationsLocked(); err != nil {
+		n.mutationMu.Unlock()
+		t.Fatal(err)
+	}
+	n.mutationMu.Unlock()
+	applied := 0
+	if result, err := n.runMutation(context.Background(), "replacement", "request", func() ([]byte, error) {
+		applied++
+		return []byte("replacement-result"), nil
+	}); err != nil || string(result) != "replacement-result" || applied != 1 {
+		t.Fatalf("mutation after retention = (%q, %v, applied=%d)", result, err, applied)
+	}
+	loaded, err := loadMutations(n.mutationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded["old"] != nil || loaded["replacement"] == nil || len(loaded) != 1 {
+		t.Fatalf("retained mutation journal = %#v", loaded)
 	}
 }
 

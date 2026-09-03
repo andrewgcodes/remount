@@ -311,6 +311,20 @@ func cmdServer(ctx context.Context, args []string) error {
 	insecure := fs.Bool("insecure", false, "allow an empty token")
 	bindings := fs.String("bindings", "", "bindings JSON file")
 	lease := fs.Int64("lease", 30, "claim lease seconds")
+	artifactBytes := fs.Int64("artifact-object-bytes", 8<<30, "maximum compressed bytes per artifact")
+	artifactStoreBytes := fs.Int64("artifact-store-bytes", 64<<30, "maximum retained and staging artifact bytes")
+	artifactObjects := fs.Int("artifact-store-objects", 100_000, "maximum retained and staging artifact objects")
+	artifactGCInterval := fs.Duration("artifact-gc-interval", 10*time.Minute, "reference-aware artifact GC interval")
+	artifactGrace := fs.Duration("artifact-grace", 24*time.Hour, "minimum age before unreferenced artifact collection")
+	eventRetention := fs.Duration("event-retention", 30*24*time.Hour, "retained canonical event history")
+	eventGCInterval := fs.Duration("event-gc-interval", 10*time.Minute, "event-retention pruning interval")
+	recordRetention := fs.Duration("control-record-retention", 30*24*time.Hour, "idempotency result and fired-timer retention")
+	recordGCInterval := fs.Duration("control-record-gc-interval", 10*time.Minute, "control-record pruning interval")
+	maxTenantWorkspaces := fs.Int("max-tenant-workspaces", 1000, "maximum non-destroyed workspaces per tenant")
+	maxSubjectWorkspaces := fs.Int("max-subject-workspaces", 100, "maximum non-destroyed workspaces per subject")
+	maxMutationRecords := fs.Int("max-mutation-records", 100_000, "maximum retained control-plane idempotency results")
+	maxTimers := fs.Int("max-timers", 100_000, "maximum retained durable timers")
+	maxWorkspaceTimers := fs.Int("max-workspace-timers", 128, "maximum retained durable timers per workspace")
 	mode := fs.String("mode", envOr("REMOUNT_SECURITY_MODE", server.ModeStandalone), "security mode: standalone, production-single-tenant, production-multi-tenant")
 	parse(fs, args)
 	if *token == "" && !*insecure {
@@ -323,7 +337,15 @@ func cmdServer(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	srv, err := server.New(server.Options{DataDir: *data, Token: *token, Bindings: b, LeaseSec: *lease, Logger: slog.Default(), Mode: *mode})
+	srv, err := server.New(server.Options{
+		DataDir: *data, Token: *token, Bindings: b, LeaseSec: *lease, Logger: slog.Default(), Mode: *mode,
+		MaxArtifactBytes: *artifactBytes, MaxArtifactStoreBytes: *artifactStoreBytes, MaxArtifactObjects: *artifactObjects,
+		ArtifactGCInterval: *artifactGCInterval, ArtifactGracePeriod: *artifactGrace,
+		EventRetention: *eventRetention, EventGCInterval: *eventGCInterval,
+		RecordRetention: *recordRetention, RecordGCInterval: *recordGCInterval,
+		MaxWorkspacesPerTenant: *maxTenantWorkspaces, MaxWorkspacesPerSubject: *maxSubjectWorkspaces,
+		MaxMutationRecords: *maxMutationRecords, MaxTimers: *maxTimers, MaxTimersPerWorkspace: *maxWorkspaceTimers,
+	})
 	if err != nil {
 		return err
 	}
@@ -341,11 +363,28 @@ func cmdUp(ctx context.Context, args []string) error {
 	fs.Var(labels, "label", "node label k=v (repeatable)")
 	backends := fs.String("backend", "process", "comma-separated backends: process,docker")
 	image := fs.String("image", "ubuntu:24.04", "default docker image")
+	artifactBytes := fs.Int64("artifact-object-bytes", 8<<30, "maximum compressed bytes per cached artifact")
+	artifactStoreBytes := fs.Int64("artifact-store-bytes", 32<<30, "maximum node artifact-cache bytes")
+	artifactObjects := fs.Int("artifact-store-objects", 50_000, "maximum node artifact-cache objects")
+	maxSessions := fs.Int("max-sessions", 1024, "maximum retained sessions on this node")
+	maxActiveSessions := fs.Int("max-active-sessions", 256, "maximum live sessions on this node")
+	maxWorkspaceSessions := fs.Int("max-workspace-sessions", 64, "maximum retained sessions per workspace")
+	maxPrincipalSessions := fs.Int("max-principal-sessions", 128, "maximum retained sessions per principal")
+	mutationRetention := fs.Duration("mutation-retention", 30*24*time.Hour, "node idempotency-result replay window")
+	maxMutationRecords := fs.Int("max-mutation-records", 10_000, "maximum retained node idempotency records")
+	maxConcurrentSnapshots := fs.Int("max-concurrent-snapshots", 4, "maximum concurrent node snapshots")
+	snapshotMinInterval := fs.Duration("snapshot-min-interval", time.Second, "minimum interval between explicit snapshots of one workspace")
 	var allow, allowPrivate listFlag
 	fs.Var(&allow, "allow", "host pattern workspaces may reach without a credential (repeatable)")
 	fs.Var(&allowPrivate, "allow-private", "host pattern allowed to resolve to a private address (repeatable)")
 	parse(fs, args)
-	n, err := buildNode(*data, c, labels, *backends, *image, allow, allowPrivate)
+	n, err := buildNode(*data, c, labels, *backends, *image, allow, allowPrivate, nodeResourceOptions{
+		artifactBytes: *artifactBytes, artifactStoreBytes: *artifactStoreBytes, artifactObjects: *artifactObjects,
+		maxSessions: *maxSessions, maxActiveSessions: *maxActiveSessions, maxWorkspaceSessions: *maxWorkspaceSessions,
+		maxPrincipalSessions: *maxPrincipalSessions,
+		mutationRetention:    *mutationRetention, maxMutationRecords: *maxMutationRecords,
+		maxConcurrentSnapshots: *maxConcurrentSnapshots, snapshotMinInterval: *snapshotMinInterval,
+	})
 	if err != nil {
 		return err
 	}
@@ -360,7 +399,21 @@ func defaultNodeData() string {
 	return "./remount-node"
 }
 
-func buildNode(data string, c common, labels map[string]string, backends, image string, allow, allowPrivate []string) (*node.Node, error) {
+type nodeResourceOptions struct {
+	artifactBytes          int64
+	artifactStoreBytes     int64
+	artifactObjects        int
+	maxSessions            int
+	maxActiveSessions      int
+	maxWorkspaceSessions   int
+	maxPrincipalSessions   int
+	mutationRetention      time.Duration
+	maxMutationRecords     int
+	maxConcurrentSnapshots int
+	snapshotMinInterval    time.Duration
+}
+
+func buildNode(data string, c common, labels map[string]string, backends, image string, allow, allowPrivate []string, resources nodeResourceOptions) (*node.Node, error) {
 	var list []workspace.Backend
 	for _, b := range strings.Split(backends, ",") {
 		switch strings.TrimSpace(b) {
@@ -387,6 +440,13 @@ func buildNode(data string, c common, labels map[string]string, backends, image 
 	return node.New(node.Options{
 		DataDir: data, Dialer: c.dialer(), Token: c.token, Labels: labels, Backends: workspace.NewRegistry(list...),
 		ArtifactURL: strings.TrimSuffix(c.server, "/") + "/v1/artifacts", Logger: slog.Default(),
+		MaxArtifactBytes: resources.artifactBytes, MaxArtifactStoreBytes: resources.artifactStoreBytes,
+		MaxArtifactObjects: resources.artifactObjects,
+		MaxSessions:        resources.maxSessions, MaxActiveSessions: resources.maxActiveSessions,
+		MaxSessionsPerWorkspace: resources.maxWorkspaceSessions,
+		MaxSessionsPerPrincipal: resources.maxPrincipalSessions,
+		MutationRetention:       resources.mutationRetention, MaxMutationRecords: resources.maxMutationRecords,
+		MaxConcurrentSnapshots: resources.maxConcurrentSnapshots, SnapshotMinInterval: resources.snapshotMinInterval,
 		Allow: allow, AllowPrivate: allowPrivate, Version: version,
 	})
 }
@@ -428,7 +488,7 @@ func cmdStandalone(ctx context.Context, args []string) error {
 		return err
 	}
 	c := common{server: "http://" + addr}
-	n, err := buildNode(filepath.Join(*data, "node"), c, map[string]string{"standalone": "true"}, *backends, "ubuntu:24.04", allow, []string{"127.0.0.1", "localhost"})
+	n, err := buildNode(filepath.Join(*data, "node"), c, map[string]string{"standalone": "true"}, *backends, "ubuntu:24.04", allow, []string{"127.0.0.1", "localhost"}, nodeResourceOptions{})
 	if err != nil {
 		return err
 	}

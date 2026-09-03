@@ -1,6 +1,7 @@
 package fsops
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -214,6 +215,12 @@ func TestSearch(t *testing.T) {
 	}
 	if _, err := f.Search("/", `x`, "[", 0); codeOf(err) != proto.CodeBadRequest {
 		t.Fatal(err)
+	}
+	if err := f.Write("long.txt", append(bytes.Repeat([]byte{'x'}, (1<<20)+1), '\n'), 0, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Search("long.txt", `x`, "", 0); codeOf(err) != proto.CodeResourceExhausted {
+		t.Fatalf("overlong search line error = %v", err)
 	}
 }
 

@@ -93,6 +93,15 @@ func TestDocumentedMetricNamesExist(t *testing.T) {
 		"remount_sessions_opened_total",
 		"remount_snapshots_total",
 		"remount_restores_total",
+		"remount_artifact_quota_rejections_total",
+		"remount_artifact_gc_runs_total",
+		"remount_event_gc_runs_total",
+		"remount_workspace_quota_rejections_total",
+		"remount_session_quota_rejections_total",
+		"remount_snapshot_quota_rejections_total",
+		"remount_mutation_quota_rejections_total",
+		"remount_timer_quota_rejections_total",
+		"remount_control_record_gc_runs_total",
 	} {
 		if _, ok := snap[name]; !ok {
 			t.Errorf("metric %s is referenced in docs and tooling but not registered", name)

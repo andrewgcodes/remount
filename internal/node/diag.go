@@ -31,9 +31,26 @@ func (n *Node) Diag(ctx context.Context) *proto.NodeDiag {
 		Metrics:    metrics.Default.Snapshot(),
 	}
 	d.DiskFree, d.DiskTotal = diskSpace(n.opts.DataDir)
-	if ids, err := n.store.List(); err == nil {
-		d.Artifacts = len(ids)
-	}
+	artifactStats := n.store.Stats()
+	d.Artifacts = artifactStats.Objects
+	d.ArtifactBytes = artifactStats.Bytes
+	d.ArtifactReservedBytes = artifactStats.ReservedBytes
+	d.ArtifactReservedObjects = artifactStats.ReservedObjects
+	d.ArtifactMaxBytes = artifactStats.MaxBytes
+	d.ArtifactMaxObjects = artifactStats.MaxObjects
+	sessionStats := n.sessions.Stats()
+	d.SessionsRetained = sessionStats.Sessions
+	d.SessionsActive = sessionStats.Active
+	d.SessionsMax = sessionStats.MaxSessions
+	d.SessionsActiveMax = sessionStats.MaxActive
+	d.SessionsPerWorkspaceMax = sessionStats.MaxSessionsPerWorkspace
+	d.SessionsPerPrincipalMax = sessionStats.MaxSessionsPerPrincipal
+	n.mutationMu.Lock()
+	d.MutationRecords = len(n.mutations)
+	n.mutationMu.Unlock()
+	d.MutationRecordsMax = n.opts.MaxMutationRecords
+	d.SnapshotsActive = len(n.snapshotSlots)
+	d.SnapshotsActiveMax = cap(n.snapshotSlots)
 
 	n.mu.Lock()
 	held := make([]*ws, 0, len(n.workspaces))

@@ -15,5 +15,9 @@ dist/
 *.out
 coverage.txt
 
+# Python tooling
+__pycache__/
+*.py[cod]
+
 # stray example binaries
 /agentloop
