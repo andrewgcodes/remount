@@ -82,6 +82,10 @@ type NodeIdentity struct {
 	Pool   string
 	Labels map[string]string
 	Fresh  bool
+	// Token is a short-lived node principal credential returned over the
+	// authenticated hello for HTTP artifact operations. It is never persisted
+	// by the node and is refreshed on every reconnect.
+	Token string
 }
 
 // NodeAuthenticator atomically enrolls a new node key or verifies an already

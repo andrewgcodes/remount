@@ -72,7 +72,7 @@ Hello  { peer, role: "node"|"client", token, caps: [string],
          issued_at: int64, nonce: bytes, proof: bytes }
 
 HelloOK { peer, caps, server, now: int64, pubkey: bytes, lease_sec: int64,
-          subject: string, tenant: string }
+          subject: string, tenant: string, node_token: string }
 
 NodeInfo { backends, backend_descriptors, connectors, os, arch, cpu, mem_mib,
            caps, snapshots, version }
@@ -91,7 +91,10 @@ the control plane derives subject and tenant from the presented credential.
 
 `HelloOK.pubkey` is the control plane's grant-signing key. Nodes verify grants
 with it. `lease_sec` tells a node how often it must renew claims. A node MUST
-renew at an interval no greater than one third of the lease.
+renew at an interval no greater than one third of the lease. After dynamic
+enrollment, `node_token` is a short-lived node-principal credential for HTTP
+artifact transfers. It is refreshed on reconnect and never written into the
+workspace or the node's persistent identity file.
 
 ### 3.1 Named capabilities
 

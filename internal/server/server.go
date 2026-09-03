@@ -5,7 +5,6 @@ package server
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
@@ -25,6 +24,7 @@ import (
 	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/eventlog"
+	"remount.dev/remount/internal/identity"
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/relay"
@@ -70,7 +70,10 @@ type Options struct {
 	Mode          string
 	Authenticator control.Authenticator
 	Authorizer    control.Authorizer
-	ApprovedNodes map[string]control.NodeApproval
+	// NodeAuthenticator atomically enrolls or verifies node keys. Production
+	// modes require it and do not accept a shared node token.
+	NodeAuthenticator control.NodeAuthenticator
+	ApprovedNodes     map[string]control.NodeApproval
 	// MaxConcurrentRequests bounds control-plane request handlers. Zero
 	// selects 128.
 	MaxConcurrentRequests int
@@ -111,15 +114,16 @@ const (
 
 // Server is a running Remount server.
 type Server struct {
-	opts    Options
-	Control *control.Control
-	Relay   *relay.Relay
-	Store   *artifact.Store
-	Log     *eventlog.Log
-	db      *sql.DB
-	http    *http.Server
-	ln      net.Listener
-	logger  *slog.Logger
+	opts     Options
+	Control  *control.Control
+	Identity *identity.Manager
+	Relay    *relay.Relay
+	Store    *artifact.Store
+	Log      *eventlog.Log
+	db       *sql.DB
+	http     *http.Server
+	ln       net.Listener
+	logger   *slog.Logger
 
 	mu          sync.RWMutex
 	ready       chan struct{}
@@ -195,10 +199,6 @@ func New(opts Options) (*Server, error) {
 	if opts.Mode == "" {
 		opts.Mode = ModeStandalone
 	}
-	floor, err := validateSecurityMode(opts)
-	if err != nil {
-		return nil, err
-	}
 	dbPath := ":memory:"
 	artDir := ""
 	if opts.DataDir != "" {
@@ -231,9 +231,56 @@ func New(opts Options) (*Server, error) {
 		return nil, err
 	}
 	log := eventlog.New(sq)
+	var identityManager *identity.Manager
+	if opts.Mode == ModeProductionSingleTenant || opts.Mode == ModeProductionMultiTenant {
+		configured := opts.Authenticator != nil || opts.Authorizer != nil || opts.NodeAuthenticator != nil
+		complete := opts.Authenticator != nil && opts.Authorizer != nil && opts.NodeAuthenticator != nil
+		if configured && !complete {
+			_ = log.Close()
+			if opts.DataDir == "" {
+				_ = os.RemoveAll(artDir)
+			}
+			return nil, errors.New("server: production identity overrides must provide authenticator, authorizer, and node authenticator together")
+		}
+		if !configured {
+			identityStore, err := identity.NewSQLiteStore(sq.DB(), log)
+			if err != nil {
+				_ = log.Close()
+				if opts.DataDir == "" {
+					_ = os.RemoveAll(artDir)
+				}
+				return nil, err
+			}
+			identityKey, err := identityStore.LoadOrCreateSigningKey(context.Background())
+			if err != nil {
+				_ = log.Close()
+				if opts.DataDir == "" {
+					_ = os.RemoveAll(artDir)
+				}
+				return nil, err
+			}
+			identityManager, err = identity.New(identity.Options{PrivateKey: identityKey, Store: identityStore})
+			if err != nil {
+				_ = log.Close()
+				if opts.DataDir == "" {
+					_ = os.RemoveAll(artDir)
+				}
+				return nil, err
+			}
+			opts.Authenticator, opts.Authorizer, opts.NodeAuthenticator = identityManager, identityManager, identityManager
+		}
+	}
+	floor, err := validateSecurityMode(opts)
+	if err != nil {
+		_ = log.Close()
+		if opts.DataDir == "" {
+			_ = os.RemoveAll(artDir)
+		}
+		return nil, err
+	}
 	ctrl, err := control.New(control.Options{DB: sq.DB(), Log: log, Token: opts.Token,
 		Bindings: opts.Bindings, SecretResolver: opts.SecretResolver, LeaseSec: opts.LeaseSec, Logger: opts.Logger, Artifacts: store,
-		Authenticator: opts.Authenticator, Authorizer: opts.Authorizer, ApprovedNodes: opts.ApprovedNodes,
+		Authenticator: opts.Authenticator, Authorizer: opts.Authorizer, NodeAuthenticator: opts.NodeAuthenticator, ApprovedNodes: opts.ApprovedNodes,
 		SecurityProfileFloor: floor, MaxWorkspacesPerTenant: opts.MaxWorkspacesPerTenant,
 		MaxWorkspacesPerSubject: opts.MaxWorkspacesPerSubject, MaxMutationRecords: opts.MaxMutationRecords,
 		MaxTimers: opts.MaxTimers, MaxTimersPerWorkspace: opts.MaxTimersPerWorkspace,
@@ -249,7 +296,7 @@ func New(opts Options) (*Server, error) {
 	ctrl.Attach(r)
 	ctrl.Start()
 	s := &Server{
-		opts: opts, Control: ctrl, Relay: r, Store: store, Log: log, db: sq.DB(), logger: opts.Logger,
+		opts: opts, Control: ctrl, Identity: identityManager, Relay: r, Store: store, Log: log, db: sq.DB(), logger: opts.Logger,
 		ready: make(chan struct{}),
 	}
 	if opts.DataDir == "" {
@@ -444,22 +491,15 @@ func validateSecurityMode(opts Options) (string, error) {
 				return "", fmt.Errorf("server: %s binding %q requires a valid external secret source and resolver", opts.Mode, binding.ID)
 			}
 		}
-		if opts.Token == "" || opts.Authenticator == nil || opts.Authorizer == nil || len(opts.ApprovedNodes) == 0 {
-			return "", fmt.Errorf("server: %s requires a node token, authenticator, authorizer, and approved nodes", opts.Mode)
+		if opts.Token != "" {
+			return "", fmt.Errorf("server: %s refuses shared tokens", opts.Mode)
+		}
+		if opts.Authenticator == nil || opts.Authorizer == nil || opts.NodeAuthenticator == nil {
+			return "", fmt.Errorf("server: %s requires principal and node identity", opts.Mode)
 		}
 		profile := proto.SecurityIsolated
 		if opts.Mode == ModeProductionMultiTenant {
 			profile = proto.SecurityMultiTenant
-		}
-		for nodeID, approval := range opts.ApprovedNodes {
-			if len(approval.PubKey) != ed25519.PublicKeySize || len(approval.Info.BackendDescriptors) == 0 {
-				return "", fmt.Errorf("server: approved node %s lacks a key or backend descriptors", nodeID)
-			}
-			for _, descriptor := range approval.Info.BackendDescriptors {
-				if err := proto.ValidateBackendSecurity(proto.SecuritySpec{Profile: profile}, descriptor); err != nil {
-					return "", fmt.Errorf("server: approved node %s backend %s cannot satisfy %s: %w", nodeID, descriptor.Name, profile, err)
-				}
-			}
 		}
 		return profile, nil
 	default:
@@ -650,11 +690,15 @@ func (s *Server) handleLink(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) authed(r *http.Request) bool {
+	h := r.Header.Get("Authorization")
+	tok := strings.TrimPrefix(h, "Bearer ")
+	if s.opts.Authenticator != nil {
+		_, err := s.opts.Authenticator.Authenticate(r.Context(), control.Credential{Token: tok})
+		return err == nil
+	}
 	if s.opts.Token == "" {
 		return true
 	}
-	h := r.Header.Get("Authorization")
-	tok := strings.TrimPrefix(h, "Bearer ")
 	return subtle.ConstantTimeCompare([]byte(tok), []byte(s.opts.Token)) == 1
 }
 
