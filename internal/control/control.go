@@ -320,6 +320,11 @@ func New(opts Options) (*Control, error) {
 	if err := c.load(); err != nil {
 		return nil, err
 	}
+	// A previous process may have committed a resource and died before its
+	// staged event reached the log; deliver it before anyone reads either.
+	if err := c.log.DrainOutbox(context.Background(), c.db); err != nil {
+		return nil, fmt.Errorf("control: drain event outbox: %w", err)
+	}
 	return c, nil
 }
 
@@ -356,6 +361,9 @@ func (c *Control) Stop() {
 // ---------------------------------------------------------------------------
 
 func (c *Control) migrate() error {
+	if err := eventlog.CreateOutbox(c.db); err != nil {
+		return err
+	}
 	_, err := c.db.Exec(`
 CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS timers (id TEXT PRIMARY KEY, data BLOB NOT NULL);
@@ -502,13 +510,10 @@ func (c *Control) load() error {
 		return err
 	}
 	for _, repair := range repairs {
-		if err := c.persistWS(repair.workspace); err != nil {
+		if err := c.persistWS(repair.workspace, c.transitionEvent(repair.from, repair.workspace, lifecycleTransition{
+			operation: transitionRecover, actor: actorRecovery, to: repair.workspace.State,
+		})); err != nil {
 			return fmt.Errorf("persist recovered workspace %s: %w", repair.workspace.ID, err)
-		}
-		if repair.from != repair.workspace.State {
-			c.emitWorkspaceTransition(context.Background(), repair.from, *repair.workspace, lifecycleTransition{
-				operation: transitionRecover, actor: actorRecovery, to: repair.workspace.State,
-			})
 		}
 	}
 	for _, a := range assignments {
@@ -612,34 +617,65 @@ func (c *Control) load() error {
 	return rows.Close()
 }
 
-func (c *Control) persistWS(ws *proto.Workspace) error {
-	ws.UpdatedAt = c.now().UnixMilli()
-	_, err := c.db.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws))
+// transact commits resource rows and the events describing them as one
+// SQLite transaction (ADR 0023). Callers hold c.mu; the lock order is
+// c.mu then the log's mutex, and nothing acquires them the other way round.
+func (c *Control) transact(fn func(tx *eventlog.Tx) error, events []*proto.Event) error {
+	err := c.log.Transact(context.Background(), c.db, func(tx *eventlog.Tx) error {
+		if err := fn(tx); err != nil {
+			return err
+		}
+		return stageAll(tx, events)
+	})
+	var deferred *eventlog.DrainError
+	if errors.As(err, &deferred) {
+		// The rows and their events are durable; only delivery to the log
+		// lagged. Tick retries so subscribers see the event without a restart.
+		c.logger.Error("event outbox drain deferred", "err", deferred.Err)
+		return nil
+	}
 	return err
 }
 
-func (c *Control) persistClaim(ws *proto.Workspace) error {
-	ws.UpdatedAt = c.now().UnixMilli()
-	tx, err := c.db.Begin()
-	if err != nil {
-		return err
+func stageAll(tx *eventlog.Tx, events []*proto.Event) error {
+	for _, e := range events {
+		if e == nil {
+			continue
+		}
+		if err := tx.Emit(e); err != nil {
+			return err
+		}
 	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`INSERT OR IGNORE INTO assignments(workspace, generation, node, tenant, created_at) VALUES(?,?,?,?,?)`,
-		ws.ID, ws.Generation, ws.Node, ws.Tenant, c.now().UnixMilli()); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return nil
 }
 
-func (c *Control) persistFleetOperation(operation *proto.FleetOperation) error {
+func (c *Control) persistWS(ws *proto.Workspace, events ...*proto.Event) error {
+	ws.UpdatedAt = c.now().UnixMilli()
+	return c.transact(func(tx *eventlog.Tx) error {
+		_, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws))
+		return err
+	}, events)
+}
+
+func (c *Control) persistClaim(ws *proto.Workspace, events ...*proto.Event) error {
+	ws.UpdatedAt = c.now().UnixMilli()
+	return c.transact(func(tx *eventlog.Tx) error {
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT OR IGNORE INTO assignments(workspace, generation, node, tenant, created_at) VALUES(?,?,?,?,?)`,
+			ws.ID, ws.Generation, ws.Node, ws.Tenant, c.now().UnixMilli())
+		return err
+	}, events)
+}
+
+func (c *Control) persistFleetOperation(operation *proto.FleetOperation, events ...*proto.Event) error {
 	operation.UpdatedAt = c.now().UnixMilli()
-	_, err := c.db.Exec(`INSERT OR REPLACE INTO fleet_operations(id, data) VALUES(?,?)`,
-		operation.ID, proto.MustMarshal(operation))
-	return err
+	return c.transact(func(tx *eventlog.Tx) error {
+		_, err := tx.Exec(`INSERT OR REPLACE INTO fleet_operations(id, data) VALUES(?,?)`,
+			operation.ID, proto.MustMarshal(operation))
+		return err
+	}, events)
 }
 
 // WithArtifactReferences invokes fn while workspace and fleet-operation
@@ -935,41 +971,30 @@ func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int)
 	return result, nil
 }
 
-func (c *Control) persistFleetOperationAndMutation(operation *proto.FleetOperation, scope, key string, request any) error {
+func (c *Control) persistFleetOperationAndMutation(operation *proto.FleetOperation, scope, key string, request any, events ...*proto.Event) error {
 	operation.UpdatedAt = c.now().UnixMilli()
-	tx, err := c.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`INSERT INTO fleet_operations(id, data) VALUES(?,?)`,
-		operation.ID, proto.MustMarshal(operation)); err != nil {
-		return err
-	}
-	if err := c.insertMutationTx(tx, scope, key, proto.OpFleetQuarantine, request,
-		mutationFleetResult{ID: operation.ID}); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return c.transact(func(tx *eventlog.Tx) error {
+		if _, err := tx.Exec(`INSERT INTO fleet_operations(id, data) VALUES(?,?)`,
+			operation.ID, proto.MustMarshal(operation)); err != nil {
+			return err
+		}
+		return c.insertMutationTx(tx.Tx, scope, key, proto.OpFleetQuarantine, request,
+			mutationFleetResult{ID: operation.ID})
+	}, events)
 }
 
-func (c *Control) persistWorkspaceAndFleetOperation(ws *proto.Workspace, operation *proto.FleetOperation) error {
+func (c *Control) persistWorkspaceAndFleetOperation(ws *proto.Workspace, operation *proto.FleetOperation, events ...*proto.Event) error {
 	ws.UpdatedAt = c.now().UnixMilli()
 	operation.UpdatedAt = c.now().UnixMilli()
-	tx, err := c.db.Begin()
-	if err != nil {
+	return c.transact(func(tx *eventlog.Tx) error {
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`,
+			ws.ID, proto.MustMarshal(ws)); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT OR REPLACE INTO fleet_operations(id, data) VALUES(?,?)`,
+			operation.ID, proto.MustMarshal(operation))
 		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`,
-		ws.ID, proto.MustMarshal(ws)); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO fleet_operations(id, data) VALUES(?,?)`,
-		operation.ID, proto.MustMarshal(operation)); err != nil {
-		return err
-	}
-	return tx.Commit()
+	}, events)
 }
 
 func (c *Control) assignmentTenant(workspace string, generation uint64, node string) (string, bool, error) {
@@ -984,71 +1009,47 @@ func (c *Control) assignmentTenant(workspace string, generation uint64, node str
 	return tenant, true, nil
 }
 
-func (c *Control) persistWSAndMutation(ws *proto.Workspace, scope, key, op string, request, result any) error {
-	ws.UpdatedAt = c.now().UnixMilli()
-	tx, err := c.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err != nil {
-		return err
-	}
-	if err := c.insertMutationTx(tx, scope, key, op, request, result); err != nil {
-		return err
-	}
-	return tx.Commit()
+func (c *Control) persistWSAndMutation(ws *proto.Workspace, scope, key, op string, request, result any, events ...*proto.Event) error {
+	return c.persistWorkspaceTimersAndMutation(ws, nil, scope, key, op, request, result, events...)
 }
 
-func (c *Control) persistWorkspaceTimerAndMutation(ws *proto.Workspace, timer *proto.Timer, scope, key, op string, request, result any) error {
-	ws.UpdatedAt = c.now().UnixMilli()
-	tx, err := c.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err != nil {
-		return err
-	}
+func (c *Control) persistWorkspaceTimerAndMutation(ws *proto.Workspace, timer *proto.Timer, scope, key, op string, request, result any, events ...*proto.Event) error {
+	var timers []*proto.Timer
 	if timer != nil {
-		if _, err := tx.Exec(`INSERT OR REPLACE INTO timers(id, data) VALUES(?,?)`, timer.ID, proto.MustMarshal(timer)); err != nil {
-			return err
-		}
+		timers = []*proto.Timer{timer}
 	}
-	if err := c.insertMutationTx(tx, scope, key, op, request, result); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return c.persistWorkspaceTimersAndMutation(ws, timers, scope, key, op, request, result, events...)
 }
 
-func (c *Control) persistWorkspaceTimersAndMutation(ws *proto.Workspace, timers []*proto.Timer, scope, key, op string, request, result any) error {
+func (c *Control) persistWorkspaceTimersAndMutation(ws *proto.Workspace, timers []*proto.Timer, scope, key, op string, request, result any, events ...*proto.Event) error {
 	ws.UpdatedAt = c.now().UnixMilli()
-	tx, err := c.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err != nil {
-		return err
-	}
-	for _, timer := range timers {
-		if _, err := tx.Exec(`INSERT OR REPLACE INTO timers(id, data) VALUES(?,?)`, timer.ID, proto.MustMarshal(timer)); err != nil {
+	return c.transact(func(tx *eventlog.Tx) error {
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err != nil {
 			return err
 		}
-	}
-	if err := c.insertMutationTx(tx, scope, key, op, request, result); err != nil {
-		return err
-	}
-	return tx.Commit()
+		for _, timer := range timers {
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO timers(id, data) VALUES(?,?)`, timer.ID, proto.MustMarshal(timer)); err != nil {
+				return err
+			}
+		}
+		return c.insertMutationTx(tx.Tx, scope, key, op, request, result)
+	}, events)
 }
 
-func (c *Control) saveNode(id string, n *nodeState) {
-	if _, err := c.db.Exec(`INSERT OR REPLACE INTO nodes(id, pubkey, data) VALUES(?,?,?)`, id, n.PubKey, proto.MustMarshal(n.Status)); err != nil {
+func (c *Control) saveNode(id string, n *nodeState, events ...*proto.Event) {
+	err := c.transact(func(tx *eventlog.Tx) error {
+		_, err := tx.Exec(`INSERT OR REPLACE INTO nodes(id, pubkey, data) VALUES(?,?,?)`, id, n.PubKey, proto.MustMarshal(n.Status))
+		return err
+	}, events)
+	if err != nil {
 		c.logger.Error("save node", "err", err)
 	}
 }
 
-func (c *Control) emit(ctx context.Context, typ, stream, principal, node string, payload any) uint64 {
+// newEvent builds a control-originated event. It takes no lock; the caller,
+// which holds c.mu, attributes the event to a workspace with stampWS and
+// stages it in the transaction that commits the resource (ADR 0023).
+func (c *Control) newEvent(typ, stream, principal, node string, payload any) *proto.Event {
 	now := c.now().UnixMilli()
 	e := &proto.Event{
 		EventID: ids.New("ev"), ReceivedAt: now, Origin: "control", Actor: principal,
@@ -1057,43 +1058,35 @@ func (c *Control) emit(ctx context.Context, typ, stream, principal, node string,
 	if payload != nil {
 		e.Payload = proto.MustMarshal(payload)
 	}
-	if strings.HasPrefix(stream, "ws_") {
-		c.mu.Lock()
-		if ws := c.workspaces[stream]; ws != nil {
-			e.Tenant, e.Workspace, e.Generation = ws.Tenant, ws.ID, ws.Generation
-		}
-		c.mu.Unlock()
-	}
-	err := c.log.Append(ctx, e)
-	if err != nil {
-		c.logger.Error("emit", "type", typ, "err", err)
-		return 0
-	}
-	return e.Seq
+	return e
 }
 
-func (c *Control) emitFleetEvent(ctx context.Context, typ, stream, node string, operation *proto.FleetOperation, payload any) uint64 {
-	now := c.now().UnixMilli()
+// stampWS attributes e to the workspace whose row commits alongside it.
+func stampWS(e *proto.Event, ws *proto.Workspace) *proto.Event {
+	if e != nil && ws != nil {
+		e.Tenant, e.Workspace, e.Generation = ws.Tenant, ws.ID, ws.Generation
+	}
+	return e
+}
+
+// wsEvent is newEvent plus stampWS for the common case of an event about the
+// workspace being persisted.
+func (c *Control) wsEvent(ws *proto.Workspace, typ, principal, node string, payload any) *proto.Event {
+	return stampWS(c.newEvent(typ, ws.ID, principal, node, payload), ws)
+}
+
+// fleetEvent builds an event attributed to a fleet operation. ws, when not
+// nil, is the target workspace committing in the same transaction.
+func (c *Control) fleetEvent(typ, stream, node string, operation *proto.FleetOperation, ws *proto.Workspace, payload any) *proto.Event {
 	e := &proto.Event{
-		EventID: ids.New("ev"), ReceivedAt: now, Origin: "control", Actor: operation.RequestedBy,
+		EventID: ids.New("ev"), ReceivedAt: c.now().UnixMilli(), Origin: "control", Actor: operation.RequestedBy,
 		Principal: operation.RequestedBy, Tenant: operation.Tenant, OperationID: operation.ID,
 		Type: typ, Stream: stream, Node: node,
 	}
 	if payload != nil {
 		e.Payload = proto.MustMarshal(payload)
 	}
-	if strings.HasPrefix(stream, "ws_") {
-		c.mu.Lock()
-		if ws := c.workspaces[stream]; ws != nil {
-			e.Tenant, e.Workspace, e.Generation = ws.Tenant, ws.ID, ws.Generation
-		}
-		c.mu.Unlock()
-	}
-	if err := c.log.Append(ctx, e); err != nil {
-		c.logger.Error("emit fleet event", "type", typ, "operation", operation.ID, "err", err)
-		return 0
-	}
-	return e.Seq
+	return stampWS(e, ws)
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,12 +1208,13 @@ func (c *Control) PeerConnected(ctx context.Context, id string, h *proto.Hello) 
 		}
 		n.Status.Online = true
 		n.Status.LastSeen = c.now().UnixMilli()
-		c.saveNode(id, n)
-		c.mu.Unlock()
+		var events []*proto.Event
 		if fresh {
-			c.emit(ctx, proto.EvNodeEnrolled, id, "", id, h.Labels)
+			events = append(events, c.newEvent(proto.EvNodeEnrolled, id, "", id, h.Labels))
 		}
-		c.emit(ctx, proto.EvNodeOnline, id, "", id, nil)
+		events = append(events, c.newEvent(proto.EvNodeOnline, id, "", id, nil))
+		c.saveNode(id, n, events...)
+		c.mu.Unlock()
 		c.offerPending(ctx)
 		return
 	}
@@ -1242,36 +1236,28 @@ func (c *Control) PeerGone(ctx context.Context, id string) {
 		// WSClaimed. Clients waiting on a workspace therefore wait for the
 		// node that will actually answer them.
 		var demoted []string
-		var transitions []proto.Workspace
 		for _, ws := range c.workspaces {
 			if ws.Node == id && ws.State == proto.WSClaimed {
-				next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+				transition := lifecycleTransition{
 					operation: transitionReconnect, actor: actorControl, to: proto.WSClaiming,
 					expectGeneration: true, generation: ws.Generation,
 					expectNode: true, node: id,
-				})
+				}
+				next, transitionErr := transitionWorkspace(ws, transition)
 				if transitionErr != nil {
 					c.logger.Error("validate node-offline demotion", "ws", ws.ID, "err", transitionErr)
 					continue
 				}
-				if err := c.persistWS(&next); err != nil {
+				if err := c.persistWS(&next, c.transitionEvent(proto.WSClaimed, &next, transition)); err != nil {
 					c.logger.Error("persist node-offline demotion", "ws", ws.ID, "err", err)
 					continue
 				}
 				*ws = next
 				demoted = append(demoted, ws.ID)
-				transitions = append(transitions, next)
 			}
 		}
+		c.saveNode(id, n, c.newEvent(proto.EvNodeOffline, id, "", id, map[string]any{"workspaces": demoted}))
 		c.mu.Unlock()
-		for _, next := range transitions {
-			c.emitWorkspaceTransition(ctx, proto.WSClaimed, next, lifecycleTransition{
-				operation: transitionReconnect, actor: actorControl, to: proto.WSClaiming,
-				expectGeneration: true, generation: next.Generation,
-				expectNode: true, node: id,
-			})
-		}
-		c.emit(ctx, proto.EvNodeOffline, id, "", id, map[string]any{"workspaces": demoted})
 		return
 	}
 	delete(c.clients, id)
@@ -1746,30 +1732,15 @@ func (c *Control) wsCreate(ctx context.Context, subject Subject, req *proto.WSCr
 		ID: ids.New("ws"), Spec: req.Spec, State: proto.WSPending, CreatedAt: now, UpdatedAt: now,
 		Tenant: subject.Tenant, Owner: subject.ID, AuthzRevision: 1,
 	}
-	tx, err := c.db.Begin()
-	if err != nil {
-		c.mu.Unlock()
-		return nil, err
-	}
-	if _, err = tx.Exec(`INSERT OR REPLACE INTO workspaces(id, data) VALUES(?,?)`, ws.ID, proto.MustMarshal(ws)); err == nil {
-		err = c.insertMutationTx(tx, scope, req.IdempotencyKey, proto.OpWSCreate, req, mutationWorkspaceResult{ID: ws.ID})
-	}
-	if err == nil {
-		err = tx.Commit()
-	} else {
-		_ = tx.Rollback()
-	}
-	if err != nil {
+	if err := c.persistWSAndMutation(ws, scope, req.IdempotencyKey, proto.OpWSCreate, req, mutationWorkspaceResult{ID: ws.ID},
+		c.wsEvent(ws, proto.EvWSCreated, subject.ID, "", req.Spec)); err != nil {
 		c.mu.Unlock()
 		return nil, err
 	}
 	c.workspaces[ws.ID] = ws
-	// The workspace is in the shared map now, so a node can claim and mutate
-	// it the moment the lock is released. Copy what the event needs first.
-	id, spec := ws.ID, ws.Spec
+	id := ws.ID
 	c.mu.Unlock()
 	metrics.WSCreated.Inc()
-	c.emit(ctx, proto.EvWSCreated, id, subject.ID, "", spec)
 	c.offerPending(ctx)
 	return c.snapshotWS(id), nil
 }
@@ -2094,16 +2065,15 @@ func (c *Control) abortPreparedRelease(ctx context.Context, id, node string, gen
 	} else {
 		next.LeaseUntil = 0
 	}
-	if err := c.persistWS(&next); err != nil {
+	if err := c.persistWS(&next, c.transitionEvent(expectedState, &next, lifecycleTransition{
+		operation: transitionReleaseAbort, actor: actorControl, to: next.State,
+		expectGeneration: true, generation: gen, expectNode: true, node: node,
+	})); err != nil {
 		c.mu.Unlock()
 		return errors.Join(cause, abortErr, fmt.Errorf("persist release reconciliation: %w", err))
 	}
 	*ws = next
 	c.mu.Unlock()
-	c.emitWorkspaceTransition(ctx, expectedState, next, lifecycleTransition{
-		operation: transitionReleaseAbort, actor: actorControl, to: next.State,
-		expectGeneration: true, generation: gen, expectNode: true, node: node,
-	})
 	if abortErr != nil {
 		return errors.Join(cause, fmt.Errorf("release abort was not acknowledged; source fenced for reconciliation: %w", abortErr))
 	}
@@ -2140,30 +2110,23 @@ func (c *Control) wsDestroy(ctx context.Context, principal, id, idem string) err
 	node, gen := ws.Node, ws.Generation
 	wasHeld := held(ws.State)
 	beforeDestroy := ws.State
-	var destroying proto.Workspace
 	if wasHeld {
-		next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+		transition := lifecycleTransition{
 			operation: transitionDestroyBegin, actor: actorControl, to: proto.WSDestroying,
 			expectGeneration: true, generation: gen, expectNode: true, node: node,
-		})
+		}
+		next, transitionErr := transitionWorkspace(ws, transition)
 		if transitionErr != nil {
 			c.mu.Unlock()
 			return transitionErr
 		}
-		if err := c.persistWS(&next); err != nil {
+		if err := c.persistWS(&next, c.transitionEvent(beforeDestroy, &next, transition)); err != nil {
 			c.mu.Unlock()
 			return err
 		}
 		*ws = next
-		destroying = next
 	}
 	c.mu.Unlock()
-	if wasHeld {
-		c.emitWorkspaceTransition(ctx, beforeDestroy, destroying, lifecycleTransition{
-			operation: transitionDestroyBegin, actor: actorControl, to: proto.WSDestroying,
-			expectGeneration: true, generation: gen, expectNode: true, node: node,
-		})
-	}
 	var prepared proto.WSReleasedReq
 	if node != "" && c.send != nil && c.send.Online(node) {
 		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -2203,7 +2166,8 @@ func (c *Control) wsDestroy(ctx context.Context, principal, id, idem string) err
 			timerUpdates = append(timerUpdates, &copyTimer)
 		}
 	}
-	if err := c.persistWorkspaceTimersAndMutation(&destroyed, timerUpdates, scope, idem, proto.OpWSDestroy, request, struct{}{}); err != nil {
+	if err := c.persistWorkspaceTimersAndMutation(&destroyed, timerUpdates, scope, idem, proto.OpWSDestroy, request, struct{}{},
+		c.wsEvent(&destroyed, proto.EvWSDestroyed, principal, node, nil)); err != nil {
 		c.mu.Unlock()
 		if prepared.ID != "" {
 			return c.abortPreparedRelease(ctx, id, node, gen, proto.WSDestroying, err)
@@ -2224,7 +2188,6 @@ func (c *Control) wsDestroy(ctx context.Context, principal, id, idem string) err
 		}
 	}
 	metrics.WSDestroyed.Inc()
-	c.emit(ctx, proto.EvWSDestroyed, id, principal, node, nil)
 	return nil
 }
 
@@ -2257,24 +2220,21 @@ func (c *Control) release(ctx context.Context, id string, snapshot bool, reason 
 		}
 	}
 	node, gen := ws.Node, ws.Generation
-	next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+	begin := lifecycleTransition{
 		operation: transitionReleaseBegin, actor: actorControl, to: proto.WSQuiescing,
 		expectGeneration: true, generation: gen, expectNode: true, node: node,
-	})
+	}
+	next, transitionErr := transitionWorkspace(ws, begin)
 	if transitionErr != nil {
 		c.mu.Unlock()
 		return "", transitionErr
 	}
-	if err := c.persistWS(&next); err != nil {
+	if err := c.persistWS(&next, c.transitionEvent(proto.WSClaimed, &next, begin)); err != nil {
 		c.mu.Unlock()
 		return "", err
 	}
 	*ws = next
 	c.mu.Unlock()
-	c.emitWorkspaceTransition(ctx, proto.WSClaimed, next, lifecycleTransition{
-		operation: transitionReleaseBegin, actor: actorControl, to: proto.WSQuiescing,
-		expectGeneration: true, generation: gen, expectNode: true, node: node,
-	})
 	var res proto.WSReleasedReq
 	rctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
@@ -2318,7 +2278,7 @@ func (c *Control) release(ctx context.Context, id string, snapshot bool, reason 
 		committed.Spec.RestoreFrom = res.Snapshot
 	}
 	last := committed.LastSnapshot
-	if err := c.persistWS(&committed); err != nil {
+	if err := c.persistWS(&committed, c.wsEvent(&committed, proto.EvWSReleased, "", node, map[string]any{"reason": reason, "snapshot": res.Snapshot})); err != nil {
 		c.mu.Unlock()
 		return "", c.abortPreparedRelease(ctx, id, node, gen, proto.WSQuiescing, err)
 	}
@@ -2332,7 +2292,6 @@ func (c *Control) release(ctx context.Context, id string, snapshot bool, reason 
 		// extra fenced source is safe; the node can reconcile it later.
 		c.logger.Warn("release commit not acknowledged; source retained", "ws", id, "node", node, "err", commitErr)
 	}
-	c.emit(ctx, proto.EvWSReleased, id, "", node, map[string]any{"reason": reason, "snapshot": res.Snapshot})
 	return last, nil
 }
 
@@ -2396,14 +2355,14 @@ func (c *Control) wsMove(ctx context.Context, principal string, req *proto.WSMov
 	next.Spec.RestoreFrom = snap
 	next.Node = ""
 	next.LeaseUntil = 0
-	if err := c.persistWSAndMutation(&next, scope, req.IdempotencyKey, proto.OpWSMove, req, &next); err != nil {
+	if err := c.persistWSAndMutation(&next, scope, req.IdempotencyKey, proto.OpWSMove, req, &next,
+		c.wsEvent(&next, proto.EvWSMoved, principal, "", map[string]any{"restore_from": snap})); err != nil {
 		c.mu.Unlock()
 		return nil, err
 	}
 	*ws = next
 	c.mu.Unlock()
 	metrics.WSMoved.Inc()
-	c.emit(ctx, proto.EvWSMoved, req.ID, principal, "", map[string]any{"restore_from": snap})
 	c.offerPending(ctx)
 	return c.snapshotWS(req.ID), nil
 }
@@ -2476,16 +2435,16 @@ func (c *Control) wsSleep(ctx context.Context, principal string, req *proto.WSSl
 	next.Spec.RestoreFrom = snap
 	next.Node = ""
 	next.LeaseUntil = 0
-	if err := c.persistWorkspaceTimerAndMutation(&next, t, scope, req.IdempotencyKey, proto.OpWSSleep, req, t); err != nil {
+	tcp := *t
+	if err := c.persistWorkspaceTimerAndMutation(&next, t, scope, req.IdempotencyKey, proto.OpWSSleep, req, t,
+		c.wsEvent(&next, proto.EvTimerSet, principal, "", tcp),
+		c.wsEvent(&next, proto.EvWSPaused, principal, "", map[string]any{"timer": tcp.ID, "snapshot": snap})); err != nil {
 		c.mu.Unlock()
 		return nil, err
 	}
 	*ws = next
 	c.timers[t.ID] = t
-	tcp := *t
 	c.mu.Unlock()
-	c.emit(ctx, proto.EvTimerSet, req.ID, principal, "", tcp)
-	c.emit(ctx, proto.EvWSPaused, req.ID, principal, "", map[string]any{"timer": tcp.ID, "snapshot": snap})
 	return &tcp, nil
 }
 
@@ -2542,7 +2501,14 @@ func (c *Control) wsWake(ctx context.Context, principal, id, timerID, idem strin
 		c.mu.Unlock()
 		return &cp, nil
 	}
-	if err := c.persistWorkspaceTimerAndMutation(&next, nextTimer, scope, idem, proto.OpWSWake, request, &next); err != nil {
+	var events []*proto.Event
+	if nextTimer != nil {
+		events = append(events, c.wsEvent(&next, proto.EvTimerFired, principal, "", *nextTimer))
+	}
+	if resumed {
+		events = append(events, c.wsEvent(&next, proto.EvWSResumed, principal, "", map[string]any{"timer": timerID}))
+	}
+	if err := c.persistWorkspaceTimerAndMutation(&next, nextTimer, scope, idem, proto.OpWSWake, request, &next, events...); err != nil {
 		c.mu.Unlock()
 		return nil, err
 	}
@@ -2554,10 +2520,8 @@ func (c *Control) wsWake(ctx context.Context, principal, id, timerID, idem strin
 	c.mu.Unlock()
 	if nextTimer != nil {
 		metrics.TimersFired.Inc()
-		c.emit(ctx, proto.EvTimerFired, id, principal, "", *nextTimer)
 	}
 	if resumed {
-		c.emit(ctx, proto.EvWSResumed, id, principal, "", map[string]any{"timer": timerID})
 		c.offerPending(ctx)
 	}
 	return &cp, nil
@@ -2575,27 +2539,23 @@ func (c *Control) wsClaim(ctx context.Context, node, id string) (*proto.WSClaimR
 		// Keep the generation so the client's outstanding grants stay valid,
 		// but go back through claiming so waiters do not race the restore.
 		before := ws.State
-		next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
+		readopt := lifecycleTransition{
 			operation: transitionClaim, actor: actorNode, to: proto.WSClaiming,
 			expectGeneration: true, generation: ws.Generation,
 			expectNode: true, node: node,
-		})
+		}
+		next, transitionErr := transitionWorkspace(ws, readopt)
 		if transitionErr != nil {
 			c.mu.Unlock()
 			return nil, transitionErr
 		}
 		next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
-		if err := c.persistClaim(&next); err != nil {
+		if err := c.persistClaim(&next, c.transitionEvent(before, &next, readopt)); err != nil {
 			c.mu.Unlock()
 			return nil, err
 		}
 		*ws = next
 		c.mu.Unlock()
-		c.emitWorkspaceTransition(ctx, before, next, lifecycleTransition{
-			operation: transitionClaim, actor: actorNode, to: proto.WSClaiming,
-			expectGeneration: true, generation: next.Generation,
-			expectNode: true, node: node,
-		})
 		return &proto.WSClaimRes{Workspace: next, LeaseSec: c.opts.LeaseSec}, nil
 	}
 	if ws.State != proto.WSPending {
@@ -2633,14 +2593,13 @@ func (c *Control) wsClaim(ctx context.Context, node, id string) (*proto.WSClaimR
 		return nil, transitionErr
 	}
 	next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
-	if err := c.persistClaim(&next); err != nil {
+	if err := c.persistClaim(&next, c.wsEvent(&next, proto.EvWSClaiming, "", node, map[string]any{"gen": next.Generation, "restore_from": next.Spec.RestoreFrom})); err != nil {
 		c.mu.Unlock()
 		return nil, err
 	}
 	*ws = next
 	c.mu.Unlock()
 	metrics.WSClaims.Inc()
-	c.emit(ctx, proto.EvWSClaiming, id, "", node, map[string]any{"gen": next.Generation, "restore_from": next.Spec.RestoreFrom})
 	return &proto.WSClaimRes{Workspace: next, LeaseSec: c.opts.LeaseSec}, nil
 }
 
@@ -2690,15 +2649,12 @@ func (c *Control) wsReady(ctx context.Context, node string, req *proto.WSReadyRe
 		return transitionErr
 	}
 	next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
-	if err := c.persistWS(&next); err != nil {
+	if err := c.persistWS(&next, c.wsEvent(&next, proto.EvWSClaimed, "", node, map[string]any{"gen": next.Generation, "restore_from": next.Spec.RestoreFrom})); err != nil {
 		c.mu.Unlock()
 		return err
 	}
 	*ws = next
-	gen := next.Generation
-	restore := next.Spec.RestoreFrom
 	c.mu.Unlock()
-	c.emit(ctx, proto.EvWSClaimed, req.ID, "", node, map[string]any{"gen": gen, "restore_from": restore})
 	return nil
 }
 
@@ -2764,13 +2720,12 @@ func (c *Control) wsSnapshotCommit(ctx context.Context, node string, req *proto.
 	}
 	next := *ws
 	next.LastSnapshot = req.Snapshot
-	if err := c.persistWS(&next); err != nil {
+	if err := c.persistWS(&next, c.wsEvent(&next, proto.EvWSSnapshot, "", node, map[string]any{"artifact": req.Snapshot, "committed": true})); err != nil {
 		c.mu.Unlock()
 		return err
 	}
 	*ws = next
 	c.mu.Unlock()
-	c.emit(ctx, proto.EvWSSnapshot, req.ID, "", node, map[string]any{"artifact": req.Snapshot, "committed": true})
 	return nil
 }
 
@@ -2813,14 +2768,13 @@ func (c *Control) wsReleased(ctx context.Context, node string, req *proto.WSRele
 	}
 	next.Node = ""
 	next.LeaseUntil = 0
-	if err := c.persistWS(&next); err != nil {
+	if err := c.persistWS(&next, c.wsEvent(&next, proto.EvWSReleased, "", node, map[string]any{"reason": req.Reason, "snapshot": req.Snapshot})); err != nil {
 		c.mu.Unlock()
 		return err
 	}
 	*ws = next
 	state := next.State
 	c.mu.Unlock()
-	c.emit(ctx, proto.EvWSReleased, req.ID, "", node, map[string]any{"reason": req.Reason, "snapshot": req.Snapshot})
 	if state == proto.WSPending {
 		c.offerPending(ctx)
 	}
@@ -3129,7 +3083,15 @@ func (c *Control) fleetQuarantine(ctx context.Context, subject Subject, request 
 	if len(operation.Results) == 0 {
 		operation.State = proto.FleetStateCompleted
 	}
-	if err := c.persistFleetOperationAndMutation(operation, scope, req.IdempotencyKey, req); err != nil {
+	events := []*proto.Event{c.fleetEvent(proto.EvFleetRequested, operation.ID, "", operation, nil, map[string]any{
+		"action": operation.Action, "selector": operation.Selector, "targets": len(operation.Results),
+	})}
+	if operation.State == proto.FleetStateCompleted {
+		events = append(events, c.fleetEvent(proto.EvFleetCompleted, operation.ID, "", operation, nil, map[string]any{
+			"state": operation.State, "targets": 0,
+		}))
+	}
+	if err := c.persistFleetOperationAndMutation(operation, scope, req.IdempotencyKey, req, events...); err != nil {
 		c.mu.Unlock()
 		return nil, err
 	}
@@ -3137,14 +3099,8 @@ func (c *Control) fleetQuarantine(ctx context.Context, subject Subject, request 
 	out := cloneFleetOperation(operation)
 	c.mu.Unlock()
 	metrics.FleetOperations.Inc()
-	c.emitFleetEvent(ctx, proto.EvFleetRequested, operation.ID, "", operation, map[string]any{
-		"action": operation.Action, "selector": operation.Selector, "targets": len(operation.Results),
-	})
 	if operation.State == proto.FleetStateCompleted {
 		metrics.FleetOperationsCompleted.Inc()
-		c.emitFleetEvent(ctx, proto.EvFleetCompleted, operation.ID, "", operation, map[string]any{
-			"state": operation.State, "targets": 0,
-		})
 	} else {
 		c.signalFleet()
 	}
@@ -3288,21 +3244,23 @@ func (c *Control) runFleetOperation(ctx context.Context, id string) {
 	default:
 		operation.State = proto.FleetStateRunning
 	}
-	if err := c.persistFleetOperation(operation); err != nil {
+	firstTerminal := !fleetStateTerminal(startedState) && terminal
+	var completed *proto.Event
+	if firstTerminal || (startedState == proto.FleetStatePartial && operation.State == proto.FleetStateCompleted) {
+		completed = c.fleetEvent(proto.EvFleetCompleted, id, "", operation, nil, map[string]any{
+			"state": operation.State, "targets": len(operation.Results),
+		})
+	}
+	c.mu.Lock()
+	if err := c.persistFleetOperation(operation, completed); err != nil {
+		c.mu.Unlock()
 		c.logger.Error("persist fleet operation result", "operation", id, "err", err)
 		return
 	}
-	c.mu.Lock()
 	c.fleetOps[id] = operation
 	c.mu.Unlock()
-	firstTerminal := !fleetStateTerminal(startedState) && terminal
 	if firstTerminal {
 		metrics.FleetOperationsCompleted.Inc()
-	}
-	if firstTerminal || (startedState == proto.FleetStatePartial && operation.State == proto.FleetStateCompleted) {
-		c.emitFleetEvent(ctx, proto.EvFleetCompleted, id, "", operation, map[string]any{
-			"state": operation.State, "targets": len(operation.Results),
-		})
 	}
 }
 
@@ -3323,8 +3281,6 @@ func (c *Control) processFleetTarget(ctx context.Context, operationID string, in
 		return
 	}
 
-	var fleetTransition *proto.Workspace
-	var fleetTransitionFrom string
 	c.mu.Lock()
 	ws := c.workspaces[target.Workspace]
 	if ws == nil {
@@ -3412,7 +3368,8 @@ func (c *Control) processFleetTarget(ctx context.Context, operationID string, in
 			}
 			target.UpdatedAt = c.now().UnixMilli()
 			operation.Results[index] = target
-			if err := c.persistWorkspaceAndFleetOperation(&next, operation); err != nil {
+			if err := c.persistWorkspaceAndFleetOperation(&next, operation, c.fleetEvent(proto.EvFleetTarget, target.Workspace, target.Node, operation, &next,
+				map[string]any{"operation": operationID, "action": operation.Action, "acknowledged": true})); err != nil {
 				c.mu.Unlock()
 				return
 			}
@@ -3420,17 +3377,16 @@ func (c *Control) processFleetTarget(ctx context.Context, operationID string, in
 			c.fleetOps[operationID] = operation
 			c.mu.Unlock()
 			metrics.FleetTargetsFenced.Inc()
-			c.emitFleetEvent(ctx, proto.EvFleetTarget, target.Workspace, target.Node, operation,
-				map[string]any{"operation": operationID, "action": operation.Action, "acknowledged": true})
 			return
 		}
 		var transitionErr error
-		fleetTransitionFrom = ws.State
-		next, transitionErr = transitionWorkspace(ws, lifecycleTransition{
+		fleetBegin := lifecycleTransition{
 			operation: transitionFleetBegin, actor: actorControl, to: proto.WSQuiescing,
 			expectGeneration: true, generation: ws.Generation,
 			expectNode: true, node: target.Node,
-		})
+		}
+		before := ws.State
+		next, transitionErr = transitionWorkspace(ws, fleetBegin)
 		if transitionErr != nil {
 			c.logger.Error("validate fleet quarantine transition", "ws", ws.ID, "err", transitionErr)
 			c.mu.Unlock()
@@ -3441,25 +3397,16 @@ func (c *Control) processFleetTarget(ctx context.Context, operationID string, in
 			next.QuarantinedAt = c.now().UnixMilli()
 		}
 		operation.Results[index] = target
-		if err := c.persistWorkspaceAndFleetOperation(&next, operation); err != nil {
+		if err := c.persistWorkspaceAndFleetOperation(&next, operation, c.transitionEvent(before, &next, fleetBegin)); err != nil {
 			c.mu.Unlock()
 			return
 		}
 		*ws = next
-		transitionCopy := next
-		fleetTransition = &transitionCopy
 		c.fleetOps[operationID] = operation
 	}
 	exclude := append([]string(nil), ws.Spec.Exclude...)
 	security := ws.Spec.Security
 	c.mu.Unlock()
-	if fleetTransition != nil {
-		c.emitWorkspaceTransition(ctx, fleetTransitionFrom, *fleetTransition, lifecycleTransition{
-			operation: transitionFleetBegin, actor: actorControl, to: proto.WSQuiescing,
-			expectGeneration: true, generation: fleetTransition.Generation,
-			expectNode: true, node: target.Node,
-		})
-	}
 
 	var response proto.WSQuarantineRes
 	request := proto.WSQuarantineReq{
@@ -3574,7 +3521,10 @@ func (c *Control) processFleetTarget(ctx context.Context, operationID string, in
 		next.Node = ""
 	}
 	operation.Results[index] = target
-	if err := c.persistWorkspaceAndFleetOperation(&next, operation); err != nil {
+	if err := c.persistWorkspaceAndFleetOperation(&next, operation, c.fleetEvent(proto.EvFleetTarget, target.Workspace, target.Node, operation, &next, map[string]any{
+		"operation": operationID, "action": operation.Action, "acknowledged": target.Acknowledged,
+		"state": target.State, "error": target.Error,
+	})); err != nil {
 		c.mu.Unlock()
 		return
 	}
@@ -3582,10 +3532,6 @@ func (c *Control) processFleetTarget(ctx context.Context, operationID string, in
 	c.fleetOps[operationID] = operation
 	c.mu.Unlock()
 	metrics.FleetTargetsFenced.Inc()
-	c.emitFleetEvent(ctx, proto.EvFleetTarget, target.Workspace, target.Node, operation, map[string]any{
-		"operation": operationID, "action": operation.Action, "acknowledged": target.Acknowledged,
-		"state": target.State, "error": target.Error,
-	})
 	if operation.Action == proto.FleetActionDestroy && target.Fenced && target.State == proto.FleetTargetPending {
 		c.commitFleetDestroy(ctx, operation, index)
 	}
@@ -4152,12 +4098,11 @@ func (c *Control) loop() {
 // Tick runs one iteration of the background work (exported for tests with
 // an injected clock).
 func (c *Control) Tick(ctx context.Context) {
-	now := c.now().UnixMilli()
-	type leaseExpiry struct {
-		workspace proto.Workspace
-		error     string
+	if err := c.log.DrainOutbox(ctx, c.db); err != nil {
+		c.logger.Error("event outbox drain", "err", err)
 	}
-	var expired []leaseExpiry
+	now := c.now().UnixMilli()
+	var expired uint64
 	var fire []*proto.Timer
 	c.mu.Lock()
 	for _, ws := range c.workspaces {
@@ -4193,18 +4138,19 @@ func (c *Control) Tick(ctx context.Context) {
 				next.Node = ""
 			}
 			next.LeaseUntil = 0
-			if err := c.persistWS(&next); err != nil {
+			var expiryError string
+			if generationErr != nil {
+				expiryError = generationErr.Error()
+			}
+			if err := c.persistWS(&next, c.wsEvent(&next, proto.EvWSLeaseExpired, "", lost, map[string]any{
+				"restore_from": next.Spec.RestoreFrom,
+				"state":        next.State, "error": expiryError,
+			})); err != nil {
 				c.logger.Error("persist lease expiry", "ws", ws.ID, "err", err)
 				continue
 			}
 			*ws = next
-			cp := next
-			cp.Node = lost
-			expiry := leaseExpiry{workspace: cp}
-			if generationErr != nil {
-				expiry.error = generationErr.Error()
-			}
-			expired = append(expired, expiry)
+			expired++
 		}
 	}
 	for _, t := range c.timers {
@@ -4213,14 +4159,7 @@ func (c *Control) Tick(ctx context.Context) {
 		}
 	}
 	c.mu.Unlock()
-	// lint:locks-ok expired holds per-iteration copies, not shared workspaces
-	for _, expiry := range expired {
-		metrics.WSLeaseExpired.Inc()
-		c.emit(ctx, proto.EvWSLeaseExpired, expiry.workspace.ID, "", expiry.workspace.Node, map[string]any{
-			"restore_from": expiry.workspace.Spec.RestoreFrom,
-			"state":        expiry.workspace.State, "error": expiry.error,
-		})
-	}
+	metrics.WSLeaseExpired.Add(uint64(expired))
 	for _, t := range fire {
 		c.fireTimer(ctx, t)
 	}

@@ -74,6 +74,11 @@ func (l *Log) Append(ctx context.Context, e *proto.Event) error {
 		return err
 	}
 	metrics.EventsAppended.Inc()
+	l.fanOutLocked(e)
+	return nil
+}
+
+func (l *Log) fanOutLocked(e *proto.Event) {
 	for s := range l.subs {
 		if s.stream != "" && s.stream != e.Stream {
 			continue
@@ -85,7 +90,6 @@ func (l *Log) Append(ctx context.Context, e *proto.Event) error {
 			s.markLagged(e.Seq)
 		}
 	}
-	return nil
 }
 
 // Read delegates to the store.
@@ -518,7 +522,21 @@ func (s *SQLite) DB() *sql.DB { return s.db }
 func (s *SQLite) Append(ctx context.Context, e *proto.Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.ExecContext(ctx, `INSERT INTO events(
+	return insertEvent(ctx, s.db, e)
+}
+
+// AppendTx implements TxStore. The transaction owns the database's single
+// connection, so no other append can interleave before it commits.
+func (s *SQLite) AppendTx(ctx context.Context, tx *sql.Tx, e *proto.Event) error {
+	return insertEvent(ctx, tx, e)
+}
+
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func insertEvent(ctx context.Context, db execer, e *proto.Event) error {
+	res, err := db.ExecContext(ctx, `INSERT INTO events(
 		at, stream, principal, node, type, payload, cause, event_id, received_at,
 		observed_at, origin, actor, tenant, workspace, generation, operation_id, producer_seq, session
 	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
