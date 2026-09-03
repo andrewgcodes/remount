@@ -508,6 +508,52 @@ reached `next`: nothing more will ever arrive. Reading the mirror needs read
 authority on the agent and never wakes a sleeping workspace; the node-side
 session log remains the source for byte-exact replay of a live run.
 
+### 6.3 The agent HTTP API
+
+Next to the frame protocol the control plane serves a JSON HTTP API for
+agents, so a browser, an editor or a chat integration can drive one without
+speaking frames. It is normative only in that every route is a translation of
+one operation above: the request's bearer credential becomes a client, the
+body becomes the protocol request, the protocol error code becomes a status.
+Authorization, idempotency and events are the ones §6.1 and §6.2 define. The
+route table, streaming formats and bounds are in `docs/api.md`.
+
+```
+POST   /v1/session                      mint the browser cookie from a header credential
+DELETE /v1/session                      clear it
+POST   /v1/agents                       agent.create      201 + Location
+GET    /v1/agents                       agent.list
+GET    /v1/agents/{id}                  agent.get
+POST   /v1/agents/{id}/messages         agent.message
+POST   /v1/agents/{id}/cancel           agent.cancel
+POST   /v1/agents/{id}/sleep            agent.sleep
+POST   /v1/agents/{id}/wake             agent.wake
+POST   /v1/agents/{id}/destroy          agent.destroy     204
+POST   /v1/agents/{id}/fork             agent.fork        201 + Location
+GET    /v1/agents/{id}/transcript       agent.transcript (JSON page, SSE or WebSocket)
+GET    /v1/agents/{id}/approvals        approval.list
+GET    /v1/approvals/{id}               approval.get
+POST   /v1/approvals/{id}               approval.decide
+GET    /v1/agents/{id}/diff             git status + git diff in the workspace
+GET    /v1/agents/{id}/terminal         WebSocket pty (new or attach+replay)
+       /v1/agents/{id}/fs/{path}        GET/HEAD/PUT/DELETE, jailed by the node
+       /v1/agents/{id}/ports/{port}/... authenticated reverse proxy into the workspace
+GET    /a/{id}                          the stable agent URL
+```
+
+Three rules are protocol, not presentation. A credential arrives in
+`Authorization`, or as the WebSocket subprotocol `remount.bearer.<base64url>`,
+or as the `remount_session` cookie; the cookie is accepted only on safe
+methods, WebSocket upgrades and the preview proxy, and never on a
+cookie-authenticated request from an untrusted `Origin`, because a
+cookie-authenticated mutation is a CSRF target. Reads never wake: the
+transcript reads the mirror, and the filesystem and terminal refuse a
+sleeping agent with `conflict` rather than waking it; `diff?wake=true` and
+the preview proxy wake deliberately and emit `agent.woken` with `by: diff`
+and `by: preview`. `/a/{id}` carries no capability: it redirects to the
+operator UI when one is configured and otherwise answers `agent.get`, both
+authenticating like every other route.
+
 ## 7. Node operations
 
 Sent to a node id, and every one carries a `Grant` on first use per connection.

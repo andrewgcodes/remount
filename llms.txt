@@ -46,6 +46,18 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/re
 - [Writing your own loop](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#writing-your-own-loop): The supported Go SDK is `remount.dev/remount/client`; its stable resource model and error codes are in `remount.dev/remount/api`.
 - [What a harness gets for free](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#what-a-harness-gets-for-free): Truthful bounded replay.
 
+## Agent HTTP API
+
+- [Base URL, authentication, errors](https://github.com/remount-dev/remount/blob/main/docs/api.md#base-url-authentication-errors): Every route is under the server's base URL (`--public-url` when set).
+- [Agents](https://github.com/remount-dev/remount/blob/main/docs/api.md#agents): `Agent`, `AgentCreateReq`, `AgentSpec` and `AgentPolicy` are the protocol types serialized as JSON with their `json` tags; the request to create an agent from a recipe is:
+- [Transcript](https://github.com/remount-dev/remount/blob/main/docs/api.md#transcript): `GET /v1/agents/{id}/transcript?from=N&limit=M` reads the durable mirror (§6.2) as a page:
+- [Approvals](https://github.com/remount-dev/remount/blob/main/docs/api.md#approvals): Decision validation is per kind (§6.1): a `tool_call` takes one of the offered `options`, an `elicitation` takes `content` (a JSON object) or `denied`, an `egress` takes `allow`/`deny`.
+- [Diff](https://github.com/remount-dev/remount/blob/main/docs/api.md#diff): `GET /v1/agents/{id}/diff[?wake=true]` returns
+- [Terminal](https://github.com/remount-dev/remount/blob/main/docs/api.md#terminal): `GET /v1/agents/{id}/terminal` upgrades to a WebSocket that is the xterm.js endpoint.
+- [Files](https://github.com/remount-dev/remount/blob/main/docs/api.md#files): `/v1/agents/{id}/fs/{path}` is the workspace filesystem, jailed by the node (§7).
+- [Preview proxy](https://github.com/remount-dev/remount/blob/main/docs/api.md#preview-proxy): `/v1/agents/{id}/ports/{port}/{rest}` is an authenticated reverse proxy to TCP `{port}` inside the workspace, the same forward `remount port` uses, for HTTP and WebSocket traffic.
+- [Bounds](https://github.com/remount-dev/remount/blob/main/docs/api.md#bounds): Every bound is a `4xx`/`5xx` with a stable code, never a truncated success.
+
 ## Optional
 
 - [design.md](https://github.com/remount-dev/remount/blob/main/docs/design.md): why each piece is shaped the way it is, and the failure model.
