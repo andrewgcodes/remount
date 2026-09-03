@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
 	"io"
@@ -15,7 +16,15 @@ import (
 	"time"
 
 	"remount.dev/remount/internal/artifact"
+	"remount.dev/remount/internal/control"
+	"remount.dev/remount/internal/proto"
 )
+
+type allowAuthorizer struct{}
+
+func (allowAuthorizer) Check(context.Context, control.Subject, string, control.Resource) error {
+	return nil
+}
 
 func testDigest(body string) string {
 	sum := sha256.Sum256([]byte(body))
@@ -188,5 +197,33 @@ func TestConcurrentHealthAddrAndClose(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not stop")
+	}
+}
+
+func TestProductionModeRejectsCooperativeEgressBackend(t *testing.T) {
+	base := Options{
+		Mode: ModeProductionSingleTenant, Token: "node-token",
+		Authenticator: control.StaticAuthenticator{"client-token": {ID: "user", Tenant: "tenant"}},
+		Authorizer:    allowAuthorizer{},
+	}
+	weak := proto.BackendDescriptor{
+		Name: "docker", Security: proto.BackendSecurityCaps{
+			Isolation: "container", EgressMode: "cooperative_proxy", BrokerIdentity: "token",
+		},
+	}
+	base.ApprovedNodes = map[string]control.NodeApproval{"n_one": {
+		PubKey: make([]byte, ed25519.PublicKeySize), Info: proto.NodeInfo{BackendDescriptors: []proto.BackendDescriptor{weak}},
+	}}
+	if _, err := validateSecurityMode(base); err == nil || !strings.Contains(err.Error(), "enforced egress") {
+		t.Fatalf("cooperative production backend error=%v", err)
+	}
+	strong := weak
+	strong.Name = "sandbox"
+	strong.Security.EgressMode = "enforced_gateway"
+	base.ApprovedNodes["n_one"] = control.NodeApproval{
+		PubKey: make([]byte, ed25519.PublicKeySize), Info: proto.NodeInfo{BackendDescriptors: []proto.BackendDescriptor{strong}},
+	}
+	if profile, err := validateSecurityMode(base); err != nil || profile != proto.SecurityIsolated {
+		t.Fatalf("enforced production backend profile=%q err=%v", profile, err)
 	}
 }

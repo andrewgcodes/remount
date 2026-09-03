@@ -92,7 +92,7 @@ requirement and every `--label` in the placement matches.
 | Backend | Isolation | What the agent gets | Use when |
 |---|---|---|---|
 | `process` | none | a directory on the host, processes as the node's user | the machine is yours and you already trust the agent with it |
-| `docker` | container | a long-lived container with the workspace mounted at `/work` | you want a boundary between the agent and the host |
+| `docker` | container, cooperative egress | a long-lived container with the workspace mounted at `/work` | local/single-owner containment where Docker's default boundary is sufficient |
 
 Be honest with yourself about `process`. The agent runs as the same user as the
 node with the host's full network and filesystem. The workspace root is only a
@@ -139,14 +139,32 @@ about a minute before expiry.
 
 ## Network policy
 
-The default is deny. A workspace may reach a host only if a binding it holds
-names that host, or the node's `--allow` list does. Everything else gets a 403
-from the broker and an `egress.denied` event. This is deliberate: an agent that
-cannot reach the internet cannot exfiltrate through it, and every exception is
-written down.
+There are two deliberately distinct modes. An explicit workspace policy is a
+first-match list of typed capabilities and defaults to deny. A workspace with
+no typed policy uses the legacy local rule: a reverse-proxy request is allowed
+when it uses a binding for that destination or matches the node's `--allow`
+list. Typed rules replace that legacy authority; they are not merged with it.
 
-`--allow` is per node, so a fleet box that installs packages needs the
-registries, and a box that only runs a model client does not.
+For example, this permits two immutable registry reads per workspace
+generation and one bounded write to a run-scoped API:
+
+```sh
+remount ws create --security local --network-default deny \
+  --egress-rule '{"id":"registry-read","protocol":"https","hosts":["registry.example"],"ports":[443],"methods":["GET","HEAD"],"path_prefixes":["/v2"],"max_requests":2,"max_response_bytes":8388608,"shared_state":"immutable_read"}' \
+  --egress-rule @scoped-write-rule.json
+```
+
+Rules match protocol (`http`, `https`, or opaque `connect`), canonical ASCII
+host, effective port, method and path-prefix segment. They may cap request
+count, request bytes and response bytes. Counts reset only when the workspace
+generation changes. `immutable_read` is restricted to `GET`/`HEAD`;
+`scoped_write` requires workspace write authority; `global_write` requires an
+administrator. Every decision records the workspace, generation and matching
+rule. A redirect is sent back through the broker and checked again.
+
+`--allow` is per node and applies only to the legacy local policy. A fleet box
+that installs packages may need registry entries; production policy should put
+those destinations in explicit workspace rules instead.
 
 The broker refuses to connect to loopback, private and link-local addresses,
 including cloud metadata endpoints, unless the host is listed in
@@ -154,10 +172,22 @@ including cloud metadata endpoints, unless the host is listed in
 and how everything else on your network stays out of reach.
 
 The broker rewrites credentials only on its reverse-proxy path
-`/d/<host>/...`. CONNECT tunnels through `HTTPS_PROXY` are allowed to permitted
-hosts but are not inspected, so a placeholder sent through a tunnel is never
-substituted. Point harnesses at `${REMOUNT_BROKER}/d/<host>` for anything that
-needs a key.
+`/d/<host>/...`. CONNECT tunnels through `HTTPS_PROXY` are not inspected, so a
+placeholder sent through a tunnel is never substituted. A binding never grants
+CONNECT authority: typed mode needs an explicit `protocol:"connect"` rule and
+legacy local mode needs `--allow`. CONNECT rules cannot claim path, byte-limit,
+or shared-state enforcement. Suspending or fencing the workspace closes
+established tunnels. Point harnesses at `${REMOUNT_BROKER}/d/<host>` for
+anything that needs a key.
+
+The broker capability authenticates one workspace and generation, but proxy
+environment variables alone cannot stop a hostile process from opening a
+direct socket. The built-in `process` and `docker` backends advertise
+`cooperative_proxy`, so `isolated` and `multi_tenant` workspaces reject them.
+There is currently no built-in production backend. An external backend may
+advertise `enforced_gateway` only when its handle implements the network
+controller that installs the generation-specific policy before readiness and
+revokes it synchronously during fencing, quarantine, and node shutdown.
 
 ## Leases
 
@@ -290,6 +320,8 @@ workspace in `pending` for more than a few seconds has no eligible node.
 | session output in memory | 2 MiB per session | ring buffer; oldest chunks spill to disk |
 | session output on disk | 128 MiB per session | under the node's `spill/`; rotated when full |
 | finished session retention | 24 hours | the exit record and log stay attachable |
+| broker client connections | 128 per workspace | listener stops accepting until a socket closes |
+| broker concurrent requests/tunnels | 64 per workspace | excess requests receive 429; streams and CONNECT hold a slot |
 | control-plane events | unbounded in SQLite | plan for the log's growth; it is the audit trail |
 | node mutation records | 10,000 per node | new mutations fail closed with `resource_exhausted` at the cap |
 | fleet acknowledgement deadline | 5 minutes default, 24 hours maximum | pending unreachable targets remain visible and are retried |

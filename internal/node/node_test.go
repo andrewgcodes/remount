@@ -121,6 +121,42 @@ func (h *failingHandle) Destroy(context.Context) error {
 	return nil
 }
 
+type fixedBackend struct {
+	name   string
+	caps   workspace.Caps
+	handle workspace.Handle
+}
+
+func (b *fixedBackend) Name() string         { return b.name }
+func (b *fixedBackend) Caps() workspace.Caps { return b.caps }
+func (b *fixedBackend) Create(context.Context, string, proto.WorkspaceSpec, io.Reader) (workspace.Handle, error) {
+	return b.handle, nil
+}
+func (b *fixedBackend) Adopt(context.Context, string) (workspace.Handle, error) {
+	return b.handle, nil
+}
+
+type networkHandle struct {
+	*failingHandle
+	backend   string
+	applyErr  error
+	revokeErr error
+	applied   atomic.Int32
+	revoked   atomic.Int32
+	endpoint  workspace.NetworkEndpoint
+}
+
+func (h *networkHandle) Backend() string { return h.backend }
+func (h *networkHandle) ApplyNetworkPolicy(_ context.Context, _ proto.NetworkPolicy, endpoint workspace.NetworkEndpoint) error {
+	h.endpoint = endpoint
+	h.applied.Add(1)
+	return h.applyErr
+}
+func (h *networkHandle) RevokeNetwork(context.Context) error {
+	h.revoked.Add(1)
+	return h.revokeErr
+}
+
 func TestReleaseSnapshotFailureRestoresSourceWithoutDestroy(t *testing.T) {
 	n := newTestNode(t, nil)
 	root := filepath.Join(t.TempDir(), "workspace")
@@ -146,6 +182,212 @@ func TestReleaseSnapshotFailureRestoresSourceWithoutDestroy(t *testing.T) {
 	n.mu.Unlock()
 	if restored != w || prepared || h.destroyed.Load() != 0 {
 		t.Fatalf("source was not restored: workspace=%p prepared=%v destroyed=%d", restored, prepared, h.destroyed.Load())
+	}
+}
+
+func TestEnforcedGatewayRequiresConcreteNetworkController(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := fsops.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := &failingHandle{id: "ws_dishonest", fs: fs}
+	backend := &fixedBackend{name: "enforced", handle: handle, caps: workspace.Caps{
+		Isolation: "container", EgressMode: "enforced_gateway", BrokerIdentity: "token",
+	}}
+	n := newTestNode(t, func(opts *Options) { opts.Backends = workspace.NewRegistry(backend) })
+	w := proto.Workspace{
+		ID: "ws_dishonest", Generation: 1, State: proto.WSClaiming,
+		Spec: proto.WorkspaceSpec{Requires: proto.Requires{Backend: "enforced"}},
+	}
+	n.mu.Lock()
+	n.materializing[w.ID] = &materialization{generation: w.Generation, deadline: time.Now().Add(time.Minute), cancel: func() {}}
+	n.mu.Unlock()
+	err = n.materialize(context.Background(), w, false)
+	if err == nil || !strings.Contains(err.Error(), "without a network controller") {
+		t.Fatalf("dishonest backend materialize error=%v", err)
+	}
+	n.mu.Lock()
+	_, serving := n.workspaces[w.ID]
+	_, quarantined := n.quarantined[w.ID]
+	n.mu.Unlock()
+	if serving || !quarantined {
+		t.Fatalf("dishonest backend serving=%v quarantined=%v", serving, quarantined)
+	}
+}
+
+func TestEnforcedGatewayAppliesPolicyAndRevokesBeforeFencing(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := fsops.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := &networkHandle{
+		failingHandle: &failingHandle{id: "ws_enforced", fs: fs}, backend: "enforced",
+	}
+	backend := &fixedBackend{name: "enforced", handle: handle, caps: workspace.Caps{
+		Isolation: "container", EgressMode: "enforced_gateway", BrokerIdentity: "token",
+	}}
+	n := newTestNode(t, func(opts *Options) { opts.Backends = workspace.NewRegistry(backend) })
+	w := proto.Workspace{
+		ID: "ws_enforced", Generation: 3, State: proto.WSClaiming,
+		Spec: proto.WorkspaceSpec{
+			Requires: proto.Requires{Backend: "enforced"},
+			Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Default: proto.NetworkDefaultDeny}},
+		},
+	}
+	n.mu.Lock()
+	n.materializing[w.ID] = &materialization{generation: w.Generation, deadline: time.Now().Add(time.Minute), cancel: func() {}}
+	n.mu.Unlock()
+	// With no control peer, materialization reaches the ready boundary and
+	// self-fences. Policy must already be installed and revocation must run.
+	err = n.materialize(context.Background(), w, false)
+	if err == nil || handle.applied.Load() != 1 || handle.revoked.Load() != 1 {
+		t.Fatalf("materialize err=%v applied=%d revoked=%d", err, handle.applied.Load(), handle.revoked.Load())
+	}
+	if handle.endpoint.Workspace != w.ID || handle.endpoint.Generation != w.Generation ||
+		handle.endpoint.ReverseProxyURL == "" || handle.endpoint.ForwardProxyURL == "" {
+		t.Fatalf("network endpoint=%#v", handle.endpoint)
+	}
+}
+
+func TestQuarantineDoesNotAffirmFenceWhenNetworkRevocationFails(t *testing.T) {
+	n := newTestNode(t, nil)
+	root := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := fsops.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := &networkHandle{
+		failingHandle: &failingHandle{id: "ws_revoke", fs: fs}, backend: "enforced",
+		revokeErr: errors.New("firewall unavailable"),
+	}
+	w := &ws{Workspace: proto.Workspace{ID: "ws_revoke", Generation: 2, State: proto.WSClaimed}, handle: handle}
+	n.mu.Lock()
+	n.workspaces[w.ID] = w
+	n.deadlines[w.ID] = time.Now().Add(time.Hour)
+	n.mu.Unlock()
+	res, err := n.quarantine(context.Background(), &proto.WSQuarantineReq{
+		OperationID: "fleet_revoke", WS: w.ID, Gen: w.Generation, Action: proto.FleetActionFreeze,
+	})
+	if err != nil || res.Fenced || !strings.Contains(res.Warning, "firewall unavailable") || handle.revoked.Load() != 1 {
+		t.Fatalf("quarantine=%#v err=%v revoked=%d", res, err, handle.revoked.Load())
+	}
+}
+
+func TestRetainedQuarantineReopensBackendAndRevokesNetwork(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := fsops.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := &networkHandle{
+		failingHandle: &failingHandle{id: "ws_retained_network", fs: fs}, backend: "enforced",
+	}
+	backend := &fixedBackend{name: "enforced", handle: handle, caps: workspace.Caps{
+		Isolation: "container", EgressMode: "enforced_gateway", BrokerIdentity: "token",
+	}}
+	n := newTestNode(t, func(opts *Options) { opts.Backends = workspace.NewRegistry(backend) })
+	n.mu.Lock()
+	n.quarantined[handle.id] = struct{}{}
+	n.mu.Unlock()
+	res, err := n.quarantine(context.Background(), &proto.WSQuarantineReq{
+		OperationID: "fleet_retained_network", WS: handle.id, Gen: 4,
+		Action: proto.FleetActionRevokeEgress, Backend: backend.name,
+		Security: proto.SecuritySpec{Profile: proto.SecurityIsolated},
+	})
+	if err != nil || !res.Fenced || res.Warning != "" || handle.revoked.Load() != 1 {
+		t.Fatalf("retained quarantine=%#v err=%v revoked=%d", res, err, handle.revoked.Load())
+	}
+}
+
+func TestQuarantineWaitsForMaterializationCancellation(t *testing.T) {
+	n := newTestNode(t, nil)
+	backend, err := n.opts.Backends.Get("process")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := backend.Create(context.Background(), "ws_materializing", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = handle.FS().Close()
+	cancelled := make(chan struct{})
+	done := make(chan struct{})
+	n.mu.Lock()
+	n.materializing["ws_materializing"] = &materialization{
+		generation: 8, cancel: func() { close(cancelled) }, done: done,
+	}
+	n.mu.Unlock()
+	type result struct {
+		res *proto.WSQuarantineRes
+		err error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		res, callErr := n.quarantine(context.Background(), &proto.WSQuarantineReq{
+			OperationID: "fleet_materializing", WS: "ws_materializing", Gen: 8,
+			Action: proto.FleetActionFreeze, Backend: "process",
+		})
+		resultCh <- result{res: res, err: callErr}
+	}()
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("quarantine did not cancel materialization")
+	}
+	select {
+	case got := <-resultCh:
+		t.Fatalf("quarantine acknowledged before materialization stopped: %#v", got)
+	default:
+	}
+	close(done)
+	select {
+	case got := <-resultCh:
+		if got.err != nil || got.res == nil || !got.res.Fenced {
+			t.Fatalf("quarantine after materialization stop=%#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("quarantine did not finish after materialization stopped")
+	}
+}
+
+func TestShutdownRevokesEnforcedWorkspaceNetwork(t *testing.T) {
+	n := newTestNode(t, nil)
+	root := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := fsops.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := &networkHandle{
+		failingHandle: &failingHandle{id: "ws_shutdown", fs: fs}, backend: "enforced",
+	}
+	n.mu.Lock()
+	n.workspaces[handle.id] = &ws{
+		Workspace: proto.Workspace{ID: handle.id, Spec: proto.WorkspaceSpec{
+			Security: proto.SecuritySpec{Profile: proto.SecurityIsolated},
+		}},
+		handle: handle,
+	}
+	n.mu.Unlock()
+	n.shutdown()
+	if handle.revoked.Load() != 1 {
+		t.Fatalf("shutdown network revocations=%d", handle.revoked.Load())
 	}
 }
 

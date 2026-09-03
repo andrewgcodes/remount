@@ -117,7 +117,7 @@ func usage() {
   remount up          enroll this machine as a node (outbound only)
   remount standalone  server + node in one process (try it on a laptop)
 
-  remount ws create [--name N] [--backend B] [--label k=v] [--binding ID] [--env K=V] [--exclude GLOB]
+	  remount ws create [--name N] [--backend B] [--security PROFILE] [--egress-rule JSON] [--binding ID]
   remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS
   remount exec WS -- cmd args...      run a command (stdout/stderr/exit streamed)
   remount sh WS [cmd]                 interactive shell (pty)
@@ -238,6 +238,45 @@ type listFlag []string
 
 func (l *listFlag) String() string     { return strings.Join(*l, ",") }
 func (l *listFlag) Set(s string) error { *l = append(*l, s); return nil }
+
+type egressRuleFlag []proto.EgressRule
+
+func (rules *egressRuleFlag) String() string {
+	raw, _ := json.Marshal([]proto.EgressRule(*rules))
+	return string(raw)
+}
+
+// Set accepts either one JSON rule object or @path to a file containing one.
+// Files are useful for rules with several methods/path prefixes while keeping
+// shell quoting out of production runbooks.
+func (rules *egressRuleFlag) Set(value string) error {
+	if strings.HasPrefix(value, "@") {
+		path := strings.TrimPrefix(value, "@")
+		if path == "" {
+			return errors.New("--egress-rule @path is empty")
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read egress rule %s: %w", path, err)
+		}
+		value = string(raw)
+	}
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.DisallowUnknownFields()
+	var rule proto.EgressRule
+	if err := decoder.Decode(&rule); err != nil {
+		return fmt.Errorf("decode egress rule: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("decode egress rule: multiple JSON values")
+		}
+		return fmt.Errorf("decode egress rule: %w", err)
+	}
+	*rules = append(*rules, rule)
+	return nil
+}
 
 // ---------------------------------------------------------------------------
 // server / up / standalone
@@ -417,7 +456,7 @@ func cmdWS(ctx context.Context, args []string) error {
 		cpu := fs.Int("cpu", 0, "required cpus")
 		mem := fs.Int("mem", 0, "required memory MiB")
 		nodeID := fs.String("node", "", "pin to node id")
-		principal := fs.String("principal", "", "principal (default: caller)")
+		principal := fs.String("principal", "", "deprecated; identity is server-authoritative")
 		run := fs.String("run", "", "run identifier used by fleet selectors")
 		model := fs.String("model", "", "model identifier used by fleet selectors")
 		labels, workspaceLabels, env := kvFlag{}, kvFlag{}, kvFlag{}
@@ -425,18 +464,42 @@ func cmdWS(ctx context.Context, args []string) error {
 		fs.Var(workspaceLabels, "workspace-label", "workspace label k=v (repeatable)")
 		fs.Var(env, "env", "env K=V; values may be ref:<binding> or ${REMOUNT_BROKER} (repeatable)")
 		var bindings, exclude listFlag
+		var egressRules egressRuleFlag
 		fs.Var(&bindings, "binding", "binding id (repeatable)")
 		fs.Var(&exclude, "exclude", "snapshot exclude glob (repeatable)")
+		securityProfile := fs.String("security", "", "security profile: local, isolated, multi_tenant")
+		minIsolation := fs.String("min-isolation", "", "minimum backend isolation: none, process_sandbox, container, microvm")
+		requireSiblingIsolation := fs.Bool("require-sibling-isolation", false, "require a backend with sibling isolation")
+		requireEnforcedEgress := fs.Bool("require-enforced-egress", false, "require a backend-controlled egress boundary")
+		secretMode := fs.String("secret-mode", "", "secret mode: none or brokered")
+		networkDefault := fs.String("network-default", "", "typed network default: deny or allow (allow is local-only)")
+		auditRequired := fs.Bool("audit-required", false, "require security audit events")
+		fs.Var(&egressRules, "egress-rule", "typed egress rule as JSON or @path (repeatable)")
 		wait := fs.Bool("wait", true, "wait until claimed")
 		parse(fs, rest)
+		if *principal != "" {
+			return errors.New("--principal is not supported; authenticated caller identity is authoritative")
+		}
 		cl := c.client()
 		defer cl.Close()
 		spec := proto.WorkspaceSpec{
-			Name: *name, Run: *run, Model: *model, Labels: workspaceLabels, Image: *image, Principal: *principal,
+			Name: *name, Run: *run, Model: *model, Labels: workspaceLabels, Image: *image,
 			Requires:  proto.Requires{Backend: *backend, CPU: *cpu, MemMiB: *mem},
 			Placement: proto.Placement{Allow: labels, Node: *nodeID},
 			Bindings:  bindings, Env: env, Exclude: exclude,
+			Security: proto.SecuritySpec{
+				Profile: *securityProfile, MinIsolation: *minIsolation,
+				RequireSiblingIsolation: *requireSiblingIsolation,
+				RequireEnforcedEgress:   *requireEnforcedEgress, SecretMode: *secretMode,
+				Network: proto.NetworkPolicy{Default: *networkDefault, Rules: egressRules},
+				Audit:   proto.AuditPolicy{Required: *auditRequired},
+			},
 		}
+		normalized, err := proto.NormalizeSecurity(spec.Security)
+		if err != nil {
+			return fmt.Errorf("security policy: %w", err)
+		}
+		spec.Security = normalized
 		ws, err := cl.CreateWorkspace(ctx, spec)
 		if err != nil {
 			return err

@@ -146,6 +146,26 @@ A claim carries a lease. The holder renews it. An expired lease returns the
 workspace to `pending` with `restore_from` set to its last snapshot. There is no
 separate failure path: a node dying and a node moving are the same event.
 
+Each `WorkspaceSpec` carries an enforceable security contract:
+
+```
+SecuritySpec { profile, min_isolation, require_sibling_isolation,
+               require_enforced_egress, secret_mode, network, audit }
+NetworkPolicy { default: "deny"|"allow", rules: [EgressRule] }
+EgressRule { id, protocol, hosts, ports, methods, path_prefixes,
+             max_requests, max_request_bytes, max_response_bytes,
+             shared_state }
+```
+
+Profiles are `local`, `isolated`, and `multi_tenant`. `isolated` and
+`multi_tenant` require an enforced egress backend; `multi_tenant` additionally
+requires microVM-strength isolation, sibling, network-namespace and device
+isolation. Placement MUST fail closed when a backend descriptor does not prove
+every requested capability. A node MUST revalidate the descriptor and install
+the network policy before reporting `ws.ready`; advertising
+`enforced_gateway` without implementing the network-controller contract is an
+error, not evidence of enforcement.
+
 **Re-adoption.** If a node reconnects and asks to claim a workspace it already
 holds, the control plane returns it at the *same* generation and moves it to
 `claiming`. Outstanding client grants stay valid, and the node re-announces
@@ -220,7 +240,7 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `ws.release` | control only: `WSReleaseReq{ws, gen, snapshot, reason}` → `WSReleasedReq`; `preparing:true` means poll with the identical request |
 | `ws.release.commit` | control only: `WSReleaseCommitReq{id, gen, snapshot}` → `{}` and authorizes source deletion |
 | `ws.release.abort` | control only: `WSReleaseCommitReq{id, gen}` → `{}` and resumes the retained source |
-| `ws.quarantine` | control only: `WSQuarantineReq{operation, ws, gen, action, backend, exclude}` → `WSQuarantineRes{fenced, gen, action, backend, snapshot?, warning?}` |
+| `ws.quarantine` | control only: `WSQuarantineReq{operation, ws, gen, action, backend, exclude, security}` → `WSQuarantineRes{fenced, gen, action, backend, snapshot?, warning?}` |
 | `ws.quarantine.commit` | control only: `WSQuarantineCommitReq{operation, ws, gen, backend, snapshot}` → `{}` and authorizes deletion only after an exact durable phase-one proof |
 
 Session kinds are `exec`, `pty` and `port`.
@@ -331,10 +351,11 @@ loopback that the workspace reaches two ways:
 
 - **Reverse-proxy path**: `GET $REMOUNT_BROKER/d/<host>/<path>` speaks TLS to
   `<host>` on the workspace's behalf. Credentials are substituted here.
-- **Forward-proxy path**: `HTTP_PROXY` and `HTTPS_PROXY` are set. `CONNECT` is
-  allowed to permitted hosts, and credentials are **not** substituted, because
-  doing so would require terminating TLS with a CA installed in the workspace.
-  v0 deliberately does not do that.
+- **Forward-proxy path**: `HTTP_PROXY` and `HTTPS_PROXY` are set. `CONNECT`
+  requires either an explicit typed `connect` rule or, in legacy local mode,
+  the node allow list. A binding alone never grants a tunnel. Credentials are
+  **not** substituted, because doing so would require terminating TLS with a CA
+  installed in the workspace.
 
 A binding leased to a node looks like:
 
@@ -351,16 +372,53 @@ The broker's rules, in order, for every request:
      placeholder was aimed at the wrong host, which is an exfiltration attempt.
    - If the lease has expired, block and emit decision `expired`. Fail closed.
    - Otherwise substitute the real secret and emit `cred.used`.
-2. A destination is permitted if a binding was used for it, or it matches the
-   node's allow list. Otherwise deny.
-3. Refuse any destination that resolves to a loopback, private, link-local or
+2. If a typed `NetworkPolicy` exists, evaluate its rules in declaration order.
+   The first rule matching protocol, canonical host, effective port, method and
+   path-prefix segment is authoritative. It replaces, rather than widens into,
+   the legacy binding/node allow list. Rules imply default deny when `default`
+   is omitted; default allow is valid only for the `local` profile.
+3. Enforce `max_requests` atomically per workspace generation. Buffer a bounded
+   request before dialing so one-byte-over bodies cannot partially mutate an
+   upstream. Bound streaming responses and terminate the stream on the first
+   byte over `max_response_bytes`. Every redirect is rewritten through the
+   capability-bearing broker URL and reauthorized as a new request.
+4. In legacy local mode only, a reverse-proxy destination is permitted if a
+   binding was used for it or it matches the node allow list. An opaque CONNECT
+   tunnel still requires the node allow list and never inherits binding
+   authority.
+5. Refuse any destination that resolves to a loopback, private, link-local or
    multicast address unless that host is explicitly allowed. This closes cloud
    metadata endpoints by default.
-4. Dial the validated IP literal, not the name, so DNS cannot change under the
+6. Dial the validated IP literal, not the name, so DNS cannot change under the
    check.
 
 Host patterns are an exact host, `*.suffix` matching subdomains only, or `*`.
 A pattern may carry a port, which then must match.
+
+Typed host patterns and request authorities are lower-cased and canonicalized;
+userinfo, Unicode, malformed ports and ambiguous encodings are rejected. Path
+prefixes match path segments (`/v2` does not match `/v2evil`). Encoded slash,
+backslash, dot and percent forms that could be decoded differently downstream
+are rejected. `shared_state` is one of `none`, `immutable_read`,
+`scoped_write`, or `global_write`; control authorizes those as execute, read,
+write, and admin respectively. `immutable_read` permits only `GET` and `HEAD`.
+CONNECT cannot claim path, body-size, or shared-state enforcement because its
+contents are opaque.
+
+Every broker listener has a random 256-bit capability unique to one workspace
+materialization, and audit records carry workspace, generation, rule, protocol,
+decision, shared-state class and body lengths when known (or the first excess
+byte on a streamed limit violation). Suspending or closing a broker closes
+already-established CONNECT tunnels as well as refusing new requests. The
+reference broker accepts at most 128 client connections and 64 concurrent
+requests or tunnels per workspace; excess requests fail with 429.
+
+The reference `process` and `docker` backends provide cooperative proxy
+mediation only. They do not provide a non-bypassable network boundary and MUST
+be rejected by production security profiles. A conforming
+`enforced_gateway` backend must force all IPv4, IPv6, UDP, DNS and raw-socket
+traffic through an out-of-workspace policy component, install policy before
+readiness, and synchronously revoke it during fencing and shutdown.
 
 Placeholders should be **shape-preserving**: same prefix and length as the real
 secret, so client-side format validation in a harness does not reject the
@@ -402,8 +460,10 @@ Event { event_id, seq, received_at, observed_at, origin, actor, tenant,
 are assigned or verified outside the workspace. `observed_at` is the producer's
 clock and is not authoritative. Nodes post an ordered outbox with a monotonic
 `producer_seq`; exact retries are deduplicated and skipped ranges create an
-`event.producer_gap` record. A reader that cares about causality should use
-`cause` rather than infer it from timestamps.
+`event.producer_gap` record. For a workspace-scoped node event, `principal` is
+derived from control-plane ownership; sender-supplied principal metadata is
+discarded. A reader that cares about causality should use `cause` rather than
+infer it from timestamps.
 Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `ws.claiming`, `ws.claimed`, `ws.released`, `ws.moved`, `ws.paused`,
 `ws.resumed`, `ws.snapshot`, `ws.restored`, `ws.destroyed`,

@@ -154,6 +154,7 @@ type materialization struct {
 	generation uint64
 	deadline   time.Time
 	cancel     context.CancelFunc
+	done       chan struct{}
 }
 
 type mutationEntry struct {
@@ -596,18 +597,32 @@ func (n *Node) shutdown() {
 	n.requestCancel()
 	n.stopOnce.Do(func() { close(n.stop) })
 	n.requestWG.Wait()
-	n.sessions.Close()
 	n.mu.Lock()
+	held := make(map[*ws]struct{}, len(n.workspaces)+len(n.prepared))
 	for _, w := range n.workspaces {
+		held[w] = struct{}{}
+	}
+	for _, prepared := range n.prepared {
+		held[prepared.workspace] = struct{}{}
+	}
+	n.mu.Unlock()
+	for w := range held {
 		if w.broker != nil {
-			w.broker.Close()
+			w.broker.Suspend()
+		}
+	}
+	for w := range held {
+		if err := n.revokeWorkspaceNetwork(context.Background(), w); err != nil {
+			n.logger.Error("revoke workspace network during shutdown", "ws", w.ID, "err", err)
+		}
+	}
+	n.sessions.Close()
+	for w := range held {
+		if w.broker != nil {
+			_ = w.broker.Close()
 		}
 		_ = w.handle.FS().Close()
 	}
-	for _, prepared := range n.prepared {
-		_ = prepared.workspace.handle.FS().Close()
-	}
-	n.mu.Unlock()
 }
 
 func (n *Node) connectOnce(ctx context.Context) error {
@@ -920,6 +935,40 @@ func writeWorkspaceEnv(handle workspace.Handle, w *ws) error {
 	return handle.FS().Write(EnvFilePath, []byte(b.String()), 0o644, false, true)
 }
 
+func (n *Node) revokeWorkspaceNetwork(ctx context.Context, w *ws) error {
+	controller, ok := w.handle.(workspace.NetworkController)
+	if !ok {
+		policy, err := proto.NormalizeSecurity(w.Spec.Security)
+		if err != nil {
+			return err
+		}
+		if policy.RequireEnforcedEgress {
+			return fmt.Errorf("backend %s has no required network controller", w.handle.Backend())
+		}
+		return nil
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	return controller.RevokeNetwork(rctx)
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func appendWarning(existing, warning string) string {
+	if existing == "" {
+		return warning
+	}
+	if warning == "" {
+		return existing
+	}
+	return existing + "; " + warning
+}
+
 // fenceWorkspace stops all execution and egress but preserves the filesystem.
 // Authority disagreement is not permission to delete the only current copy.
 func (n *Node) fenceWorkspace(ctx context.Context, id, reason string) {
@@ -933,7 +982,7 @@ func (n *Node) fenceWorkspace(ctx context.Context, id, reason string) {
 	delete(n.workspaces, id)
 	delete(n.deadlines, id)
 	n.quarantined[id] = struct{}{}
-	if materializing != nil {
+	if materializing != nil && materializing.cancel != nil {
 		materializing.cancel()
 	}
 	for k, s := range n.subs {
@@ -943,15 +992,30 @@ func (n *Node) fenceWorkspace(ctx context.Context, id, reason string) {
 		}
 	}
 	n.mu.Unlock()
+	if w != nil {
+		if w.broker != nil {
+			w.broker.Suspend()
+		}
+	}
+	var networkErr error
+	if w != nil {
+		networkErr = n.revokeWorkspaceNetwork(ctx, w)
+		if networkErr != nil {
+			n.logger.Error("revoke workspace network while fencing", "ws", id, "err", networkErr)
+		}
+	}
 	n.sessions.KillWorkspace(id)
 	if w != nil {
 		if w.broker != nil {
-			w.broker.Close()
+			_ = w.broker.Close()
 		}
 		_ = w.handle.FS().Close()
 	}
-	n.logger.Warn("workspace fenced; local filesystem retained", "ws", id, "reason", reason)
-	n.emit(proto.EvWSFenced, id, "", map[string]any{"reason": reason})
+	n.logger.Warn("workspace execution fenced; local filesystem retained", "ws", id, "reason", reason,
+		"network_revoked", networkErr == nil, "network_error", errorString(networkErr))
+	n.emit(proto.EvWSFenced, id, "", map[string]any{
+		"reason": reason, "network_revoked": networkErr == nil, "network_error": errorString(networkErr),
+	})
 }
 
 // quarantine is the node half of a durable fleet containment operation. It
@@ -983,51 +1047,65 @@ func (n *Node) quarantine(ctx context.Context, req *proto.WSQuarantineReq) (*pro
 				n.mu.Unlock()
 				return nil, proto.Err(proto.CodeConflict, "generation mismatch")
 			}
-			if materializing != nil {
+			if materializing != nil && materializing.cancel != nil {
 				materializing.cancel()
 			}
 			n.quarantined[req.WS] = struct{}{}
 			delete(n.deadlines, req.WS)
 			n.mu.Unlock()
+
 			res := proto.WSQuarantineRes{
 				Fenced: true, Generation: req.Gen, Action: req.Action, Backend: req.Backend,
 			}
-			if req.Action == proto.FleetActionCheckpoint || req.Action == proto.FleetActionDestroy {
-				switch {
-				case materializing != nil:
-					res.Warning = "materialization cancelled before a stable checkpoint could be taken"
-				case req.Backend == "":
-					res.Warning = "retained workspace has no backend identity for checkpoint"
-				default:
-					backend, backendErr := n.opts.Backends.Get(req.Backend)
-					if backendErr != nil {
-						res.Warning = backendErr.Error()
-						break
+			if materializing != nil {
+				if materializing.done == nil {
+					res.Fenced = false
+					res.Warning = "materialization cancellation cannot be confirmed"
+				} else {
+					select {
+					case <-materializing.done:
+					case <-ctx.Done():
+						return nil, ctx.Err()
 					}
-					handle, adoptErr := backend.Adopt(ctx, req.WS)
-					if adoptErr != nil {
-						res.Warning = adoptErr.Error()
-						break
-					}
-					retainedWorkspace := &ws{
-						Workspace: proto.Workspace{
-							ID: req.WS, Generation: req.Gen,
-							Spec: proto.WorkspaceSpec{Exclude: append([]string(nil), req.Exclude...)},
+				}
+			}
+
+			if req.Backend == "" {
+				res.Fenced = false
+				res.Warning = appendWarning(res.Warning, "retained workspace has no backend identity for network revocation")
+			} else if backend, backendErr := n.opts.Backends.Get(req.Backend); backendErr != nil {
+				res.Fenced = false
+				res.Warning = appendWarning(res.Warning, backendErr.Error())
+			} else if handle, adoptErr := backend.Adopt(ctx, req.WS); adoptErr != nil {
+				res.Fenced = false
+				res.Warning = appendWarning(res.Warning, adoptErr.Error())
+			} else {
+				retainedWorkspace := &ws{
+					Workspace: proto.Workspace{
+						ID: req.WS, Generation: req.Gen,
+						Spec: proto.WorkspaceSpec{
+							Exclude: append([]string(nil), req.Exclude...), Security: req.Security,
 						},
-						handle: handle,
-					}
+					},
+					handle: handle,
+				}
+				if revokeErr := n.revokeWorkspaceNetwork(ctx, retainedWorkspace); revokeErr != nil {
+					res.Fenced = false
+					res.Warning = appendWarning(res.Warning, "network revocation failed: "+revokeErr.Error())
+				}
+				if req.Action == proto.FleetActionCheckpoint || req.Action == proto.FleetActionDestroy {
 					id, _, snapshotErr := n.snapshot(ctx, retainedWorkspace, true)
-					_ = handle.FS().Close()
 					if snapshotErr != nil {
-						res.Warning = snapshotErr.Error()
+						res.Warning = appendWarning(res.Warning, snapshotErr.Error())
 					} else {
 						res.Snapshot = id
 					}
 				}
+				_ = handle.FS().Close()
 			}
 			n.emit(proto.EvWSFenced, req.WS, "", map[string]any{
 				"operation": req.OperationID, "action": req.Action, "materializing": materializing != nil,
-				"snapshot": res.Snapshot, "warning": res.Warning,
+				"snapshot": res.Snapshot, "warning": res.Warning, "network_revoked": res.Fenced,
 			})
 			return proto.Marshal(res)
 		}
@@ -1053,16 +1131,23 @@ func (n *Node) quarantine(ctx context.Context, req *proto.WSQuarantineReq) (*pro
 
 		if w.broker != nil {
 			w.broker.Suspend()
+		}
+		networkErr := n.revokeWorkspaceNetwork(ctx, w)
+		if w.broker != nil {
 			_ = w.broker.Close()
 		}
 		n.sessions.KillWorkspace(req.WS)
 		res := proto.WSQuarantineRes{
 			Fenced: true, Generation: req.Gen, Action: req.Action, Backend: w.handle.Backend(),
 		}
+		if networkErr != nil {
+			res.Fenced = false
+			res.Warning = appendWarning(res.Warning, "network revocation failed: "+networkErr.Error())
+		}
 		if req.Action == proto.FleetActionCheckpoint || req.Action == proto.FleetActionDestroy {
 			id, _, snapshotErr := n.snapshot(ctx, w, true)
 			if snapshotErr != nil {
-				res.Warning = snapshotErr.Error()
+				res.Warning = appendWarning(res.Warning, snapshotErr.Error())
 			} else {
 				res.Snapshot = id
 			}
@@ -1070,7 +1155,7 @@ func (n *Node) quarantine(ctx context.Context, req *proto.WSQuarantineReq) (*pro
 		_ = w.handle.FS().Close()
 		n.emit(proto.EvWSFenced, req.WS, w.Spec.Principal, map[string]any{
 			"operation": req.OperationID, "action": req.Action, "snapshot": res.Snapshot,
-			"warning": res.Warning,
+			"warning": res.Warning, "network_revoked": res.Fenced,
 		})
 		return proto.Marshal(res)
 	})
@@ -1961,7 +2046,7 @@ func (n *Node) tryClaim(ctx context.Context, wsID string, adopt bool) {
 	}
 	adopt = adopt || retained
 	mctx, materializeCancel := context.WithCancel(ctx)
-	materializing := &materialization{cancel: materializeCancel}
+	materializing := &materialization{cancel: materializeCancel, done: make(chan struct{})}
 	n.materializing[wsID] = materializing
 	n.mu.Unlock()
 	defer func() {
@@ -1971,6 +2056,7 @@ func (n *Node) tryClaim(ctx context.Context, wsID string, adopt bool) {
 			delete(n.materializing, wsID)
 		}
 		n.mu.Unlock()
+		close(materializing.done)
 	}()
 	var res proto.WSClaimRes
 	cctx, cancel := context.WithTimeout(mctx, 15*time.Second)
@@ -1997,7 +2083,9 @@ func (n *Node) tryClaim(ctx context.Context, wsID string, adopt bool) {
 	n.mu.Unlock()
 	if err := n.materialize(mctx, res.Workspace, adopt); err != nil {
 		n.logger.Error("materialize failed; releasing", "ws", wsID, "err", err)
-		_ = p.Call(ctx, proto.PeerControl, proto.OpWSReleased, proto.WSReleasedReq{ID: wsID, Gen: res.Workspace.Generation, Reason: "materialize failed: " + err.Error()}, nil)
+		rctx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		_ = p.Call(rctx, proto.PeerControl, proto.OpWSReleased, proto.WSReleasedReq{ID: wsID, Gen: res.Workspace.Generation, Reason: "materialize failed: " + err.Error()}, nil)
+		releaseCancel()
 	}
 }
 
@@ -2051,6 +2139,9 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 	}
 	entry := &ws{Workspace: w, handle: handle}
 	retainOnError := func(err error) error {
+		if revokeErr := n.revokeWorkspaceNetwork(ctx, entry); revokeErr != nil {
+			n.logger.Error("revoke network after materialization failure", "ws", w.ID, "err", revokeErr)
+		}
 		n.quarantineMaterialization(w.ID, handle, entry.broker, err.Error())
 		return err
 	}
@@ -2077,17 +2168,24 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 	}
 	entry.leases = leases
 	brokerOpts := broker.Options{
-		WS: w.ID, Principal: w.Spec.Principal, Leases: leases, Allow: n.opts.Allow, AllowPrivate: n.opts.AllowPrivate,
+		WS: w.ID, Generation: w.Generation, Principal: w.Spec.Principal, Leases: leases,
+		Network: w.Spec.Security.Network, Allow: n.opts.Allow, AllowPrivate: n.opts.AllowPrivate,
 		RootCAs: n.opts.BrokerRootCAs,
 		Audit: func(a broker.Audit) {
 			typ := proto.EvEgressAllowed
 			switch a.Decision {
 			case broker.DecisionSubstituted:
 				typ = proto.EvCredUsed
-			case broker.DecisionDenied, broker.DecisionLeakBlocked, broker.DecisionExpired, broker.DecisionUnauthenticated:
+			case broker.DecisionDenied, broker.DecisionLeakBlocked, broker.DecisionExpired,
+				broker.DecisionUnauthenticated, broker.DecisionLimitExceeded:
 				typ = proto.EvEgressDenied
 			}
-			n.emit(typ, a.WS, a.Principal, map[string]any{"decision": a.Decision, "binding": a.Binding, "host": a.Host, "method": a.Method, "path": a.Path, "reason": a.Reason, "status": a.Status})
+			n.emit(typ, a.WS, a.Principal, map[string]any{
+				"generation": a.Generation, "decision": a.Decision, "binding": a.Binding,
+				"rule": a.Rule, "protocol": a.Protocol, "shared_state": a.SharedState,
+				"host": a.Host, "method": a.Method, "path": a.Path, "reason": a.Reason,
+				"status": a.Status, "request_bytes": a.RequestBytes, "response_bytes": a.ResponseBytes,
+			})
 		},
 	}
 	if handle.Backend() == "docker" {
@@ -2099,6 +2197,19 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 	entry.broker = broker.New(brokerOpts)
 	if _, err := entry.broker.Start(); err != nil {
 		return retainOnError(err)
+	}
+	if descriptor.Security.EgressMode == "enforced_gateway" {
+		controller, ok := handle.(workspace.NetworkController)
+		if !ok {
+			return retainOnError(proto.Err(proto.CodeDenied,
+				"backend %s advertises enforced egress without a network controller", be.Name()))
+		}
+		if err := controller.ApplyNetworkPolicy(ctx, w.Spec.Security.Network, workspace.NetworkEndpoint{
+			Workspace: w.ID, Generation: w.Generation,
+			ReverseProxyURL: entry.broker.BaseURL(), ForwardProxyURL: entry.broker.ProxyURL(),
+		}); err != nil {
+			return retainOnError(fmt.Errorf("apply enforced network policy: %w", err))
+		}
 	}
 	// Drop a sourceable env file into the workspace. The broker's address
 	// changes every time a workspace is materialized, so anything that bakes

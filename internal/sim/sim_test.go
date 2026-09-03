@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"remount.dev/remount/internal/broker"
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/node"
@@ -669,6 +670,77 @@ func TestSecretBlindWorkspace(t *testing.T) {
 	})
 	if found {
 		t.Fatal("secret on workspace disk")
+	}
+}
+
+func TestTypedWorkspaceEgressPolicyIsEnforcedAndAttributed(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = io.WriteString(w, "allowed")
+	}))
+	defer up.Close()
+	upHost := strings.TrimPrefix(up.URL, "https://")
+	roots := x509.NewCertPool()
+	roots.AddCert(up.Certificate())
+	w := newWorld(t)
+	w.nodeWithBrokerRoots("n1", nil, roots)
+	c := w.client("c1")
+	ws := mustWS(t, c, proto.WorkspaceSpec{
+		Env: map[string]string{"API_URL": "${REMOUNT_BROKER}/d/" + upHost},
+		Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+			ID: "read-once", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{upHost},
+			Methods: []string{"GET"}, PathPrefixes: []string{"/allowed"}, MaxRequests: 1,
+			SharedState: proto.SharedStateImmutableRead,
+		}}}},
+	})
+	ctx := ctxT(t, 60*time.Second)
+	out, errb, exit, err := c.Run(ctx, ws.ID, "sh", "-c", `curl -s "$API_URL/allowed"`)
+	if err != nil || exit.Code != 0 || string(out) != "allowed" {
+		t.Fatalf("allowed request err=%v exit=%+v stdout=%q stderr=%q", err, exit, out, errb)
+	}
+	out, _, _, _ = c.Run(ctx, ws.ID, "sh", "-c", `curl -s -o /dev/null -w "%{http_code}" "$API_URL/allowed"`)
+	if string(out) != "429" {
+		t.Fatalf("request budget status=%q", out)
+	}
+	out, _, _, _ = c.Run(ctx, ws.ID, "sh", "-c", `curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/allowed"`)
+	if string(out) != "403" {
+		t.Fatalf("method policy status=%q", out)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("upstream hits=%d", hits.Load())
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	events, err := c.ReadEvents(ctx, 1, ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attributed bool
+	deniedDecisions := map[string]bool{}
+	for _, event := range events {
+		if event.Type != proto.EvEgressAllowed && event.Type != proto.EvEgressDenied {
+			continue
+		}
+		var payload map[string]any
+		if err := proto.Unmarshal(event.Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type == proto.EvEgressDenied {
+			if decision, ok := payload["decision"].(string); ok {
+				deniedDecisions[decision] = true
+			}
+		}
+		if event.Type == proto.EvEgressAllowed && payload["rule"] == "read-once" &&
+			event.Generation == ws.Generation && payload["generation"] == ws.Generation {
+			attributed = true
+		}
+	}
+	if !attributed {
+		t.Fatalf("no generation-attributed rule decision in events: %#v", events)
+	}
+	if !deniedDecisions[broker.DecisionLimitExceeded] || !deniedDecisions[broker.DecisionDenied] {
+		t.Fatalf("limit/method denials were not classified as denied events: %#v", deniedDecisions)
 	}
 }
 
