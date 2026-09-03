@@ -2844,7 +2844,7 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 			})
 		},
 	}
-	if advertise := n.brokerAdvertiseHost(handle.Backend()); advertise != "" {
+	if advertise := n.brokerAdvertiseHost(handle); advertise != "" {
 		// Containers cannot reach a host loopback listener. The random
 		// per-workspace capability authenticates this host-gateway listener.
 		brokerOpts.Listen = "0.0.0.0:0"
@@ -2945,11 +2945,16 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 	return nil
 }
 
-func (n *Node) brokerAdvertiseHost(backend string) string {
+func (n *Node) brokerAdvertiseHost(handle workspace.Handle) string {
+	if advertiser, ok := handle.(workspace.BrokerAdvertiser); ok {
+		if address := advertiser.BrokerAdvertiseHost(); address != "" {
+			return address
+		}
+	}
 	if n.opts.BrokerAdvertiseHost != "" {
 		return n.opts.BrokerAdvertiseHost
 	}
-	if backend == "docker" {
+	if handle.Backend() == "docker" {
 		return "host.docker.internal"
 	}
 	return ""
