@@ -304,6 +304,34 @@ ApprovalOption = TypedDict("ApprovalOption", {
     "kind": NotRequired[str],
 }, total=False)
 
+ArtifactProofClaims = TypedDict("ArtifactProofClaims", {
+    "id": Required[str],
+    "node": Required[str],
+    "tenant": Required[str],
+    "ws": Required[str],
+    "gen": Required[int],
+    "method": Required[str],
+    "artifact": Required[str],
+    "issued_at": Required[int],
+    "expires_at": Required[int],
+}, total=False)
+
+ArtifactProofEnvelope = TypedDict("ArtifactProofEnvelope", {
+    "claims": Required["ArtifactProofClaims"],
+    "signature": Required[bytes],
+}, total=False)
+
+ArtifactProofReq = TypedDict("ArtifactProofReq", {
+    "ws": Required[str],
+    "gen": Required[int],
+    "method": Required[str],
+    "artifact": Required[str],
+}, total=False)
+
+ArtifactProofRes = TypedDict("ArtifactProofRes", {
+    "proof": Required[str],
+}, total=False)
+
 AuditPolicy = TypedDict("AuditPolicy", {
     "required": NotRequired[bool],
 }, total=False)
@@ -335,6 +363,8 @@ Base = TypedDict("Base", {
     "tenant": Required[str],
     "owner": Required[str],
     "artifact": Required[str],
+    "format": NotRequired[str],
+    "objects": NotRequired[list[str]],
     "workspace": NotRequired[str],
     "bytes": NotRequired[int],
     "created_at": Required[int],
@@ -343,6 +373,7 @@ Base = TypedDict("Base", {
 BaseCreateReq = TypedDict("BaseCreateReq", {
     "name": Required[str],
     "artifact": Required[str],
+    "format": NotRequired[str],
     "workspace": NotRequired[str],
     "idem": NotRequired[str],
 }, total=False)
@@ -486,8 +517,34 @@ ControlDiag = TypedDict("ControlDiag", {
     "workspaces_per_subject_max": NotRequired[int],
     "db_integrity": NotRequired[str],
     "lease_sec": Required[int],
+    "controller_role": NotRequired[str],
+    "controller_epoch": NotRequired[int],
+    "controller_lease_age_ms": NotRequired[int],
+    "last_replicated_at": NotRequired[int],
+    "restored_event_seq": NotRequired[int],
+    "recovery_lost_window_ms": NotRequired[int],
+    "controller_reconciling": NotRequired[bool],
     "metrics": NotRequired[dict[str, float]],
     "findings": NotRequired[list["Finding"]],
+}, total=False)
+
+ControllerNodeState = TypedDict("ControllerNodeState", {
+    "node": Required[str],
+    "epoch": Required[int],
+    "workspaces": NotRequired[list["ControllerWorkspace"]],
+    "releases": NotRequired[list["ControllerReleaseState"]],
+}, total=False)
+
+ControllerReleaseState = TypedDict("ControllerReleaseState", {
+    "request": Required["WSReleaseReq"],
+    "response": Required["WSReleasedReq"],
+    "operation_id": NotRequired[str],
+    "state": Required[str],
+}, total=False)
+
+ControllerWorkspace = TypedDict("ControllerWorkspace", {
+    "workspace": Required["Workspace"],
+    "sessions": NotRequired[list[str]],
 }, total=False)
 
 DiagReq = TypedDict("DiagReq", {
@@ -552,6 +609,7 @@ Event = TypedDict("Event", {
     "tenant": NotRequired[str],
     "workspace": NotRequired[str],
     "generation": NotRequired[int],
+    "controller_epoch": NotRequired[int],
     "session": NotRequired[str],
     "operation_id": NotRequired[str],
     "producer_seq": NotRequired[int],
@@ -743,6 +801,8 @@ FleetOperationResult = TypedDict("FleetOperationResult", {
     "fenced": NotRequired[bool],
     "acknowledged": Required[bool],
     "snapshot": NotRequired[str],
+    "snapshot_format": NotRequired[str],
+    "snapshot_objects": NotRequired[list[str]],
     "error": NotRequired[str],
     "updated_at": Required[int],
 }, total=False)
@@ -758,6 +818,7 @@ FleetQuarantineReq = TypedDict("FleetQuarantineReq", {
 Frame = TypedDict("Frame", {
     "v": Required[int],
     "t": Required[str],
+    "controller_epoch": NotRequired[int],
     "id": NotRequired[int],
     "seq": NotRequired[int],
     "s": NotRequired[str],
@@ -772,6 +833,7 @@ Frame = TypedDict("Frame", {
 Gap = TypedDict("Gap", {
     "from": Required[int],
     "to": Required[int],
+    "tier": NotRequired[str],
 }, total=False)
 
 Grant = TypedDict("Grant", {
@@ -786,9 +848,11 @@ GrantClaims = TypedDict("GrantClaims", {
     "node": Required[str],
     "principal": NotRequired[str],
     "tenant": NotRequired[str],
+    "roles": NotRequired[list[str]],
     "authz_revision": NotRequired[int],
     "exp": Required[int],
     "gen": Required[int],
+    "controller_epoch": NotRequired[int],
 }, total=False)
 
 GrantReq = TypedDict("GrantReq", {
@@ -816,6 +880,7 @@ HelloOK = TypedDict("HelloOK", {
     "now": Required[int],
     "pubkey": NotRequired[bytes],
     "lease_sec": NotRequired[int],
+    "controller_epoch": NotRequired[int],
     "subject": NotRequired[str],
     "tenant": NotRequired[str],
     "node_token": NotRequired[str],
@@ -833,6 +898,7 @@ NetworkPolicy = TypedDict("NetworkPolicy", {
 
 NodeDiag = TypedDict("NodeDiag", {
     "node": Required[str],
+    "controller_epoch": NotRequired[int],
     "info": Required["NodeInfo"],
     "now": Required[int],
     "uptime_sec": Required[int],
@@ -868,6 +934,13 @@ NodeDiag = TypedDict("NodeDiag", {
     "mutation_records_max": NotRequired[int],
     "snapshots_active": NotRequired[int],
     "snapshots_active_max": NotRequired[int],
+    "volumes": NotRequired[int],
+    "volume_attachments": NotRequired[int],
+    "volume_source_bytes": NotRequired[int],
+    "volume_source_max_bytes": NotRequired[int],
+    "volume_source_entries": NotRequired[int],
+    "volume_source_max_entries": NotRequired[int],
+    "volume_quota_rejections": NotRequired[int],
     "metrics": NotRequired[dict[str, float]],
     "findings": NotRequired[list["Finding"]],
 }, total=False)
@@ -956,6 +1029,60 @@ PortOpenReq = TypedDict("PortOpenReq", {
     "host": NotRequired[str],
     "idem": NotRequired[str],
     "grant": NotRequired[Optional["Grant"]],
+}, total=False)
+
+Principal = TypedDict("Principal", {
+    "id": Required[str],
+    "tenant": Required[str],
+    "roles": Required[list[str]],
+    "revision": Required[int],
+    "created_at": Required[int],
+    "updated_at": Required[int],
+}, total=False)
+
+PrincipalCreateReq = TypedDict("PrincipalCreateReq", {
+    "tenant": NotRequired[str],
+    "principal": Required[str],
+    "roles": Required[list[str]],
+    "idem": Required[str],
+}, total=False)
+
+PrincipalInviteReq = TypedDict("PrincipalInviteReq", {
+    "tenant": Required[str],
+    "principal": Required[str],
+    "ttl_ms": Required[int],
+    "idem": Required[str],
+}, total=False)
+
+PrincipalListReq = TypedDict("PrincipalListReq", {
+    "tenant": NotRequired[str],
+}, total=False)
+
+PrincipalListRes = TypedDict("PrincipalListRes", {
+    "principals": Required[list["Principal"]],
+}, total=False)
+
+PrincipalRevokeReq = TypedDict("PrincipalRevokeReq", {
+    "tenant": NotRequired[str],
+    "principal": Required[str],
+    "idem": Required[str],
+}, total=False)
+
+PrincipalRevokeRes = TypedDict("PrincipalRevokeRes", {
+    "revision": Required[int],
+}, total=False)
+
+PrincipalTokenIssueReq = TypedDict("PrincipalTokenIssueReq", {
+    "tenant": NotRequired[str],
+    "principal": Required[str],
+    "role": Required[str],
+    "ttl_ms": Required[int],
+    "idem": Required[str],
+}, total=False)
+
+PrincipalTokenIssueRes = TypedDict("PrincipalTokenIssueRes", {
+    "access_token": Required[str],
+    "expires_at": Required[int],
 }, total=False)
 
 Queue = TypedDict("Queue", {
@@ -1132,6 +1259,38 @@ SecuritySpec = TypedDict("SecuritySpec", {
     "audit": NotRequired["AuditPolicy"],
 }, total=False)
 
+SessionCapabilityCheckReq = TypedDict("SessionCapabilityCheckReq", {
+    "ws": Required[str],
+    "gen": Required[int],
+    "capability": Required[str],
+}, total=False)
+
+SessionCapabilityCheckRes = TypedDict("SessionCapabilityCheckRes", {
+    "principal": Required[str],
+    "tenant": Required[str],
+}, total=False)
+
+SessionCapabilityIssueReq = TypedDict("SessionCapabilityIssueReq", {
+    "client": Required[str],
+    "ws": Required[str],
+    "gen": Required[int],
+    "authz_revision": Required[int],
+    "principal": Required[str],
+    "tenant": Required[str],
+    "roles": NotRequired[list[str]],
+}, total=False)
+
+SessionCapabilityIssueRes = TypedDict("SessionCapabilityIssueRes", {
+    "capability": Required[str],
+    "expires_at": Required[int],
+}, total=False)
+
+SessionCapabilityRenewReq = TypedDict("SessionCapabilityRenewReq", {
+    "ws": Required[str],
+    "gen": Required[int],
+    "capability": Required[str],
+}, total=False)
+
 SessionInfo = TypedDict("SessionInfo", {
     "id": Required[str],
     "ws": Required[str],
@@ -1142,12 +1301,141 @@ SessionInfo = TypedDict("SessionInfo", {
     "run": NotRequired[Optional["RunInfo"]],
 }, total=False)
 
+SessionLogCommitReq = TypedDict("SessionLogCommitReq", {
+    "session": Required[str],
+    "workspace": Required[str],
+    "gen": Required[int],
+    "principal": Required[str],
+    "kind": Required[str],
+    "info": NotRequired["SessionInfo"],
+    "exit": NotRequired["ExitInfo"],
+    "max_chunk": Required[int],
+    "segments": NotRequired[list["SessionLogSegment"]],
+    "complete": NotRequired[bool],
+}, total=False)
+
+SessionLogGetReq = TypedDict("SessionLogGetReq", {
+    "session": Required[str],
+    "workspace": Required[str],
+    "gen": Required[int],
+}, total=False)
+
+SessionLogRecord = TypedDict("SessionLogRecord", {
+    "session": Required[str],
+    "workspace": Required[str],
+    "tenant": Required[str],
+    "principal": Required[str],
+    "kind": Required[str],
+    "info": Required["SessionInfo"],
+    "exit": Required["ExitInfo"],
+    "max_chunk": Required[int],
+    "segments": NotRequired[list["SessionLogSegment"]],
+    "complete": NotRequired[bool],
+    "updated_at": Required[int],
+    "expires_at": NotRequired[int],
+}, total=False)
+
+SessionLogSegment = TypedDict("SessionLogSegment", {
+    "first": Required[int],
+    "next": Required[int],
+    "artifact": Required[str],
+    "bytes": Required[int],
+}, total=False)
+
 SessionStatus = TypedDict("SessionStatus", {
     "info": Required["SessionInfo"],
     "exited": Required[bool],
     "exit": NotRequired[Optional["ExitInfo"]],
     "next": Required[int],
     "oldest": Required[int],
+    "blob_bytes": NotRequired[int],
+    "blob_segments": NotRequired[int],
+    "unavailable_tier": NotRequired[str],
+}, total=False)
+
+Tenant = TypedDict("Tenant", {
+    "id": Required[str],
+    "state": Required[str],
+    "revision": Required[int],
+    "policy": Required["TenantPolicy"],
+    "created_at": Required[int],
+    "updated_at": Required[int],
+}, total=False)
+
+TenantCreateReq = TypedDict("TenantCreateReq", {
+    "id": Required[str],
+    "policy": Required["TenantPolicy"],
+    "idem": Required[str],
+}, total=False)
+
+TenantGetReq = TypedDict("TenantGetReq", {
+    "id": Required[str],
+}, total=False)
+
+TenantListRes = TypedDict("TenantListRes", {
+    "tenants": Required[list["Tenant"]],
+}, total=False)
+
+TenantOIDC = TypedDict("TenantOIDC", {
+    "issuer": NotRequired[str],
+    "client_id": NotRequired[str],
+    "audience": NotRequired[str],
+    "scopes": NotRequired[list[str]],
+    "group_roles": NotRequired[dict[str, list[str]]],
+    "tenant_claim": NotRequired[str],
+    "groups_claim": NotRequired[str],
+}, total=False)
+
+TenantPolicy = TypedDict("TenantPolicy", {
+    "quotas": Required["TenantQuotas"],
+    "retention": Required["TenantRetention"],
+    "residency": Required["TenantResidency"],
+    "oidc": Required["TenantOIDC"],
+    "stripe_customer_id": NotRequired[str],
+}, total=False)
+
+TenantQuotas = TypedDict("TenantQuotas", {
+    "max_workspaces": Required[int],
+    "max_nodes": Required[int],
+    "max_artifact_bytes": Required[int],
+    "max_active_sessions": Required[int],
+}, total=False)
+
+TenantResidency = TypedDict("TenantResidency", {
+    "allowed_regions": NotRequired[list[str]],
+    "required_labels": NotRequired[dict[str, str]],
+}, total=False)
+
+TenantRetention = TypedDict("TenantRetention", {
+    "events_ms": Required[int],
+    "session_logs_ms": Required[int],
+    "artifacts_ms": Required[int],
+    "meter_events_ms": Required[int],
+}, total=False)
+
+TenantStateReq = TypedDict("TenantStateReq", {
+    "id": Required[str],
+    "state": Required[str],
+    "expected_revision": Required[int],
+    "idem": Required[str],
+}, total=False)
+
+TenantUpdateReq = TypedDict("TenantUpdateReq", {
+    "id": Required[str],
+    "policy": Required["TenantPolicy"],
+    "expected_revision": Required[int],
+    "idem": Required[str],
+}, total=False)
+
+TenantUsage = TypedDict("TenantUsage", {
+    "workspaces": Required[int],
+    "nodes": Required[int],
+    "artifact_bytes": Required[int],
+    "active_sessions": Required[int],
+}, total=False)
+
+TenantUsageReq = TypedDict("TenantUsageReq", {
+    "tenant": NotRequired[str],
 }, total=False)
 
 Timer = TypedDict("Timer", {
@@ -1155,6 +1443,7 @@ Timer = TypedDict("Timer", {
     "ws": Required[str],
     "at": NotRequired[int],
     "on": NotRequired[str],
+    "match": NotRequired[dict[str, str]],
     "action": Required[str],
     "fired": Required[bool],
     "fired_at": NotRequired[int],
@@ -1210,6 +1499,93 @@ UsageRes = TypedDict("UsageRes", {
     "usage": Required[list["Usage"]],
 }, total=False)
 
+Volume = TypedDict("Volume", {
+    "id": Required[str],
+    "tenant": Required[str],
+    "owner": Required[str],
+    "artifact": Required[str],
+    "version": Required[int],
+    "versions": Required[list["VolumeVersion"]],
+    "created_at": Required[int],
+    "updated_at": Required[int],
+}, total=False)
+
+VolumeArchiveReq = TypedDict("VolumeArchiveReq", {
+    "ws": Required[str],
+    "path": Required[str],
+    "upload": Required[bool],
+    "idem": NotRequired[str],
+    "grant": NotRequired[Optional["Grant"]],
+}, total=False)
+
+VolumeAttachReq = TypedDict("VolumeAttachReq", {
+    "id": Required[str],
+    "ws": Required[str],
+    "generation": Required[int],
+    "path": Required[str],
+    "idem": NotRequired[str],
+}, total=False)
+
+VolumeCreateReq = TypedDict("VolumeCreateReq", {
+    "id": Required[str],
+    "artifact": Required[str],
+    "idem": NotRequired[str],
+}, total=False)
+
+VolumeDetachReq = TypedDict("VolumeDetachReq", {
+    "ws": Required[str],
+    "generation": Required[int],
+    "path": Required[str],
+    "idem": NotRequired[str],
+}, total=False)
+
+VolumeGetReq = TypedDict("VolumeGetReq", {
+    "id": Required[str],
+}, total=False)
+
+VolumeListRes = TypedDict("VolumeListRes", {
+    "volumes": Required[list["Volume"]],
+}, total=False)
+
+VolumeMount = TypedDict("VolumeMount", {
+    "id": Required[str],
+    "path": Required[str],
+    "version": NotRequired[int],
+    "artifact": NotRequired[str],
+}, total=False)
+
+VolumePublishPathReq = TypedDict("VolumePublishPathReq", {
+    "ws": Required[str],
+    "path": Required[str],
+    "volume": Required[str],
+    "expected_version": Required[int],
+    "idem": NotRequired[str],
+    "grant": NotRequired[Optional["Grant"]],
+}, total=False)
+
+VolumePublishReq = TypedDict("VolumePublishReq", {
+    "id": Required[str],
+    "ws": Required[str],
+    "generation": Required[int],
+    "artifact": Required[str],
+    "expected_version": Required[int],
+    "idem": NotRequired[str],
+    "grant": NotRequired[Optional["Grant"]],
+}, total=False)
+
+VolumeRemoveReq = TypedDict("VolumeRemoveReq", {
+    "id": Required[str],
+    "idem": NotRequired[str],
+}, total=False)
+
+VolumeVersion = TypedDict("VolumeVersion", {
+    "number": Required[int],
+    "artifact": Required[str],
+    "published_by": NotRequired[str],
+    "generation": NotRequired[int],
+    "published_at": Required[int],
+}, total=False)
+
 WSACLReq = TypedDict("WSACLReq", {
     "id": Required[str],
     "acl": Required["WorkspaceACL"],
@@ -1235,6 +1611,7 @@ WSDiag = TypedDict("WSDiag", {
     "gen": Required[int],
     "backend": Required[str],
     "root": Required[str],
+    "volumes": NotRequired[list["VolumeMount"]],
     "bytes": Required[int],
     "files": Required[int],
     "broker": NotRequired[str],
@@ -1274,6 +1651,7 @@ WSQuarantineCommitReq = TypedDict("WSQuarantineCommitReq", {
     "gen": Required[int],
     "backend": Required[str],
     "snapshot": Required[str],
+    "snapshot_format": NotRequired[str],
 }, total=False)
 
 WSQuarantineReq = TypedDict("WSQuarantineReq", {
@@ -1284,6 +1662,8 @@ WSQuarantineReq = TypedDict("WSQuarantineReq", {
     "backend": NotRequired[str],
     "exclude": NotRequired[list[str]],
     "security": NotRequired["SecuritySpec"],
+    "tenant": NotRequired[str],
+    "volumes": NotRequired[list["VolumeMount"]],
 }, total=False)
 
 WSQuarantineRes = TypedDict("WSQuarantineRes", {
@@ -1292,6 +1672,7 @@ WSQuarantineRes = TypedDict("WSQuarantineRes", {
     "action": Required[str],
     "backend": NotRequired[str],
     "snapshot": NotRequired[str],
+    "snapshot_format": NotRequired[str],
     "warning": NotRequired[str],
 }, total=False)
 
@@ -1303,20 +1684,28 @@ WSReadyReq = TypedDict("WSReadyReq", {
 WSReleaseCommitReq = TypedDict("WSReleaseCommitReq", {
     "id": Required[str],
     "gen": Required[int],
+    "operation": NotRequired[str],
     "snapshot": NotRequired[str],
+    "snapshot_format": NotRequired[str],
 }, total=False)
 
 WSReleaseReq = TypedDict("WSReleaseReq", {
     "ws": Required[str],
     "gen": Required[int],
+    "operation": NotRequired[str],
     "snapshot": Required[bool],
     "reason": NotRequired[str],
+    "tenant": NotRequired[str],
+    "backend": NotRequired[str],
+    "spec": NotRequired["WorkspaceSpec"],
 }, total=False)
 
 WSReleasedReq = TypedDict("WSReleasedReq", {
     "id": Required[str],
     "gen": Required[int],
+    "operation": NotRequired[str],
     "snapshot": NotRequired[str],
+    "snapshot_format": NotRequired[str],
     "reason": NotRequired[str],
     "failed": NotRequired[bool],
     "preparing": NotRequired[bool],
@@ -1325,11 +1714,13 @@ WSReleasedReq = TypedDict("WSReleasedReq", {
 WSRenewReq = TypedDict("WSRenewReq", {
     "ids": Required[list[str]],
     "gen": NotRequired[dict[str, int]],
+    "controller_epoch": NotRequired[int],
     "authz": NotRequired[dict[str, int]],
 }, total=False)
 
 WSRenewRes = TypedDict("WSRenewRes", {
     "results": Required[list["WSRenewResult"]],
+    "controller_epoch": NotRequired[int],
 }, total=False)
 
 WSRenewResult = TypedDict("WSRenewResult", {
@@ -1339,6 +1730,7 @@ WSRenewResult = TypedDict("WSRenewResult", {
     "authoritative_gen": NotRequired[int],
     "lease_until": NotRequired[int],
     "action": Required[str],
+    "controller_epoch": NotRequired[int],
     "authz_revision": NotRequired[int],
     "revoked": NotRequired[list[str]],
     "authz_reset": NotRequired[bool],
@@ -1349,6 +1741,7 @@ WSSleepReq = TypedDict("WSSleepReq", {
     "after_sec": NotRequired[int],
     "at": NotRequired[int],
     "on": NotRequired[str],
+    "match": NotRequired[dict[str, str]],
     "idem": NotRequired[str],
 }, total=False)
 
@@ -1356,6 +1749,7 @@ WSSnapshotCommitReq = TypedDict("WSSnapshotCommitReq", {
     "id": Required[str],
     "gen": Required[int],
     "snapshot": Required[str],
+    "format": NotRequired[str],
 }, total=False)
 
 WSSnapshotReq = TypedDict("WSSnapshotReq", {
@@ -1372,6 +1766,10 @@ WSSnapshotRes = TypedDict("WSSnapshotRes", {
     "bytes": Required[int],
     "consistency": Required[str],
     "authoritative": Required[bool],
+    "format": NotRequired[str],
+    "uploaded_bytes": NotRequired[int],
+    "chunks": NotRequired[int],
+    "uploaded_chunks": NotRequired[int],
 }, total=False)
 
 Workspace = TypedDict("Workspace", {
@@ -1381,6 +1779,8 @@ Workspace = TypedDict("Workspace", {
     "node": NotRequired[str],
     "lease_until": NotRequired[int],
     "last_snapshot": NotRequired[str],
+    "last_snapshot_format": NotRequired[str],
+    "last_snapshot_objects": NotRequired[list[str]],
     "created_at": Required[int],
     "updated_at": Required[int],
     "gen": Required[int],
@@ -1389,6 +1789,7 @@ Workspace = TypedDict("Workspace", {
     "authz_revision": NotRequired[int],
     "revocations": NotRequired[list["AuthzRevocation"]],
     "revocation_floor": NotRequired[int],
+    "release_operation": NotRequired[str],
     "quarantine_operation": NotRequired[str],
     "quarantined_at": NotRequired[int],
 }, total=False)
@@ -1400,6 +1801,7 @@ WorkspaceACL = TypedDict("WorkspaceACL", {
 
 WorkspaceSelector = TypedDict("WorkspaceSelector", {
     "all": NotRequired[bool],
+    "workspace": NotRequired[str],
     "tenant": NotRequired[str],
     "principal": NotRequired[str],
     "run": NotRequired[str],
@@ -1418,6 +1820,8 @@ WorkspaceSpec = TypedDict("WorkspaceSpec", {
     "labels": NotRequired[dict[str, str]],
     "image": NotRequired[str],
     "restore_from": NotRequired[str],
+    "restore_format": NotRequired[str],
+    "restore_objects": NotRequired[list[str]],
     "base": NotRequired[str],
     "requires": Required["Requires"],
     "placement": Required["Placement"],
@@ -1430,96 +1834,126 @@ WorkspaceSpec = TypedDict("WorkspaceSpec", {
     "acl": NotRequired["WorkspaceACL"],
     "mount_path": NotRequired[str],
     "repo": NotRequired["RepoSpec"],
+    "volumes": NotRequired[list["VolumeMount"]],
 }, total=False)
 
 OPERATIONS: dict[str, dict[str, object]] = {
-    "agent.approval.decided": {"constant": "OpAgentApprovalDecided", "request": "AgentApprovalDecidedReq", "response": "", "mutating": False},
-    "agent.cancel": {"constant": "OpAgentCancel", "request": "AgentGetReq", "response": "Agent", "mutating": True},
-    "agent.create": {"constant": "OpAgentCreate", "request": "AgentCreateReq", "response": "Agent", "mutating": True},
-    "agent.deliver": {"constant": "OpAgentDeliver", "request": "AgentDeliverReq", "response": "", "mutating": False},
-    "agent.destroy": {"constant": "OpAgentDestroy", "request": "AgentGetReq", "response": "", "mutating": True},
-    "agent.fork": {"constant": "OpAgentFork", "request": "AgentForkReq", "response": "Agent", "mutating": True},
-    "agent.get": {"constant": "OpAgentGet", "request": "AgentGetReq", "response": "Agent", "mutating": False},
-    "agent.list": {"constant": "OpAgentList", "request": "AgentListReq", "response": "AgentListRes", "mutating": False},
-    "agent.message": {"constant": "OpAgentMessage", "request": "AgentMessageReq", "response": "AgentMessageRes", "mutating": True},
-    "agent.report": {"constant": "OpAgentReport", "request": "AgentReport", "response": "", "mutating": False},
-    "agent.run": {"constant": "OpAgentRun", "request": "AgentRunReq", "response": "AgentRunRes", "mutating": False},
-    "agent.run.cancel": {"constant": "OpAgentRunCancel", "request": "AgentRunCancelReq", "response": "", "mutating": False},
-    "agent.sleep": {"constant": "OpAgentSleep", "request": "AgentGetReq", "response": "Agent", "mutating": True},
-    "agent.transcript": {"constant": "OpAgentTranscript", "request": "AgentTranscriptReq", "response": "AgentTranscriptRes", "mutating": False},
-    "agent.wake": {"constant": "OpAgentWake", "request": "AgentWakeReq", "response": "Agent", "mutating": True},
-    "approval.decide": {"constant": "OpApprovalDecide", "request": "ApprovalDecideReq", "response": "Approval", "mutating": True},
-    "approval.get": {"constant": "OpApprovalGet", "request": "ApprovalGetReq", "response": "Approval", "mutating": False},
-    "approval.list": {"constant": "OpApprovalList", "request": "ApprovalListReq", "response": "ApprovalListRes", "mutating": False},
-    "base.create": {"constant": "OpBaseCreate", "request": "BaseCreateReq", "response": "Base", "mutating": True},
-    "base.list": {"constant": "OpBaseList", "request": "", "response": "BaseListRes", "mutating": False},
-    "base.remove": {"constant": "OpBaseRemove", "request": "BaseRemoveReq", "response": "", "mutating": True},
-    "binding.lease": {"constant": "OpBindingLease", "request": "BindingLeaseReq", "response": "BindingLeaseRes", "mutating": False},
-    "budget.create": {"constant": "OpBudgetCreate", "request": "BudgetCreateReq", "response": "Budget", "mutating": True},
-    "budget.list": {"constant": "OpBudgetList", "request": "BudgetListReq", "response": "BudgetListRes", "mutating": False},
-    "budget.remove": {"constant": "OpBudgetRemove", "request": "BudgetRemoveReq", "response": "", "mutating": True},
-    "budget.reserve": {"constant": "OpBudgetReserve", "request": "BudgetReserveReq", "response": "BudgetReservation", "mutating": False},
-    "budget.settle": {"constant": "OpBudgetSettle", "request": "BudgetSettleReq", "response": "BudgetSettlement", "mutating": False},
-    "diag": {"constant": "OpDiag", "request": "DiagReq", "response": "", "mutating": False},
-    "egress.approval": {"constant": "OpEgressApproval", "request": "EgressApprovalReq", "response": "EgressApprovalRes", "mutating": False},
-    "events.post": {"constant": "OpEventsPost", "request": "EventPost", "response": "", "mutating": False},
-    "events.stop": {"constant": "OpEventsStop", "request": "EventsStopReq", "response": "", "mutating": False},
-    "events.tail": {"constant": "OpEventsTail", "request": "EventsTailReq", "response": "", "mutating": False},
-    "fleet.get": {"constant": "OpFleetGet", "request": "FleetGetReq", "response": "FleetOperation", "mutating": False},
-    "fleet.list": {"constant": "OpFleetList", "request": "", "response": "FleetListRes", "mutating": False},
-    "fleet.quarantine": {"constant": "OpFleetQuarantine", "request": "FleetQuarantineReq", "response": "FleetOperation", "mutating": True},
-    "fs.apply_tar": {"constant": "OpFSApplyTar", "request": "FSApplyTarReq", "response": "FSApplyTarRes", "mutating": True},
-    "fs.edit": {"constant": "OpFSEdit", "request": "FSEditReq", "response": "FSEditRes", "mutating": True},
-    "fs.list": {"constant": "OpFSList", "request": "FSListReq", "response": "FSListRes", "mutating": False},
-    "fs.mkdir": {"constant": "OpFSMkdir", "request": "FSMkdirReq", "response": "", "mutating": True},
-    "fs.read": {"constant": "OpFSRead", "request": "FSReadReq", "response": "FSReadRes", "mutating": False},
-    "fs.remove": {"constant": "OpFSRemove", "request": "FSRemoveReq", "response": "", "mutating": True},
-    "fs.rename": {"constant": "OpFSRename", "request": "FSRenameReq", "response": "", "mutating": True},
-    "fs.search": {"constant": "OpFSSearch", "request": "FSSearchReq", "response": "FSSearchRes", "mutating": False},
-    "fs.stat": {"constant": "OpFSStat", "request": "", "response": "FSStatRes", "mutating": False},
-    "fs.write": {"constant": "OpFSWrite", "request": "FSWriteReq", "response": "", "mutating": True},
-    "grant": {"constant": "OpGrant", "request": "GrantReq", "response": "Grant", "mutating": False},
-    "node.diag": {"constant": "OpNodeDiag", "request": "NodeDiagReq", "response": "", "mutating": False},
-    "node.list": {"constant": "OpNodeList", "request": "", "response": "NodeListRes", "mutating": False},
-    "node.status": {"constant": "OpNodeStatus", "request": "", "response": "", "mutating": False},
-    "pool.create": {"constant": "OpPoolCreate", "request": "PoolCreateReq", "response": "Pool", "mutating": True},
-    "pool.get": {"constant": "OpPoolGet", "request": "PoolGetReq", "response": "Pool", "mutating": False},
-    "pool.list": {"constant": "OpPoolList", "request": "", "response": "PoolListRes", "mutating": False},
-    "pool.remove": {"constant": "OpPoolRemove", "request": "PoolRemoveReq", "response": "", "mutating": True},
-    "port.open": {"constant": "OpPortOpen", "request": "PortOpenReq", "response": "SOpenRes", "mutating": True},
-    "queue.advance": {"constant": "OpQueueAdvance", "request": "QueueAdvanceReq", "response": "Queue", "mutating": True},
-    "queue.create": {"constant": "OpQueueCreate", "request": "QueueCreateReq", "response": "Queue", "mutating": True},
-    "queue.get": {"constant": "OpQueueGet", "request": "QueueGetReq", "response": "Queue", "mutating": False},
-    "queue.list": {"constant": "OpQueueList", "request": "QueueListReq", "response": "QueueListRes", "mutating": False},
-    "s.ack": {"constant": "OpSAck", "request": "SAckReq", "response": "", "mutating": False},
-    "s.attach": {"constant": "OpSAttach", "request": "SAttachReq", "response": "SOpenRes", "mutating": False},
-    "s.close": {"constant": "OpSClose", "request": "SCloseReq", "response": "", "mutating": False},
-    "s.input": {"constant": "OpSInput", "request": "SInputReq", "response": "", "mutating": False},
-    "s.list": {"constant": "OpSList", "request": "SListReq", "response": "SListRes", "mutating": False},
-    "s.open": {"constant": "OpSOpen", "request": "SOpenReq", "response": "SOpenRes", "mutating": True},
-    "s.resize": {"constant": "OpSResize", "request": "SResizeReq", "response": "", "mutating": False},
-    "s.signal": {"constant": "OpSSignal", "request": "SSignalReq", "response": "", "mutating": False},
-    "s.wait": {"constant": "OpSWait", "request": "SWaitReq", "response": "SWaitRes", "mutating": False},
-    "timer.list": {"constant": "OpTimerList", "request": "", "response": "TimerListRes", "mutating": False},
-    "usage.get": {"constant": "OpUsageGet", "request": "UsageReq", "response": "UsageRes", "mutating": False},
-    "ws.acl": {"constant": "OpWSACL", "request": "WSACLReq", "response": "Workspace", "mutating": True},
-    "ws.claim": {"constant": "OpWSClaim", "request": "WSClaimReq", "response": "WSClaimRes", "mutating": False},
-    "ws.create": {"constant": "OpWSCreate", "request": "WSCreateReq", "response": "Workspace", "mutating": True},
-    "ws.destroy": {"constant": "OpWSDestroy", "request": "WSGetReq", "response": "", "mutating": True},
-    "ws.get": {"constant": "OpWSGet", "request": "WSGetReq", "response": "Workspace", "mutating": False},
-    "ws.info": {"constant": "OpWSInfo", "request": "WSGetReq", "response": "WSInfoRes", "mutating": False},
-    "ws.list": {"constant": "OpWSList", "request": "", "response": "WSListRes", "mutating": False},
-    "ws.move": {"constant": "OpWSMove", "request": "WSMoveReq", "response": "Workspace", "mutating": True},
-    "ws.quarantine": {"constant": "OpWSQuarantine", "request": "WSQuarantineReq", "response": "WSQuarantineRes", "mutating": False},
-    "ws.quarantine.commit": {"constant": "OpWSQuarantineCommit", "request": "WSQuarantineCommitReq", "response": "", "mutating": False},
-    "ws.ready": {"constant": "OpWSReady", "request": "WSReadyReq", "response": "", "mutating": False},
-    "ws.release": {"constant": "OpWSRelease", "request": "WSReleaseReq", "response": "", "mutating": False},
-    "ws.release.abort": {"constant": "OpWSReleaseAbort", "request": "", "response": "", "mutating": False},
-    "ws.release.commit": {"constant": "OpWSReleaseCommit", "request": "WSReleaseCommitReq", "response": "", "mutating": False},
-    "ws.released": {"constant": "OpWSReleased", "request": "WSReleasedReq", "response": "", "mutating": False},
-    "ws.renew": {"constant": "OpWSRenew", "request": "WSRenewReq", "response": "WSRenewRes", "mutating": False},
-    "ws.sleep": {"constant": "OpWSSleep", "request": "WSSleepReq", "response": "Timer", "mutating": True},
-    "ws.snapshot": {"constant": "OpWSSnapshot", "request": "WSSnapshotReq", "response": "WSSnapshotRes", "mutating": True},
-    "ws.snapshot.commit": {"constant": "OpWSSnapshotCommit", "request": "WSSnapshotCommitReq", "response": "", "mutating": False},
-    "ws.wake": {"constant": "OpWSWake", "request": "WSGetReq", "response": "Workspace", "mutating": True},
+    "agent.approval.decided": {"constant": "OpAgentApprovalDecided", "request": "AgentApprovalDecidedReq", "response": ""},
+    "agent.cancel": {"constant": "OpAgentCancel", "request": "AgentGetReq", "response": "Agent"},
+    "agent.create": {"constant": "OpAgentCreate", "request": "AgentCreateReq", "response": "Agent"},
+    "agent.deliver": {"constant": "OpAgentDeliver", "request": "AgentDeliverReq", "response": ""},
+    "agent.destroy": {"constant": "OpAgentDestroy", "request": "AgentGetReq", "response": ""},
+    "agent.fork": {"constant": "OpAgentFork", "request": "AgentForkReq", "response": "Agent"},
+    "agent.get": {"constant": "OpAgentGet", "request": "AgentGetReq", "response": "Agent"},
+    "agent.list": {"constant": "OpAgentList", "request": "AgentListReq", "response": "AgentListRes"},
+    "agent.message": {"constant": "OpAgentMessage", "request": "AgentMessageReq", "response": "AgentMessageRes"},
+    "agent.report": {"constant": "OpAgentReport", "request": "AgentReport", "response": ""},
+    "agent.run": {"constant": "OpAgentRun", "request": "AgentRunReq", "response": "AgentRunRes"},
+    "agent.run.cancel": {"constant": "OpAgentRunCancel", "request": "AgentRunCancelReq", "response": ""},
+    "agent.sleep": {"constant": "OpAgentSleep", "request": "AgentGetReq", "response": "Agent"},
+    "agent.transcript": {"constant": "OpAgentTranscript", "request": "AgentTranscriptReq", "response": "AgentTranscriptRes"},
+    "agent.wake": {"constant": "OpAgentWake", "request": "AgentWakeReq", "response": "Agent"},
+    "approval.decide": {"constant": "OpApprovalDecide", "request": "ApprovalDecideReq", "response": "Approval"},
+    "approval.get": {"constant": "OpApprovalGet", "request": "ApprovalGetReq", "response": "Approval"},
+    "approval.list": {"constant": "OpApprovalList", "request": "ApprovalListReq", "response": "ApprovalListRes"},
+    "artifact.proof": {"constant": "OpArtifactProof", "request": "ArtifactProofReq", "response": "ArtifactProofRes"},
+    "base.create": {"constant": "OpBaseCreate", "request": "BaseCreateReq", "response": "Base"},
+    "base.list": {"constant": "OpBaseList", "request": "", "response": "BaseListRes"},
+    "base.remove": {"constant": "OpBaseRemove", "request": "BaseRemoveReq", "response": ""},
+    "binding.lease": {"constant": "OpBindingLease", "request": "BindingLeaseReq", "response": "BindingLeaseRes"},
+    "budget.create": {"constant": "OpBudgetCreate", "request": "BudgetCreateReq", "response": "Budget"},
+    "budget.list": {"constant": "OpBudgetList", "request": "BudgetListReq", "response": "BudgetListRes"},
+    "budget.remove": {"constant": "OpBudgetRemove", "request": "BudgetRemoveReq", "response": ""},
+    "budget.reserve": {"constant": "OpBudgetReserve", "request": "BudgetReserveReq", "response": "BudgetReservation"},
+    "budget.settle": {"constant": "OpBudgetSettle", "request": "BudgetSettleReq", "response": "BudgetSettlement"},
+    "controller.state": {"constant": "OpControllerState", "request": "", "response": ""},
+    "diag": {"constant": "OpDiag", "request": "DiagReq", "response": "ControlDiag"},
+    "egress.approval": {"constant": "OpEgressApproval", "request": "EgressApprovalReq", "response": "EgressApprovalRes"},
+    "events.post": {"constant": "OpEventsPost", "request": "EventPost", "response": ""},
+    "events.stop": {"constant": "OpEventsStop", "request": "EventsStopReq", "response": ""},
+    "events.tail": {"constant": "OpEventsTail", "request": "EventsTailReq", "response": ""},
+    "fleet.get": {"constant": "OpFleetGet", "request": "FleetGetReq", "response": "FleetOperation"},
+    "fleet.list": {"constant": "OpFleetList", "request": "", "response": "FleetListRes"},
+    "fleet.quarantine": {"constant": "OpFleetQuarantine", "request": "FleetQuarantineReq", "response": "FleetOperation"},
+    "fs.apply_tar": {"constant": "OpFSApplyTar", "request": "FSApplyTarReq", "response": "FSApplyTarRes"},
+    "fs.edit": {"constant": "OpFSEdit", "request": "FSEditReq", "response": "FSEditRes"},
+    "fs.list": {"constant": "OpFSList", "request": "FSListReq", "response": "FSListRes"},
+    "fs.mkdir": {"constant": "OpFSMkdir", "request": "FSMkdirReq", "response": ""},
+    "fs.read": {"constant": "OpFSRead", "request": "FSReadReq", "response": "FSReadRes"},
+    "fs.remove": {"constant": "OpFSRemove", "request": "FSRemoveReq", "response": ""},
+    "fs.rename": {"constant": "OpFSRename", "request": "FSRenameReq", "response": ""},
+    "fs.search": {"constant": "OpFSSearch", "request": "FSSearchReq", "response": "FSSearchRes"},
+    "fs.stat": {"constant": "OpFSStat", "request": "", "response": "FSStatRes"},
+    "fs.write": {"constant": "OpFSWrite", "request": "FSWriteReq", "response": ""},
+    "grant": {"constant": "OpGrant", "request": "GrantReq", "response": "Grant"},
+    "node.diag": {"constant": "OpNodeDiag", "request": "NodeDiagReq", "response": "NodeDiag"},
+    "node.list": {"constant": "OpNodeList", "request": "", "response": "NodeListRes"},
+    "node.status": {"constant": "OpNodeStatus", "request": "", "response": "NodeStatus"},
+    "pool.create": {"constant": "OpPoolCreate", "request": "PoolCreateReq", "response": "Pool"},
+    "pool.get": {"constant": "OpPoolGet", "request": "PoolGetReq", "response": "Pool"},
+    "pool.list": {"constant": "OpPoolList", "request": "", "response": "PoolListRes"},
+    "pool.remove": {"constant": "OpPoolRemove", "request": "PoolRemoveReq", "response": ""},
+    "port.open": {"constant": "OpPortOpen", "request": "PortOpenReq", "response": "SOpenRes"},
+    "principal.create": {"constant": "OpPrincipalCreate", "request": "PrincipalCreateReq", "response": ""},
+    "principal.invite": {"constant": "OpPrincipalInvite", "request": "PrincipalInviteReq", "response": ""},
+    "principal.list": {"constant": "OpPrincipalList", "request": "PrincipalListReq", "response": "PrincipalListRes"},
+    "principal.revoke": {"constant": "OpPrincipalRevoke", "request": "PrincipalRevokeReq", "response": "PrincipalRevokeRes"},
+    "principal.token.issue": {"constant": "OpPrincipalTokenIssue", "request": "PrincipalTokenIssueReq", "response": "PrincipalTokenIssueRes"},
+    "queue.advance": {"constant": "OpQueueAdvance", "request": "QueueAdvanceReq", "response": "Queue"},
+    "queue.create": {"constant": "OpQueueCreate", "request": "QueueCreateReq", "response": "Queue"},
+    "queue.get": {"constant": "OpQueueGet", "request": "QueueGetReq", "response": "Queue"},
+    "queue.list": {"constant": "OpQueueList", "request": "QueueListReq", "response": "QueueListRes"},
+    "s.ack": {"constant": "OpSAck", "request": "SAckReq", "response": ""},
+    "s.attach": {"constant": "OpSAttach", "request": "SAttachReq", "response": "SOpenRes"},
+    "s.close": {"constant": "OpSClose", "request": "SCloseReq", "response": ""},
+    "s.input": {"constant": "OpSInput", "request": "SInputReq", "response": ""},
+    "s.list": {"constant": "OpSList", "request": "SListReq", "response": "SListRes"},
+    "s.open": {"constant": "OpSOpen", "request": "SOpenReq", "response": "SOpenRes"},
+    "s.resize": {"constant": "OpSResize", "request": "SResizeReq", "response": ""},
+    "s.signal": {"constant": "OpSSignal", "request": "SSignalReq", "response": ""},
+    "s.wait": {"constant": "OpSWait", "request": "SWaitReq", "response": "SWaitRes"},
+    "session.cap.check": {"constant": "OpSessionCapabilityCheck", "request": "SessionCapabilityCheckReq", "response": "SessionCapabilityCheckRes"},
+    "session.cap.issue": {"constant": "OpSessionCapabilityIssue", "request": "SessionCapabilityIssueReq", "response": "SessionCapabilityIssueRes"},
+    "session.cap.renew": {"constant": "OpSessionCapabilityRenew", "request": "SessionCapabilityRenewReq", "response": ""},
+    "session.log.commit": {"constant": "OpSessionLogCommit", "request": "SessionLogCommitReq", "response": ""},
+    "session.log.delete": {"constant": "OpSessionLogDelete", "request": "", "response": ""},
+    "session.log.get": {"constant": "OpSessionLogGet", "request": "SessionLogGetReq", "response": ""},
+    "tenant.create": {"constant": "OpTenantCreate", "request": "TenantCreateReq", "response": ""},
+    "tenant.get": {"constant": "OpTenantGet", "request": "TenantGetReq", "response": ""},
+    "tenant.list": {"constant": "OpTenantList", "request": "", "response": "TenantListRes"},
+    "tenant.state": {"constant": "OpTenantState", "request": "TenantStateReq", "response": ""},
+    "tenant.update": {"constant": "OpTenantUpdate", "request": "TenantUpdateReq", "response": ""},
+    "tenant.usage": {"constant": "OpTenantUsage", "request": "TenantUsageReq", "response": ""},
+    "timer.list": {"constant": "OpTimerList", "request": "", "response": "TimerListRes"},
+    "usage.get": {"constant": "OpUsageGet", "request": "UsageReq", "response": "UsageRes"},
+    "volume.archive": {"constant": "OpVolumeArchive", "request": "VolumeArchiveReq", "response": "WSSnapshotRes"},
+    "volume.attach": {"constant": "OpVolumeAttach", "request": "VolumeAttachReq", "response": "Workspace"},
+    "volume.create": {"constant": "OpVolumeCreate", "request": "VolumeCreateReq", "response": "Volume"},
+    "volume.detach": {"constant": "OpVolumeDetach", "request": "VolumeDetachReq", "response": "Workspace"},
+    "volume.get": {"constant": "OpVolumeGet", "request": "VolumeGetReq", "response": "Volume"},
+    "volume.list": {"constant": "OpVolumeList", "request": "", "response": "VolumeListRes"},
+    "volume.publish": {"constant": "OpVolumePublish", "request": "VolumePublishReq", "response": ""},
+    "volume.publish.commit": {"constant": "OpVolumePublishCommit", "request": "", "response": ""},
+    "volume.remove": {"constant": "OpVolumeRemove", "request": "VolumeRemoveReq", "response": ""},
+    "ws.acl": {"constant": "OpWSACL", "request": "WSACLReq", "response": "Workspace"},
+    "ws.claim": {"constant": "OpWSClaim", "request": "WSClaimReq", "response": "WSClaimRes"},
+    "ws.create": {"constant": "OpWSCreate", "request": "WSCreateReq", "response": "Workspace"},
+    "ws.destroy": {"constant": "OpWSDestroy", "request": "WSGetReq", "response": ""},
+    "ws.get": {"constant": "OpWSGet", "request": "WSGetReq", "response": "Workspace"},
+    "ws.info": {"constant": "OpWSInfo", "request": "WSGetReq", "response": "WSInfoRes"},
+    "ws.list": {"constant": "OpWSList", "request": "", "response": "WSListRes"},
+    "ws.move": {"constant": "OpWSMove", "request": "WSMoveReq", "response": "Workspace"},
+    "ws.quarantine": {"constant": "OpWSQuarantine", "request": "WSQuarantineReq", "response": "WSQuarantineRes"},
+    "ws.quarantine.commit": {"constant": "OpWSQuarantineCommit", "request": "WSQuarantineCommitReq", "response": ""},
+    "ws.ready": {"constant": "OpWSReady", "request": "WSReadyReq", "response": ""},
+    "ws.release": {"constant": "OpWSRelease", "request": "WSReleaseReq", "response": ""},
+    "ws.release.abort": {"constant": "OpWSReleaseAbort", "request": "", "response": ""},
+    "ws.release.abort.commit": {"constant": "OpWSReleaseAbortCommit", "request": "", "response": ""},
+    "ws.release.commit": {"constant": "OpWSReleaseCommit", "request": "WSReleaseCommitReq", "response": ""},
+    "ws.released": {"constant": "OpWSReleased", "request": "WSReleasedReq", "response": ""},
+    "ws.renew": {"constant": "OpWSRenew", "request": "WSRenewReq", "response": "WSRenewRes"},
+    "ws.sleep": {"constant": "OpWSSleep", "request": "WSSleepReq", "response": "Timer"},
+    "ws.snapshot": {"constant": "OpWSSnapshot", "request": "WSSnapshotReq", "response": "WSSnapshotRes"},
+    "ws.snapshot.commit": {"constant": "OpWSSnapshotCommit", "request": "WSSnapshotCommitReq", "response": ""},
+    "ws.wake": {"constant": "OpWSWake", "request": "WSGetReq", "response": "Workspace"},
 }

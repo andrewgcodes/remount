@@ -44,8 +44,10 @@ type HelloOK struct {
 	Now      int64    `cbor:"now" json:"now"`                                 // server unix millis; clients may use for skew
 	PubKey   []byte   `cbor:"pubkey,omitempty" json:"pubkey,omitempty"`       // control plane's ed25519 key; nodes verify grants with it
 	LeaseSec int64    `cbor:"lease_sec,omitempty" json:"lease_sec,omitempty"` // how often nodes must renew claims
-	Subject  string   `cbor:"subject,omitempty" json:"subject,omitempty"`
-	Tenant   string   `cbor:"tenant,omitempty" json:"tenant,omitempty"`
+	// ControllerEpoch is the durable writer epoch acquired before this hello.
+	ControllerEpoch uint64 `cbor:"controller_epoch,omitempty" json:"controller_epoch,omitempty"`
+	Subject         string `cbor:"subject,omitempty" json:"subject,omitempty"`
+	Tenant          string `cbor:"tenant,omitempty" json:"tenant,omitempty"`
 	// NodeToken is a short-lived node-principal credential for authenticated
 	// HTTP operations. It is returned only to a successfully enrolled node.
 	NodeToken string `cbor:"node_token,omitempty" json:"node_token,omitempty"`
@@ -136,16 +138,22 @@ type WorkspaceSpec struct {
 	Labels      map[string]string `cbor:"labels,omitempty" json:"labels,omitempty"`
 	Image       string            `cbor:"image,omitempty" json:"image,omitempty"`               // backend-specific (docker image); ignored by process
 	RestoreFrom string            `cbor:"restore_from,omitempty" json:"restore_from,omitempty"` // artifact id to restore the filesystem from
-	Base        string            `cbor:"base,omitempty" json:"base,omitempty"`                 // tenant base name; control resolves it into RestoreFrom at create
-	Requires    Requires          `cbor:"requires" json:"requires"`
-	Placement   Placement         `cbor:"placement" json:"placement"`
-	Bindings    []string          `cbor:"bindings,omitempty" json:"bindings,omitempty"`   // secret binding ids this workspace may use
-	Env         map[string]string `cbor:"env,omitempty" json:"env,omitempty"`             // default env for sessions; values may be ref:…
-	Principal   string            `cbor:"principal,omitempty" json:"principal,omitempty"` // who acts through this workspace (a_…)
-	Idle        Idle              `cbor:"idle" json:"idle"`
-	Exclude     []string          `cbor:"exclude,omitempty" json:"exclude,omitempty"` // snapshot path globs to skip (node_modules, .venv …)
-	Security    SecuritySpec      `cbor:"security,omitempty" json:"security,omitempty"`
-	ACL         WorkspaceACL      `cbor:"acl,omitempty" json:"acl,omitempty"`
+	// RestoreFormat distinguishes the legacy deterministic tar.gz body from a
+	// canonical chunk manifest. Empty means tar for wire compatibility.
+	RestoreFormat string `cbor:"restore_format,omitempty" json:"restore_format,omitempty"`
+	// RestoreObjects is the control-verified, tenant-local transitive closure
+	// of RestoreFrom. It is durable GC metadata, never caller authority.
+	RestoreObjects []string          `cbor:"restore_objects,omitempty" json:"restore_objects,omitempty"`
+	Base           string            `cbor:"base,omitempty" json:"base,omitempty"` // tenant base name; control resolves it into RestoreFrom at create
+	Requires       Requires          `cbor:"requires" json:"requires"`
+	Placement      Placement         `cbor:"placement" json:"placement"`
+	Bindings       []string          `cbor:"bindings,omitempty" json:"bindings,omitempty"`   // secret binding ids this workspace may use
+	Env            map[string]string `cbor:"env,omitempty" json:"env,omitempty"`             // default env for sessions; values may be ref:…
+	Principal      string            `cbor:"principal,omitempty" json:"principal,omitempty"` // who acts through this workspace (a_…)
+	Idle           Idle              `cbor:"idle" json:"idle"`
+	Exclude        []string          `cbor:"exclude,omitempty" json:"exclude,omitempty"` // snapshot path globs to skip (node_modules, .venv …)
+	Security       SecuritySpec      `cbor:"security,omitempty" json:"security,omitempty"`
+	ACL            WorkspaceACL      `cbor:"acl,omitempty" json:"acl,omitempty"`
 	// MountPath is where the workspace filesystem appears inside the
 	// workspace's own mount namespace; "" means DefaultMountPath. Harnesses
 	// key state on the working directory, so a handoff sets this to the
@@ -157,6 +165,64 @@ type WorkspaceSpec struct {
 	// before ws.ready. It is exclusive with RestoreFrom and Base: a wake or
 	// move restores the snapshot instead and never clones again.
 	Repo RepoSpec `cbor:"repo,omitempty" json:"repo,omitempty"`
+	// Volumes are immutable artifact versions mounted read-only into the
+	// workspace. The control plane resolves ID-only declarations to a pinned
+	// Version and Artifact before a node can claim the workspace.
+	Volumes []VolumeMount `cbor:"volumes,omitempty" json:"volumes,omitempty"`
+}
+
+// VolumeMount pins one immutable shared-data volume version at a clean,
+// absolute workspace path. Version and Artifact are control-plane resolved;
+// callers normally supply only ID and Path.
+type VolumeMount struct {
+	ID       string `cbor:"id" json:"id"`
+	Path     string `cbor:"path" json:"path"`
+	Version  uint64 `cbor:"version,omitempty" json:"version,omitempty"`
+	Artifact string `cbor:"artifact,omitempty" json:"artifact,omitempty"`
+}
+
+const (
+	// MaxWorkspaceVolumes bounds declarations copied into every offer and
+	// persisted with every workspace transition.
+	MaxWorkspaceVolumes = 64
+	// MaxVolumeVersions bounds durable artifact references per volume.
+	MaxVolumeVersions = 128
+	// CapabilityReadOnlyVolumes is advertised only after the node proves it
+	// can establish the required read-only bind mount.
+	CapabilityReadOnlyVolumes = "readonly-volumes"
+)
+
+// ValidateVolumeMount applies the path and identity rules shared by control,
+// clients and nodes. Shared data may not shadow the workspace root or system
+// paths and is always read-only by protocol definition.
+func ValidateVolumeMount(m VolumeMount) error {
+	if err := ValidateVolumeID(m.ID); err != nil {
+		return err
+	}
+	if len(m.Path) > 1024 || !strings.HasPrefix(m.Path, "/") || path.Clean(m.Path) != m.Path || strings.Contains(m.Path, "\x00") {
+		return Err(CodeBadRequest, "volume path %q must be a clean absolute path", m.Path)
+	}
+	for _, reserved := range []string{"/", "/proc", "/sys", "/dev", "/etc", "/bin", "/sbin", "/lib", "/usr", "/var", "/run", "/boot", "/.remount"} {
+		if m.Path == reserved || strings.HasPrefix(m.Path, reserved+"/") {
+			return Err(CodeBadRequest, "volume path %q is reserved", m.Path)
+		}
+	}
+	return nil
+}
+
+// ValidateVolumeID enforces the one identifier grammar shared by the wire,
+// control plane, CLI delimiter and node-local catalog.
+func ValidateVolumeID(id string) error {
+	if id == "" || len(id) > 64 || strings.HasPrefix(id, ".") {
+		return Err(CodeBadRequest, "volume id must be 1-64 path-safe characters and may not start with '.'")
+	}
+	for _, char := range id {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || strings.ContainsRune("._-", char) {
+			continue
+		}
+		return Err(CodeBadRequest, "volume id must contain only ASCII letters, digits, '.', '_' or '-'")
+	}
+	return nil
 }
 
 // DefaultMountPath is where a workspace is materialized when the spec does
@@ -284,24 +350,29 @@ type Idle struct {
 
 // Workspace is the control plane's view.
 type Workspace struct {
-	ID            string        `cbor:"id" json:"id"`
-	Spec          WorkspaceSpec `cbor:"spec" json:"spec"`
-	State         string        `cbor:"state" json:"state"`
-	Node          string        `cbor:"node,omitempty" json:"node,omitempty"`
-	LeaseUntil    int64         `cbor:"lease_until,omitempty" json:"lease_until,omitempty"`     // unix millis
-	LastSnapshot  string        `cbor:"last_snapshot,omitempty" json:"last_snapshot,omitempty"` // artifact id
-	CreatedAt     int64         `cbor:"created_at" json:"created_at"`
-	UpdatedAt     int64         `cbor:"updated_at" json:"updated_at"`
-	Generation    uint64        `cbor:"gen" json:"gen"` // bumps on every claim; a node with a stale gen must not act
-	Tenant        string        `cbor:"tenant,omitempty" json:"tenant,omitempty"`
-	Owner         string        `cbor:"owner,omitempty" json:"owner,omitempty"`
-	AuthzRevision uint64        `cbor:"authz_revision,omitempty" json:"authz_revision,omitempty"`
+	ID                  string        `cbor:"id" json:"id"`
+	Spec                WorkspaceSpec `cbor:"spec" json:"spec"`
+	State               string        `cbor:"state" json:"state"`
+	Node                string        `cbor:"node,omitempty" json:"node,omitempty"`
+	LeaseUntil          int64         `cbor:"lease_until,omitempty" json:"lease_until,omitempty"`     // unix millis
+	LastSnapshot        string        `cbor:"last_snapshot,omitempty" json:"last_snapshot,omitempty"` // artifact id
+	LastSnapshotFormat  string        `cbor:"last_snapshot_format,omitempty" json:"last_snapshot_format,omitempty"`
+	LastSnapshotObjects []string      `cbor:"last_snapshot_objects,omitempty" json:"last_snapshot_objects,omitempty"`
+	CreatedAt           int64         `cbor:"created_at" json:"created_at"`
+	UpdatedAt           int64         `cbor:"updated_at" json:"updated_at"`
+	Generation          uint64        `cbor:"gen" json:"gen"` // bumps on every claim; a node with a stale gen must not act
+	Tenant              string        `cbor:"tenant,omitempty" json:"tenant,omitempty"`
+	Owner               string        `cbor:"owner,omitempty" json:"owner,omitempty"`
+	AuthzRevision       uint64        `cbor:"authz_revision,omitempty" json:"authz_revision,omitempty"`
 	// Revocations records which principals lost access at which authorization
 	// revision, newest last, so a node renewing from an older revision learns
 	// exactly whose sessions to close. Entries below RevocationFloor have been
 	// pruned; a node behind the floor must fail closed for the whole workspace.
 	Revocations     []AuthzRevocation `cbor:"revocations,omitempty" json:"revocations,omitempty"`
 	RevocationFloor uint64            `cbor:"revocation_floor,omitempty" json:"revocation_floor,omitempty"`
+	// ReleaseOperation is the durable epoch for the release or release-abort
+	// handshake currently controlling this workspace generation.
+	ReleaseOperation string `cbor:"release_operation,omitempty" json:"release_operation,omitempty"`
 	// QuarantineOperation identifies the durable fleet operation that fenced
 	// this workspace. It prevents restart reconciliation from treating an
 	// incident response as an ordinary transient failure.
@@ -314,44 +385,55 @@ type Workspace struct {
 // ---------------------------------------------------------------------------
 
 const (
-	OpWSCreate         = "ws.create"          // WSCreateReq -> Workspace
-	OpWSGet            = "ws.get"             // WSGetReq -> Workspace
-	OpWSList           = "ws.list"            // -> WSListRes
-	OpWSDestroy        = "ws.destroy"         // WSGetReq -> {}
-	OpWSMove           = "ws.move"            // WSMoveReq -> Workspace (re-queued)
-	OpWSSleep          = "ws.sleep"           // WSSleepReq -> Timer
-	OpWSWake           = "ws.wake"            // WSGetReq -> Workspace
-	OpWSACL            = "ws.acl"             // WSACLReq -> Workspace (bumps authz_revision)
-	OpWSClaim          = "ws.claim"           // node: WSClaimReq -> WSClaimRes
-	OpWSRenew          = "ws.renew"           // node: WSRenewReq -> WSRenewRes
-	OpWSReleased       = "ws.released"        // node: WSReleasedReq -> {}
-	OpWSReady          = "ws.ready"           // node: WSReadyReq -> {} (materialized, now serving)
-	OpWSReleaseCommit  = "ws.release.commit"  // control -> node: source checkpoint is committed; destroy source
-	OpWSReleaseAbort   = "ws.release.abort"   // control -> node: prepare failed/ambiguous; resume retained source
-	OpWSSnapshotCommit = "ws.snapshot.commit" // node -> control: make an uploaded snapshot authoritative
-	OpNodeList         = "node.list"          // -> NodeListRes
-	OpEventsTail       = "events.tail"        // EventsTailReq -> streams ev frames, then res
-	OpEventsStop       = "events.stop"        // EventsStopReq -> {}; stops one event subscription
-	OpEventsPost       = "events.post"        // EventPost -> {} (node -> control; also webhook wake)
-	OpBindingLease     = "binding.lease"      // node: BindingLeaseReq -> BindingLeaseRes
-	OpEgressApproval   = "egress.approval"    // node: EgressApprovalReq -> EgressApprovalRes
-	OpGrant            = "grant"              // client: GrantReq -> Grant (permission to talk to a node about a ws)
-	OpTimerList        = "timer.list"         // -> TimerListRes
-	OpDiag             = "diag"               // -> ControlDiag (control-plane health and integrity)
-	OpFleetQuarantine  = "fleet.quarantine"   // FleetQuarantineReq -> FleetOperation
-	OpFleetGet         = "fleet.get"          // FleetGetReq -> FleetOperation
-	OpFleetList        = "fleet.list"         // -> FleetListRes
-	OpBaseCreate       = "base.create"        // BaseCreateReq -> Base (pins a snapshot under a tenant-scoped name)
-	OpBaseList         = "base.list"          // -> BaseListRes
-	OpBaseRemove       = "base.remove"        // BaseRemoveReq -> {}
-	OpQueueCreate      = "queue.create"       // QueueCreateReq -> Queue (durable task list for one workspace)
-	OpQueueGet         = "queue.get"          // QueueGetReq -> Queue
-	OpQueueList        = "queue.list"         // QueueListReq -> QueueListRes
-	OpQueueAdvance     = "queue.advance"      // QueueAdvanceReq -> Queue (records one task's outcome, moves the cursor)
-	OpPoolCreate       = "pool.create"        // PoolCreateReq -> Pool
-	OpPoolGet          = "pool.get"           // PoolGetReq -> Pool
-	OpPoolList         = "pool.list"          // -> PoolListRes
-	OpPoolRemove       = "pool.remove"        // PoolRemoveReq -> {}
+	OpWSCreate             = "ws.create"               // WSCreateReq -> Workspace
+	OpWSGet                = "ws.get"                  // WSGetReq -> Workspace
+	OpWSList               = "ws.list"                 // -> WSListRes
+	OpWSDestroy            = "ws.destroy"              // WSGetReq -> {}
+	OpWSMove               = "ws.move"                 // WSMoveReq -> Workspace (re-queued)
+	OpWSSleep              = "ws.sleep"                // WSSleepReq -> Timer
+	OpWSWake               = "ws.wake"                 // WSGetReq -> Workspace
+	OpWSACL                = "ws.acl"                  // WSACLReq -> Workspace (bumps authz_revision)
+	OpWSClaim              = "ws.claim"                // node: WSClaimReq -> WSClaimRes
+	OpWSRenew              = "ws.renew"                // node: WSRenewReq -> WSRenewRes
+	OpWSReleased           = "ws.released"             // node: WSReleasedReq -> {}
+	OpWSReady              = "ws.ready"                // node: WSReadyReq -> {} (materialized, now serving)
+	OpWSReleaseCommit      = "ws.release.commit"       // control -> node: source checkpoint is committed; destroy source
+	OpWSReleaseAbort       = "ws.release.abort"        // control -> node: restore retained source but keep it fenced
+	OpWSReleaseAbortCommit = "ws.release.abort.commit" // control -> node: control durably permits restored source publication
+	OpControllerState      = "controller.state"        // control -> node: authoritative promotion reconciliation state
+	OpWSSnapshotCommit     = "ws.snapshot.commit"      // node -> control: make an uploaded snapshot authoritative
+	OpNodeList             = "node.list"               // -> NodeListRes
+	OpEventsTail           = "events.tail"             // EventsTailReq -> streams ev frames, then res
+	OpEventsStop           = "events.stop"             // EventsStopReq -> {}; stops one event subscription
+	OpEventsPost           = "events.post"             // EventPost -> {} (node -> control; also webhook wake)
+	OpBindingLease         = "binding.lease"           // node: BindingLeaseReq -> BindingLeaseRes
+	OpEgressApproval       = "egress.approval"         // node: EgressApprovalReq -> EgressApprovalRes
+	OpGrant                = "grant"                   // client: GrantReq -> Grant (permission to talk to a node about a ws)
+	OpTimerList            = "timer.list"              // -> TimerListRes
+	OpDiag                 = "diag"                    // -> ControlDiag (control-plane health and integrity)
+	OpFleetQuarantine      = "fleet.quarantine"        // FleetQuarantineReq -> FleetOperation
+	OpFleetGet             = "fleet.get"               // FleetGetReq -> FleetOperation
+	OpFleetList            = "fleet.list"              // -> FleetListRes
+	OpBaseCreate           = "base.create"             // BaseCreateReq -> Base (pins a snapshot under a tenant-scoped name)
+	OpBaseList             = "base.list"               // -> BaseListRes
+	OpBaseRemove           = "base.remove"             // BaseRemoveReq -> {}
+	OpVolumeCreate         = "volume.create"           // VolumeCreateReq -> Volume
+	OpVolumeGet            = "volume.get"              // VolumeGetReq -> Volume
+	OpVolumeList           = "volume.list"             // -> VolumeListRes
+	OpVolumeRemove         = "volume.remove"           // VolumeRemoveReq -> {}
+	OpVolumePublish        = "volume.publish"          // client -> node: VolumePublishPathReq -> Volume
+	OpVolumePublishCommit  = "volume.publish.commit"   // node -> control: VolumePublishReq -> Volume
+	OpVolumeAttach         = "volume.attach"           // VolumeAttachReq -> Workspace
+	OpVolumeDetach         = "volume.detach"           // VolumeDetachReq -> Workspace
+	OpVolumeArchive        = "volume.archive"          // node: VolumeArchiveReq -> WSSnapshotRes
+	OpQueueCreate          = "queue.create"            // QueueCreateReq -> Queue (durable task list for one workspace)
+	OpQueueGet             = "queue.get"               // QueueGetReq -> Queue
+	OpQueueList            = "queue.list"              // QueueListReq -> QueueListRes
+	OpQueueAdvance         = "queue.advance"           // QueueAdvanceReq -> Queue (records one task's outcome, moves the cursor)
+	OpPoolCreate           = "pool.create"             // PoolCreateReq -> Pool
+	OpPoolGet              = "pool.get"                // PoolGetReq -> Pool
+	OpPoolList             = "pool.list"               // -> PoolListRes
+	OpPoolRemove           = "pool.remove"             // PoolRemoveReq -> {}
 )
 
 type WSCreateReq struct {
@@ -409,8 +491,9 @@ type WSReadyReq struct {
 }
 
 type WSRenewReq struct {
-	IDs []string          `cbor:"ids" json:"ids"`
-	Gen map[string]uint64 `cbor:"gen,omitempty" json:"gen,omitempty"`
+	IDs             []string          `cbor:"ids" json:"ids"`
+	Gen             map[string]uint64 `cbor:"gen,omitempty" json:"gen,omitempty"`
+	ControllerEpoch uint64            `cbor:"controller_epoch,omitempty" json:"controller_epoch,omitempty"`
 	// Authz is the authorization revision the node currently enforces for
 	// each workspace (authz-push). Control answers with what changed since.
 	Authz map[string]uint64 `cbor:"authz,omitempty" json:"authz,omitempty"`
@@ -426,6 +509,7 @@ type WSRenewResult struct {
 	AuthoritativeGen uint64 `cbor:"authoritative_gen,omitempty" json:"authoritative_gen,omitempty"`
 	LeaseUntil       int64  `cbor:"lease_until,omitempty" json:"lease_until,omitempty"`
 	Action           string `cbor:"action" json:"action"` // continue | fence | destroy | reconcile
+	ControllerEpoch  uint64 `cbor:"controller_epoch,omitempty" json:"controller_epoch,omitempty"`
 	// AuthzRevision is the authoritative authorization revision (authz-push).
 	// Revoked lists principals that lost access after the revision the node
 	// reported in WSRenewReq.Authz. AuthzReset means the node's revision is
@@ -437,14 +521,17 @@ type WSRenewResult struct {
 }
 
 type WSRenewRes struct {
-	Results []WSRenewResult `cbor:"results" json:"results"`
+	Results         []WSRenewResult `cbor:"results" json:"results"`
+	ControllerEpoch uint64          `cbor:"controller_epoch,omitempty" json:"controller_epoch,omitempty"`
 }
 
 type WSReleasedReq struct {
-	ID       string `cbor:"id" json:"id"`
-	Gen      uint64 `cbor:"gen" json:"gen"`
-	Snapshot string `cbor:"snapshot,omitempty" json:"snapshot,omitempty"` // artifact id, if one was taken
-	Reason   string `cbor:"reason,omitempty" json:"reason,omitempty"`
+	ID             string `cbor:"id" json:"id"`
+	Gen            uint64 `cbor:"gen" json:"gen"`
+	OperationID    string `cbor:"operation,omitempty" json:"operation,omitempty"`
+	Snapshot       string `cbor:"snapshot,omitempty" json:"snapshot,omitempty"` // artifact id, if one was taken
+	SnapshotFormat string `cbor:"snapshot_format,omitempty" json:"snapshot_format,omitempty"`
+	Reason         string `cbor:"reason,omitempty" json:"reason,omitempty"`
 	// Failed marks a release caused by a materialization that could not
 	// complete (restore, clone, policy). Control holds the workspace out of
 	// placement with a growing delay instead of re-offering it immediately.
@@ -456,15 +543,41 @@ type WSReleasedReq struct {
 }
 
 type WSReleaseCommitReq struct {
-	ID       string `cbor:"id" json:"id"`
-	Gen      uint64 `cbor:"gen" json:"gen"`
-	Snapshot string `cbor:"snapshot,omitempty" json:"snapshot,omitempty"`
+	ID             string `cbor:"id" json:"id"`
+	Gen            uint64 `cbor:"gen" json:"gen"`
+	OperationID    string `cbor:"operation,omitempty" json:"operation,omitempty"`
+	Snapshot       string `cbor:"snapshot,omitempty" json:"snapshot,omitempty"`
+	SnapshotFormat string `cbor:"snapshot_format,omitempty" json:"snapshot_format,omitempty"`
+}
+
+// ControllerNodeState is the live and retained authority a node reports to a
+// newly promoted controller. It contains no credentials or broker capability.
+type ControllerNodeState struct {
+	Node       string                   `cbor:"node" json:"node"`
+	Epoch      uint64                   `cbor:"epoch" json:"epoch"`
+	Workspaces []ControllerWorkspace    `cbor:"workspaces,omitempty" json:"workspaces,omitempty"`
+	Releases   []ControllerReleaseState `cbor:"releases,omitempty" json:"releases,omitempty"`
+}
+
+// ControllerWorkspace is one currently serviceable node assignment.
+type ControllerWorkspace struct {
+	Workspace Workspace `cbor:"workspace" json:"workspace"`
+	Sessions  []string  `cbor:"sessions,omitempty" json:"sessions,omitempty"`
+}
+
+// ControllerReleaseState is a retained release journal entry.
+type ControllerReleaseState struct {
+	Request     WSReleaseReq  `cbor:"request" json:"request"`
+	Response    WSReleasedReq `cbor:"response" json:"response"`
+	OperationID string        `cbor:"operation_id,omitempty" json:"operation_id,omitempty"`
+	State       string        `cbor:"state" json:"state"`
 }
 
 type WSSnapshotCommitReq struct {
 	ID       string `cbor:"id" json:"id"`
 	Gen      uint64 `cbor:"gen" json:"gen"`
 	Snapshot string `cbor:"snapshot" json:"snapshot"`
+	Format   string `cbor:"format,omitempty" json:"format,omitempty"`
 }
 
 type NodeListRes struct {
@@ -520,16 +633,18 @@ type FleetOperation struct {
 
 // FleetOperationResult records containment progress for one frozen target.
 type FleetOperationResult struct {
-	Workspace    string `cbor:"workspace" json:"workspace"`
-	Node         string `cbor:"node,omitempty" json:"node,omitempty"`
-	Backend      string `cbor:"backend,omitempty" json:"backend,omitempty"`
-	Generation   uint64 `cbor:"generation,omitempty" json:"generation,omitempty"`
-	State        string `cbor:"state" json:"state"`
-	Fenced       bool   `cbor:"fenced,omitempty" json:"fenced,omitempty"`
-	Acknowledged bool   `cbor:"acknowledged" json:"acknowledged"`
-	Snapshot     string `cbor:"snapshot,omitempty" json:"snapshot,omitempty"`
-	Error        string `cbor:"error,omitempty" json:"error,omitempty"`
-	UpdatedAt    int64  `cbor:"updated_at" json:"updated_at"`
+	Workspace       string   `cbor:"workspace" json:"workspace"`
+	Node            string   `cbor:"node,omitempty" json:"node,omitempty"`
+	Backend         string   `cbor:"backend,omitempty" json:"backend,omitempty"`
+	Generation      uint64   `cbor:"generation,omitempty" json:"generation,omitempty"`
+	State           string   `cbor:"state" json:"state"`
+	Fenced          bool     `cbor:"fenced,omitempty" json:"fenced,omitempty"`
+	Acknowledged    bool     `cbor:"acknowledged" json:"acknowledged"`
+	Snapshot        string   `cbor:"snapshot,omitempty" json:"snapshot,omitempty"`
+	SnapshotFormat  string   `cbor:"snapshot_format,omitempty" json:"snapshot_format,omitempty"`
+	SnapshotObjects []string `cbor:"snapshot_objects,omitempty" json:"snapshot_objects,omitempty"`
+	Error           string   `cbor:"error,omitempty" json:"error,omitempty"`
+	UpdatedAt       int64    `cbor:"updated_at" json:"updated_at"`
 }
 
 // FleetQuarantineReq creates an idempotent fleet containment operation.
@@ -555,13 +670,15 @@ type FleetListRes struct {
 // The artifact stays pinned against garbage collection until the base is
 // removed, which is what distinguishes it from a workspace's last snapshot.
 type Base struct {
-	Name      string `cbor:"name" json:"name"`
-	Tenant    string `cbor:"tenant" json:"tenant"`
-	Owner     string `cbor:"owner" json:"owner"`
-	Artifact  string `cbor:"artifact" json:"artifact"`
-	Workspace string `cbor:"workspace,omitempty" json:"workspace,omitempty"` // the workspace it was snapshotted from, when known
-	Bytes     int64  `cbor:"bytes,omitempty" json:"bytes,omitempty"`
-	CreatedAt int64  `cbor:"created_at" json:"created_at"`
+	Name      string   `cbor:"name" json:"name"`
+	Tenant    string   `cbor:"tenant" json:"tenant"`
+	Owner     string   `cbor:"owner" json:"owner"`
+	Artifact  string   `cbor:"artifact" json:"artifact"`
+	Format    string   `cbor:"format,omitempty" json:"format,omitempty"`
+	Objects   []string `cbor:"objects,omitempty" json:"objects,omitempty"`
+	Workspace string   `cbor:"workspace,omitempty" json:"workspace,omitempty"` // the workspace it was snapshotted from, when known
+	Bytes     int64    `cbor:"bytes,omitempty" json:"bytes,omitempty"`
+	CreatedAt int64    `cbor:"created_at" json:"created_at"`
 }
 
 // BaseCreateReq pins an uploaded artifact under a base name in the caller's
@@ -570,6 +687,7 @@ type Base struct {
 type BaseCreateReq struct {
 	Name           string `cbor:"name" json:"name"`
 	Artifact       string `cbor:"artifact" json:"artifact"`
+	Format         string `cbor:"format,omitempty" json:"format,omitempty"`
 	Workspace      string `cbor:"workspace,omitempty" json:"workspace,omitempty"`
 	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
 }
@@ -577,6 +695,105 @@ type BaseCreateReq struct {
 // BaseListRes lists the bases visible to the caller, sorted by name.
 type BaseListRes struct {
 	Bases []Base `cbor:"bases" json:"bases"`
+}
+
+// Volume is a tenant-scoped pointer to the latest immutable artifact. Its
+// retained Versions keep artifacts pinned while an attachment references an
+// older version.
+type Volume struct {
+	ID        string          `cbor:"id" json:"id"`
+	Tenant    string          `cbor:"tenant" json:"tenant"`
+	Owner     string          `cbor:"owner" json:"owner"`
+	Artifact  string          `cbor:"artifact" json:"artifact"`
+	Version   uint64          `cbor:"version" json:"version"`
+	Versions  []VolumeVersion `cbor:"versions" json:"versions"`
+	CreatedAt int64           `cbor:"created_at" json:"created_at"`
+	UpdatedAt int64           `cbor:"updated_at" json:"updated_at"`
+}
+
+// VolumeVersion records one immutable value published from a fenced
+// workspace generation.
+type VolumeVersion struct {
+	Number      uint64 `cbor:"number" json:"number"`
+	Artifact    string `cbor:"artifact" json:"artifact"`
+	PublishedBy string `cbor:"published_by,omitempty" json:"published_by,omitempty"`
+	Generation  uint64 `cbor:"generation,omitempty" json:"generation,omitempty"`
+	PublishedAt int64  `cbor:"published_at" json:"published_at"`
+}
+
+// VolumeCreateReq creates the first version from an already uploaded and
+// verified artifact.
+type VolumeCreateReq struct {
+	ID             string `cbor:"id" json:"id"`
+	Artifact       string `cbor:"artifact" json:"artifact"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// VolumeGetReq identifies a tenant-scoped volume.
+type VolumeGetReq struct {
+	ID string `cbor:"id" json:"id"`
+}
+
+// VolumeListRes lists every volume visible to the caller.
+type VolumeListRes struct {
+	Volumes []Volume `cbor:"volumes" json:"volumes"`
+}
+
+// VolumeRemoveReq removes an unattached volume and unpins its versions.
+type VolumeRemoveReq struct {
+	ID             string `cbor:"id" json:"id"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// VolumePublishReq advances a volume with both version and workspace-
+// generation compare-and-swap fences.
+type VolumePublishReq struct {
+	ID              string `cbor:"id" json:"id"`
+	Workspace       string `cbor:"ws" json:"ws"`
+	Generation      uint64 `cbor:"generation" json:"generation"`
+	Artifact        string `cbor:"artifact" json:"artifact"`
+	ExpectedVersion uint64 `cbor:"expected_version" json:"expected_version"`
+	IdempotencyKey  string `cbor:"idem,omitempty" json:"idem,omitempty"`
+	Grant           *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+}
+
+// VolumeAttachReq pins the current volume version in one workspace spec.
+type VolumeAttachReq struct {
+	ID             string `cbor:"id" json:"id"`
+	Workspace      string `cbor:"ws" json:"ws"`
+	Generation     uint64 `cbor:"generation" json:"generation"`
+	Path           string `cbor:"path" json:"path"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// VolumeDetachReq removes a pinned read-only mount declaration.
+type VolumeDetachReq struct {
+	Workspace      string `cbor:"ws" json:"ws"`
+	Generation     uint64 `cbor:"generation" json:"generation"`
+	Path           string `cbor:"path" json:"path"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// VolumeArchiveReq snapshots one jailed workspace directory as a standalone
+// immutable artifact suitable for VolumePublishReq.
+type VolumeArchiveReq struct {
+	WS             string `cbor:"ws" json:"ws"`
+	Path           string `cbor:"path" json:"path"`
+	Upload         bool   `cbor:"upload" json:"upload"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+}
+
+// VolumePublishPathReq is the client-to-node half of volume.publish. The node
+// archives Path and keeps the workspace tree boundary until control commits
+// the version and generation CAS.
+type VolumePublishPathReq struct {
+	WS              string `cbor:"ws" json:"ws"`
+	Path            string `cbor:"path" json:"path"`
+	Volume          string `cbor:"volume" json:"volume"`
+	ExpectedVersion uint64 `cbor:"expected_version" json:"expected_version"`
+	IdempotencyKey  string `cbor:"idem,omitempty" json:"idem,omitempty"`
+	Grant           *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 // Queue states.
@@ -790,25 +1007,26 @@ type EventsStopReq struct {
 
 // Event is one entry in the canonical log. Payload is CBOR.
 type Event struct {
-	Seq         uint64 `cbor:"seq" json:"seq"`
-	At          int64  `cbor:"at" json:"at"`                             // unix millis
-	Stream      string `cbor:"stream,omitempty" json:"stream,omitempty"` // ws id, node id, or "" for global
-	Principal   string `cbor:"principal,omitempty" json:"principal,omitempty"`
-	Node        string `cbor:"node,omitempty" json:"node,omitempty"`
-	EventID     string `cbor:"event_id,omitempty" json:"event_id,omitempty"`
-	ReceivedAt  int64  `cbor:"received_at,omitempty" json:"received_at,omitempty"`
-	ObservedAt  int64  `cbor:"observed_at,omitempty" json:"observed_at,omitempty"`
-	Origin      string `cbor:"origin,omitempty" json:"origin,omitempty"`
-	Actor       string `cbor:"actor,omitempty" json:"actor,omitempty"`
-	Tenant      string `cbor:"tenant,omitempty" json:"tenant,omitempty"`
-	Workspace   string `cbor:"workspace,omitempty" json:"workspace,omitempty"`
-	Generation  uint64 `cbor:"generation,omitempty" json:"generation,omitempty"`
-	Session     string `cbor:"session,omitempty" json:"session,omitempty"` // session id for s.* events
-	OperationID string `cbor:"operation_id,omitempty" json:"operation_id,omitempty"`
-	ProducerSeq uint64 `cbor:"producer_seq,omitempty" json:"producer_seq,omitempty"`
-	Type        string `cbor:"type" json:"type"`
-	Payload     []byte `cbor:"payload,omitempty" json:"payload,omitempty"`
-	Cause       uint64 `cbor:"cause,omitempty" json:"cause,omitempty"` // seq of the event that caused this one
+	Seq             uint64 `cbor:"seq" json:"seq"`
+	At              int64  `cbor:"at" json:"at"`                             // unix millis
+	Stream          string `cbor:"stream,omitempty" json:"stream,omitempty"` // ws id, node id, or "" for global
+	Principal       string `cbor:"principal,omitempty" json:"principal,omitempty"`
+	Node            string `cbor:"node,omitempty" json:"node,omitempty"`
+	EventID         string `cbor:"event_id,omitempty" json:"event_id,omitempty"`
+	ReceivedAt      int64  `cbor:"received_at,omitempty" json:"received_at,omitempty"`
+	ObservedAt      int64  `cbor:"observed_at,omitempty" json:"observed_at,omitempty"`
+	Origin          string `cbor:"origin,omitempty" json:"origin,omitempty"`
+	Actor           string `cbor:"actor,omitempty" json:"actor,omitempty"`
+	Tenant          string `cbor:"tenant,omitempty" json:"tenant,omitempty"`
+	Workspace       string `cbor:"workspace,omitempty" json:"workspace,omitempty"`
+	Generation      uint64 `cbor:"generation,omitempty" json:"generation,omitempty"`
+	ControllerEpoch uint64 `cbor:"controller_epoch,omitempty" json:"controller_epoch,omitempty"`
+	Session         string `cbor:"session,omitempty" json:"session,omitempty"` // session id for s.* events
+	OperationID     string `cbor:"operation_id,omitempty" json:"operation_id,omitempty"`
+	ProducerSeq     uint64 `cbor:"producer_seq,omitempty" json:"producer_seq,omitempty"`
+	Type            string `cbor:"type" json:"type"`
+	Payload         []byte `cbor:"payload,omitempty" json:"payload,omitempty"`
+	Cause           uint64 `cbor:"cause,omitempty" json:"cause,omitempty"` // seq of the event that caused this one
 }
 
 // Time returns At as time.Time.
@@ -856,14 +1074,16 @@ type Grant struct {
 }
 
 type GrantClaims struct {
-	Client        string `cbor:"client" json:"client"`
-	WS            string `cbor:"ws" json:"ws"`
-	Node          string `cbor:"node" json:"node"`
-	Principal     string `cbor:"principal,omitempty" json:"principal,omitempty"`
-	Tenant        string `cbor:"tenant,omitempty" json:"tenant,omitempty"`
-	AuthzRevision uint64 `cbor:"authz_revision,omitempty" json:"authz_revision,omitempty"`
-	ExpiresAt     int64  `cbor:"exp" json:"exp"`
-	Gen           uint64 `cbor:"gen" json:"gen"`
+	Client          string   `cbor:"client" json:"client"`
+	WS              string   `cbor:"ws" json:"ws"`
+	Node            string   `cbor:"node" json:"node"`
+	Principal       string   `cbor:"principal,omitempty" json:"principal,omitempty"`
+	Tenant          string   `cbor:"tenant,omitempty" json:"tenant,omitempty"`
+	Roles           []string `cbor:"roles,omitempty" json:"roles,omitempty"`
+	AuthzRevision   uint64   `cbor:"authz_revision,omitempty" json:"authz_revision,omitempty"`
+	ExpiresAt       int64    `cbor:"exp" json:"exp"`
+	Gen             uint64   `cbor:"gen" json:"gen"`
+	ControllerEpoch uint64   `cbor:"controller_epoch,omitempty" json:"controller_epoch,omitempty"`
 }
 
 // Timer is a durable wake.
@@ -1019,6 +1239,7 @@ func (r *RunInfo) Validate() error {
 type Gap struct {
 	From uint64 `cbor:"from" json:"from"` // first evicted seq
 	To   uint64 `cbor:"to" json:"to"`     // last evicted seq
+	Tier string `cbor:"tier,omitempty" json:"tier,omitempty"`
 }
 
 type SOpenReq struct {
@@ -1096,11 +1317,14 @@ type SListRes struct {
 }
 
 type SessionStatus struct {
-	Info   SessionInfo `cbor:"info" json:"info"`
-	Exited bool        `cbor:"exited" json:"exited"`
-	Exit   *ExitInfo   `cbor:"exit,omitempty" json:"exit,omitempty"`
-	Next   uint64      `cbor:"next" json:"next"`     // next seq
-	Oldest uint64      `cbor:"oldest" json:"oldest"` // oldest replayable seq
+	Info            SessionInfo `cbor:"info" json:"info"`
+	Exited          bool        `cbor:"exited" json:"exited"`
+	Exit            *ExitInfo   `cbor:"exit,omitempty" json:"exit,omitempty"`
+	Next            uint64      `cbor:"next" json:"next"`     // next seq
+	Oldest          uint64      `cbor:"oldest" json:"oldest"` // oldest replayable seq
+	BlobBytes       int64       `cbor:"blob_bytes,omitempty" json:"blob_bytes,omitempty"`
+	BlobSegments    int         `cbor:"blob_segments,omitempty" json:"blob_segments,omitempty"`
+	UnavailableTier string      `cbor:"unavailable_tier,omitempty" json:"unavailable_tier,omitempty"`
 }
 
 type SWaitReq struct {
@@ -1272,54 +1496,72 @@ type WSSnapshotReq struct {
 }
 
 type WSSnapshotRes struct {
-	Artifact      string `cbor:"artifact" json:"artifact"` // art_sha256:<hex>
-	Bytes         int64  `cbor:"bytes" json:"bytes"`
-	Consistency   string `cbor:"consistency" json:"consistency"`
-	Authoritative bool   `cbor:"authoritative" json:"authoritative"`
+	Artifact       string `cbor:"artifact" json:"artifact"` // art_sha256:<hex>
+	Bytes          int64  `cbor:"bytes" json:"bytes"`
+	Consistency    string `cbor:"consistency" json:"consistency"`
+	Authoritative  bool   `cbor:"authoritative" json:"authoritative"`
+	Format         string `cbor:"format,omitempty" json:"format,omitempty"`
+	UploadedBytes  int64  `cbor:"uploaded_bytes,omitempty" json:"uploaded_bytes,omitempty"`
+	Chunks         int    `cbor:"chunks,omitempty" json:"chunks,omitempty"`
+	UploadedChunks int    `cbor:"uploaded_chunks,omitempty" json:"uploaded_chunks,omitempty"`
 }
 
 const (
-	SnapshotConsistencyLive     = "live"
-	SnapshotConsistencyQuiesced = "quiesced"
+	SnapshotConsistencyLive         = "live"
+	SnapshotConsistencyQuiesced     = "quiesced"
+	ArtifactFormatTar               = "tar"
+	ArtifactFormatChunkedV1         = "chunked-v1"
+	ArtifactFormatFirecrackerFullV1 = "firecracker-full-v1"
 )
 
 type WSReleaseReq struct {
-	WS       string `cbor:"ws" json:"ws"`
-	Gen      uint64 `cbor:"gen" json:"gen"`
-	Snapshot bool   `cbor:"snapshot" json:"snapshot"` // take + upload a snapshot before releasing
-	Reason   string `cbor:"reason,omitempty" json:"reason,omitempty"`
+	WS          string `cbor:"ws" json:"ws"`
+	Gen         uint64 `cbor:"gen" json:"gen"`
+	OperationID string `cbor:"operation,omitempty" json:"operation,omitempty"`
+	Snapshot    bool   `cbor:"snapshot" json:"snapshot"` // take + upload a snapshot before releasing
+	Reason      string `cbor:"reason,omitempty" json:"reason,omitempty"`
+	// Tenant, Backend and Spec are control-derived recovery declarations. They
+	// let a restarted node reconcile the exact retained tree and volume pins;
+	// they never grant authority to release a different generation.
+	Tenant  string        `cbor:"tenant,omitempty" json:"tenant,omitempty"`
+	Backend string        `cbor:"backend,omitempty" json:"backend,omitempty"`
+	Spec    WorkspaceSpec `cbor:"spec,omitempty" json:"spec,omitempty"`
 }
 
 // WSQuarantineReq asks the recorded holder to fence and optionally checkpoint
 // a workspace as phase one of a fleet operation.
 type WSQuarantineReq struct {
-	OperationID string       `cbor:"operation" json:"operation"`
-	WS          string       `cbor:"ws" json:"ws"`
-	Gen         uint64       `cbor:"gen" json:"gen"`
-	Action      string       `cbor:"action" json:"action"`
-	Backend     string       `cbor:"backend,omitempty" json:"backend,omitempty"`
-	Exclude     []string     `cbor:"exclude,omitempty" json:"exclude,omitempty"`
-	Security    SecuritySpec `cbor:"security,omitempty" json:"security,omitempty"`
+	OperationID string        `cbor:"operation" json:"operation"`
+	WS          string        `cbor:"ws" json:"ws"`
+	Gen         uint64        `cbor:"gen" json:"gen"`
+	Action      string        `cbor:"action" json:"action"`
+	Backend     string        `cbor:"backend,omitempty" json:"backend,omitempty"`
+	Exclude     []string      `cbor:"exclude,omitempty" json:"exclude,omitempty"`
+	Security    SecuritySpec  `cbor:"security,omitempty" json:"security,omitempty"`
+	Tenant      string        `cbor:"tenant,omitempty" json:"tenant,omitempty"`
+	Volumes     []VolumeMount `cbor:"volumes,omitempty" json:"volumes,omitempty"`
 }
 
 // WSQuarantineRes is the node's durable phase-one containment proof.
 type WSQuarantineRes struct {
-	Fenced     bool   `cbor:"fenced" json:"fenced"`
-	Generation uint64 `cbor:"gen" json:"gen"`
-	Action     string `cbor:"action" json:"action"`
-	Backend    string `cbor:"backend,omitempty" json:"backend,omitempty"`
-	Snapshot   string `cbor:"snapshot,omitempty" json:"snapshot,omitempty"`
-	Warning    string `cbor:"warning,omitempty" json:"warning,omitempty"`
+	Fenced         bool   `cbor:"fenced" json:"fenced"`
+	Generation     uint64 `cbor:"gen" json:"gen"`
+	Action         string `cbor:"action" json:"action"`
+	Backend        string `cbor:"backend,omitempty" json:"backend,omitempty"`
+	Snapshot       string `cbor:"snapshot,omitempty" json:"snapshot,omitempty"`
+	SnapshotFormat string `cbor:"snapshot_format,omitempty" json:"snapshot_format,omitempty"`
+	Warning        string `cbor:"warning,omitempty" json:"warning,omitempty"`
 }
 
 // WSQuarantineCommitReq authorizes physical deletion after control has
 // durably committed a matching phase-one proof and generation fence.
 type WSQuarantineCommitReq struct {
-	OperationID string `cbor:"operation" json:"operation"`
-	WS          string `cbor:"ws" json:"ws"`
-	Gen         uint64 `cbor:"gen" json:"gen"`
-	Backend     string `cbor:"backend" json:"backend"`
-	Snapshot    string `cbor:"snapshot" json:"snapshot"`
+	OperationID    string `cbor:"operation" json:"operation"`
+	WS             string `cbor:"ws" json:"ws"`
+	Gen            uint64 `cbor:"gen" json:"gen"`
+	Backend        string `cbor:"backend" json:"backend"`
+	Snapshot       string `cbor:"snapshot" json:"snapshot"`
+	SnapshotFormat string `cbor:"snapshot_format,omitempty" json:"snapshot_format,omitempty"`
 }
 
 type WSInfoRes struct {
@@ -1366,6 +1608,13 @@ type ControlDiag struct {
 	WorkspacesPerSubjectMax int                `cbor:"workspaces_per_subject_max,omitempty" json:"workspaces_per_subject_max,omitempty"`
 	DBIntegrity             string             `cbor:"db_integrity,omitempty" json:"db_integrity,omitempty"`
 	LeaseSec                int64              `cbor:"lease_sec" json:"lease_sec"`
+	ControllerRole          string             `cbor:"controller_role,omitempty" json:"controller_role,omitempty"`
+	ControllerEpoch         uint64             `cbor:"controller_epoch,omitempty" json:"controller_epoch,omitempty"`
+	ControllerLeaseAgeMS    int64              `cbor:"controller_lease_age_ms,omitempty" json:"controller_lease_age_ms,omitempty"`
+	LastReplicatedAt        int64              `cbor:"last_replicated_at,omitempty" json:"last_replicated_at,omitempty"`
+	RestoredEventSeq        uint64             `cbor:"restored_event_seq,omitempty" json:"restored_event_seq,omitempty"`
+	RecoveryLostWindowMS    int64              `cbor:"recovery_lost_window_ms,omitempty" json:"recovery_lost_window_ms,omitempty"`
+	ControllerReconciling   bool               `cbor:"controller_reconciling,omitempty" json:"controller_reconciling,omitempty"`
 	Metrics                 map[string]float64 `cbor:"metrics,omitempty" json:"metrics,omitempty"`
 	// Findings are problems the control plane can see by itself.
 	Findings []Finding `cbor:"findings,omitempty" json:"findings,omitempty"`
@@ -1399,6 +1648,7 @@ type DiagReq struct {
 // NodeDiag is one machine's deep state.
 type NodeDiag struct {
 	Node                     string             `cbor:"node" json:"node"`
+	ControllerEpoch          uint64             `cbor:"controller_epoch,omitempty" json:"controller_epoch,omitempty"`
 	Info                     NodeInfo           `cbor:"info" json:"info"`
 	Now                      int64              `cbor:"now" json:"now"`
 	Uptime                   int64              `cbor:"uptime_sec" json:"uptime_sec"`
@@ -1434,6 +1684,13 @@ type NodeDiag struct {
 	MutationRecordsMax       int                `cbor:"mutation_records_max,omitempty" json:"mutation_records_max,omitempty"`
 	SnapshotsActive          int                `cbor:"snapshots_active,omitempty" json:"snapshots_active,omitempty"`
 	SnapshotsActiveMax       int                `cbor:"snapshots_active_max,omitempty" json:"snapshots_active_max,omitempty"`
+	Volumes                  int                `cbor:"volumes,omitempty" json:"volumes,omitempty"`
+	VolumeAttachments        int                `cbor:"volume_attachments,omitempty" json:"volume_attachments,omitempty"`
+	VolumeSourceBytes        int64              `cbor:"volume_source_bytes,omitempty" json:"volume_source_bytes,omitempty"`
+	VolumeSourceMaxBytes     int64              `cbor:"volume_source_max_bytes,omitempty" json:"volume_source_max_bytes,omitempty"`
+	VolumeSourceEntries      int                `cbor:"volume_source_entries,omitempty" json:"volume_source_entries,omitempty"`
+	VolumeSourceMaxEntries   int                `cbor:"volume_source_max_entries,omitempty" json:"volume_source_max_entries,omitempty"`
+	VolumeQuotaRejections    uint64             `cbor:"volume_quota_rejections,omitempty" json:"volume_quota_rejections,omitempty"`
 	Metrics                  map[string]float64 `cbor:"metrics,omitempty" json:"metrics,omitempty"`
 	Findings                 []Finding          `cbor:"findings,omitempty" json:"findings,omitempty"`
 }
@@ -1444,6 +1701,7 @@ type WSDiag struct {
 	Gen       uint64          `cbor:"gen" json:"gen"`
 	Backend   string          `cbor:"backend" json:"backend"`
 	Root      string          `cbor:"root" json:"root"`
+	Volumes   []VolumeMount   `cbor:"volumes,omitempty" json:"volumes,omitempty"`
 	Bytes     int64           `cbor:"bytes" json:"bytes"`
 	Files     int             `cbor:"files" json:"files"`
 	Broker    string          `cbor:"broker,omitempty" json:"broker,omitempty"`
@@ -1474,6 +1732,8 @@ const (
 	EvWSLeaseExpired    = "ws.lease_expired"
 	EvWSFenced          = "ws.fenced"
 	EvWSStateChanged    = "ws.state_changed"
+	EvControlReconciled = "control.reconciled"
+	EvControlRecovered  = "control.recovered"
 	EvWSACL             = "ws.acl"        // ACL replaced; payload names revoked principals and the new revision
 	EvAuthzRevoked      = "authz.revoked" // node closed a revoked principal's sessions
 	EvSOpened           = "s.opened"
@@ -1500,6 +1760,11 @@ const (
 	EvFleetCompleted    = "fleet.quarantine.completed"
 	EvBaseCreated       = "base.created"
 	EvBaseRemoved       = "base.removed"
+	EvVolumeCreated     = "volume.created"
+	EvVolumePublished   = "volume.published"
+	EvVolumeAttached    = "volume.attached"
+	EvVolumeDetached    = "volume.detached"
+	EvVolumeRemoved     = "volume.removed"
 	EvQueueCreated      = "queue.created"                // payload {queue, ws, items}
 	EvQueueAdvanced     = "queue.advanced"               // one queued task finished; payload {queue, index, exit, status}
 	EvPoolCreated       = "pool.created"                 // a durable pool specification was admitted

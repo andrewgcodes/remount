@@ -125,7 +125,7 @@ func TestRunCustomRecipeEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range snapshotNames(t, c, ctx, snap.Artifact) {
+	for _, name := range snapshotNames(t, c, ctx, snap.Artifact, snap.Format) {
 		if strings.Contains(name, ".remount") {
 			t.Fatalf("snapshot carries %s", name)
 		}
@@ -252,9 +252,9 @@ func TestRunReusesWorkspaceAndReplaysIdempotently(t *testing.T) {
 	}
 }
 
-func snapshotNames(t *testing.T, c *client.Client, ctx context.Context, id string) []string {
+func snapshotNames(t *testing.T, c *client.Client, ctx context.Context, id, format string) []string {
 	t.Helper()
-	rc, err := c.DownloadArtifact(ctx, id)
+	rc, err := c.DownloadSnapshot(ctx, id, format)
 	if err != nil {
 		t.Fatal(err)
 	}

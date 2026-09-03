@@ -214,7 +214,11 @@ func TestV1HelloGoldenFixture(t *testing.T) {
 		t.Fatalf("v1 hello encoding changed:\n got %x\nwant %x", reencoded, raw)
 	}
 	negotiated, err := NegotiateCapabilities(hello.Caps)
-	if err != nil || !reflect.DeepEqual(negotiated, PeerCapabilities()) {
+	// The fixture is deliberately an older release. Newly implemented named
+	// capabilities are not retroactively added to its bytes, and capabilities
+	// it offered that this release retired are not echoed.
+	wantNegotiated := []string{CapabilityV1, CapabilityAuthzPush, CapabilityControllerEpoch, CapabilitySessionCap, CapabilityChunkedArtifacts}
+	if err != nil || !reflect.DeepEqual(negotiated, wantNegotiated) {
 		t.Fatalf("fixture hello negotiated %v, %v", negotiated, err)
 	}
 }

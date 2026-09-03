@@ -9,12 +9,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,11 +31,24 @@ import (
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/node"
+	"remount.dev/remount/internal/notifier"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/server"
 	"remount.dev/remount/internal/transport"
 	"remount.dev/remount/internal/workspace"
 )
+
+type simResolverFunc func(context.Context, string, string) ([]netip.Addr, error)
+
+func (f simResolverFunc) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	return f(ctx, network, host)
+}
+
+type simRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f simRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
 
 // world is one simulated deployment.
 type world struct {
@@ -47,6 +62,7 @@ type world struct {
 	mu          sync.Mutex
 	conns       []*fault // every live pipe end handed to a dialer
 	nodeCancels map[string]context.CancelFunc
+	nodeDone    map[string]<-chan error
 	// peerHooks and serverHooks rewrite or drop frames sent by, respectively,
 	// the named peer and the server on that peer's connections. They model a
 	// peer built from a different release.
@@ -81,7 +97,7 @@ func newWorldWith(t *testing.T, adjust func(*server.Options)) *world {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &world{
 		t: t, artifactDir: filepath.Join(dataDir, "artifacts"), srv: srv,
-		http: hs, ctx: ctx, cancel: cancel, nodeCancels: make(map[string]context.CancelFunc),
+		http: hs, ctx: ctx, cancel: cancel, nodeCancels: make(map[string]context.CancelFunc), nodeDone: make(map[string]<-chan error),
 		peerHooks: make(map[string]func(*proto.Frame) bool), serverHooks: make(map[string]func(*proto.Frame) bool),
 	}
 	t.Cleanup(func() {
@@ -136,12 +152,24 @@ func (w *world) cut(who string) int {
 func (w *world) stopNode(name string) {
 	w.mu.Lock()
 	cancel := w.nodeCancels[name]
+	done := w.nodeDone[name]
 	delete(w.nodeCancels, name)
+	delete(w.nodeDone, name)
 	w.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	w.cut(name)
+	if done != nil {
+		select {
+		case err := <-done:
+			if err != nil {
+				w.t.Errorf("node %s shutdown: %v", name, err)
+			}
+		case <-time.After(10 * time.Second):
+			w.t.Errorf("node %s did not finish shutdown", name)
+		}
+	}
 }
 
 func (w *world) node(name string, labels map[string]string) *node.Node {
@@ -169,10 +197,15 @@ func (w *world) nodeWith(name string, adjust func(*node.Options)) *node.Node {
 		w.t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(w.ctx)
+	done := make(chan error, 1)
 	w.mu.Lock()
 	w.nodeCancels[name] = cancel
+	w.nodeDone[name] = done
 	w.mu.Unlock()
-	go n.Run(ctx)
+	go func() {
+		done <- n.Run(ctx)
+		close(done)
+	}()
 	w.t.Cleanup(func() { w.stopNode(name) })
 	select {
 	case <-n.Online():
@@ -480,8 +513,13 @@ func TestAuthoritativeCheckpointFencesManagedProcessWriters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sessions) != 0 {
-		t.Fatalf("process writer survived checkpoint: %+v", sessions)
+	if len(sessions) == 0 {
+		t.Fatal("checkpoint discarded the terminated session replay record")
+	}
+	for _, status := range sessions {
+		if !status.Exited {
+			t.Fatalf("process writer survived checkpoint: %+v", sessions)
+		}
 	}
 }
 
@@ -1071,6 +1109,52 @@ func TestApproveModeParksBeforeUpstreamAndResumesAfterDecision(t *testing.T) {
 	}
 	if hits.Load() != 0 {
 		t.Fatalf("undecided request reached upstream: hits=%d", hits.Load())
+	}
+	// E6 is a composed contract: the committed pending event must reach the
+	// configured Slack adapter while the upstream request is still parked.
+	cursors, err := w.srv.Control.ExportCursors("local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var slackDeliveries int
+	notifications, err := notifier.New(notifier.Options{
+		Source: w.srv.Log, Cursors: cursors, CursorName: "e6-slack",
+		Subscriptions: []notifier.Subscription{{
+			ID: "approvals", Tenant: "local", Events: []string{proto.EvEgressPending},
+			Destination: notifier.Destination{Kind: notifier.SlackWebhook, URL: "https://hooks.slack.com/services/T/B/test"},
+		}},
+		Resolver: simResolverFunc(func(context.Context, string, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+		}),
+		RoundTripper: simRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			slackDeliveries++
+			if hits.Load() != 0 {
+				t.Errorf("parked request reached upstream before notification: hits=%d", hits.Load())
+			}
+			var message struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&message); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(message.Text, proto.EvEgressPending) {
+				t.Errorf("Slack notification = %q", message.Text)
+			}
+			return &http.Response{
+				StatusCode: http.StatusNoContent,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("")),
+			}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := notifications.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if slackDeliveries != 1 || hits.Load() != 0 {
+		t.Fatalf("notifications=%d upstream hits=%d before decision", slackDeliveries, hits.Load())
 	}
 	if _, err := c.DecideApproval(ctx, proto.ApprovalDecideReq{ID: pending.ID, Remember: proto.ApprovalRememberNone}); err != nil {
 		t.Fatal(err)

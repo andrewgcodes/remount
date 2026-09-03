@@ -82,7 +82,7 @@ func newAgentFixtureWithNode(t *testing.T, path string, nodeKey ed25519.PrivateK
 		case proto.OpWSRelease:
 			req := body.(proto.WSReleaseReq)
 			if res, ok := out.(*proto.WSReleasedReq); ok {
-				*res = proto.WSReleasedReq{ID: req.WS, Gen: req.Gen, Reason: req.Reason, Snapshot: af.put("sleep:" + req.WS)}
+				*res = proto.WSReleasedReq{ID: req.WS, Gen: req.Gen, OperationID: req.OperationID, Reason: req.Reason, Snapshot: af.put("sleep:" + req.WS)}
 			}
 		}
 		return nil

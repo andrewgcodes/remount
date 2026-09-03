@@ -10,6 +10,7 @@ import (
 
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/workspace"
 )
 
 // Diag reports this machine's deep state: what it is holding, how big each
@@ -21,14 +22,15 @@ func (n *Node) Diag(ctx context.Context) *proto.NodeDiag {
 	runtime.ReadMemStats(&ms)
 	info := n.status().Info
 	d := &proto.NodeDiag{
-		Node:       n.id,
-		Info:       info,
-		Now:        time.Now().UnixMilli(),
-		Uptime:     int64(time.Since(n.started).Seconds()),
-		DataDir:    n.opts.DataDir,
-		Goroutines: runtime.NumGoroutine(),
-		HeapBytes:  ms.HeapAlloc,
-		Metrics:    metrics.Default.Snapshot(),
+		Node:            n.id,
+		ControllerEpoch: n.currentControllerEpoch(),
+		Info:            info,
+		Now:             time.Now().UnixMilli(),
+		Uptime:          int64(time.Since(n.started).Seconds()),
+		DataDir:         n.opts.DataDir,
+		Goroutines:      runtime.NumGoroutine(),
+		HeapBytes:       ms.HeapAlloc,
+		Metrics:         metrics.Default.Snapshot(),
 	}
 	d.DiskFree, d.DiskTotal = diskSpace(n.opts.DataDir)
 	artifactStats := n.store.Stats()
@@ -61,6 +63,13 @@ func (n *Node) Diag(ctx context.Context) *proto.NodeDiag {
 	d.MutationRecordsMax = n.opts.MaxMutationRecords
 	d.SnapshotsActive = len(n.snapshotSlots)
 	d.SnapshotsActiveMax = cap(n.snapshotSlots)
+	if n.volumes != nil {
+		stats := n.volumes.Stats()
+		d.Volumes, d.VolumeAttachments, d.VolumeQuotaRejections = stats.Volumes, stats.Attachments, stats.QuotaRejections
+		d.VolumeSourceBytes, d.VolumeSourceEntries, _ = volumeSourceUsage(filepath.Join(n.opts.DataDir, "volumes", "sources"))
+		d.VolumeSourceMaxBytes = n.opts.MaxVolumeSourceBytes
+		d.VolumeSourceMaxEntries = n.opts.MaxVolumeSourceEntries
+	}
 
 	n.mu.Lock()
 	held := make([]*ws, 0, len(n.workspaces))
@@ -80,10 +89,34 @@ func (n *Node) Diag(ctx context.Context) *proto.NodeDiag {
 			ID:        w.ID,
 			Gen:       w.Generation,
 			Backend:   w.handle.Backend(),
-			Root:      w.handle.FS().Root(),
+			Root:      workspace.MountPathOf(w.handle),
 			LeaseEnds: w.LeaseUntil,
+			Volumes:   append([]proto.VolumeMount(nil), w.Spec.Volumes...),
 		}
-		wd.Bytes, wd.Files = dirUsage(w.handle.FS().Root())
+		for _, mount := range w.Spec.Volumes {
+			if n.volumes == nil {
+				d.Findings = append(d.Findings, proto.Finding{Severity: "error", Check: "node.diag_unavailable", Subject: w.ID, Detail: "volume mount verification is unavailable"})
+				continue
+			}
+			detail, err := n.volumes.Inspect(ctx, w.Tenant, mount.ID)
+			if err != nil {
+				d.Findings = append(d.Findings, proto.Finding{Severity: "error", Check: "volume.inspect", Subject: w.ID, Detail: err.Error()})
+				continue
+			}
+			verified := false
+			for _, attachment := range detail.Attachments {
+				if attachment.Workspace == w.ID && attachment.Generation == w.Generation && attachment.Path == mount.Path && attachment.VolumeVersion == mount.Version && attachment.Artifact == mount.Artifact && attachment.ReadOnly && attachment.MountPresent && attachment.MountVerified && attachment.State == "attached" {
+					verified = true
+					break
+				}
+			}
+			if !verified {
+				d.Findings = append(d.Findings, proto.Finding{Severity: "error", Check: "volume.mount", Subject: w.ID, Detail: fmt.Sprintf("%s at %s is not verified read-only for generation %d", mount.ID, mount.Path, w.Generation)})
+			}
+		}
+		if host, ok := workspace.HostFileSystemOf(w.handle); ok {
+			wd.Bytes, wd.Files = dirUsage(host.Root())
+		}
 		if w.broker != nil {
 			wd.Broker = w.broker.BaseURL()
 		}
@@ -99,10 +132,7 @@ func (n *Node) Diag(ctx context.Context) *proto.NodeDiag {
 			}
 		}
 		for _, s := range n.sessions.List(w.ID) {
-			st := proto.SessionStatus{
-				Info: s.Info, Exited: s.Exited(), Exit: s.ExitInfo(),
-				Next: s.Log.Next(), Oldest: s.Log.Oldest(),
-			}
+			st := nodeSessionStatus(s)
 			wd.Sessions = append(wd.Sessions, st)
 			// A non-zero oldest means output has already been evicted, so a
 			// client that reconnects far enough behind will see a gap.
@@ -111,6 +141,12 @@ func (n *Node) Diag(ctx context.Context) *proto.NodeDiag {
 					Severity: "info", Check: "session.evicted_output", Subject: s.ID,
 					Detail: fmt.Sprintf("output below seq %d is gone; a replay from earlier gets a gap chunk", st.Oldest),
 					Hint:   "raise the session log limits if clients reconnect after long gaps",
+				})
+			}
+			if st.UnavailableTier != "" {
+				d.Findings = append(d.Findings, proto.Finding{
+					Severity: "error", Check: "session.tier_unavailable", Subject: s.ID,
+					Detail: fmt.Sprintf("%s log tier is unavailable; affected replay returns a named gap", st.UnavailableTier),
 				})
 			}
 		}

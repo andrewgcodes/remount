@@ -1,0 +1,7073 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://remount.dev/spec/protocol.schema.json",
+  "title": "Remount protocol v1",
+  "protocolVersion": 1,
+  "$defs": {
+    "ACPCapabilities": {
+      "type": "object",
+      "properties": {
+        "additional_directories": {
+          "type": "boolean"
+        },
+        "close_session": {
+          "type": "boolean"
+        },
+        "load_session": {
+          "type": "boolean"
+        },
+        "resume_session": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "ACPFrameRecord": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "integer"
+        },
+        "frame": {},
+        "redacted": {
+          "type": "boolean"
+        },
+        "replayed": {
+          "type": "boolean"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "at",
+        "frame"
+      ],
+      "additionalProperties": true
+    },
+    "ACPRecordAssembler": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Agent": {
+      "type": "object",
+      "properties": {
+        "acp_session_id": {
+          "type": "string"
+        },
+        "capabilities": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ACPCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "created_at": {
+          "type": "integer"
+        },
+        "failures": {
+          "type": "integer"
+        },
+        "forked_from": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "idle_since": {
+          "type": "integer"
+        },
+        "inbox": {
+          "items": {
+            "$ref": "#/$defs/AgentMessage"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "owns_ws": {
+          "type": "boolean"
+        },
+        "parent": {
+          "type": "string"
+        },
+        "parent_notified": {
+          "type": "boolean"
+        },
+        "pending_approvals": {
+          "type": "integer"
+        },
+        "policy": {
+          "$ref": "#/$defs/AgentPolicy"
+        },
+        "runs": {
+          "items": {
+            "$ref": "#/$defs/AgentRun"
+          },
+          "type": "array"
+        },
+        "spec": {
+          "$ref": "#/$defs/AgentSpec"
+        },
+        "status": {
+          "type": "string"
+        },
+        "status_reason": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "transcript_bytes": {
+          "type": "integer"
+        },
+        "transcript_first": {
+          "type": "integer"
+        },
+        "transcript_next": {
+          "type": "integer"
+        },
+        "transcript_node": {
+          "type": "string"
+        },
+        "transcript_session": {
+          "type": "string"
+        },
+        "turns": {
+          "type": "integer"
+        },
+        "updated_at": {
+          "type": "integer"
+        },
+        "url": {
+          "type": "string"
+        },
+        "wake_timer": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "id",
+        "inbox",
+        "mode",
+        "owner",
+        "policy",
+        "runs",
+        "spec",
+        "status",
+        "tenant",
+        "turns",
+        "updated_at",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "AgentApprovalDecidedReq": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "approval": {
+          "type": "string"
+        },
+        "decision": {
+          "$ref": "#/$defs/ApprovalDecision"
+        },
+        "run": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent",
+        "approval",
+        "decision",
+        "run"
+      ],
+      "additionalProperties": true
+    },
+    "AgentCreateReq": {
+      "type": "object",
+      "properties": {
+        "acp_session_id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "parent": {
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/AgentPolicy"
+        },
+        "spec": {
+          "$ref": "#/$defs/AgentSpec"
+        },
+        "workspace": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "policy",
+        "spec"
+      ],
+      "additionalProperties": true
+    },
+    "AgentDeliverReq": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "message": {
+          "$ref": "#/$defs/AgentMessage"
+        },
+        "run": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent",
+        "message",
+        "run"
+      ],
+      "additionalProperties": true
+    },
+    "AgentForkReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "task": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "AgentGetReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "AgentListReq": {
+      "type": "object",
+      "properties": {
+        "parent": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "AgentListRes": {
+      "type": "object",
+      "properties": {
+        "agents": {
+          "items": {
+            "$ref": "#/$defs/Agent"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "agents"
+      ],
+      "additionalProperties": true
+    },
+    "AgentMessage": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "integer"
+        },
+        "by": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "id",
+        "kind",
+        "text"
+      ],
+      "additionalProperties": true
+    },
+    "AgentMessageReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "text"
+      ],
+      "additionalProperties": true
+    },
+    "AgentMessageRes": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/Agent"
+        },
+        "degraded": {
+          "type": "boolean"
+        },
+        "message": {
+          "$ref": "#/$defs/AgentMessage"
+        },
+        "woken": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "agent",
+        "message"
+      ],
+      "additionalProperties": true
+    },
+    "AgentPolicy": {
+      "type": "object",
+      "properties": {
+        "approve": {
+          "type": "string"
+        },
+        "max_turns": {
+          "type": "integer"
+        },
+        "sleep_after_sec": {
+          "type": "integer"
+        },
+        "start_at": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": true
+    },
+    "AgentReport": {
+      "type": "object",
+      "properties": {
+        "acp_session_id": {
+          "type": "string"
+        },
+        "agent": {
+          "type": "string"
+        },
+        "approval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Approval"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "at": {
+          "type": "integer"
+        },
+        "cancelled": {
+          "type": "boolean"
+        },
+        "capabilities": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ACPCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "chunks": {
+          "items": {
+            "$ref": "#/$defs/TranscriptChunk"
+          },
+          "type": "array"
+        },
+        "error": {
+          "type": "string"
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "loaded": {
+          "type": "boolean"
+        },
+        "locations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "message": {
+          "type": "string"
+        },
+        "run": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer"
+        },
+        "stop_reason": {
+          "type": "string"
+        },
+        "tool_call": {
+          "type": "string"
+        },
+        "tool_kind": {
+          "type": "string"
+        },
+        "tool_status": {
+          "type": "string"
+        },
+        "tool_title": {
+          "type": "string"
+        },
+        "transcript": {
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentUsage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent",
+        "at",
+        "gen",
+        "kind",
+        "run",
+        "seq",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "AgentRun": {
+      "type": "object",
+      "properties": {
+        "attempt": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "finished_at": {
+          "type": "integer"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "last_report": {
+          "type": "integer"
+        },
+        "loaded": {
+          "type": "boolean"
+        },
+        "node": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "integer"
+        },
+        "state": {
+          "type": "string"
+        },
+        "stop_reason": {
+          "type": "string"
+        },
+        "transcript": {
+          "type": "string"
+        },
+        "turn_message": {
+          "type": "string"
+        },
+        "turns": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "attempt",
+        "id",
+        "state",
+        "turns"
+      ],
+      "additionalProperties": true
+    },
+    "AgentRunCancelReq": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "run": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent",
+        "run"
+      ],
+      "additionalProperties": true
+    },
+    "AgentRunReq": {
+      "type": "object",
+      "properties": {
+        "acp_session_id": {
+          "type": "string"
+        },
+        "agent": {
+          "type": "string"
+        },
+        "attempt": {
+          "type": "integer"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "messages": {
+          "items": {
+            "$ref": "#/$defs/AgentMessage"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/AgentPolicy"
+        },
+        "run": {
+          "type": "string"
+        },
+        "spec": {
+          "$ref": "#/$defs/AgentSpec"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent",
+        "attempt",
+        "gen",
+        "messages",
+        "mode",
+        "owner",
+        "policy",
+        "run",
+        "spec",
+        "tenant",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "AgentRunRes": {
+      "type": "object",
+      "properties": {
+        "transcript": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "transcript"
+      ],
+      "additionalProperties": true
+    },
+    "AgentSpec": {
+      "type": "object",
+      "properties": {
+        "acp_command": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "auth": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "primary": {
+          "type": "string"
+        },
+        "providers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "recipe": {
+          "type": "string"
+        },
+        "recipe_yaml": {
+          "type": "string"
+        },
+        "sandbox": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "recipe",
+        "task"
+      ],
+      "additionalProperties": true
+    },
+    "AgentTranscriptReq": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "AgentTranscriptRes": {
+      "type": "object",
+      "properties": {
+        "done": {
+          "type": "boolean"
+        },
+        "gap": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TranscriptGap"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next": {
+          "type": "integer"
+        },
+        "records": {
+          "items": {
+            "$ref": "#/$defs/TranscriptRecord"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "next",
+        "records"
+      ],
+      "additionalProperties": true
+    },
+    "AgentUsage": {
+      "type": "object",
+      "properties": {
+        "input": {
+          "type": "integer"
+        },
+        "output": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": true
+    },
+    "AgentWakeReq": {
+      "type": "object",
+      "properties": {
+        "by": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "Approval": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "body_hash": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "integer"
+        },
+        "decision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApprovalDecision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "delivered_at": {
+          "type": "integer"
+        },
+        "detail": {},
+        "expires_at": {
+          "type": "integer"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "locations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "method": {
+          "type": "string"
+        },
+        "options": {
+          "items": {
+            "$ref": "#/$defs/ApprovalOption"
+          },
+          "type": "array"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "path_hash": {
+          "type": "string"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "rule": {
+          "type": "string"
+        },
+        "run": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "tool_call": {
+          "type": "string"
+        },
+        "tool_kind": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "id",
+        "kind",
+        "owner",
+        "status",
+        "tenant",
+        "updated_at"
+      ],
+      "additionalProperties": true
+    },
+    "ApprovalDecideReq": {
+      "type": "object",
+      "properties": {
+        "content": {},
+        "denied": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "option": {
+          "type": "string"
+        },
+        "remember": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "ApprovalDecision": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "integer"
+        },
+        "by": {
+          "type": "string"
+        },
+        "content": {},
+        "denied": {
+          "type": "boolean"
+        },
+        "option": {
+          "type": "string"
+        },
+        "remember": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "by"
+      ],
+      "additionalProperties": true
+    },
+    "ApprovalGetReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "ApprovalListReq": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "ApprovalListRes": {
+      "type": "object",
+      "properties": {
+        "approvals": {
+          "items": {
+            "$ref": "#/$defs/Approval"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "approvals"
+      ],
+      "additionalProperties": true
+    },
+    "ApprovalOption": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "ArtifactProofClaims": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string"
+        },
+        "expires_at": {
+          "type": "integer"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "issued_at": {
+          "type": "integer"
+        },
+        "method": {
+          "type": "string"
+        },
+        "node": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact",
+        "expires_at",
+        "gen",
+        "id",
+        "issued_at",
+        "method",
+        "node",
+        "tenant",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "ArtifactProofEnvelope": {
+      "type": "object",
+      "properties": {
+        "claims": {
+          "$ref": "#/$defs/ArtifactProofClaims"
+        },
+        "signature": {
+          "contentEncoding": "base64",
+          "type": "string"
+        }
+      },
+      "required": [
+        "claims",
+        "signature"
+      ],
+      "additionalProperties": true
+    },
+    "ArtifactProofReq": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "method": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact",
+        "gen",
+        "method",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "ArtifactProofRes": {
+      "type": "object",
+      "properties": {
+        "proof": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "proof"
+      ],
+      "additionalProperties": true
+    },
+    "AuditPolicy": {
+      "type": "object",
+      "properties": {
+        "required": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "AuthzRevocation": {
+      "type": "object",
+      "properties": {
+        "principal": {
+          "type": "string"
+        },
+        "rev": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "principal",
+        "rev"
+      ],
+      "additionalProperties": true
+    },
+    "BackendDescriptor": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "runtime": {
+          "$ref": "#/$defs/RuntimeCaps"
+        },
+        "security": {
+          "$ref": "#/$defs/BackendSecurityCaps"
+        }
+      },
+      "required": [
+        "name",
+        "runtime",
+        "security"
+      ],
+      "additionalProperties": true
+    },
+    "BackendSecurityCaps": {
+      "type": "object",
+      "properties": {
+        "broker_identity": {
+          "type": "string"
+        },
+        "device_isolation": {
+          "type": "boolean"
+        },
+        "egress_mode": {
+          "type": "string"
+        },
+        "filesystem_boundary": {
+          "type": "string"
+        },
+        "isolation": {
+          "type": "string"
+        },
+        "multi_tenant": {
+          "type": "boolean"
+        },
+        "network_namespace": {
+          "type": "boolean"
+        },
+        "sibling_isolation": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "broker_identity",
+        "device_isolation",
+        "egress_mode",
+        "filesystem_boundary",
+        "isolation",
+        "multi_tenant",
+        "network_namespace",
+        "sibling_isolation"
+      ],
+      "additionalProperties": true
+    },
+    "Base": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string"
+        },
+        "bytes": {
+          "type": "integer"
+        },
+        "created_at": {
+          "type": "integer"
+        },
+        "format": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "objects": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact",
+        "created_at",
+        "name",
+        "owner",
+        "tenant"
+      ],
+      "additionalProperties": true
+    },
+    "BaseCreateReq": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string"
+        },
+        "format": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact",
+        "name"
+      ],
+      "additionalProperties": true
+    },
+    "BaseListRes": {
+      "type": "object",
+      "properties": {
+        "bases": {
+          "items": {
+            "$ref": "#/$defs/Base"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "bases"
+      ],
+      "additionalProperties": true
+    },
+    "BaseRemoveReq": {
+      "type": "object",
+      "properties": {
+        "idem": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": true
+    },
+    "BindingLease": {
+      "type": "object",
+      "properties": {
+        "destinations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "expires_at": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "placeholder": {
+          "type": "string"
+        },
+        "principals": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "secret": {
+          "type": "string"
+        },
+        "shape": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "destinations",
+        "expires_at",
+        "id",
+        "secret"
+      ],
+      "additionalProperties": true
+    },
+    "BindingLeaseReq": {
+      "type": "object",
+      "properties": {
+        "gen": {
+          "type": "integer"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "BindingLeaseRes": {
+      "type": "object",
+      "properties": {
+        "leases": {
+          "items": {
+            "$ref": "#/$defs/BindingLease"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "leases"
+      ],
+      "additionalProperties": true
+    },
+    "Budget": {
+      "type": "object",
+      "properties": {
+        "attach_id": {
+          "type": "string"
+        },
+        "attach_to": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "max_estimated_cost_micros": {
+          "type": "integer"
+        },
+        "max_requests": {
+          "type": "integer"
+        },
+        "max_tokens": {
+          "type": "integer"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer"
+        },
+        "window": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attach_id",
+        "attach_to",
+        "id",
+        "window"
+      ],
+      "additionalProperties": true
+    },
+    "BudgetCreateReq": {
+      "type": "object",
+      "properties": {
+        "budget": {
+          "$ref": "#/$defs/Budget"
+        },
+        "idem": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "budget"
+      ],
+      "additionalProperties": true
+    },
+    "BudgetListReq": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "BudgetListRes": {
+      "type": "object",
+      "properties": {
+        "budgets": {
+          "items": {
+            "$ref": "#/$defs/Budget"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "budgets"
+      ],
+      "additionalProperties": true
+    },
+    "BudgetRemoveReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "BudgetReservation": {
+      "type": "object",
+      "properties": {
+        "budget_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "denied": {
+          "type": "boolean"
+        },
+        "expires_at": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "string"
+        },
+        "tracked": {
+          "type": "boolean"
+        },
+        "unmetered_reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "BudgetReserveReq": {
+      "type": "object",
+      "properties": {
+        "bindings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "input_tokens": {
+          "type": "integer"
+        },
+        "key": {
+          "type": "string"
+        },
+        "max_output_tokens": {
+          "type": "integer"
+        },
+        "metered": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "string"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gen",
+        "key",
+        "provider",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "BudgetSettleReq": {
+      "type": "object",
+      "properties": {
+        "input_tokens": {
+          "type": "integer"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "output_tokens": {
+          "type": "integer"
+        },
+        "reservation": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "reservation"
+      ],
+      "additionalProperties": true
+    },
+    "BudgetSettlement": {
+      "type": "object",
+      "properties": {
+        "estimated_cost_micros": {
+          "type": "integer"
+        },
+        "estimated_cost_unavailable": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "reservation": {
+          "type": "string"
+        },
+        "tokens": {
+          "type": "integer"
+        },
+        "usage_exceeded_reservation": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "mode",
+        "reservation"
+      ],
+      "additionalProperties": true
+    },
+    "ChildSummary": {
+      "type": "object",
+      "properties": {
+        "child": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "turns": {
+          "type": "integer"
+        },
+        "url": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "child",
+        "status",
+        "turns",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "ChunkBody": {
+      "type": "object",
+      "properties": {
+        "d": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "st": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "st"
+      ],
+      "additionalProperties": true
+    },
+    "ControlDiag": {
+      "type": "object",
+      "properties": {
+        "artifact_bytes": {
+          "type": "integer"
+        },
+        "artifact_count": {
+          "type": "integer"
+        },
+        "artifact_max_bytes": {
+          "type": "integer"
+        },
+        "artifact_max_objects": {
+          "type": "integer"
+        },
+        "artifact_reserved_bytes": {
+          "type": "integer"
+        },
+        "artifact_reserved_objects": {
+          "type": "integer"
+        },
+        "bindings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "controller_epoch": {
+          "type": "integer"
+        },
+        "controller_lease_age_ms": {
+          "type": "integer"
+        },
+        "controller_reconciling": {
+          "type": "boolean"
+        },
+        "controller_role": {
+          "type": "string"
+        },
+        "db_integrity": {
+          "type": "string"
+        },
+        "event_oldest": {
+          "type": "integer"
+        },
+        "event_seq": {
+          "type": "integer"
+        },
+        "events_max": {
+          "type": "integer"
+        },
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/Finding"
+          },
+          "type": "array"
+        },
+        "last_replicated_at": {
+          "type": "integer"
+        },
+        "lease_sec": {
+          "type": "integer"
+        },
+        "metrics": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "type": "object"
+        },
+        "mutation_records": {
+          "type": "integer"
+        },
+        "mutation_records_max": {
+          "type": "integer"
+        },
+        "nodes_online": {
+          "type": "integer"
+        },
+        "nodes_total": {
+          "type": "integer"
+        },
+        "now": {
+          "type": "integer"
+        },
+        "recovery_lost_window_ms": {
+          "type": "integer"
+        },
+        "requests_active_max": {
+          "type": "integer"
+        },
+        "restored_event_seq": {
+          "type": "integer"
+        },
+        "timers_fired": {
+          "type": "integer"
+        },
+        "timers_max": {
+          "type": "integer"
+        },
+        "timers_pending": {
+          "type": "integer"
+        },
+        "uptime_sec": {
+          "type": "integer"
+        },
+        "version": {
+          "type": "string"
+        },
+        "workspaces_per_subject_max": {
+          "type": "integer"
+        },
+        "workspaces_per_tenant_max": {
+          "type": "integer"
+        },
+        "ws_state": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "artifact_bytes",
+        "artifact_count",
+        "event_seq",
+        "lease_sec",
+        "nodes_online",
+        "nodes_total",
+        "now",
+        "timers_fired",
+        "timers_pending",
+        "uptime_sec",
+        "ws_state"
+      ],
+      "additionalProperties": true
+    },
+    "ControllerNodeState": {
+      "type": "object",
+      "properties": {
+        "epoch": {
+          "type": "integer"
+        },
+        "node": {
+          "type": "string"
+        },
+        "releases": {
+          "items": {
+            "$ref": "#/$defs/ControllerReleaseState"
+          },
+          "type": "array"
+        },
+        "workspaces": {
+          "items": {
+            "$ref": "#/$defs/ControllerWorkspace"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "epoch",
+        "node"
+      ],
+      "additionalProperties": true
+    },
+    "ControllerReleaseState": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string"
+        },
+        "request": {
+          "$ref": "#/$defs/WSReleaseReq"
+        },
+        "response": {
+          "$ref": "#/$defs/WSReleasedReq"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "request",
+        "response",
+        "state"
+      ],
+      "additionalProperties": true
+    },
+    "ControllerWorkspace": {
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "workspace": {
+          "$ref": "#/$defs/Workspace"
+        }
+      },
+      "required": [
+        "workspace"
+      ],
+      "additionalProperties": true
+    },
+    "DiagReq": {
+      "type": "object",
+      "properties": {
+        "verify": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "EgressApprovalReq": {
+      "type": "object",
+      "properties": {
+        "body_hash": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "host": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "path_hash": {
+          "type": "string"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "rule": {
+          "type": "string"
+        },
+        "wait_ms": {
+          "type": "integer"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "body_hash",
+        "fingerprint",
+        "gen",
+        "host",
+        "method",
+        "path_hash",
+        "principal",
+        "rule",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "EgressApprovalRes": {
+      "type": "object",
+      "properties": {
+        "allowed": {
+          "type": "boolean"
+        },
+        "expires_at": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "status"
+      ],
+      "additionalProperties": true
+    },
+    "EgressRule": {
+      "type": "object",
+      "properties": {
+        "connector": {
+          "type": "string"
+        },
+        "hosts": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "max_request_bytes": {
+          "type": "integer"
+        },
+        "max_requests": {
+          "type": "integer"
+        },
+        "max_response_bytes": {
+          "type": "integer"
+        },
+        "methods": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "path_prefixes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "ports": {
+          "items": {
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "protocol": {
+          "type": "string"
+        },
+        "push": {
+          "type": "boolean"
+        },
+        "redact": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "repos": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "shared_state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "protocol"
+      ],
+      "additionalProperties": true
+    },
+    "Error": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "msg": {
+          "type": "string"
+        },
+        "oldest": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "additionalProperties": true
+    },
+    "Event": {
+      "type": "object",
+      "properties": {
+        "actor": {
+          "type": "string"
+        },
+        "at": {
+          "type": "integer"
+        },
+        "cause": {
+          "type": "integer"
+        },
+        "controller_epoch": {
+          "type": "integer"
+        },
+        "event_id": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "integer"
+        },
+        "node": {
+          "type": "string"
+        },
+        "observed_at": {
+          "type": "integer"
+        },
+        "operation_id": {
+          "type": "string"
+        },
+        "origin": {
+          "type": "string"
+        },
+        "payload": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "producer_seq": {
+          "type": "integer"
+        },
+        "received_at": {
+          "type": "integer"
+        },
+        "seq": {
+          "type": "integer"
+        },
+        "session": {
+          "type": "string"
+        },
+        "stream": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "seq",
+        "type"
+      ],
+      "additionalProperties": true
+    },
+    "EventPost": {
+      "type": "object",
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/$defs/Event"
+          },
+          "type": "array"
+        },
+        "sub": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "events"
+      ],
+      "additionalProperties": true
+    },
+    "EventsStopReq": {
+      "type": "object",
+      "properties": {
+        "sub": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "EventsTailReq": {
+      "type": "object",
+      "properties": {
+        "follow": {
+          "type": "boolean"
+        },
+        "from": {
+          "type": "integer"
+        },
+        "sub": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "follow",
+        "from"
+      ],
+      "additionalProperties": true
+    },
+    "ExitInfo": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "signal": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "additionalProperties": true
+    },
+    "FSApplyTarReq": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idem": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "FSApplyTarRes": {
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "type": "integer"
+        },
+        "dirs": {
+          "type": "integer"
+        },
+        "files": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "bytes",
+        "dirs",
+        "files"
+      ],
+      "additionalProperties": true
+    },
+    "FSEdit": {
+      "type": "object",
+      "properties": {
+        "all": {
+          "type": "boolean"
+        },
+        "new": {
+          "type": "string"
+        },
+        "old": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "new",
+        "old"
+      ],
+      "additionalProperties": true
+    },
+    "FSEditReq": {
+      "type": "object",
+      "properties": {
+        "edits": {
+          "items": {
+            "$ref": "#/$defs/FSEdit"
+          },
+          "type": "array"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idem": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "edits",
+        "path",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "FSEditRes": {
+      "type": "object",
+      "properties": {
+        "replacements": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "replacements"
+      ],
+      "additionalProperties": true
+    },
+    "FSEntry": {
+      "type": "object",
+      "properties": {
+        "dir": {
+          "type": "boolean"
+        },
+        "link": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "integer"
+        },
+        "mtime": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dir",
+        "mode",
+        "mtime",
+        "name",
+        "size"
+      ],
+      "additionalProperties": true
+    },
+    "FSListReq": {
+      "type": "object",
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "FSListRes": {
+      "type": "object",
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/FSEntry"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "entries"
+      ],
+      "additionalProperties": true
+    },
+    "FSMatch": {
+      "type": "object",
+      "properties": {
+        "line": {
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "line",
+        "path",
+        "text"
+      ],
+      "additionalProperties": true
+    },
+    "FSMkdirReq": {
+      "type": "object",
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idem": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "FSReadReq": {
+      "type": "object",
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "offset": {
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "FSReadRes": {
+      "type": "object",
+      "properties": {
+        "d": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "eof": {
+          "type": "boolean"
+        },
+        "size": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "d",
+        "eof",
+        "size"
+      ],
+      "additionalProperties": true
+    },
+    "FSRemoveReq": {
+      "type": "object",
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idem": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "recursive": {
+          "type": "boolean"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "FSRenameReq": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idem": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "FSSearchReq": {
+      "type": "object",
+      "properties": {
+        "glob": {
+          "type": "string"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max": {
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "pattern": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "pattern",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "FSSearchRes": {
+      "type": "object",
+      "properties": {
+        "matches": {
+          "items": {
+            "$ref": "#/$defs/FSMatch"
+          },
+          "type": "array"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "matches",
+        "truncated"
+      ],
+      "additionalProperties": true
+    },
+    "FSStatRes": {
+      "type": "object",
+      "properties": {
+        "entry": {
+          "$ref": "#/$defs/FSEntry"
+        }
+      },
+      "required": [
+        "entry"
+      ],
+      "additionalProperties": true
+    },
+    "FSWriteReq": {
+      "type": "object",
+      "properties": {
+        "append": {
+          "type": "boolean"
+        },
+        "d": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idem": {
+          "type": "string"
+        },
+        "mkdirp": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "d",
+        "path",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "Finding": {
+      "type": "object",
+      "properties": {
+        "check": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "severity": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "check",
+        "detail",
+        "severity"
+      ],
+      "additionalProperties": true
+    },
+    "FleetGetReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "FleetListRes": {
+      "type": "object",
+      "properties": {
+        "operations": {
+          "items": {
+            "$ref": "#/$defs/FleetOperation"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "operations"
+      ],
+      "additionalProperties": true
+    },
+    "FleetOperation": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "integer"
+        },
+        "deadline": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "requested_by": {
+          "type": "string"
+        },
+        "results": {
+          "items": {
+            "$ref": "#/$defs/FleetOperationResult"
+          },
+          "type": "array"
+        },
+        "selector": {
+          "$ref": "#/$defs/WorkspaceSelector"
+        },
+        "state": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "action",
+        "created_at",
+        "deadline",
+        "id",
+        "requested_by",
+        "results",
+        "selector",
+        "state",
+        "tenant",
+        "updated_at"
+      ],
+      "additionalProperties": true
+    },
+    "FleetOperationResult": {
+      "type": "object",
+      "properties": {
+        "acknowledged": {
+          "type": "boolean"
+        },
+        "backend": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "fenced": {
+          "type": "boolean"
+        },
+        "generation": {
+          "type": "integer"
+        },
+        "node": {
+          "type": "string"
+        },
+        "snapshot": {
+          "type": "string"
+        },
+        "snapshot_format": {
+          "type": "string"
+        },
+        "snapshot_objects": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "state": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "acknowledged",
+        "state",
+        "updated_at",
+        "workspace"
+      ],
+      "additionalProperties": true
+    },
+    "FleetQuarantineReq": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "deadline": {
+          "type": "integer"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "selector": {
+          "$ref": "#/$defs/WorkspaceSelector"
+        },
+        "timeout_ms": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "action",
+        "selector"
+      ],
+      "additionalProperties": true
+    },
+    "Frame": {
+      "type": "object",
+      "properties": {
+        "body": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "controller_epoch": {
+          "type": "integer"
+        },
+        "err": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Error"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "from": {
+          "type": "string"
+        },
+        "id": {
+          "type": "integer"
+        },
+        "op": {
+          "type": "string"
+        },
+        "s": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer"
+        },
+        "t": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        },
+        "v": {
+          "type": "integer"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "t",
+        "v"
+      ],
+      "additionalProperties": true
+    },
+    "Gap": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "integer"
+        },
+        "tier": {
+          "type": "string"
+        },
+        "to": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "additionalProperties": true
+    },
+    "Grant": {
+      "type": "object",
+      "properties": {
+        "claims": {
+          "$ref": "#/$defs/GrantClaims"
+        },
+        "node": {
+          "type": "string"
+        },
+        "sig": {
+          "contentEncoding": "base64",
+          "type": "string"
+        }
+      },
+      "required": [
+        "claims",
+        "node",
+        "sig"
+      ],
+      "additionalProperties": true
+    },
+    "GrantClaims": {
+      "type": "object",
+      "properties": {
+        "authz_revision": {
+          "type": "integer"
+        },
+        "client": {
+          "type": "string"
+        },
+        "controller_epoch": {
+          "type": "integer"
+        },
+        "exp": {
+          "type": "integer"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "node": {
+          "type": "string"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "roles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "client",
+        "exp",
+        "gen",
+        "node",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "GrantReq": {
+      "type": "object",
+      "properties": {
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "Hello": {
+      "type": "object",
+      "properties": {
+        "caps": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "issued_at": {
+          "type": "integer"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "node": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NodeInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "nonce": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "peer": {
+          "type": "string"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "proof": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "pubkey": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "peer",
+        "role"
+      ],
+      "additionalProperties": true
+    },
+    "HelloOK": {
+      "type": "object",
+      "properties": {
+        "caps": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "controller_epoch": {
+          "type": "integer"
+        },
+        "lease_sec": {
+          "type": "integer"
+        },
+        "node_token": {
+          "type": "string"
+        },
+        "now": {
+          "type": "integer"
+        },
+        "peer": {
+          "type": "string"
+        },
+        "pubkey": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "server": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "caps",
+        "now",
+        "peer"
+      ],
+      "additionalProperties": true
+    },
+    "Idle": {
+      "type": "object",
+      "properties": {
+        "destroy_after_sec": {
+          "type": "integer"
+        },
+        "snapshot_every_sec": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": true
+    },
+    "NetworkPolicy": {
+      "type": "object",
+      "properties": {
+        "default": {
+          "type": "string"
+        },
+        "rules": {
+          "items": {
+            "$ref": "#/$defs/EgressRule"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": true
+    },
+    "NodeDiag": {
+      "type": "object",
+      "properties": {
+        "artifact_bytes": {
+          "type": "integer"
+        },
+        "artifact_max_bytes": {
+          "type": "integer"
+        },
+        "artifact_max_objects": {
+          "type": "integer"
+        },
+        "artifact_reserved_bytes": {
+          "type": "integer"
+        },
+        "artifact_reserved_objects": {
+          "type": "integer"
+        },
+        "artifacts": {
+          "type": "integer"
+        },
+        "connector_max_bytes": {
+          "type": "integer"
+        },
+        "connector_max_objects": {
+          "type": "integer"
+        },
+        "connector_object_max_bytes": {
+          "type": "integer"
+        },
+        "connector_scope_max_bytes": {
+          "type": "integer"
+        },
+        "connector_scope_max_objects": {
+          "type": "integer"
+        },
+        "controller_epoch": {
+          "type": "integer"
+        },
+        "data_dir": {
+          "type": "string"
+        },
+        "disk_free_bytes": {
+          "type": "integer"
+        },
+        "disk_total_bytes": {
+          "type": "integer"
+        },
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/Finding"
+          },
+          "type": "array"
+        },
+        "goroutines": {
+          "type": "integer"
+        },
+        "heap_bytes": {
+          "type": "integer"
+        },
+        "info": {
+          "$ref": "#/$defs/NodeInfo"
+        },
+        "metrics": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "type": "object"
+        },
+        "mutation_records": {
+          "type": "integer"
+        },
+        "mutation_records_max": {
+          "type": "integer"
+        },
+        "node": {
+          "type": "string"
+        },
+        "now": {
+          "type": "integer"
+        },
+        "requests_active_max": {
+          "type": "integer"
+        },
+        "session_chunk_bytes": {
+          "type": "integer"
+        },
+        "session_memory_bytes": {
+          "type": "integer"
+        },
+        "session_memory_chunks": {
+          "type": "integer"
+        },
+        "session_spill_bytes": {
+          "type": "integer"
+        },
+        "sessions_active": {
+          "type": "integer"
+        },
+        "sessions_active_max": {
+          "type": "integer"
+        },
+        "sessions_max": {
+          "type": "integer"
+        },
+        "sessions_per_principal_max": {
+          "type": "integer"
+        },
+        "sessions_per_workspace_max": {
+          "type": "integer"
+        },
+        "sessions_retained": {
+          "type": "integer"
+        },
+        "snapshots_active": {
+          "type": "integer"
+        },
+        "snapshots_active_max": {
+          "type": "integer"
+        },
+        "uptime_sec": {
+          "type": "integer"
+        },
+        "volume_attachments": {
+          "type": "integer"
+        },
+        "volume_quota_rejections": {
+          "type": "integer"
+        },
+        "volume_source_bytes": {
+          "type": "integer"
+        },
+        "volume_source_entries": {
+          "type": "integer"
+        },
+        "volume_source_max_bytes": {
+          "type": "integer"
+        },
+        "volume_source_max_entries": {
+          "type": "integer"
+        },
+        "volumes": {
+          "type": "integer"
+        },
+        "workspaces": {
+          "items": {
+            "$ref": "#/$defs/WSDiag"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "artifacts",
+        "data_dir",
+        "disk_free_bytes",
+        "disk_total_bytes",
+        "goroutines",
+        "heap_bytes",
+        "info",
+        "node",
+        "now",
+        "uptime_sec"
+      ],
+      "additionalProperties": true
+    },
+    "NodeDiagReq": {
+      "type": "object",
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "verify": {
+          "type": "boolean"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "NodeInfo": {
+      "type": "object",
+      "properties": {
+        "arch": {
+          "type": "string"
+        },
+        "backend_descriptors": {
+          "items": {
+            "$ref": "#/$defs/BackendDescriptor"
+          },
+          "type": "array"
+        },
+        "backends": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "caps": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "connectors": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cpu": {
+          "type": "integer"
+        },
+        "mem_mib": {
+          "type": "integer"
+        },
+        "os": {
+          "type": "string"
+        },
+        "snapshots": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "arch",
+        "backends",
+        "cpu",
+        "mem_mib",
+        "os"
+      ],
+      "additionalProperties": true
+    },
+    "NodeListRes": {
+      "type": "object",
+      "properties": {
+        "nodes": {
+          "items": {
+            "$ref": "#/$defs/NodeStatus"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "nodes"
+      ],
+      "additionalProperties": true
+    },
+    "NodeStatus": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "info": {
+          "$ref": "#/$defs/NodeInfo"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "last_seen": {
+          "type": "integer"
+        },
+        "online": {
+          "type": "boolean"
+        },
+        "protocol": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "workspaces": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "info",
+        "last_seen",
+        "online"
+      ],
+      "additionalProperties": true
+    },
+    "Placement": {
+      "type": "object",
+      "properties": {
+        "allow": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "node": {
+          "type": "string"
+        },
+        "prefer": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "additionalProperties": true
+    },
+    "Pool": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer"
+        },
+        "current": {
+          "type": "integer"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "spec": {
+          "$ref": "#/$defs/PoolSpec"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "created_at",
+        "current",
+        "owner",
+        "spec",
+        "tenant",
+        "updated_at"
+      ],
+      "additionalProperties": true
+    },
+    "PoolCreateReq": {
+      "type": "object",
+      "properties": {
+        "idem": {
+          "type": "string"
+        },
+        "spec": {
+          "$ref": "#/$defs/PoolSpec"
+        }
+      },
+      "required": [
+        "spec"
+      ],
+      "additionalProperties": true
+    },
+    "PoolGetReq": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": true
+    },
+    "PoolListRes": {
+      "type": "object",
+      "properties": {
+        "pools": {
+          "items": {
+            "$ref": "#/$defs/Pool"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "pools"
+      ],
+      "additionalProperties": true
+    },
+    "PoolRemoveReq": {
+      "type": "object",
+      "properties": {
+        "idem": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": true
+    },
+    "PoolSpec": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "idle_scale_down_ms": {
+          "type": "integer"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "max": {
+          "type": "integer"
+        },
+        "min": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "region": {
+          "type": "string"
+        },
+        "size": {
+          "type": "string"
+        },
+        "vendor": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backend",
+        "max",
+        "min",
+        "name",
+        "vendor"
+      ],
+      "additionalProperties": true
+    },
+    "PortOpenReq": {
+      "type": "object",
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "host": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "port",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "Principal": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "roles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "created_at",
+        "id",
+        "revision",
+        "roles",
+        "tenant",
+        "updated_at"
+      ],
+      "additionalProperties": true
+    },
+    "PrincipalCreateReq": {
+      "type": "object",
+      "properties": {
+        "idem": {
+          "type": "string"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "roles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tenant": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "idem",
+        "principal",
+        "roles"
+      ],
+      "additionalProperties": true
+    },
+    "PrincipalInviteReq": {
+      "type": "object",
+      "properties": {
+        "idem": {
+          "type": "string"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "ttl_ms": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "idem",
+        "principal",
+        "tenant",
+        "ttl_ms"
+      ],
+      "additionalProperties": true
+    },
+    "PrincipalListReq": {
+      "type": "object",
+      "properties": {
+        "tenant": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "PrincipalListRes": {
+      "type": "object",
+      "properties": {
+        "principals": {
+          "items": {
+            "$ref": "#/$defs/Principal"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "principals"
+      ],
+      "additionalProperties": true
+    },
+    "PrincipalRevokeReq": {
+      "type": "object",
+      "properties": {
+        "idem": {
+          "type": "string"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "idem",
+        "principal"
+      ],
+      "additionalProperties": true
+    },
+    "PrincipalRevokeRes": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision"
+      ],
+      "additionalProperties": true
+    },
+    "PrincipalTokenIssueReq": {
+      "type": "object",
+      "properties": {
+        "idem": {
+          "type": "string"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "ttl_ms": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "idem",
+        "principal",
+        "role",
+        "ttl_ms"
+      ],
+      "additionalProperties": true
+    },
+    "PrincipalTokenIssueRes": {
+      "type": "object",
+      "properties": {
+        "access_token": {
+          "type": "string"
+        },
+        "expires_at": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "access_token",
+        "expires_at"
+      ],
+      "additionalProperties": true
+    },
+    "Queue": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer"
+        },
+        "cursor": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/QueueItem"
+          },
+          "type": "array"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "recipe": {
+          "type": "string"
+        },
+        "sleep_after_sec": {
+          "type": "integer"
+        },
+        "sleep_until": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "cursor",
+        "id",
+        "items",
+        "owner",
+        "status",
+        "tenant",
+        "updated_at",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "QueueAdvanceReq": {
+      "type": "object",
+      "properties": {
+        "exit": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "index": {
+          "type": "integer"
+        },
+        "session": {
+          "type": "string"
+        },
+        "signal": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "exit",
+        "id",
+        "index"
+      ],
+      "additionalProperties": true
+    },
+    "QueueCreateReq": {
+      "type": "object",
+      "properties": {
+        "idem": {
+          "type": "string"
+        },
+        "recipe": {
+          "type": "string"
+        },
+        "sleep_after_sec": {
+          "type": "integer"
+        },
+        "sleep_until": {
+          "type": "string"
+        },
+        "tasks": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tasks",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "QueueGetReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "QueueItem": {
+      "type": "object",
+      "properties": {
+        "attempts": {
+          "type": "integer"
+        },
+        "exit": {
+          "type": "integer"
+        },
+        "finished_at": {
+          "type": "integer"
+        },
+        "session": {
+          "type": "string"
+        },
+        "signal": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task"
+      ],
+      "additionalProperties": true
+    },
+    "QueueListReq": {
+      "type": "object",
+      "properties": {
+        "ws": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "QueueListRes": {
+      "type": "object",
+      "properties": {
+        "queues": {
+          "items": {
+            "$ref": "#/$defs/Queue"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "queues"
+      ],
+      "additionalProperties": true
+    },
+    "RepoSpec": {
+      "type": "object",
+      "properties": {
+        "branch": {
+          "type": "string"
+        },
+        "depth": {
+          "type": "integer"
+        },
+        "ref": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "Requires": {
+      "type": "object",
+      "properties": {
+        "arch": {
+          "type": "string"
+        },
+        "backend": {
+          "type": "string"
+        },
+        "caps": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cpu": {
+          "type": "integer"
+        },
+        "mem_mib": {
+          "type": "integer"
+        },
+        "os": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "RunInfo": {
+      "type": "object",
+      "properties": {
+        "auth": {
+          "type": "string"
+        },
+        "recipe": {
+          "type": "string"
+        },
+        "sandbox": {
+          "type": "string"
+        },
+        "task_hash": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "recipe"
+      ],
+      "additionalProperties": true
+    },
+    "RuntimeCaps": {
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "boolean"
+        },
+        "mount_path": {
+          "type": "boolean"
+        },
+        "snapshots": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "snapshots"
+      ],
+      "additionalProperties": true
+    },
+    "SAckReq": {
+      "type": "object",
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "s": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "s",
+        "seq"
+      ],
+      "additionalProperties": true
+    },
+    "SAttachReq": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "integer"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "s": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "s"
+      ],
+      "additionalProperties": true
+    },
+    "SCloseReq": {
+      "type": "object",
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kill": {
+          "type": "boolean"
+        },
+        "s": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "s"
+      ],
+      "additionalProperties": true
+    },
+    "SInputReq": {
+      "type": "object",
+      "properties": {
+        "d": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "eof": {
+          "type": "boolean"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "iseq": {
+          "type": "integer"
+        },
+        "s": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "iseq",
+        "s"
+      ],
+      "additionalProperties": true
+    },
+    "SListReq": {
+      "type": "object",
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "SListRes": {
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/SessionStatus"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "sessions"
+      ],
+      "additionalProperties": true
+    },
+    "SOpenReq": {
+      "type": "object",
+      "properties": {
+        "cols": {
+          "type": "integer"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idem": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "no_sub": {
+          "type": "boolean"
+        },
+        "program": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "rows": {
+          "type": "integer"
+        },
+        "run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stdin": {
+          "type": "boolean"
+        },
+        "timeout_sec": {
+          "type": "integer"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "program",
+        "stdin",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "SOpenRes": {
+      "type": "object",
+      "properties": {
+        "last_iseq": {
+          "type": "integer"
+        },
+        "next": {
+          "type": "integer"
+        },
+        "s": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "next",
+        "s"
+      ],
+      "additionalProperties": true
+    },
+    "SResizeReq": {
+      "type": "object",
+      "properties": {
+        "cols": {
+          "type": "integer"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rows": {
+          "type": "integer"
+        },
+        "s": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "cols",
+        "rows",
+        "s"
+      ],
+      "additionalProperties": true
+    },
+    "SSignalReq": {
+      "type": "object",
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "s": {
+          "type": "string"
+        },
+        "signal": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "s",
+        "signal"
+      ],
+      "additionalProperties": true
+    },
+    "SWaitReq": {
+      "type": "object",
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "s": {
+          "type": "string"
+        },
+        "timeout_sec": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "s"
+      ],
+      "additionalProperties": true
+    },
+    "SWaitRes": {
+      "type": "object",
+      "properties": {
+        "exit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExitInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "exited": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "exited"
+      ],
+      "additionalProperties": true
+    },
+    "SecuritySpec": {
+      "type": "object",
+      "properties": {
+        "audit": {
+          "$ref": "#/$defs/AuditPolicy"
+        },
+        "min_isolation": {
+          "type": "string"
+        },
+        "network": {
+          "$ref": "#/$defs/NetworkPolicy"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "require_enforced_egress": {
+          "type": "boolean"
+        },
+        "require_sibling_isolation": {
+          "type": "boolean"
+        },
+        "secret_mode": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "SessionCapabilityCheckReq": {
+      "type": "object",
+      "properties": {
+        "capability": {
+          "type": "string"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "capability",
+        "gen",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "SessionCapabilityCheckRes": {
+      "type": "object",
+      "properties": {
+        "principal": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "principal",
+        "tenant"
+      ],
+      "additionalProperties": true
+    },
+    "SessionCapabilityIssueReq": {
+      "type": "object",
+      "properties": {
+        "authz_revision": {
+          "type": "integer"
+        },
+        "client": {
+          "type": "string"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "roles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "authz_revision",
+        "client",
+        "gen",
+        "principal",
+        "tenant",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "SessionCapabilityIssueRes": {
+      "type": "object",
+      "properties": {
+        "capability": {
+          "type": "string"
+        },
+        "expires_at": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "capability",
+        "expires_at"
+      ],
+      "additionalProperties": true
+    },
+    "SessionCapabilityRenewReq": {
+      "type": "object",
+      "properties": {
+        "capability": {
+          "type": "string"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "capability",
+        "gen",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "SessionInfo": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "opened_at": {
+          "type": "integer"
+        },
+        "pid": {
+          "type": "integer"
+        },
+        "program": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "opened_at",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "SessionLogCommitReq": {
+      "type": "object",
+      "properties": {
+        "complete": {
+          "type": "boolean"
+        },
+        "exit": {
+          "$ref": "#/$defs/ExitInfo"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "info": {
+          "$ref": "#/$defs/SessionInfo"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "max_chunk": {
+          "type": "integer"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "segments": {
+          "items": {
+            "$ref": "#/$defs/SessionLogSegment"
+          },
+          "type": "array"
+        },
+        "session": {
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gen",
+        "kind",
+        "max_chunk",
+        "principal",
+        "session",
+        "workspace"
+      ],
+      "additionalProperties": true
+    },
+    "SessionLogGetReq": {
+      "type": "object",
+      "properties": {
+        "gen": {
+          "type": "integer"
+        },
+        "session": {
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gen",
+        "session",
+        "workspace"
+      ],
+      "additionalProperties": true
+    },
+    "SessionLogRecord": {
+      "type": "object",
+      "properties": {
+        "complete": {
+          "type": "boolean"
+        },
+        "exit": {
+          "$ref": "#/$defs/ExitInfo"
+        },
+        "expires_at": {
+          "type": "integer"
+        },
+        "info": {
+          "$ref": "#/$defs/SessionInfo"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "max_chunk": {
+          "type": "integer"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "segments": {
+          "items": {
+            "$ref": "#/$defs/SessionLogSegment"
+          },
+          "type": "array"
+        },
+        "session": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "exit",
+        "info",
+        "kind",
+        "max_chunk",
+        "principal",
+        "session",
+        "tenant",
+        "updated_at",
+        "workspace"
+      ],
+      "additionalProperties": true
+    },
+    "SessionLogSegment": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string"
+        },
+        "bytes": {
+          "type": "integer"
+        },
+        "first": {
+          "type": "integer"
+        },
+        "next": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "artifact",
+        "bytes",
+        "first",
+        "next"
+      ],
+      "additionalProperties": true
+    },
+    "SessionStatus": {
+      "type": "object",
+      "properties": {
+        "blob_bytes": {
+          "type": "integer"
+        },
+        "blob_segments": {
+          "type": "integer"
+        },
+        "exit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExitInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "exited": {
+          "type": "boolean"
+        },
+        "info": {
+          "$ref": "#/$defs/SessionInfo"
+        },
+        "next": {
+          "type": "integer"
+        },
+        "oldest": {
+          "type": "integer"
+        },
+        "unavailable_tier": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "exited",
+        "info",
+        "next",
+        "oldest"
+      ],
+      "additionalProperties": true
+    },
+    "Tenant": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/TenantPolicy"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "state": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "created_at",
+        "id",
+        "policy",
+        "revision",
+        "state",
+        "updated_at"
+      ],
+      "additionalProperties": true
+    },
+    "TenantCreateReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/TenantPolicy"
+        }
+      },
+      "required": [
+        "id",
+        "idem",
+        "policy"
+      ],
+      "additionalProperties": true
+    },
+    "TenantGetReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "TenantListRes": {
+      "type": "object",
+      "properties": {
+        "tenants": {
+          "items": {
+            "$ref": "#/$defs/Tenant"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "tenants"
+      ],
+      "additionalProperties": true
+    },
+    "TenantOIDC": {
+      "type": "object",
+      "properties": {
+        "audience": {
+          "type": "string"
+        },
+        "client_id": {
+          "type": "string"
+        },
+        "group_roles": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        },
+        "groups_claim": {
+          "type": "string"
+        },
+        "issuer": {
+          "type": "string"
+        },
+        "scopes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tenant_claim": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "TenantPolicy": {
+      "type": "object",
+      "properties": {
+        "oidc": {
+          "$ref": "#/$defs/TenantOIDC"
+        },
+        "quotas": {
+          "$ref": "#/$defs/TenantQuotas"
+        },
+        "residency": {
+          "$ref": "#/$defs/TenantResidency"
+        },
+        "retention": {
+          "$ref": "#/$defs/TenantRetention"
+        },
+        "stripe_customer_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "oidc",
+        "quotas",
+        "residency",
+        "retention"
+      ],
+      "additionalProperties": true
+    },
+    "TenantQuotas": {
+      "type": "object",
+      "properties": {
+        "max_active_sessions": {
+          "type": "integer"
+        },
+        "max_artifact_bytes": {
+          "type": "integer"
+        },
+        "max_nodes": {
+          "type": "integer"
+        },
+        "max_workspaces": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_active_sessions",
+        "max_artifact_bytes",
+        "max_nodes",
+        "max_workspaces"
+      ],
+      "additionalProperties": true
+    },
+    "TenantResidency": {
+      "type": "object",
+      "properties": {
+        "allowed_regions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "required_labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "additionalProperties": true
+    },
+    "TenantRetention": {
+      "type": "object",
+      "properties": {
+        "artifacts_ms": {
+          "type": "integer"
+        },
+        "events_ms": {
+          "type": "integer"
+        },
+        "meter_events_ms": {
+          "type": "integer"
+        },
+        "session_logs_ms": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "artifacts_ms",
+        "events_ms",
+        "meter_events_ms",
+        "session_logs_ms"
+      ],
+      "additionalProperties": true
+    },
+    "TenantStateReq": {
+      "type": "object",
+      "properties": {
+        "expected_revision": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expected_revision",
+        "id",
+        "idem",
+        "state"
+      ],
+      "additionalProperties": true
+    },
+    "TenantUpdateReq": {
+      "type": "object",
+      "properties": {
+        "expected_revision": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/TenantPolicy"
+        }
+      },
+      "required": [
+        "expected_revision",
+        "id",
+        "idem",
+        "policy"
+      ],
+      "additionalProperties": true
+    },
+    "TenantUsage": {
+      "type": "object",
+      "properties": {
+        "active_sessions": {
+          "type": "integer"
+        },
+        "artifact_bytes": {
+          "type": "integer"
+        },
+        "nodes": {
+          "type": "integer"
+        },
+        "workspaces": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "active_sessions",
+        "artifact_bytes",
+        "nodes",
+        "workspaces"
+      ],
+      "additionalProperties": true
+    },
+    "TenantUsageReq": {
+      "type": "object",
+      "properties": {
+        "tenant": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "Timer": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "at": {
+          "type": "integer"
+        },
+        "created_at": {
+          "type": "integer"
+        },
+        "fired": {
+          "type": "boolean"
+        },
+        "fired_at": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "match": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "on": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "created_at",
+        "fired",
+        "id",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "TimerListRes": {
+      "type": "object",
+      "properties": {
+        "timers": {
+          "items": {
+            "$ref": "#/$defs/Timer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "timers"
+      ],
+      "additionalProperties": true
+    },
+    "TranscriptChunk": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "integer"
+        },
+        "data": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer"
+        },
+        "stream": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "at",
+        "data",
+        "seq",
+        "stream"
+      ],
+      "additionalProperties": true
+    },
+    "TranscriptGap": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "integer"
+        },
+        "to": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "additionalProperties": true
+    },
+    "TranscriptRecord": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "integer"
+        },
+        "data": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "index": {
+          "type": "integer"
+        },
+        "run": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer"
+        },
+        "stream": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "at",
+        "data",
+        "index",
+        "run",
+        "seq",
+        "stream"
+      ],
+      "additionalProperties": true
+    },
+    "Usage": {
+      "type": "object",
+      "properties": {
+        "active_reservations": {
+          "type": "integer"
+        },
+        "budget_id": {
+          "type": "string"
+        },
+        "estimated_cost_micros": {
+          "type": "integer"
+        },
+        "incomplete_requests": {
+          "type": "integer"
+        },
+        "requests": {
+          "type": "integer"
+        },
+        "since": {
+          "type": "integer"
+        },
+        "tokens": {
+          "type": "integer"
+        },
+        "unmetered_requests": {
+          "type": "integer"
+        },
+        "window": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "active_reservations",
+        "budget_id",
+        "estimated_cost_micros",
+        "incomplete_requests",
+        "requests",
+        "since",
+        "tokens",
+        "unmetered_requests",
+        "window"
+      ],
+      "additionalProperties": true
+    },
+    "UsageReq": {
+      "type": "object",
+      "properties": {
+        "binding": {
+          "type": "string"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "window": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "UsageRes": {
+      "type": "object",
+      "properties": {
+        "usage": {
+          "items": {
+            "$ref": "#/$defs/Usage"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "usage"
+      ],
+      "additionalProperties": true
+    },
+    "Volume": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer"
+        },
+        "version": {
+          "type": "integer"
+        },
+        "versions": {
+          "items": {
+            "$ref": "#/$defs/VolumeVersion"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "artifact",
+        "created_at",
+        "id",
+        "owner",
+        "tenant",
+        "updated_at",
+        "version",
+        "versions"
+      ],
+      "additionalProperties": true
+    },
+    "VolumeArchiveReq": {
+      "type": "object",
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idem": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "upload": {
+          "type": "boolean"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "upload",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "VolumeAttachReq": {
+      "type": "object",
+      "properties": {
+        "generation": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "generation",
+        "id",
+        "path",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "VolumeCreateReq": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact",
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "VolumeDetachReq": {
+      "type": "object",
+      "properties": {
+        "generation": {
+          "type": "integer"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "generation",
+        "path",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "VolumeGetReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "VolumeListRes": {
+      "type": "object",
+      "properties": {
+        "volumes": {
+          "items": {
+            "$ref": "#/$defs/Volume"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "volumes"
+      ],
+      "additionalProperties": true
+    },
+    "VolumeMount": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "path"
+      ],
+      "additionalProperties": true
+    },
+    "VolumePublishPathReq": {
+      "type": "object",
+      "properties": {
+        "expected_version": {
+          "type": "integer"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idem": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "volume": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expected_version",
+        "path",
+        "volume",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "VolumePublishReq": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string"
+        },
+        "expected_version": {
+          "type": "integer"
+        },
+        "generation": {
+          "type": "integer"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact",
+        "expected_version",
+        "generation",
+        "id",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "VolumeRemoveReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "VolumeVersion": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "integer"
+        },
+        "number": {
+          "type": "integer"
+        },
+        "published_at": {
+          "type": "integer"
+        },
+        "published_by": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact",
+        "number",
+        "published_at"
+      ],
+      "additionalProperties": true
+    },
+    "WSACLReq": {
+      "type": "object",
+      "properties": {
+        "acl": {
+          "$ref": "#/$defs/WorkspaceACL"
+        },
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "acl",
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "WSClaimReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "WSClaimRes": {
+      "type": "object",
+      "properties": {
+        "lease_sec": {
+          "type": "integer"
+        },
+        "workspace": {
+          "$ref": "#/$defs/Workspace"
+        }
+      },
+      "required": [
+        "lease_sec",
+        "workspace"
+      ],
+      "additionalProperties": true
+    },
+    "WSCreateReq": {
+      "type": "object",
+      "properties": {
+        "idem": {
+          "type": "string"
+        },
+        "spec": {
+          "$ref": "#/$defs/WorkspaceSpec"
+        }
+      },
+      "required": [
+        "spec"
+      ],
+      "additionalProperties": true
+    },
+    "WSDiag": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "bindings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "broker": {
+          "type": "string"
+        },
+        "bytes": {
+          "type": "integer"
+        },
+        "files": {
+          "type": "integer"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "lease_ends": {
+          "type": "integer"
+        },
+        "root": {
+          "type": "string"
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/SessionStatus"
+          },
+          "type": "array"
+        },
+        "volumes": {
+          "items": {
+            "$ref": "#/$defs/VolumeMount"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "backend",
+        "bytes",
+        "files",
+        "gen",
+        "id",
+        "root"
+      ],
+      "additionalProperties": true
+    },
+    "WSGetReq": {
+      "type": "object",
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "WSInfoRes": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "broker": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        },
+        "sessions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backend",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "WSListRes": {
+      "type": "object",
+      "properties": {
+        "workspaces": {
+          "items": {
+            "$ref": "#/$defs/Workspace"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "workspaces"
+      ],
+      "additionalProperties": true
+    },
+    "WSMoveReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "placement": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Placement"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "requires": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Requires"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "WSQuarantineCommitReq": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "snapshot": {
+          "type": "string"
+        },
+        "snapshot_format": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backend",
+        "gen",
+        "operation",
+        "snapshot",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "WSQuarantineReq": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "backend": {
+          "type": "string"
+        },
+        "exclude": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "security": {
+          "$ref": "#/$defs/SecuritySpec"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "volumes": {
+          "items": {
+            "$ref": "#/$defs/VolumeMount"
+          },
+          "type": "array"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "gen",
+        "operation",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "WSQuarantineRes": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "backend": {
+          "type": "string"
+        },
+        "fenced": {
+          "type": "boolean"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "snapshot": {
+          "type": "string"
+        },
+        "snapshot_format": {
+          "type": "string"
+        },
+        "warning": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "fenced",
+        "gen"
+      ],
+      "additionalProperties": true
+    },
+    "WSReadyReq": {
+      "type": "object",
+      "properties": {
+        "gen": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gen",
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "WSReleaseCommitReq": {
+      "type": "object",
+      "properties": {
+        "gen": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "snapshot": {
+          "type": "string"
+        },
+        "snapshot_format": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gen",
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "WSReleaseReq": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "snapshot": {
+          "type": "boolean"
+        },
+        "spec": {
+          "$ref": "#/$defs/WorkspaceSpec"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gen",
+        "snapshot",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "WSReleasedReq": {
+      "type": "object",
+      "properties": {
+        "failed": {
+          "type": "boolean"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "preparing": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "snapshot": {
+          "type": "string"
+        },
+        "snapshot_format": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gen",
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "WSRenewReq": {
+      "type": "object",
+      "properties": {
+        "authz": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "controller_epoch": {
+          "type": "integer"
+        },
+        "gen": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "ids"
+      ],
+      "additionalProperties": true
+    },
+    "WSRenewRes": {
+      "type": "object",
+      "properties": {
+        "controller_epoch": {
+          "type": "integer"
+        },
+        "results": {
+          "items": {
+            "$ref": "#/$defs/WSRenewResult"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "results"
+      ],
+      "additionalProperties": true
+    },
+    "WSRenewResult": {
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "action": {
+          "type": "string"
+        },
+        "authoritative_gen": {
+          "type": "integer"
+        },
+        "authz_reset": {
+          "type": "boolean"
+        },
+        "authz_revision": {
+          "type": "integer"
+        },
+        "controller_epoch": {
+          "type": "integer"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "lease_until": {
+          "type": "integer"
+        },
+        "revoked": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "accepted",
+        "action",
+        "gen",
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "WSSleepReq": {
+      "type": "object",
+      "properties": {
+        "after_sec": {
+          "type": "integer"
+        },
+        "at": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "match": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "on": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "WSSnapshotCommitReq": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "type": "string"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "snapshot": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gen",
+        "id",
+        "snapshot"
+      ],
+      "additionalProperties": true
+    },
+    "WSSnapshotReq": {
+      "type": "object",
+      "properties": {
+        "authoritative": {
+          "type": "boolean"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idem": {
+          "type": "string"
+        },
+        "upload": {
+          "type": "boolean"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "upload",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "WSSnapshotRes": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string"
+        },
+        "authoritative": {
+          "type": "boolean"
+        },
+        "bytes": {
+          "type": "integer"
+        },
+        "chunks": {
+          "type": "integer"
+        },
+        "consistency": {
+          "type": "string"
+        },
+        "format": {
+          "type": "string"
+        },
+        "uploaded_bytes": {
+          "type": "integer"
+        },
+        "uploaded_chunks": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "artifact",
+        "authoritative",
+        "bytes",
+        "consistency"
+      ],
+      "additionalProperties": true
+    },
+    "Workspace": {
+      "type": "object",
+      "properties": {
+        "authz_revision": {
+          "type": "integer"
+        },
+        "created_at": {
+          "type": "integer"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "last_snapshot": {
+          "type": "string"
+        },
+        "last_snapshot_format": {
+          "type": "string"
+        },
+        "last_snapshot_objects": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "lease_until": {
+          "type": "integer"
+        },
+        "node": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "quarantine_operation": {
+          "type": "string"
+        },
+        "quarantined_at": {
+          "type": "integer"
+        },
+        "release_operation": {
+          "type": "string"
+        },
+        "revocation_floor": {
+          "type": "integer"
+        },
+        "revocations": {
+          "items": {
+            "$ref": "#/$defs/AuthzRevocation"
+          },
+          "type": "array"
+        },
+        "spec": {
+          "$ref": "#/$defs/WorkspaceSpec"
+        },
+        "state": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "created_at",
+        "gen",
+        "id",
+        "spec",
+        "state",
+        "updated_at"
+      ],
+      "additionalProperties": true
+    },
+    "WorkspaceACL": {
+      "type": "object",
+      "properties": {
+        "readers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "writers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": true
+    },
+    "WorkspaceSelector": {
+      "type": "object",
+      "properties": {
+        "all": {
+          "type": "boolean"
+        },
+        "backend": {
+          "type": "string"
+        },
+        "created_after": {
+          "type": "integer"
+        },
+        "created_before": {
+          "type": "integer"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "model": {
+          "type": "string"
+        },
+        "node": {
+          "type": "string"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "run": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "WorkspaceSpec": {
+      "type": "object",
+      "properties": {
+        "acl": {
+          "$ref": "#/$defs/WorkspaceACL"
+        },
+        "base": {
+          "type": "string"
+        },
+        "bindings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "exclude": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "idle": {
+          "$ref": "#/$defs/Idle"
+        },
+        "image": {
+          "type": "string"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "model": {
+          "type": "string"
+        },
+        "mount_path": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "placement": {
+          "$ref": "#/$defs/Placement"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "repo": {
+          "$ref": "#/$defs/RepoSpec"
+        },
+        "requires": {
+          "$ref": "#/$defs/Requires"
+        },
+        "restore_format": {
+          "type": "string"
+        },
+        "restore_from": {
+          "type": "string"
+        },
+        "restore_objects": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "run": {
+          "type": "string"
+        },
+        "security": {
+          "$ref": "#/$defs/SecuritySpec"
+        },
+        "volumes": {
+          "items": {
+            "$ref": "#/$defs/VolumeMount"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "idle",
+        "placement",
+        "requires"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "operations": [
+    {
+      "constant": "OpAgentApprovalDecided",
+      "name": "agent.approval.decided",
+      "request": "AgentApprovalDecidedReq"
+    },
+    {
+      "constant": "OpAgentCancel",
+      "name": "agent.cancel",
+      "request": "AgentGetReq",
+      "response": "Agent"
+    },
+    {
+      "constant": "OpAgentCreate",
+      "name": "agent.create",
+      "request": "AgentCreateReq",
+      "response": "Agent"
+    },
+    {
+      "constant": "OpAgentDeliver",
+      "name": "agent.deliver",
+      "request": "AgentDeliverReq"
+    },
+    {
+      "constant": "OpAgentDestroy",
+      "name": "agent.destroy",
+      "request": "AgentGetReq"
+    },
+    {
+      "constant": "OpAgentFork",
+      "name": "agent.fork",
+      "request": "AgentForkReq",
+      "response": "Agent"
+    },
+    {
+      "constant": "OpAgentGet",
+      "name": "agent.get",
+      "request": "AgentGetReq",
+      "response": "Agent"
+    },
+    {
+      "constant": "OpAgentList",
+      "name": "agent.list",
+      "request": "AgentListReq",
+      "response": "AgentListRes"
+    },
+    {
+      "constant": "OpAgentMessage",
+      "name": "agent.message",
+      "request": "AgentMessageReq",
+      "response": "AgentMessageRes"
+    },
+    {
+      "constant": "OpAgentReport",
+      "name": "agent.report",
+      "request": "AgentReport"
+    },
+    {
+      "constant": "OpAgentRun",
+      "name": "agent.run",
+      "request": "AgentRunReq",
+      "response": "AgentRunRes"
+    },
+    {
+      "constant": "OpAgentRunCancel",
+      "name": "agent.run.cancel",
+      "request": "AgentRunCancelReq"
+    },
+    {
+      "constant": "OpAgentSleep",
+      "name": "agent.sleep",
+      "request": "AgentGetReq",
+      "response": "Agent"
+    },
+    {
+      "constant": "OpAgentTranscript",
+      "name": "agent.transcript",
+      "request": "AgentTranscriptReq",
+      "response": "AgentTranscriptRes"
+    },
+    {
+      "constant": "OpAgentWake",
+      "name": "agent.wake",
+      "request": "AgentWakeReq",
+      "response": "Agent"
+    },
+    {
+      "constant": "OpApprovalDecide",
+      "name": "approval.decide",
+      "request": "ApprovalDecideReq",
+      "response": "Approval"
+    },
+    {
+      "constant": "OpApprovalGet",
+      "name": "approval.get",
+      "request": "ApprovalGetReq",
+      "response": "Approval"
+    },
+    {
+      "constant": "OpApprovalList",
+      "name": "approval.list",
+      "request": "ApprovalListReq",
+      "response": "ApprovalListRes"
+    },
+    {
+      "constant": "OpArtifactProof",
+      "name": "artifact.proof",
+      "request": "ArtifactProofReq",
+      "response": "ArtifactProofRes"
+    },
+    {
+      "constant": "OpBaseCreate",
+      "name": "base.create",
+      "request": "BaseCreateReq",
+      "response": "Base"
+    },
+    {
+      "constant": "OpBaseList",
+      "name": "base.list",
+      "response": "BaseListRes"
+    },
+    {
+      "constant": "OpBaseRemove",
+      "name": "base.remove",
+      "request": "BaseRemoveReq"
+    },
+    {
+      "constant": "OpBindingLease",
+      "name": "binding.lease",
+      "request": "BindingLeaseReq",
+      "response": "BindingLeaseRes"
+    },
+    {
+      "constant": "OpBudgetCreate",
+      "name": "budget.create",
+      "request": "BudgetCreateReq",
+      "response": "Budget"
+    },
+    {
+      "constant": "OpBudgetList",
+      "name": "budget.list",
+      "request": "BudgetListReq",
+      "response": "BudgetListRes"
+    },
+    {
+      "constant": "OpBudgetRemove",
+      "name": "budget.remove",
+      "request": "BudgetRemoveReq"
+    },
+    {
+      "constant": "OpBudgetReserve",
+      "name": "budget.reserve",
+      "request": "BudgetReserveReq",
+      "response": "BudgetReservation"
+    },
+    {
+      "constant": "OpBudgetSettle",
+      "name": "budget.settle",
+      "request": "BudgetSettleReq",
+      "response": "BudgetSettlement"
+    },
+    {
+      "constant": "OpControllerState",
+      "name": "controller.state"
+    },
+    {
+      "constant": "OpDiag",
+      "name": "diag",
+      "request": "DiagReq",
+      "response": "ControlDiag"
+    },
+    {
+      "constant": "OpEgressApproval",
+      "name": "egress.approval",
+      "request": "EgressApprovalReq",
+      "response": "EgressApprovalRes"
+    },
+    {
+      "constant": "OpEventsPost",
+      "name": "events.post",
+      "request": "EventPost"
+    },
+    {
+      "constant": "OpEventsStop",
+      "name": "events.stop",
+      "request": "EventsStopReq"
+    },
+    {
+      "constant": "OpEventsTail",
+      "name": "events.tail",
+      "request": "EventsTailReq"
+    },
+    {
+      "constant": "OpFleetGet",
+      "name": "fleet.get",
+      "request": "FleetGetReq",
+      "response": "FleetOperation"
+    },
+    {
+      "constant": "OpFleetList",
+      "name": "fleet.list",
+      "response": "FleetListRes"
+    },
+    {
+      "constant": "OpFleetQuarantine",
+      "name": "fleet.quarantine",
+      "request": "FleetQuarantineReq",
+      "response": "FleetOperation"
+    },
+    {
+      "constant": "OpFSApplyTar",
+      "name": "fs.apply_tar",
+      "request": "FSApplyTarReq",
+      "response": "FSApplyTarRes"
+    },
+    {
+      "constant": "OpFSEdit",
+      "name": "fs.edit",
+      "request": "FSEditReq",
+      "response": "FSEditRes"
+    },
+    {
+      "constant": "OpFSList",
+      "name": "fs.list",
+      "request": "FSListReq",
+      "response": "FSListRes"
+    },
+    {
+      "constant": "OpFSMkdir",
+      "name": "fs.mkdir",
+      "request": "FSMkdirReq"
+    },
+    {
+      "constant": "OpFSRead",
+      "name": "fs.read",
+      "request": "FSReadReq",
+      "response": "FSReadRes"
+    },
+    {
+      "constant": "OpFSRemove",
+      "name": "fs.remove",
+      "request": "FSRemoveReq"
+    },
+    {
+      "constant": "OpFSRename",
+      "name": "fs.rename",
+      "request": "FSRenameReq"
+    },
+    {
+      "constant": "OpFSSearch",
+      "name": "fs.search",
+      "request": "FSSearchReq",
+      "response": "FSSearchRes"
+    },
+    {
+      "constant": "OpFSStat",
+      "name": "fs.stat",
+      "response": "FSStatRes"
+    },
+    {
+      "constant": "OpFSWrite",
+      "name": "fs.write",
+      "request": "FSWriteReq"
+    },
+    {
+      "constant": "OpGrant",
+      "name": "grant",
+      "request": "GrantReq",
+      "response": "Grant"
+    },
+    {
+      "constant": "OpNodeDiag",
+      "name": "node.diag",
+      "request": "NodeDiagReq",
+      "response": "NodeDiag"
+    },
+    {
+      "constant": "OpNodeList",
+      "name": "node.list",
+      "response": "NodeListRes"
+    },
+    {
+      "constant": "OpNodeStatus",
+      "name": "node.status",
+      "response": "NodeStatus"
+    },
+    {
+      "constant": "OpPoolCreate",
+      "name": "pool.create",
+      "request": "PoolCreateReq",
+      "response": "Pool"
+    },
+    {
+      "constant": "OpPoolGet",
+      "name": "pool.get",
+      "request": "PoolGetReq",
+      "response": "Pool"
+    },
+    {
+      "constant": "OpPoolList",
+      "name": "pool.list",
+      "response": "PoolListRes"
+    },
+    {
+      "constant": "OpPoolRemove",
+      "name": "pool.remove",
+      "request": "PoolRemoveReq"
+    },
+    {
+      "constant": "OpPortOpen",
+      "name": "port.open",
+      "request": "PortOpenReq",
+      "response": "SOpenRes"
+    },
+    {
+      "constant": "OpPrincipalCreate",
+      "name": "principal.create",
+      "request": "PrincipalCreateReq"
+    },
+    {
+      "constant": "OpPrincipalInvite",
+      "name": "principal.invite",
+      "request": "PrincipalInviteReq"
+    },
+    {
+      "constant": "OpPrincipalList",
+      "name": "principal.list",
+      "request": "PrincipalListReq",
+      "response": "PrincipalListRes"
+    },
+    {
+      "constant": "OpPrincipalRevoke",
+      "name": "principal.revoke",
+      "request": "PrincipalRevokeReq",
+      "response": "PrincipalRevokeRes"
+    },
+    {
+      "constant": "OpPrincipalTokenIssue",
+      "name": "principal.token.issue",
+      "request": "PrincipalTokenIssueReq",
+      "response": "PrincipalTokenIssueRes"
+    },
+    {
+      "constant": "OpQueueAdvance",
+      "name": "queue.advance",
+      "request": "QueueAdvanceReq",
+      "response": "Queue"
+    },
+    {
+      "constant": "OpQueueCreate",
+      "name": "queue.create",
+      "request": "QueueCreateReq",
+      "response": "Queue"
+    },
+    {
+      "constant": "OpQueueGet",
+      "name": "queue.get",
+      "request": "QueueGetReq",
+      "response": "Queue"
+    },
+    {
+      "constant": "OpQueueList",
+      "name": "queue.list",
+      "request": "QueueListReq",
+      "response": "QueueListRes"
+    },
+    {
+      "constant": "OpSAck",
+      "name": "s.ack",
+      "request": "SAckReq"
+    },
+    {
+      "constant": "OpSAttach",
+      "name": "s.attach",
+      "request": "SAttachReq",
+      "response": "SOpenRes"
+    },
+    {
+      "constant": "OpSClose",
+      "name": "s.close",
+      "request": "SCloseReq"
+    },
+    {
+      "constant": "OpSInput",
+      "name": "s.input",
+      "request": "SInputReq"
+    },
+    {
+      "constant": "OpSList",
+      "name": "s.list",
+      "request": "SListReq",
+      "response": "SListRes"
+    },
+    {
+      "constant": "OpSOpen",
+      "name": "s.open",
+      "request": "SOpenReq",
+      "response": "SOpenRes"
+    },
+    {
+      "constant": "OpSResize",
+      "name": "s.resize",
+      "request": "SResizeReq"
+    },
+    {
+      "constant": "OpSSignal",
+      "name": "s.signal",
+      "request": "SSignalReq"
+    },
+    {
+      "constant": "OpSWait",
+      "name": "s.wait",
+      "request": "SWaitReq",
+      "response": "SWaitRes"
+    },
+    {
+      "constant": "OpSessionCapabilityCheck",
+      "name": "session.cap.check",
+      "request": "SessionCapabilityCheckReq",
+      "response": "SessionCapabilityCheckRes"
+    },
+    {
+      "constant": "OpSessionCapabilityIssue",
+      "name": "session.cap.issue",
+      "request": "SessionCapabilityIssueReq",
+      "response": "SessionCapabilityIssueRes"
+    },
+    {
+      "constant": "OpSessionCapabilityRenew",
+      "name": "session.cap.renew",
+      "request": "SessionCapabilityRenewReq"
+    },
+    {
+      "constant": "OpSessionLogCommit",
+      "name": "session.log.commit",
+      "request": "SessionLogCommitReq"
+    },
+    {
+      "constant": "OpSessionLogDelete",
+      "name": "session.log.delete"
+    },
+    {
+      "constant": "OpSessionLogGet",
+      "name": "session.log.get",
+      "request": "SessionLogGetReq"
+    },
+    {
+      "constant": "OpTenantCreate",
+      "name": "tenant.create",
+      "request": "TenantCreateReq"
+    },
+    {
+      "constant": "OpTenantGet",
+      "name": "tenant.get",
+      "request": "TenantGetReq"
+    },
+    {
+      "constant": "OpTenantList",
+      "name": "tenant.list",
+      "response": "TenantListRes"
+    },
+    {
+      "constant": "OpTenantState",
+      "name": "tenant.state",
+      "request": "TenantStateReq"
+    },
+    {
+      "constant": "OpTenantUpdate",
+      "name": "tenant.update",
+      "request": "TenantUpdateReq"
+    },
+    {
+      "constant": "OpTenantUsage",
+      "name": "tenant.usage",
+      "request": "TenantUsageReq"
+    },
+    {
+      "constant": "OpTimerList",
+      "name": "timer.list",
+      "response": "TimerListRes"
+    },
+    {
+      "constant": "OpUsageGet",
+      "name": "usage.get",
+      "request": "UsageReq",
+      "response": "UsageRes"
+    },
+    {
+      "constant": "OpVolumeArchive",
+      "name": "volume.archive",
+      "request": "VolumeArchiveReq",
+      "response": "WSSnapshotRes"
+    },
+    {
+      "constant": "OpVolumeAttach",
+      "name": "volume.attach",
+      "request": "VolumeAttachReq",
+      "response": "Workspace"
+    },
+    {
+      "constant": "OpVolumeCreate",
+      "name": "volume.create",
+      "request": "VolumeCreateReq",
+      "response": "Volume"
+    },
+    {
+      "constant": "OpVolumeDetach",
+      "name": "volume.detach",
+      "request": "VolumeDetachReq",
+      "response": "Workspace"
+    },
+    {
+      "constant": "OpVolumeGet",
+      "name": "volume.get",
+      "request": "VolumeGetReq",
+      "response": "Volume"
+    },
+    {
+      "constant": "OpVolumeList",
+      "name": "volume.list",
+      "response": "VolumeListRes"
+    },
+    {
+      "constant": "OpVolumePublish",
+      "name": "volume.publish",
+      "request": "VolumePublishReq"
+    },
+    {
+      "constant": "OpVolumePublishCommit",
+      "name": "volume.publish.commit"
+    },
+    {
+      "constant": "OpVolumeRemove",
+      "name": "volume.remove",
+      "request": "VolumeRemoveReq"
+    },
+    {
+      "constant": "OpWSACL",
+      "name": "ws.acl",
+      "request": "WSACLReq",
+      "response": "Workspace"
+    },
+    {
+      "constant": "OpWSClaim",
+      "name": "ws.claim",
+      "request": "WSClaimReq",
+      "response": "WSClaimRes"
+    },
+    {
+      "constant": "OpWSCreate",
+      "name": "ws.create",
+      "request": "WSCreateReq",
+      "response": "Workspace"
+    },
+    {
+      "constant": "OpWSDestroy",
+      "name": "ws.destroy",
+      "request": "WSGetReq"
+    },
+    {
+      "constant": "OpWSGet",
+      "name": "ws.get",
+      "request": "WSGetReq",
+      "response": "Workspace"
+    },
+    {
+      "constant": "OpWSInfo",
+      "name": "ws.info",
+      "request": "WSGetReq",
+      "response": "WSInfoRes"
+    },
+    {
+      "constant": "OpWSList",
+      "name": "ws.list",
+      "response": "WSListRes"
+    },
+    {
+      "constant": "OpWSMove",
+      "name": "ws.move",
+      "request": "WSMoveReq",
+      "response": "Workspace"
+    },
+    {
+      "constant": "OpWSQuarantine",
+      "name": "ws.quarantine",
+      "request": "WSQuarantineReq",
+      "response": "WSQuarantineRes"
+    },
+    {
+      "constant": "OpWSQuarantineCommit",
+      "name": "ws.quarantine.commit",
+      "request": "WSQuarantineCommitReq"
+    },
+    {
+      "constant": "OpWSReady",
+      "name": "ws.ready",
+      "request": "WSReadyReq"
+    },
+    {
+      "constant": "OpWSRelease",
+      "name": "ws.release",
+      "request": "WSReleaseReq"
+    },
+    {
+      "constant": "OpWSReleaseAbort",
+      "name": "ws.release.abort"
+    },
+    {
+      "constant": "OpWSReleaseAbortCommit",
+      "name": "ws.release.abort.commit"
+    },
+    {
+      "constant": "OpWSReleaseCommit",
+      "name": "ws.release.commit",
+      "request": "WSReleaseCommitReq"
+    },
+    {
+      "constant": "OpWSReleased",
+      "name": "ws.released",
+      "request": "WSReleasedReq"
+    },
+    {
+      "constant": "OpWSRenew",
+      "name": "ws.renew",
+      "request": "WSRenewReq",
+      "response": "WSRenewRes"
+    },
+    {
+      "constant": "OpWSSleep",
+      "name": "ws.sleep",
+      "request": "WSSleepReq",
+      "response": "Timer"
+    },
+    {
+      "constant": "OpWSSnapshot",
+      "name": "ws.snapshot",
+      "request": "WSSnapshotReq",
+      "response": "WSSnapshotRes"
+    },
+    {
+      "constant": "OpWSSnapshotCommit",
+      "name": "ws.snapshot.commit",
+      "request": "WSSnapshotCommitReq"
+    },
+    {
+      "constant": "OpWSWake",
+      "name": "ws.wake",
+      "request": "WSGetReq",
+      "response": "Workspace"
+    }
+  ]
+}

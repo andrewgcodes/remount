@@ -55,17 +55,21 @@ const (
 
 // Frame is the single wire unit.
 type Frame struct {
-	V    uint8  `cbor:"v" json:"v"`
-	T    string `cbor:"t" json:"t"`
-	ID   uint64 `cbor:"id,omitempty" json:"id,omitempty"`     // req/res correlation
-	Seq  uint64 `cbor:"seq,omitempty" json:"seq,omitempty"`   // chunk: per-session output sequence
-	S    string `cbor:"s,omitempty" json:"s,omitempty"`       // session id
-	WS   string `cbor:"ws,omitempty" json:"ws,omitempty"`     // workspace id
-	To   string `cbor:"to,omitempty" json:"to,omitempty"`     // destination peer
-	From string `cbor:"from,omitempty" json:"from,omitempty"` // source peer (set by the relay, never trusted from the sender)
-	Op   string `cbor:"op,omitempty" json:"op,omitempty"`     // req: operation name; ev: event type
-	Body []byte `cbor:"body,omitempty" json:"body,omitempty"` // CBOR-encoded payload, kind/op specific
-	Err  *Error `cbor:"err,omitempty" json:"err,omitempty"`   // res: non-nil on failure
+	V uint8  `cbor:"v" json:"v"`
+	T string `cbor:"t" json:"t"`
+	// ControllerEpoch fences every post-hello frame emitted under one
+	// control-plane writer lease. Peers negotiating controller-epoch reject a
+	// lower value before dispatching the frame.
+	ControllerEpoch uint64 `cbor:"controller_epoch,omitempty" json:"controller_epoch,omitempty"`
+	ID              uint64 `cbor:"id,omitempty" json:"id,omitempty"`     // req/res correlation
+	Seq             uint64 `cbor:"seq,omitempty" json:"seq,omitempty"`   // chunk: per-session output sequence
+	S               string `cbor:"s,omitempty" json:"s,omitempty"`       // session id
+	WS              string `cbor:"ws,omitempty" json:"ws,omitempty"`     // workspace id
+	To              string `cbor:"to,omitempty" json:"to,omitempty"`     // destination peer
+	From            string `cbor:"from,omitempty" json:"from,omitempty"` // source peer (set by the relay, never trusted from the sender)
+	Op              string `cbor:"op,omitempty" json:"op,omitempty"`     // req: operation name; ev: event type
+	Body            []byte `cbor:"body,omitempty" json:"body,omitempty"` // CBOR-encoded payload, kind/op specific
+	Err             *Error `cbor:"err,omitempty" json:"err,omitempty"`   // res: non-nil on failure
 }
 
 // Error is a machine-readable failure. Code is stable; Msg is for humans.
@@ -200,6 +204,12 @@ const (
 	// CapabilityChunkedArtifacts: artifacts move as verified chunks so a
 	// truncated transfer can never be restored as complete.
 	CapabilityChunkedArtifacts = "chunked-artifacts"
+	// CapabilityTieredSessionLogs: sealed session ranges are durably recorded
+	// as tenant-local blobs and can be replayed after node restart or handoff.
+	CapabilityTieredSessionLogs = "tiered-session-logs"
+	// CapabilityIdentityAdmin advertises the principal and tenant onboarding
+	// management operations. It is not a workspace enforcement requirement.
+	CapabilityIdentityAdmin = "identity-admin"
 	// CapabilityApprovals: an operation may be held for an approval decision
 	// and the peer honours the held state rather than proceeding.
 	CapabilityApprovals = "approvals"
@@ -216,6 +226,8 @@ var knownCapabilities = []string{
 	CapabilityControllerEpoch,
 	CapabilitySessionCap,
 	CapabilityChunkedArtifacts,
+	CapabilityTieredSessionLogs,
+	CapabilityIdentityAdmin,
 	CapabilityApprovals,
 	CapabilityEncryptedArtifacts,
 }
@@ -228,6 +240,11 @@ var knownCapabilities = []string{
 var implementedCapabilities = []string{
 	CapabilityV1,
 	CapabilityAuthzPush,
+	CapabilityControllerEpoch,
+	CapabilitySessionCap,
+	CapabilityChunkedArtifacts,
+	CapabilityTieredSessionLogs,
+	CapabilityIdentityAdmin,
 }
 
 // PeerCapabilities returns the capabilities a peer built from this release
@@ -243,8 +260,8 @@ func PeerCapabilities() []string {
 // hole those profiles promise is closed.
 var profileCapabilities = map[string][]string{
 	SecurityLocal:       nil,
-	SecurityIsolated:    {CapabilityAuthzPush},
-	SecurityMultiTenant: {CapabilityAuthzPush},
+	SecurityIsolated:    {CapabilityAuthzPush, CapabilityControllerEpoch, CapabilitySessionCap, CapabilityChunkedArtifacts, CapabilityTieredSessionLogs},
+	SecurityMultiTenant: {CapabilityAuthzPush, CapabilityControllerEpoch, CapabilitySessionCap, CapabilityChunkedArtifacts, CapabilityTieredSessionLogs},
 }
 
 // SecurityCapabilities returns the named capabilities a peer must have

@@ -77,13 +77,13 @@ func run(ctx context.Context, argv []string) error {
 	}
 	cmd, args := argv[0], argv[1:]
 	switch cmd {
-	case "ws", "fs", "fleet", "pool", "budget", "run", "agent", "mcp":
+	case "ws", "fs", "fleet", "pool", "volume", "budget", "run", "agent", "mcp", "tenant", "principal", "token":
 		if len(args) > 0 && !isFlag(args[0]) {
 			args = append(append([]string{args[0]}, globals...), args[1:]...)
 		} else {
 			args = append(globals, args...)
 		}
-	case "server", "standalone", "version", "help", "-h", "--help":
+	case "server", "standalone", "guest-agent", "guest-manifest", "version", "help", "-h", "--help":
 		if len(globals) > 0 {
 			return fmt.Errorf("%s does not accept %s before the command", cmd, globals[0])
 		}
@@ -97,6 +97,10 @@ func run(ctx context.Context, argv []string) error {
 		return cmdUp(ctx, args)
 	case "standalone":
 		return cmdStandalone(ctx, args)
+	case "guest-agent":
+		return cmdGuestAgent(ctx, args)
+	case "guest-manifest":
+		return cmdGuestManifest(args)
 	case "ws":
 		return cmdWS(ctx, args)
 	case "exec":
@@ -117,6 +121,8 @@ func run(ctx context.Context, argv []string) error {
 		return cmdFleet(ctx, args)
 	case "base":
 		return cmdBase(ctx, args)
+	case "volume":
+		return cmdVolume(ctx, args)
 	case "pool":
 		return cmdPool(ctx, args)
 	case "budget":
@@ -137,6 +143,16 @@ func run(ctx context.Context, argv []string) error {
 		return cmdApprovals(ctx, args)
 	case "mcp":
 		return cmdMCP(ctx, args)
+	case "tenant":
+		return cmdTenant(ctx, args)
+	case "principal":
+		return cmdPrincipal(ctx, args)
+	case "token":
+		return cmdToken(ctx, args)
+	case "invite":
+		return cmdInvite(ctx, args)
+	case "login":
+		return cmdLogin(ctx, args)
 	case "approve":
 		return cmdApprove(ctx, args)
 	case "status":
@@ -200,8 +216,13 @@ func usage() {
   remount server      run the control plane + relay + artifact store
   remount up          enroll this machine as a node (outbound only)
   remount standalone  server + node in one process (try it on a laptop)
+  remount tenant create TENANT [--oidc FILE] | ls
+  remount invite PRINCIPAL --tenant TENANT [--ttl 15m]
+  remount principal create PRINCIPAL [--tenant T] [--roles agent] | ls | revoke PRINCIPAL
+  remount token issue PRINCIPAL --role agent --ttl 1h [--tenant T]
+  remount login --tenant TENANT      OIDC device login; stores rotating credentials mode 0600
 
-  remount ws create [--name N] [--dir PATH | --base NAME | --repo URL[@REF]] [--backend B] [--image IMG] [--security PROFILE] [--egress-rule JSON] [--binding ID]
+  remount ws create [--name N] [--dir PATH | --base NAME | --repo URL[@REF]] [--volume ID:PATH] [--backend B] [--image IMG] [--security PROFILE] [--egress-rule JSON] [--binding ID]
   remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS [--authoritative] [--as-base NAME] | acl WS [--reader P]... [--writer P]...
   remount exec WS -- cmd args...      run a command (stdout/stderr/exit streamed)
   remount sh WS [cmd]                 interactive shell (pty)
@@ -212,6 +233,8 @@ func usage() {
   remount port WS PORT [--local 127.0.0.1:PORT]
   remount fleet quarantine --action freeze (--all | SELECTORS...) | ls | get OPERATION
   remount base ls | rm NAME                                              named snapshots for ws create --base (pinned until rm)
+  remount volume create ID --dir PATH | ls | get ID | rm ID | publish WS PATH [--volume ID]
+  remount volume attach ID WS PATH | detach WS PATH | publish WS PATH    immutable read-only shared data
   remount pool create NAME --vendor V --backend B [--min 0 --max 5] | ls | get NAME | rm NAME
   remount budget create ID --attach KIND:ID [--window 1d] [--max-requests N] [--max-tokens N] | ls | rm ID
   remount usage [--tenant T] [--ws WS] [--principal P] [--binding B] [--window 1h|1d|30d]
@@ -383,8 +406,12 @@ func (c *common) dialer() transport.Dialer {
 
 func (c *common) client() *client.Client {
 	principal := envOr("REMOUNT_PRINCIPAL", envOr("USER", "cli"))
+	token := c.token
+	if token == "" {
+		token = storedAccessToken(c.server)
+	}
 	return client.New(client.Options{
-		Dialer: c.dialer(), Token: c.token, Principal: principal,
+		Dialer: c.dialer(), Token: token, Principal: principal,
 		ArtifactURL: strings.TrimSuffix(c.server, "/") + "/v1/artifacts",
 	})
 }
@@ -491,6 +518,12 @@ func cmdServer(ctx context.Context, args []string) error {
 	artifactObjects := fs.Int("artifact-store-objects", 100_000, "maximum retained and staging artifact objects")
 	artifactGCInterval := fs.Duration("artifact-gc-interval", 10*time.Minute, "reference-aware artifact GC interval")
 	artifactGrace := fs.Duration("artifact-grace", 24*time.Hour, "minimum age before unreferenced artifact collection")
+	blob := fs.String("blob", envOr("REMOUNT_BLOB", ""), "physical artifact store (s3://bucket/prefix; local encrypted storage by default in production)")
+	controlReplication := fs.Bool("control-replication", false, "ship the control SQLite database to the configured S3 blob store")
+	standby := fs.Bool("standby", false, "wait for the active lease to expire, restore, reconcile, and promote")
+	controllerLease := fs.Duration("controller-lease", 3*time.Second, "fenced active-controller lease TTL")
+	controlShipInterval := fs.Duration("control-ship-interval", time.Second, "control WAL recovery-point publication interval")
+	controlSnapshotInterval := fs.Duration("control-snapshot-interval", 5*time.Minute, "full control SQLite snapshot interval")
 	eventRetention := fs.Duration("event-retention", 30*24*time.Hour, "retained canonical event history")
 	eventGCInterval := fs.Duration("event-gc-interval", 10*time.Minute, "event-retention pruning interval")
 	maxEvents := fs.Int("max-events", 1_000_000, "maximum retained canonical event rows")
@@ -503,6 +536,9 @@ func cmdServer(ctx context.Context, args []string) error {
 	maxWorkspaceTimers := fs.Int("max-workspace-timers", 128, "maximum retained durable timers per workspace")
 	maxConcurrentRequests := fs.Int("max-concurrent-requests", 128, "maximum concurrent control-plane requests")
 	mode := fs.String("mode", envOr("REMOUNT_SECURITY_MODE", server.ModeStandalone), "security mode: standalone, production-single-tenant, production-multi-tenant")
+	bootstrapPrincipal := fs.String("bootstrap-principal", "", "create the first global operator (requires --bootstrap-token-file)")
+	bootstrapTokenFile := fs.String("bootstrap-token-file", "", "exclusive mode-0600 path for the initial short-lived operator bearer")
+	bootstrapTTL := fs.Duration("bootstrap-ttl", 15*time.Minute, "initial operator bearer lifetime")
 	publicURL := fs.String("public-url", envOr("REMOUNT_PUBLIC_URL", ""), "externally reachable base URL agent links are minted under (https://host)")
 	agentUI := fs.String("agent-ui", envOr("REMOUNT_AGENT_UI", ""), "operator UI URL that /a/{id} redirects to; {id} is replaced, else appended")
 	cors := fs.String("cors", envOr("REMOUNT_CORS", ""), "comma-separated browser origins allowed to call the HTTP API (\"*\" for any, without credentials)")
@@ -522,6 +558,15 @@ func cmdServer(ctx context.Context, args []string) error {
 	if *mode != server.ModeStandalone && *token != "" {
 		return errors.New("production modes refuse --token; use principal identity and one-time node enrollment")
 	}
+	if (*bootstrapPrincipal == "") != (*bootstrapTokenFile == "") || (*bootstrapPrincipal != "" && *mode == server.ModeStandalone) {
+		return errors.New("production bootstrap requires both --bootstrap-principal and --bootstrap-token-file")
+	}
+	if *standby {
+		*controlReplication = true
+	}
+	if *controlReplication && (*controllerLease <= 0 || *controlShipInterval <= 0 || *controlSnapshotInterval < *controlShipInterval || *controllerLease < 3**controlShipInterval) {
+		return errors.New("control replication requires positive intervals, snapshot >= ship, and controller lease >= 3x ship interval")
+	}
 	dataDir, err := absFlagPath("data", *data)
 	if err != nil {
 		return err
@@ -529,6 +574,17 @@ func cmdServer(ctx context.Context, args []string) error {
 	*data = dataDir
 	if err := os.MkdirAll(*data, 0o700); err != nil {
 		return fmt.Errorf("--data %s: %w", *data, err)
+	}
+	tenantArtifacts, err := buildTenantArtifactRuntime(*data, *mode, *blob, *artifactBytes, *artifactStoreBytes, *artifactObjects)
+	if err != nil {
+		return err
+	}
+	var replicationOptions *server.ReplicationOptions
+	if *controlReplication {
+		replicationOptions, err = prepareControllerReplication(ctx, *data, *blob, *standby, *controllerLease, *controlShipInterval, *controlSnapshotInterval)
+		if err != nil {
+			return err
+		}
 	}
 	b, err := loadBindings(*bindings)
 	if err != nil {
@@ -558,6 +614,7 @@ func cmdServer(ctx context.Context, args []string) error {
 		DataDir: *data, Token: *token, Bindings: b, SecretResolver: secretResolver, LeaseSec: *lease, Logger: slog.Default(), Mode: *mode,
 		ProvisionDrivers: drivers, PoolBootstrap: poolBootstrap,
 		MaxArtifactBytes: *artifactBytes, MaxArtifactStoreBytes: *artifactStoreBytes, MaxArtifactObjects: *artifactObjects,
+		TenantArtifacts:    tenantArtifacts,
 		ArtifactGCInterval: *artifactGCInterval, ArtifactGracePeriod: *artifactGrace,
 		EventRetention: *eventRetention, EventGCInterval: *eventGCInterval, MaxEvents: *maxEvents,
 		RecordRetention: *recordRetention, RecordGCInterval: *recordGCInterval,
@@ -566,6 +623,7 @@ func cmdServer(ctx context.Context, args []string) error {
 		MaxConcurrentRequests: *maxConcurrentRequests,
 		PublicURL:             *publicURL, AgentURLBase: *agentUI, CORSOrigins: splitList(*cors), MaxAPIClients: *maxAPIClients,
 		WebhookSecret: *webhookSecret, WebhookToken: *webhookToken,
+		Replication: replicationOptions,
 	}
 	notificationConfig.apply(&serverOptions)
 	srv, err := server.New(serverOptions)
@@ -573,6 +631,31 @@ func cmdServer(ctx context.Context, args []string) error {
 		return err
 	}
 	defer srv.Close()
+	if *bootstrapPrincipal != "" {
+		bootstrapPath, err := absFlagPath("bootstrap-token-file", *bootstrapTokenFile)
+		if err != nil {
+			return err
+		}
+		file, err := os.OpenFile(bootstrapPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return fmt.Errorf("create bootstrap token file: %w", err)
+		}
+		token, expires, issueErr := srv.BootstrapOperator(ctx, *bootstrapPrincipal, *bootstrapTTL)
+		if issueErr == nil {
+			_, issueErr = fmt.Fprintf(file, "%s\n", token)
+		}
+		if syncErr := file.Sync(); issueErr == nil {
+			issueErr = syncErr
+		}
+		if closeErr := file.Close(); issueErr == nil {
+			issueErr = closeErr
+		}
+		if issueErr != nil {
+			_ = os.Remove(bootstrapPath)
+			return issueErr
+		}
+		slog.Info("initial operator credential written", "path", bootstrapPath, "expires_at", expires)
+	}
 	slog.Info("remount server listening", "addr", *listen, "data", *data, "bindings", len(b), "security_mode", *mode)
 	return srv.Serve(ctx, *listen)
 }
@@ -585,8 +668,22 @@ func cmdUp(ctx context.Context, args []string) error {
 	nodeID := fs.String("node-id", os.Getenv("REMOUNT_NODE_ID"), "fixed n_ identity for one-time provisioned nodes")
 	labels := kvFlag{}
 	fs.Var(labels, "label", "node label k=v (repeatable)")
-	backends := fs.String("backend", "process", "comma-separated backends: process,docker,gvisor")
+	backends := fs.String("backend", "process", "comma-separated backends: process,docker,gvisor,firecracker")
 	image := fs.String("image", workspace.DefaultImage(version), "default docker image (ubuntu:24.04 for a plain distro)")
+	fcKernel := fs.String("firecracker-kernel", envOr("REMOUNT_FIRECRACKER_KERNEL", ""), "trusted guest kernel image")
+	fcRootFS := fs.String("firecracker-rootfs", envOr("REMOUNT_FIRECRACKER_ROOTFS", ""), "base ext4 image containing remount guest-agent")
+	fcBinary := fs.String("firecracker-binary", envOr("REMOUNT_FIRECRACKER_BINARY", "firecracker"), "matching static Firecracker binary")
+	fcJailer := fs.String("firecracker-jailer", envOr("REMOUNT_FIRECRACKER_JAILER", "jailer"), "matching static jailer binary")
+	fcGuestManifest := fs.String("firecracker-guest-manifest", envOr("REMOUNT_FIRECRACKER_GUEST_MANIFEST", ""), "versioned guest-agent image manifest")
+	fcChroot := fs.String("firecracker-chroot", envOr("REMOUNT_FIRECRACKER_CHROOT", "/srv/jailer"), "trusted jailer chroot base")
+	fcUID := fs.Int("firecracker-uid", 1000, "dedicated non-root jailer and TAP owner UID")
+	fcGID := fs.Int("firecracker-gid", 1000, "dedicated non-root jailer and TAP owner GID")
+	fcCgroupVersion := fs.Int("firecracker-cgroup-version", 2, "jailer cgroup version")
+	fcCgroupParent := fs.String("firecracker-cgroup-parent", envOr("REMOUNT_FIRECRACKER_CGROUP_PARENT", "remount"), "existing trusted cgroup parent")
+	fcCgroups := fs.String("firecracker-cgroups", envOr("REMOUNT_FIRECRACKER_CGROUPS", "memory.max=8589934592,pids.max=4096"), "comma-separated jailer cgroup controls")
+	fcMaxWorkspaces := fs.Int("firecracker-max-workspaces", 128, "maximum active Firecracker VMs")
+	fcMaxImages := fs.Int("firecracker-max-images", 128, "maximum retained Firecracker root images")
+	fcImageBytes := fs.Int64("firecracker-image-bytes", 1<<40, "maximum logical bytes reserved by Firecracker images")
 	artifactBytes := fs.Int64("artifact-object-bytes", 8<<30, "maximum compressed bytes per cached artifact")
 	artifactStoreBytes := fs.Int64("artifact-store-bytes", 32<<30, "maximum node artifact-cache bytes")
 	artifactObjects := fs.Int("artifact-store-objects", 50_000, "maximum node artifact-cache objects")
@@ -631,6 +728,12 @@ func cmdUp(ctx context.Context, args []string) error {
 		sessionMemoryChunks: *sessionMemoryChunks, maxConcurrentRequests: *maxConcurrentRequests,
 		mutationRetention: *mutationRetention, maxMutationRecords: *maxMutationRecords,
 		maxConcurrentSnapshots: *maxConcurrentSnapshots, snapshotMinInterval: *snapshotMinInterval,
+		firecracker: firecrackerNodeOptions{
+			kernel: *fcKernel, rootfs: *fcRootFS, binary: *fcBinary, jailer: *fcJailer,
+			guestManifest: *fcGuestManifest, chroot: *fcChroot, uid: *fcUID, gid: *fcGID,
+			cgroupVersion: *fcCgroupVersion, cgroupParent: *fcCgroupParent, cgroups: splitList(*fcCgroups),
+			maxWorkspaces: *fcMaxWorkspaces, maxImages: *fcMaxImages, imageBytes: *fcImageBytes,
+		},
 	})
 	if err != nil {
 		return err
@@ -740,10 +843,11 @@ func cmdWS(ctx context.Context, args []string) error {
 		fs.Var(labels, "label", "placement label k=v (repeatable)")
 		fs.Var(workspaceLabels, "workspace-label", "workspace label k=v (repeatable)")
 		fs.Var(env, "env", "env K=V; values may use ref:<binding>, ${REMOUNT_BROKER}, or ${REMOUNT_PACKAGE_CONNECTOR} (repeatable)")
-		var bindings, exclude listFlag
+		var bindings, exclude, volumeFlags listFlag
 		var egressRules egressRuleFlag
 		fs.Var(&bindings, "binding", "binding id (repeatable)")
 		fs.Var(&exclude, "exclude", "snapshot exclude glob (repeatable)")
+		fs.Var(&volumeFlags, "volume", "read-only shared volume ID:PATH (repeatable)")
 		dir := fs.String("dir", "", "seed the workspace from this local directory (honors .gitignore and .remountignore)")
 		includeGit := fs.Bool("include-git", true, "with --dir: include .git so the agent can commit")
 		restoreFrom := fs.String("restore-from", "", "seed the workspace from an existing artifact id")
@@ -794,11 +898,23 @@ func cmdWS(ctx context.Context, args []string) error {
 			}
 			*restoreFrom = id
 		}
+		volumeMounts := make([]proto.VolumeMount, 0, len(volumeFlags))
+		for _, value := range volumeFlags {
+			id, mountPath, ok := strings.Cut(value, ":")
+			if !ok {
+				return fmt.Errorf("--volume %q must be ID:PATH", value)
+			}
+			mount := proto.VolumeMount{ID: id, Path: mountPath}
+			if err := proto.ValidateVolumeMount(mount); err != nil {
+				return err
+			}
+			volumeMounts = append(volumeMounts, mount)
+		}
 		spec := proto.WorkspaceSpec{
 			Name: *name, Run: *run, Model: *model, Labels: workspaceLabels, Image: *image, RestoreFrom: *restoreFrom, Base: *base, Repo: repoSpec,
 			Requires:  proto.Requires{Backend: *backend, CPU: *cpu, MemMiB: *mem},
 			Placement: proto.Placement{Allow: labels, Node: *nodeID},
-			Bindings:  bindings, Env: env, Exclude: exclude,
+			Bindings:  bindings, Env: env, Exclude: exclude, Volumes: volumeMounts,
 			Security: proto.SecuritySpec{
 				Profile: *securityProfile, MinIsolation: *minIsolation,
 				RequireSiblingIsolation: *requireSiblingIsolation,
@@ -1022,7 +1138,7 @@ func cmdWS(ctx context.Context, args []string) error {
 		}
 		var base *proto.Base
 		if *asBase != "" {
-			base, err = cl.CreateBase(ctx, proto.BaseCreateReq{Name: *asBase, Artifact: res.Artifact, Workspace: fs.Arg(0)})
+			base, err = cl.CreateBase(ctx, proto.BaseCreateReq{Name: *asBase, Artifact: res.Artifact, Format: res.Format, Workspace: fs.Arg(0)})
 			if err != nil {
 				return fmt.Errorf("snapshot %s uploaded but not pinned as base %q: %w", res.Artifact, *asBase, err)
 			}

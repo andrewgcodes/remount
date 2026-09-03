@@ -215,12 +215,83 @@ func (k *systemKernel) InstallDenyAll(ctx context.Context, namespace string) err
 				return fmt.Errorf("disable IPv6: %w", err)
 			}
 		}
+		if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0o600); err != nil {
+			return fmt.Errorf("enable namespace forwarding: %w", err)
+		}
 		return k.installDenyTable(ctx)
 	})
 }
 
 func (k *systemKernel) PermitBroker(ctx context.Context, namespace string, broker netip.AddrPort) error {
-	return k.withNamespace(namespace, func() error { return k.installPermitRule(ctx, broker) })
+	return k.withNamespace(namespace, func() error {
+		if err := k.installPermitRule(ctx, broker); err != nil {
+			return err
+		}
+		return k.installForwardPermitRules(ctx, broker)
+	})
+}
+
+func (k *systemKernel) CreateTap(ctx context.Context, namespace, name string, uid, gid int, gateway netip.Prefix) error {
+	return k.withNamespace(namespace, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return err
+		}
+		defer unix.Close(fd)
+		request, err := unix.NewIfreq(name)
+		if err != nil {
+			return err
+		}
+		request.SetUint16(unix.IFF_TAP | unix.IFF_NO_PI)
+		if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, request); err != nil {
+			return err
+		}
+		if err := unix.IoctlSetInt(fd, unix.TUNSETOWNER, uid); err != nil {
+			return err
+		}
+		if err := unix.IoctlSetInt(fd, unix.TUNSETGROUP, gid); err != nil {
+			return err
+		}
+		if err := unix.IoctlSetInt(fd, unix.TUNSETPERSIST, 1); err != nil {
+			return err
+		}
+		iface, err := net.InterfaceByName(name)
+		if err != nil {
+			return err
+		}
+		if err := k.addAddress(ctx, iface.Index, gateway); err != nil {
+			return err
+		}
+		return k.setLinkUp(ctx, iface.Index)
+	})
+}
+
+func (k *systemKernel) DeleteTap(ctx context.Context, namespace, name string) error {
+	return k.withNamespace(namespace, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return err
+		}
+		defer unix.Close(fd)
+		request, err := unix.NewIfreq(name)
+		if err != nil {
+			return err
+		}
+		request.SetUint16(unix.IFF_TAP | unix.IFF_NO_PI)
+		if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, request); err != nil {
+			if errors.Is(err, unix.ENODEV) {
+				return nil
+			}
+			return err
+		}
+		return unix.IoctlSetInt(fd, unix.TUNSETPERSIST, 0)
+	})
 }
 
 func (k *systemKernel) BringUp(ctx context.Context, namespace, hostName string) error {
@@ -398,6 +469,48 @@ func (k *systemKernel) installDenyTable(ctx context.Context) error {
 	)
 	if err := k.nft(ctx, unix.NFT_MSG_NEWCHAIN, unix.NLM_F_CREATE|unix.NLM_F_EXCL, unix.NFPROTO_INET, attrs); err != nil {
 		return fmt.Errorf("create nftables chain: %w", err)
+	}
+	forwardHook := nlaNestedAttr(unix.NFTA_CHAIN_HOOK, concat(
+		nlaU32BE(unix.NFTA_HOOK_HOOKNUM, unix.NF_INET_FORWARD),
+		nlaU32BE(unix.NFTA_HOOK_PRIORITY, 0),
+	))
+	forward := concat(
+		nlaString(unix.NFTA_CHAIN_TABLE, table),
+		nlaString(unix.NFTA_CHAIN_NAME, "forward"),
+		nlaString(unix.NFTA_CHAIN_TYPE, "filter"),
+		forwardHook,
+		nlaU32BE(unix.NFTA_CHAIN_POLICY, nfDrop),
+	)
+	if err := k.nft(ctx, unix.NFT_MSG_NEWCHAIN, unix.NLM_F_CREATE|unix.NLM_F_EXCL, unix.NFPROTO_INET, forward); err != nil {
+		return fmt.Errorf("create nftables forward chain: %w", err)
+	}
+	return nil
+}
+
+func (k *systemKernel) installForwardPermitRules(ctx context.Context, broker netip.AddrPort) error {
+	for _, rule := range []struct {
+		addressOffset uint32
+		portOffset    uint32
+		value         []byte
+	}{
+		{16, 2, broker.Addr().AsSlice()},
+		{12, 0, broker.Addr().AsSlice()},
+	} {
+		expressions := concat(
+			nftExpr("meta", concat(nlaU32BE(unix.NFTA_META_KEY, unix.NFT_META_NFPROTO), nlaU32BE(unix.NFTA_META_DREG, unix.NFT_REG_1))),
+			nftCmp(unix.NFT_REG_1, []byte{unix.NFPROTO_IPV4}),
+			nftExpr("payload", concat(nlaU32BE(unix.NFTA_PAYLOAD_BASE, unix.NFT_PAYLOAD_NETWORK_HEADER), nlaU32BE(unix.NFTA_PAYLOAD_OFFSET, rule.addressOffset), nlaU32BE(unix.NFTA_PAYLOAD_LEN, 4), nlaU32BE(unix.NFTA_PAYLOAD_DREG, unix.NFT_REG_1))),
+			nftCmp(unix.NFT_REG_1, rule.value),
+			nftExpr("meta", concat(nlaU32BE(unix.NFTA_META_KEY, unix.NFT_META_L4PROTO), nlaU32BE(unix.NFTA_META_DREG, unix.NFT_REG_1))),
+			nftCmp(unix.NFT_REG_1, []byte{unix.IPPROTO_TCP}),
+			nftExpr("payload", concat(nlaU32BE(unix.NFTA_PAYLOAD_BASE, unix.NFT_PAYLOAD_TRANSPORT_HEADER), nlaU32BE(unix.NFTA_PAYLOAD_OFFSET, rule.portOffset), nlaU32BE(unix.NFTA_PAYLOAD_LEN, 2), nlaU32BE(unix.NFTA_PAYLOAD_DREG, unix.NFT_REG_1))),
+			nftCmp(unix.NFT_REG_1, []byte{byte(broker.Port() >> 8), byte(broker.Port())}),
+			nftExpr("immediate", concat(nlaU32BE(unix.NFTA_IMMEDIATE_DREG, unix.NFT_REG_VERDICT), nlaNestedAttr(unix.NFTA_IMMEDIATE_DATA, nlaNestedAttr(unix.NFTA_DATA_VERDICT, nlaU32BE(unix.NFTA_VERDICT_CODE, nfAccept))))),
+		)
+		attrs := concat(nlaString(unix.NFTA_RULE_TABLE, "remount"), nlaString(unix.NFTA_RULE_CHAIN, "forward"), nlaNestedAttr(unix.NFTA_RULE_EXPRESSIONS, expressions))
+		if err := k.nft(ctx, unix.NFT_MSG_NEWRULE, unix.NLM_F_CREATE|unix.NLM_F_APPEND, unix.NFPROTO_INET, attrs); err != nil {
+			return err
+		}
 	}
 	return nil
 }
