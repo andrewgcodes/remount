@@ -1496,6 +1496,7 @@ const (
 	EvPoolRemoved    = "pool.removed"            // an empty pool specification was removed
 	EvPoolScaled     = "pool.scaled"             // payload {pool, from, to, reason}
 	EvPoolFailed     = "pool.provision_failed"   // payload {pool, reason, retry_at}; no credentials
+	EvExportAdvanced = "export.cursor.advanced"  // a durable destination cursor advanced after accepting a batch
 	EvRunStarted     = "run.started"             // a harness launch opened its session; payload {s, recipe, task_hash, sandbox, auth}
 	EvRunFinished    = "run.finished"            // that session exited; payload {s, recipe, exit, signal}
 	EvAuthWSResident = "auth.workspace_resident" // a launch relies on a login the harness keeps inside the workspace; payload {s, recipe}
