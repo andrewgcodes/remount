@@ -84,6 +84,24 @@ type Identity interface {
 	Backend() string
 }
 
+// Mounter reports where the tree appears to processes running inside the
+// workspace. Harness protocols that speak in absolute paths (ACP) need it to
+// translate between the harness's view and the node's jail.
+type Mounter interface {
+	// MountPath is the tree's root as the workspace's processes see it.
+	MountPath() string
+}
+
+// MountPathOf returns the in-workspace root of h: the backend's answer when
+// it has a mount namespace, otherwise the host-side jail root, which is the
+// same directory the processes see.
+func MountPathOf(h Handle) string {
+	if m, ok := h.(Mounter); ok {
+		return m.MountPath()
+	}
+	return h.FS().Root()
+}
+
 // Filesystem exposes the backend's jailed host-side filesystem adapter.
 type Filesystem interface {
 	// FS returns the jailed filesystem view.
@@ -523,9 +541,10 @@ type dockerHandle struct {
 	fs    *fsops.FS
 }
 
-func (h *dockerHandle) ID() string      { return h.id }
-func (h *dockerHandle) Backend() string { return "docker" }
-func (h *dockerHandle) FS() *fsops.FS   { return h.fs }
+func (h *dockerHandle) ID() string        { return h.id }
+func (h *dockerHandle) Backend() string   { return "docker" }
+func (h *dockerHandle) FS() *fsops.FS     { return h.fs }
+func (h *dockerHandle) MountPath() string { return h.mount }
 
 func (h *dockerHandle) Prepare(spec *session.Spec) error {
 	if spec.Kind == proto.SessionPort {
