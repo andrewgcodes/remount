@@ -182,6 +182,11 @@ func (n *Node) cloneRepo(ctx context.Context, w *ws) (string, error) {
 			return "", err
 		}
 	}
+	if repo.Branch != "" {
+		if _, err := run("checkout", "-q", "-b", repo.Branch); err != nil {
+			return "", err
+		}
+	}
 	commit, err := run("rev-parse", "--verify", "HEAD")
 	if err != nil {
 		return "", err
@@ -219,6 +224,9 @@ func cloneEventPayload(repo proto.RepoSpec, commit, backend string) map[string]a
 	}
 	if repo.Depth > 0 {
 		payload["depth"] = repo.Depth
+	}
+	if repo.Branch != "" {
+		payload["branch"] = repo.Branch
 	}
 	return payload
 }

@@ -221,3 +221,46 @@ func (c *Control) transitionEvent(before string, next *proto.Workspace, request 
 		"actor": request.actor, "generation": next.Generation, "node": node,
 	})
 }
+
+// agentTransitions is the central table for Agent.Status (ADR 0043). Status
+// is mostly derived from the run and the workspace, so the table is about
+// which statuses can follow which; terminal statuses have no successors
+// except that a failed agent may be destroyed.
+var agentTransitions = buildAgentTransitions()
+
+func buildAgentTransitions() map[statePair]struct{} {
+	out := map[statePair]struct{}{}
+	add := func(from string, to ...string) {
+		for _, t := range to {
+			out[statePair{from, t}] = struct{}{}
+		}
+	}
+	live := []string{proto.AgentCreating, proto.AgentRunning, proto.AgentWaitingInput, proto.AgentWaitingApproval, proto.AgentIdle, proto.AgentSleeping}
+	// Any live status may fail, finish, be destroyed, or fall back to
+	// creating (workspace pending again after a wake or a lost node).
+	for _, from := range live {
+		add(from, proto.AgentFailed, proto.AgentFinished, proto.AgentDestroyed, proto.AgentCreating, proto.AgentSleeping, proto.AgentRunning, proto.AgentIdle)
+	}
+	add(proto.AgentCreating, proto.AgentWaitingInput)
+	add(proto.AgentRunning, proto.AgentWaitingInput, proto.AgentWaitingApproval)
+	add(proto.AgentWaitingInput, proto.AgentWaitingApproval)
+	add(proto.AgentWaitingApproval, proto.AgentWaitingInput)
+	add(proto.AgentSleeping, proto.AgentWaitingInput)
+	add(proto.AgentIdle, proto.AgentWaitingInput)
+	// Terminal statuses only move to destroyed, which frees the row.
+	add(proto.AgentFailed, proto.AgentDestroyed)
+	add(proto.AgentFinished, proto.AgentDestroyed)
+	return out
+}
+
+// transitionAgent validates one agent status change against the table. A
+// same-state "transition" is always allowed so derived refreshes are cheap.
+func transitionAgent(from, to string) error {
+	if from == to {
+		return nil
+	}
+	if _, ok := agentTransitions[statePair{from, to}]; !ok {
+		return proto.Err(proto.CodeConflict, "agent cannot go from %s to %s", from, to)
+	}
+	return nil
+}

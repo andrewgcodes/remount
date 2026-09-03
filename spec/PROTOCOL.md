@@ -334,6 +334,17 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `queue.get` | C | `QueueGetReq{id}` → `Queue`; owner, workspace principals or admin |
 | `queue.list` | C | `QueueListReq{ws?}` → `QueueListRes{queues}`; the caller's tenant only, unless admin |
 | `queue.advance` | C | `QueueAdvanceReq{id, index, session?, exit, signal?, idem}` → `Queue`; `index` must equal `cursor` or the call fails with `conflict` |
+| `agent.create` | C | `AgentCreateReq{name?, ws?\|workspace?, spec, policy, parent?, acp_session_id?, idem}` → `Agent`; makes the workspace unless `ws` adopts one (§6.1) |
+| `agent.get` | C | `AgentGetReq{id}` → `Agent` |
+| `agent.list` | C | `AgentListReq{status?, ws?, parent?}` → `AgentListRes{agents}`; only agents the caller may read |
+| `agent.message` | C | `AgentMessageReq{id, text, kind?, idem}` → `AgentMessageRes{agent, message, degraded?, woken?}`; appends to the inbox, wakes a sleeping agent |
+| `agent.cancel` | C | `AgentGetReq{id, idem}` → `Agent`; drops the inbox and cancels the current turn; the run stays open for the next message |
+| `agent.sleep` | C | `AgentGetReq{id, idem}` → `Agent`; stops the run, checkpoints and pauses the workspace |
+| `agent.fork` | C | `AgentForkReq{id, name?, task?, policy?, idem}` → `Agent`; snapshots the workspace and starts a child from the copy with the same harness session |
+| `agent.destroy` | C | `AgentGetReq{id, idem}` → `{}`; destroys the workspace only if the agent created it |
+| `approval.list` | C | `ApprovalListReq{agent?, status?}` → `ApprovalListRes{approvals}`; pending only unless `status` is given |
+| `approval.get` | C | `ApprovalGetReq{id}` → `Approval` |
+| `approval.decide` | C | `ApprovalDecideReq{id, option?, denied?, content?, idem}` → `Approval`; the decision commits before it is handed to the run |
 | `grant` | C | `GrantReq{ws}` → `Grant` |
 | `node.list` | C | → `NodeListRes{nodes}` |
 | `timer.list` | C | → `TimerListRes{timers}` |
@@ -349,6 +360,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `ws.released` | N | `WSReleasedReq{id, gen, snapshot, reason, failed?}` → `{}`; `failed:true` means materialization could not complete and control holds the workspace out of placement with a growing delay (1s doubling to 30s, reset by the next `ws.ready`) instead of re-offering it at once |
 | `ws.snapshot.commit` | N | `WSSnapshotCommitReq{id, gen, snapshot}` → `{}` |
 | `binding.lease` | N | `BindingLeaseReq{ws}` → `BindingLeaseRes{leases}` |
+| `agent.report` | N | `AgentReport{agent, run, ws, gen, seq, kind, ...}` → `{}`; one observation about a run, fenced to the node, generation and run, deduplicated by `seq` (§6.1) |
 | `diag` | C | `DiagReq{verify}` → control diagnostics |
 
 Every mutating request carries an `idem` key. Replaying a request with the same
@@ -358,6 +370,86 @@ after a dropped connection safe.
 The control plane sends nodes one event: `ws.offer`, a hint that a workspace is
 available to claim. It is a hint, not an instruction; a node that ignores it
 loses nothing but the work.
+
+### 6.1 Agents and approvals
+
+An `Agent` is a durable control-plane resource: a workspace plus a harness
+conversation plus a policy. The workspace holds the files and the harness
+process; the control plane holds the inbox, the run history, the ACP session
+id and the status. Nothing about the agent lives only in a process, so a node
+loss, a move or a sleep never loses the conversation.
+
+```
+Agent { id, tenant, owner, name, ws, owns_ws, spec, mode, acp_session_id,
+        capabilities, status, status_reason, inbox[], runs[], turns, parent,
+        forked_from, policy, transcript_session, transcript_node,
+        pending_approvals, url, created_at, updated_at, wake_timer,
+        idle_since, failures }
+```
+
+`status` is derived, never stored as intent: `creating` until a node first
+holds the workspace; `running` while a prompt is in flight or queued;
+`waiting_approval` while an approval is pending; `waiting_input` when the
+harness finished a turn and is still up; `idle` when no harness is running and
+nothing is queued; `sleeping` when the workspace is paused; `failed` after the
+harness exited nonzero or a protocol error twice in a row; `finished` when a
+policy (`max_turns`) ended it; `destroyed` forever. Transitions pass the
+central table in `control/state_machine.go`; a terminal agent is never
+resurrected.
+
+The control plane reconciles durable intent to node operations on every tick:
+a claimed workspace with a queued message and no live run gets `agent.run`
+(`AgentRunReq{agent, run, attempt, ws, gen, tenant, owner, spec, policy,
+mode, acp_session_id, messages}` → `AgentRunRes{transcript}`); a live run gets
+queued messages by `agent.deliver`; `agent.cancel`/`agent.sleep` send
+`agent.run.cancel`. A node answers with `agent.report` observations. A
+message stays in the inbox until the node reports `turn_finished` for it, so
+a harness that dies mid-turn is re-prompted with the same text on the retry.
+A run whose node is gone past its lease, or whose workspace moved, is closed
+with `stop_reason: node gone` and retried after a back-off; two consecutive
+failures fail the agent. `agent.report` is refused with `conflict` for a
+stale generation, `unauthorized` from a node that does not hold the run, and
+is idempotent per `(run, seq)`.
+
+`agent.message` kinds are `follow_up` (default) and `steer`. ACP has no
+mid-turn input, so a `steer` is queued as a follow-up and the response says
+`degraded: true`. The inbox is bounded (64) and rejects with
+`resource_exhausted`. A message to a `sleeping` agent wakes the workspace and
+returns `woken: true`; the run starts once a node claims it and loads the same
+ACP session.
+
+`agent.fork` needs a claimed workspace: the control plane asks the holding
+node for an uploaded snapshot on its own authority (`ws.snapshot{ws, gen,
+upload, idem}`, fenced to the generation it believes the node holds, no client
+grant), then creates a new agent whose workspace restores that snapshot and
+whose `acp_session_id` is the parent's. A child's policy may only be narrower
+than its parent's: `approve` may not widen and a bounded `max_turns` may not
+grow or become unbounded.
+
+`policy.approve` is `never`, `on-request` (default) or `auto`. `auto` is
+refused with `denied` for a local process workspace; it needs the docker
+backend or a security profile above `local`.
+
+An `Approval` is a question the harness asked that policy routed to a human:
+
+```
+Approval { id, tenant, owner, agent, ws, run, kind, title, tool_call,
+           tool_kind, locations[], options[], detail, status, decision,
+           delivered_at, created_at, updated_at }
+```
+
+`kind` is `tool_call` (an ACP `session/request_permission`), `elicitation`
+(an ACP elicitation) or `egress` (the broker asked). The node parks the
+harness request and reports it (`agent.report{kind: permission|elicitation,
+approval}`); the control plane owns the row and the decision; the node
+answers the harness when the decision reaches it (`agent.approval.decided`).
+The decision commits with its event before it is sent and is re-sent every
+ten seconds until the node acknowledges (`delivered_at`) or the run ends. An
+approval never outlives its run: ACP cannot re-ask, so a run ending expires
+what it parked (`delivered_at: -1` for an undelivered decision) and the
+harness asks again on its next turn. At most 64 approvals per agent may be
+pending. `detail` is the harness's raw request (bounded to 64 KiB) and
+appears in `approval.get`, never in an event payload.
 
 ## 7. Node operations
 
@@ -758,7 +850,25 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `fleet.quarantine.requested`, `fleet.quarantine.target`,
 `fleet.quarantine.completed`, `base.created`, `base.removed`, `run.started`,
 `run.finished`, `auth.workspace_resident`, `queue.created`,
-`queue.advanced` and `repo.cloned`.
+`queue.advanced`, `repo.cloned`, `agent.created`, `agent.message`,
+`agent.run.started`, `agent.run.finished`, `agent.session`, `agent.turn`,
+`agent.tool_call`, `agent.waiting`, `agent.cancelled`, `agent.slept`,
+`agent.woken`, `agent.forked`, `agent.failed`, `agent.finished`,
+`agent.destroyed`, `approval.pending`, `approval.decided` and
+`approval.expired`.
+
+Agent events are on the workspace stream and every one carries `agent`.
+`agent.created` carries `ws`, `owns_ws`, `recipe`, `mode`, `task_hash`,
+`policy` and `parent`; `agent.message` carries `message`, `kind`,
+`text_hash` and `degraded`; `agent.run.started` carries `run`, `attempt`,
+`node` and `transcript`; `agent.run.finished` carries `run`, `stop_reason`,
+`error`, `cancelled` and `turns`; `agent.turn` carries `run`, `message`,
+`stop_reason` and `tokens`; `agent.cancelled` carries `run`, `dropped` (a
+count) and `by`; `agent.forked` carries `from` and `snapshot`;
+`approval.pending` carries `run`, `title`, `tool_call`, `tool_kind` and
+`options` (a count); `approval.decided` carries `option`, `denied`, `by` and
+`run`. No agent or approval event carries a prompt's text, an elicitation's
+content, a permission request's detail or a provider key.
 
 `run.started` carries `s`, `recipe`, `task_hash`, `sandbox` and `auth`;
 `run.finished` carries `s`, `recipe`, `exit` and `signal`;

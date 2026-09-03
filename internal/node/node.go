@@ -1959,6 +1959,12 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 				return nil, err
 			}
 			return struct{}{}, n.releaseAbort(req)
+		case proto.OpWSSnapshot:
+			req, err := decode[proto.WSSnapshotReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return n.controlSnapshot(ctx, p, req)
 		}
 		return nil, proto.Err(proto.CodeUnsupported, "unknown control op %q", f.Op)
 	}
@@ -2980,6 +2986,50 @@ func (n *Node) snapshot(ctx context.Context, w *ws, upload bool) (string, int64,
 	defer w.treeMu.Unlock()
 	result, err := n.snapshotRaw(ctx, w, upload, proto.SnapshotConsistencyQuiesced)
 	return result.Artifact, result.Bytes, err
+}
+
+// controlSnapshot serves a snapshot the control plane asks for on its own
+// authority (an agent fork). There is no client grant to verify; the request
+// is fenced to the generation the control plane believes this node holds so a
+// request that crossed a move cannot archive the wrong tree.
+func (n *Node) controlSnapshot(ctx context.Context, p *transport.Peer, req *proto.WSSnapshotReq) (any, error) {
+	n.mu.Lock()
+	w := n.workspaces[req.WS]
+	if w == nil {
+		n.mu.Unlock()
+		return nil, proto.Err(proto.CodeNotFound, "workspace %s not here", req.WS)
+	}
+	if w.Generation != req.Gen {
+		n.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "generation mismatch")
+	}
+	if w.checkpointing {
+		n.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace %s is checkpointing", req.WS)
+	}
+	n.mu.Unlock()
+	clean := *req
+	key := n.mutationKey(proto.PeerControl, w.ID, proto.OpWSSnapshot, req.IdempotencyKey)
+	raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
+		result, err := n.snapshotExplicit(ctx, w, req.Upload, req.Authoritative, func(id string) error {
+			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			return p.Call(cctx, proto.PeerControl, proto.OpWSSnapshotCommit,
+				proto.WSSnapshotCommitReq{ID: w.ID, Gen: w.Generation, Snapshot: id}, nil)
+		})
+		if err != nil {
+			return nil, err
+		}
+		return proto.Marshal(result)
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result proto.WSSnapshotRes
+	if err := proto.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (n *Node) snapshotExplicit(ctx context.Context, w *ws, upload, authoritative bool, commit func(string) error) (proto.WSSnapshotRes, error) {
