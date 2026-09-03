@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"remount.dev/remount/internal/node"
 	"remount.dev/remount/internal/workspace"
+	"remount.dev/remount/internal/workspace/gvisor"
 )
 
 type nodeResourceOptions struct {
@@ -57,6 +60,20 @@ func buildNode(data string, c common, labels map[string]string, backends, image 
 				return nil, err
 			}
 			list = append(list, d)
+		case "gvisor":
+			rootfs := os.Getenv("REMOUNT_GVISOR_ROOTFS")
+			if rootfs == "" {
+				return nil, errors.New("gvisor backend requires REMOUNT_GVISOR_ROOTFS to name an unpacked rootfs")
+			}
+			probeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			g, err := gvisor.New(probeCtx, gvisor.Options{
+				Dir: filepath.Join(data, "ws-gvisor"), RootFS: rootfs, Runsc: os.Getenv("REMOUNT_RUNSC"),
+			})
+			cancel()
+			if err != nil {
+				return nil, fmt.Errorf("gvisor backend unavailable: %w", err)
+			}
+			list = append(list, g)
 		case "":
 		default:
 			return nil, fmt.Errorf("unknown backend %q", b)

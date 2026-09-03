@@ -87,6 +87,10 @@ func TestAbsFlagPathResolvesRelativeAndNamesFlag(t *testing.T) {
 	if _, err := buildNode("relative/node", common{}, nil, "process", "", nil, nil, nodeResourceOptions{}); err == nil || !strings.Contains(err.Error(), "absolute") {
 		t.Fatalf("buildNode accepted a relative root: %v", err)
 	}
+	t.Setenv("REMOUNT_GVISOR_ROOTFS", "")
+	if _, err := buildNode(filepath.Join(t.TempDir(), "node"), common{}, nil, "gvisor", "", nil, nil, nodeResourceOptions{}); err == nil || !strings.Contains(err.Error(), "REMOUNT_GVISOR_ROOTFS") {
+		t.Fatalf("gvisor without rootfs = %v", err)
+	}
 }
 
 func TestArityRejectsExtraPositionalsAndSuggestsImage(t *testing.T) {
