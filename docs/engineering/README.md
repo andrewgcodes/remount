@@ -6,6 +6,14 @@ statements that the described controls already exist.
 
 ## Documents
 
+### [Repository-executable Plan B — 2026-09-03](./plan-b-repository-executable-2026-09-03.md)
+
+The proposed next implementation plan. It replaces people-, customer-, and
+vendor-coordination gates with repository code, deterministic fixtures,
+failure simulation, black-box conformance, and reproducible artifacts. E2B is
+the preferred optional live compute lane; OpenCode with OpenAI through the
+secret-blind broker is the preferred harness lane.
+
 ### [Codex continuation handoff — 2026-09-03](./handoff-2026-09-03-codex-wrap.md)
 
 The current continuation ledger for the Phase 2–6 implementation pass. It
