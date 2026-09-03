@@ -20,6 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"remount.dev/remount/internal/broker/meter"
+	"remount.dev/remount/internal/budget"
 	"remount.dev/remount/internal/connector"
 	"remount.dev/remount/internal/proto"
 )
@@ -708,6 +710,127 @@ func TestBodyBudgetArithmeticDoesNotOverflow(t *testing.T) {
 		t.Fatalf("request buffer bytes=%d err=%v", n, err)
 	}
 	defer body.Close()
+}
+
+func TestRequestBudgetBoundFailsClosedWithoutFiniteOrLocalInputs(t *testing.T) {
+	body := []byte(`{"model":"gpt-5","input":"hello","max_output_tokens":25}`)
+	model, input, output := requestBudgetBound(meter.ProviderOpenAI, body)
+	if model != "gpt-5" || input != int64(len(body)) || output != 25 {
+		t.Fatalf("bounded request = model %q input %d output %d", model, input, output)
+	}
+	_, input, output = requestBudgetBound(meter.ProviderOpenAI, []byte(`{"model":"gpt-5","input":"hello"}`))
+	if input+output != budget.MaxTokenCount {
+		t.Fatalf("missing output bound reserved %d, want %d", input+output, budget.MaxTokenCount)
+	}
+	_, input, output = requestBudgetBound(meter.ProviderOpenAI, []byte(`{"model":"gpt-5","input_image":"https://files.example/image.png","max_tokens":10}`))
+	if input != budget.MaxTokenCount || output != 0 {
+		t.Fatalf("external input bound = %d+%d, want closed maximum", input, output)
+	}
+}
+
+func TestBudgetDenialPrecedesCredentialSubstitutionAndUpstream(t *testing.T) {
+	up := newUpstream(t)
+	rec := &recorder{}
+	lease := proto.BindingLease{ID: "model-key", Secret: "real-secret", Destinations: []string{"127.0.0.1"}, Placeholder: "placeholder-secret"}
+	b := New(Options{
+		WS: "ws_budget", Generation: 4, Tenant: "tenant-a", Principal: "agent-a", Leases: []proto.BindingLease{lease},
+		AllowPrivate: []string{"127.0.0.1"}, RootCAs: up.pool(), Audit: rec.add,
+		BudgetReserve: func(_ context.Context, req proto.BudgetReserveReq) (*proto.BudgetReservation, error) {
+			if len(req.Bindings) != 1 || req.Bindings[0] != lease.ID {
+				t.Fatalf("reservation bindings = %v", req.Bindings)
+			}
+			return &proto.BudgetReservation{Denied: true, BudgetIDs: []string{"hard-limit"}, Limit: "requests"}, nil
+		},
+	})
+	if _, err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	resp, _ := get(t, DestURL(b.BaseURL(), up.host)+"/budget", map[string]string{"Authorization": "Bearer placeholder-secret"})
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("budget denial status = %d", resp.StatusCode)
+	}
+	up.mu.Lock()
+	hits := len(up.paths)
+	up.mu.Unlock()
+	if hits != 0 {
+		t.Fatalf("budget-denied request reached upstream %d times", hits)
+	}
+	if rec.count(DecisionLimitExceeded) != 0 {
+		t.Fatal("broker duplicated the authority's canonical budget denial event")
+	}
+}
+
+func TestUnknownProviderSettlementIsExplicitlyRequestOnly(t *testing.T) {
+	up := newUpstream(t)
+	settled := make(chan proto.BudgetSettleReq, 1)
+	b := New(Options{
+		WS: "ws_budget", Generation: 4, Tenant: "tenant-a", Principal: "agent-a", Allow: []string{"*"},
+		AllowPrivate: []string{"127.0.0.1"}, RootCAs: up.pool(),
+		BudgetReserve: func(_ context.Context, req proto.BudgetReserveReq) (*proto.BudgetReservation, error) {
+			if req.Provider != string(meter.ProviderUnknown) || req.Metered {
+				t.Fatalf("unknown provider reservation = %+v", req)
+			}
+			return &proto.BudgetReservation{ID: "bres_unknown", Tracked: true, BudgetIDs: []string{"request-limit"}}, nil
+		},
+		BudgetSettle: func(_ context.Context, req proto.BudgetSettleReq) (*proto.BudgetSettlement, error) {
+			settled <- req
+			return &proto.BudgetSettlement{Reservation: req.Reservation, Mode: req.Mode}, nil
+		},
+	})
+	if _, err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	resp, _ := get(t, DestURL(b.BaseURL(), up.host)+"/budget", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("upstream status = %d", resp.StatusCode)
+	}
+	select {
+	case req := <-settled:
+		if req.Reservation != "bres_unknown" || req.Mode != string(budget.SettlementRequestOnly) {
+			t.Fatalf("settlement = %+v", req)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request-only settlement did not commit")
+	}
+}
+
+func TestBudgetReservationIdempotencyDistinguishesIntentionalRepeats(t *testing.T) {
+	up := newUpstream(t)
+	requests := make(chan proto.BudgetReserveReq, 4)
+	b := New(Options{
+		WS: "ws_budget", Generation: 4, Tenant: "tenant-a", Principal: "agent-a", Allow: []string{"*"},
+		AllowPrivate: []string{"127.0.0.1"}, RootCAs: up.pool(),
+		BudgetReserve: func(_ context.Context, req proto.BudgetReserveReq) (*proto.BudgetReservation, error) {
+			requests <- req
+			return &proto.BudgetReservation{}, nil
+		},
+	})
+	if _, err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	for i := 0; i < 2; i++ {
+		resp, _ := get(t, DestURL(b.BaseURL(), up.host)+"/repeat", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("repeat %d status = %d", i, resp.StatusCode)
+		}
+	}
+	first, second := <-requests, <-requests
+	if first.Key == second.Key {
+		t.Fatalf("intentional identical calls reused reservation %q", first.Key)
+	}
+	for i := 0; i < 2; i++ {
+		resp, _ := get(t, DestURL(b.BaseURL(), up.host)+"/idempotent", map[string]string{"Idempotency-Key": "provider-mutation-one"})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("idempotent %d status = %d", i, resp.StatusCode)
+		}
+	}
+	first, second = <-requests, <-requests
+	if first.Key != second.Key {
+		t.Fatalf("explicit idempotency key produced %q then %q", first.Key, second.Key)
+	}
 }
 
 func TestTypedEgressRuleEnforcesMethodPathPortAndRequestCount(t *testing.T) {

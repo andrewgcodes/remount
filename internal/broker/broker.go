@@ -26,6 +26,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -44,7 +45,10 @@ import (
 	"syscall"
 	"time"
 
+	"remount.dev/remount/internal/broker/meter"
+	"remount.dev/remount/internal/budget"
 	"remount.dev/remount/internal/connector"
+	"remount.dev/remount/internal/ids"
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 )
@@ -124,8 +128,10 @@ type Options struct {
 	Audit        func(Audit)
 	// Approval crosses to the control plane before an approve-mode request is
 	// released. Nil fails closed for such rules.
-	Approval     func(context.Context, proto.EgressApprovalReq) (*proto.EgressApprovalRes, error)
-	ApprovalWait time.Duration
+	Approval      func(context.Context, proto.EgressApprovalReq) (*proto.EgressApprovalRes, error)
+	ApprovalWait  time.Duration
+	BudgetReserve func(context.Context, proto.BudgetReserveReq) (*proto.BudgetReservation, error)
+	BudgetSettle  func(context.Context, proto.BudgetSettleReq) (*proto.BudgetSettlement, error)
 	// RootCAs overrides upstream TLS trust (tests).
 	RootCAs *x509.CertPool
 	// Listen address; default 127.0.0.1:0.
@@ -821,6 +827,155 @@ func (b *Broker) awaitApproval(ctx context.Context, policy policyAuthorization, 
 	})
 }
 
+type budgetAdmission struct {
+	reservation proto.BudgetReservation
+	provider    meter.Provider
+}
+
+func requestBudgetBound(provider meter.Provider, body []byte) (string, int64, int64) {
+	if provider == meter.ProviderUnknown {
+		return "", 0, 0
+	}
+	model := "unknown"
+	maxOutput := int64(0)
+	var document map[string]json.RawMessage
+	if json.Unmarshal(body, &document) == nil {
+		if raw := document["model"]; len(raw) > 0 {
+			var value string
+			if json.Unmarshal(raw, &value) == nil && value != "" {
+				model = value
+			}
+		}
+		for _, field := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
+			if raw := document[field]; len(raw) > 0 && json.Unmarshal(raw, &maxOutput) == nil {
+				break
+			}
+		}
+		if raw := document["generationConfig"]; maxOutput == 0 && len(raw) > 0 {
+			var config struct {
+				MaxOutputTokens int64 `json:"maxOutputTokens"`
+			}
+			if json.Unmarshal(raw, &config) == nil {
+				maxOutput = config.MaxOutputTokens
+			}
+		}
+	}
+	// Each text token consumes at least one submitted byte, so the body length
+	// is a conservative text-token bound without a tokenizer dependency.
+	// Remote media/file references break that relationship because their
+	// provider-side content is not present in the request; reserve the closed
+	// maximum so a finite hard-token budget fails closed.
+	input := int64(len(body))
+	if bytes.Contains(body, []byte("http://")) || bytes.Contains(body, []byte("https://")) ||
+		bytes.Contains(body, []byte(`"file_id"`)) || bytes.Contains(body, []byte(`"file_uri"`)) {
+		input = budget.MaxTokenCount
+		maxOutput = 0
+	}
+	if input > budget.MaxTokenCount {
+		input = budget.MaxTokenCount
+	}
+	remaining := budget.MaxTokenCount - input
+	if maxOutput <= 0 || maxOutput > remaining {
+		maxOutput = remaining
+	}
+	return model, input, maxOutput
+}
+
+func sortedBindings(used map[string]bool) []string {
+	bindings := make([]string, 0, len(used))
+	for id := range used {
+		bindings = append(bindings, id)
+	}
+	sort.Strings(bindings)
+	return bindings
+}
+
+func (b *Broker) reserveBudget(ctx context.Context, policy policyAuthorization, host, method, requestTarget, idempotencyKey string, body []byte, used map[string]bool) (*budgetAdmission, error) {
+	return b.reserveBudgetForProvider(ctx, meter.ProviderForHost(host), policy, host, method, requestTarget, idempotencyKey, body, used)
+}
+
+func (b *Broker) reserveBudgetForProvider(ctx context.Context, provider meter.Provider, policy policyAuthorization, host, method, requestTarget, idempotencyKey string, body []byte, used map[string]bool) (*budgetAdmission, error) {
+	if b.opts.BudgetReserve == nil {
+		return nil, nil
+	}
+	model, inputTokens, maxOutputTokens := requestBudgetBound(provider, body)
+	key := ids.New("breq")
+	if idempotencyKey != "" {
+		// An explicit upstream idempotency key identifies one logical provider
+		// mutation. Body-derived accounting remains part of the authority's
+		// replay comparison, so changed usage bounds at the same endpoint fail
+		// with a conflict rather than reserving a second allowance.
+		key = "breq_" + digestString(strings.Join([]string{
+			b.opts.WS, strconv.FormatUint(b.opts.Generation, 10), b.opts.Principal,
+			policy.rule.ID, host, strings.ToUpper(method), digestString(requestTarget), idempotencyKey,
+		}, "\x00"))
+	}
+	result, err := b.opts.BudgetReserve(ctx, proto.BudgetReserveReq{
+		Key: key, WS: b.opts.WS, Gen: b.opts.Generation, Principal: b.opts.Principal,
+		Bindings: sortedBindings(used), Provider: string(provider), Model: model,
+		InputTokens: inputTokens, MaxOutputTokens: maxOutputTokens, Metered: provider != meter.ProviderUnknown,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if result.Denied {
+		return &budgetAdmission{reservation: *result, provider: provider}, budget.ErrBudgetExceeded
+	}
+	return &budgetAdmission{reservation: *result, provider: provider}, nil
+}
+
+func (b *Broker) settleBudget(ctx context.Context, admission *budgetAdmission, mode budget.SettlementMode, input, output int64) error {
+	if admission == nil || !admission.reservation.Tracked || admission.reservation.ID == "" {
+		return nil
+	}
+	if b.opts.BudgetSettle == nil {
+		return errors.New("budget settlement authority unavailable")
+	}
+	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	_, err := b.opts.BudgetSettle(settleCtx, proto.BudgetSettleReq{
+		Reservation: admission.reservation.ID, Mode: string(mode), InputTokens: input, OutputTokens: output,
+	})
+	return err
+}
+
+func (b *Broker) settleObserved(ctx context.Context, admission *budgetAdmission, observer *meter.Observer) {
+	usage, err := observer.Result()
+	if admission.provider == meter.ProviderUnknown {
+		_ = b.settleBudget(ctx, admission, budget.SettlementRequestOnly, 0, 0)
+		return
+	}
+	if err != nil || usage.InputTokens > uint64(^uint64(0)>>1) || usage.OutputTokens > uint64(^uint64(0)>>1) {
+		_ = b.settleBudget(ctx, admission, budget.SettlementIncomplete, 0, 0)
+		return
+	}
+	_ = b.settleBudget(ctx, admission, budget.SettlementMetered, int64(usage.InputTokens), int64(usage.OutputTokens))
+}
+
+type settlingBody struct {
+	io.ReadCloser
+	ctx      context.Context
+	observer *meter.Observer
+	settle   func(context.Context, *meter.Observer)
+	once     sync.Once
+}
+
+func (b *settlingBody) finish() { b.once.Do(func() { b.settle(b.ctx, b.observer) }) }
+
+func (b *settlingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.finish()
+	}
+	return n, err
+}
+
+func (b *settlingBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.finish()
+	return err
+}
+
 var errRequestLimit = errors.New("request body exceeds rule limit")
 
 // authorizePolicy evaluates rules in declaration order and consumes a rule's
@@ -1030,6 +1185,16 @@ type credentialRejection struct {
 // request to a destination. The caller must emit the returned rejection and
 // must record every returned binding before attempting outbound I/O.
 func (b *Broker) rewriteCredentials(header http.Header, scheme, host string) (map[string]bool, *credentialRejection) {
+	return b.processCredentials(header, scheme, host, true)
+}
+
+// inspectCredentials validates placeholders and returns their binding ids
+// without bringing a real secret into the request before governance admits it.
+func (b *Broker) inspectCredentials(header http.Header, scheme, host string) (map[string]bool, *credentialRejection) {
+	return b.processCredentials(header, scheme, host, false)
+}
+
+func (b *Broker) processCredentials(header http.Header, scheme, host string, substitute bool) (map[string]bool, *credentialRejection) {
 	b.mu.RLock()
 	leases := append([]proto.BindingLease(nil), b.leases...)
 	b.mu.RUnlock()
@@ -1069,10 +1234,12 @@ func (b *Broker) rewriteCredentials(header http.Header, scheme, host string) (ma
 						status: http.StatusForbidden,
 					}
 				}
-				replacements = append(replacements, credentialReplacement{placeholder: placeholder, secret: lease.Secret})
+				if substitute {
+					replacements = append(replacements, credentialReplacement{placeholder: placeholder, secret: lease.Secret})
+				}
 				used[lease.ID] = true
 			}
-			if len(replacements) > 0 {
+			if substitute && len(replacements) > 0 {
 				rewritten := substituteAll(plain, replacements)
 				if basic {
 					rewritten = "Basic " + base64.StdEncoding.EncodeToString([]byte(rewritten))
@@ -1080,7 +1247,9 @@ func (b *Broker) rewriteCredentials(header http.Header, scheme, host string) (ma
 				vals[i] = rewritten
 			}
 		}
-		header[name] = vals
+		if substitute {
+			header[name] = vals
+		}
 	}
 	return used, nil
 }
@@ -1389,8 +1558,9 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 	host = authority
 	matchHost := authority
 	audit.Host = authority
-	// 1. Substitute placeholders; block any placeholder aimed elsewhere.
-	used, rejected := b.rewriteCredentials(r.Header, scheme, matchHost)
+	// 1. Validate placeholders without substituting secrets. Approval and
+	// budget authority run before a real credential enters the request.
+	used, rejected := b.inspectCredentials(r.Header, scheme, matchHost)
 	if rejected != nil {
 		audit.Decision, audit.Binding, audit.Reason = rejected.decision, rejected.binding, rejected.reason
 		b.emit(audit)
@@ -1425,40 +1595,49 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 		http.Error(w, "remount broker: egress to "+host+" is not permitted for this workspace", http.StatusForbidden)
 		return
 	}
-	bodyBuffered := false
-	if policy.approval {
+	requestTarget := path
+	if query != "" {
+		requestTarget += "?" + query
+	}
+	var requestBody []byte
+	bufferBody := policy.approval || b.opts.BudgetReserve != nil || policy.rule.MaxRequestBytes > 0
+	if bufferBody {
 		limit := maxApprovalRequestBytes
+		if !policy.approval && b.opts.BudgetReserve == nil && policy.rule.MaxRequestBytes > limit {
+			limit = policy.rule.MaxRequestBytes
+		}
 		if policy.rule.MaxRequestBytes > 0 && policy.rule.MaxRequestBytes < limit {
 			limit = policy.rule.MaxRequestBytes
 		}
 		if r.ContentLength > limit {
 			audit.RequestBytes = r.ContentLength
-			audit.Decision, audit.Reason = DecisionLimitExceeded, "request body exceeds approval fingerprint limit"
+			audit.Decision, audit.Reason = DecisionLimitExceeded, "request body exceeds governance limit"
 			b.emit(audit)
-			http.Error(w, "remount broker: request body exceeds approval fingerprint limit", http.StatusRequestEntityTooLarge)
+			http.Error(w, "remount broker: request body exceeds governance limit", http.StatusRequestEntityTooLarge)
 			return
 		}
 		body, bodyBytes, bodyErr := bufferRequestBody(r.Body, limit)
 		audit.RequestBytes = bodyBytes
 		if bodyErr != nil {
-			audit.Decision, audit.Reason = DecisionDenied, "cannot fingerprint request body"
+			status := http.StatusBadRequest
+			audit.Decision, audit.Reason = DecisionDenied, "cannot inspect request body"
+			if errors.Is(bodyErr, errRequestLimit) {
+				status = http.StatusRequestEntityTooLarge
+				audit.Decision, audit.Reason = DecisionLimitExceeded, errRequestLimit.Error()
+			}
 			b.emit(audit)
-			http.Error(w, "remount broker: cannot fingerprint request body", http.StatusBadRequest)
+			http.Error(w, "remount broker: "+audit.Reason, status)
 			return
 		}
-		bodyBuffered = true
-		r.Body, r.ContentLength, r.GetBody = body, bodyBytes, nil
-		bodyBytesRaw, readErr := io.ReadAll(r.Body)
-		if readErr != nil {
-			http.Error(w, "remount broker: cannot fingerprint request body", http.StatusBadRequest)
+		requestBody, bodyErr = io.ReadAll(body)
+		if bodyErr != nil {
+			http.Error(w, "remount broker: cannot inspect request body", http.StatusBadRequest)
 			return
 		}
-		r.Body = io.NopCloser(bytes.NewReader(bodyBytesRaw))
-		requestTarget := path
-		if query != "" {
-			requestTarget += "?" + query
-		}
-		approval, approvalErr := b.awaitApproval(r.Context(), policy, matchHost, r.Method, requestTarget, digestString(string(bodyBytesRaw)))
+		r.Body, r.ContentLength, r.GetBody = io.NopCloser(bytes.NewReader(requestBody)), bodyBytes, nil
+	}
+	if policy.approval {
+		approval, approvalErr := b.awaitApproval(r.Context(), policy, matchHost, r.Method, requestTarget, digestString(string(requestBody)))
 		if approvalErr != nil {
 			audit.Decision, audit.Reason = DecisionDenied, "approval unavailable"
 			b.emit(audit)
@@ -1489,31 +1668,27 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 			return
 		}
 	}
-	if policy.rule.MaxRequestBytes > 0 && !bodyBuffered {
-		if r.ContentLength > policy.rule.MaxRequestBytes {
-			audit.RequestBytes = r.ContentLength
-			audit.Decision, audit.Reason = DecisionLimitExceeded, "request body exceeds rule limit"
-			b.emit(audit)
-			http.Error(w, "remount broker: request body exceeds rule limit", http.StatusRequestEntityTooLarge)
+	admission, budgetErr := b.reserveBudget(r.Context(), policy, matchHost, r.Method, requestTarget, r.Header.Get("Idempotency-Key"), requestBody, used)
+	if budgetErr != nil {
+		if errors.Is(budgetErr, budget.ErrBudgetExceeded) {
+			// The authority committed the canonical egress.denied event before
+			// returning this result. A second node audit would duplicate one
+			// decision in the system of record.
+			http.Error(w, "remount broker: budget authority denied request", http.StatusTooManyRequests)
 			return
 		}
-		body, bodyBytes, bodyErr := bufferRequestBody(r.Body, policy.rule.MaxRequestBytes)
-		audit.RequestBytes = bodyBytes
-		if bodyErr != nil {
-			if errors.Is(bodyErr, errRequestLimit) {
-				audit.Decision, audit.Reason = DecisionLimitExceeded, errRequestLimit.Error()
-				b.emit(audit)
-				http.Error(w, "remount broker: "+errRequestLimit.Error(), http.StatusRequestEntityTooLarge)
-				return
-			}
-			audit.Decision, audit.Reason = DecisionDenied, "read request body: "+bodyErr.Error()
-			b.emit(audit)
-			http.Error(w, "remount broker: invalid request body", http.StatusBadRequest)
-			return
-		}
-		r.Body = body
-		r.ContentLength = bodyBytes
-		r.GetBody = nil
+		audit.Decision, audit.Reason = DecisionDenied, "budget authority unavailable"
+		b.emit(audit)
+		http.Error(w, "remount broker: budget authority unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	used, rejected = b.rewriteCredentials(r.Header, scheme, matchHost)
+	if rejected != nil {
+		_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
+		audit.Decision, audit.Binding, audit.Reason = rejected.decision, rejected.binding, rejected.reason
+		b.emit(audit)
+		http.Error(w, "remount broker: "+rejected.public, rejected.status)
+		return
 	}
 	credUse := b.credentialUse(audit, used, "credential released to outbound transport")
 	// 3. Forward.
@@ -1540,6 +1715,7 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 		Transport:     b.client,
 		FlushInterval: -1, // stream SSE / chunked LLM responses immediately
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
 			emit := true
 			if errors.Is(err, errResponseLimit) {
 				audit.Decision, audit.Reason, audit.Status = DecisionLimitExceeded, errResponseLimit.Error(), http.StatusBadGateway
@@ -1560,7 +1736,16 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			audit.Status = resp.StatusCode
+			var observer *meter.Observer
+			if admission != nil && admission.reservation.Tracked {
+				observer, _ = meter.NewObserver(admission.provider, resp.Header.Get("Content-Type"), meter.Limits{})
+				resp.Body = observer.Wrap(resp.Body)
+			}
 			if err := b.rewriteRedirect(resp); err != nil {
+				if observer != nil {
+					_ = resp.Body.Close()
+					b.settleObserved(r.Context(), admission, observer)
+				}
 				credUse(resp.StatusCode, ErrorClassRedirect)
 				audit.Decision, audit.Reason = DecisionDenied, err.Error()
 				b.emit(audit)
@@ -1568,6 +1753,9 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 			}
 			redactions, upstreamBytes, err := redactResponse(resp, b.redactors[policy.rule.ID], policy.rule.MaxResponseBytes)
 			if err != nil {
+				if observer != nil {
+					b.settleObserved(r.Context(), admission, observer)
+				}
 				credUse(resp.StatusCode, ErrorClassLimit)
 				audit.Decision, audit.Reason, audit.ResponseBytes = DecisionDenied, err.Error(), upstreamBytes
 				if errors.Is(err, errResponseLimit) {
@@ -1596,6 +1784,14 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 						a.Decision, a.Reason = DecisionLimitExceeded, "response body exceeds rule limit"
 						a.ResponseBytes = policy.rule.MaxResponseBytes + 1
 						b.emit(a)
+					},
+				}
+			}
+			if observer != nil {
+				resp.Body = &settlingBody{
+					ReadCloser: resp.Body, ctx: r.Context(), observer: observer,
+					settle: func(ctx context.Context, observer *meter.Observer) {
+						b.settleObserved(ctx, admission, observer)
 					},
 				}
 			}
@@ -1767,9 +1963,24 @@ func (b *Broker) handleConnect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// CONNECT is opaque by design: reserve request-count budgets, but mark the
+	// provider unknown so token/cost policy cannot mistake an encrypted tunnel
+	// for a metered model response.
+	admission, budgetErr := b.reserveBudgetForProvider(r.Context(), meter.ProviderUnknown, policy, host, r.Method, "", r.Header.Get("Idempotency-Key"), nil, nil)
+	if budgetErr != nil {
+		if errors.Is(budgetErr, budget.ErrBudgetExceeded) {
+			http.Error(w, "remount broker: budget authority denied request", http.StatusTooManyRequests)
+			return
+		}
+		audit.Decision, audit.Reason = DecisionDenied, "budget authority unavailable"
+		b.emit(audit)
+		http.Error(w, "remount broker: budget authority unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	dialer := &net.Dialer{Timeout: 15 * time.Second}
 	up, err := b.dial(r.Context(), dialer, "tcp", host)
 	if err != nil {
+		_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
 		audit.Decision, audit.Reason = DecisionDenied, "dial: "+err.Error()
 		b.emit(audit)
 		http.Error(w, "remount broker: "+err.Error(), http.StatusBadGateway)
@@ -1777,21 +1988,25 @@ func (b *Broker) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	hj, ok := w.(http.Hijacker)
 	if !ok {
+		_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
 		up.Close()
 		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
 		return
 	}
 	down, buf, err := hj.Hijack()
 	if err != nil {
+		_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
 		up.Close()
 		return
 	}
 	if _, err := buf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
 		_ = down.Close()
 		_ = up.Close()
 		return
 	}
 	if err := buf.Flush(); err != nil {
+		_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
 		_ = down.Close()
 		_ = up.Close()
 		return
@@ -1800,6 +2015,7 @@ func (b *Broker) handleConnect(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	if b.suspended {
 		b.mu.Unlock()
+		_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
 		_ = down.Close()
 		_ = up.Close()
 		return
@@ -1809,6 +2025,7 @@ func (b *Broker) handleConnect(w http.ResponseWriter, r *http.Request) {
 	audit.Decision = DecisionAllowed
 	b.emit(audit)
 	defer func() {
+		_ = b.settleBudget(r.Context(), admission, budget.SettlementRequestOnly, 0, 0)
 		b.mu.Lock()
 		delete(b.tunnels, tunnel)
 		b.mu.Unlock()

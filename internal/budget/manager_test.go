@@ -352,7 +352,7 @@ func TestBudgetAdministrationIsIdempotentAndReferenceSafe(t *testing.T) {
 	if err != nil || !reservation.Tracked {
 		t.Fatalf("dynamic Reserve = %+v, %v", reservation, err)
 	}
-	if err := manager.DeleteBudget(context.Background(), value.ID); err != nil {
+	if err := manager.DeleteBudget(context.Background(), value.Tenant, value.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.PutBudget(context.Background(), value); !errors.Is(err, ErrConflict) {
@@ -361,6 +361,28 @@ func TestBudgetAdministrationIsIdempotentAndReferenceSafe(t *testing.T) {
 	values, err := manager.Budgets(context.Background())
 	if err != nil || len(values) != 0 {
 		t.Fatalf("Budgets after delete = %+v, %v", values, err)
+	}
+}
+
+func TestBudgetIDsAreTenantScoped(t *testing.T) {
+	manager := newTestManager(t, Config{MaxBudgets: 2})
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		value := Budget{ID: "daily", Tenant: tenant, AttachTo: AttachTenant, AttachID: tenant, Window: WindowDay, MaxRequests: 1}
+		if err := manager.PutBudget(context.Background(), value); err != nil {
+			t.Fatalf("put %s: %v", tenant, err)
+		}
+		if got, ok := manager.Budget(tenant, value.ID); !ok || got != value {
+			t.Fatalf("budget %s = %+v, %v", tenant, got, ok)
+		}
+	}
+	if err := manager.DeleteBudget(context.Background(), "tenant-a", "daily"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := manager.Budget("tenant-a", "daily"); ok {
+		t.Fatal("tenant-a budget remained")
+	}
+	if _, ok := manager.Budget("tenant-b", "daily"); !ok {
+		t.Fatal("tenant-a removal deleted tenant-b budget")
 	}
 }
 
@@ -376,6 +398,42 @@ func TestPerRequestAttachmentWorkIsBounded(t *testing.T) {
 	}
 	if stats := manager.Stats(); stats.Reservations != 0 {
 		t.Fatalf("bounded rejection retained a reservation: %+v", stats)
+	}
+}
+
+func TestDurableRecordRoundTripPreservesAdmissionAndSettlement(t *testing.T) {
+	policy := Budget{ID: "durable", Tenant: "tenant-a", AttachTo: AttachTenant, AttachID: "tenant-a", Window: WindowDay, MaxRequests: 1, MaxTokens: 100}
+	first := newTestManager(t, Config{Budgets: []Budget{policy}})
+	request := ReserveRequest{Key: "durable-request", Node: "node-a", Subject: testSubject, Provider: "openai", Model: "gpt-4o-mini", InputTokens: 10, MaxOutputTokens: 20, Metered: true}
+	reservation, err := first.Reserve(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, ok := first.Record(reservation.ID)
+	if !ok {
+		t.Fatal("reserved record is not exportable")
+	}
+	restored := newTestManager(t, Config{Budgets: []Budget{policy}})
+	if err := restored.RestoreRecord(reservation.ID, &record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restored.Reserve(context.Background(), ReserveRequest{Key: "second", Node: "node-a", Subject: testSubject, Provider: "other", Metered: false}); !errors.Is(err, ErrBudgetExceeded) {
+		t.Fatalf("restored active reservation did not consume request capacity: %v", err)
+	}
+	settlement, err := first.Settle(context.Background(), SettleRequest{ReservationID: reservation.ID, Mode: SettlementMetered, InputTokens: 9, OutputTokens: 11})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, ok = first.Record(reservation.ID)
+	if !ok || record.Settlement == nil || record.Settlement.Tokens != settlement.Tokens {
+		t.Fatalf("settled record = %+v, ok=%v", record, ok)
+	}
+	if err := restored.RestoreRecord(reservation.ID, &record); err != nil {
+		t.Fatal(err)
+	}
+	usage, err := restored.Usage(context.Background(), UsageQuery{Tenant: "tenant-a"})
+	if err != nil || len(usage) != 1 || usage[0].Tokens != 20 || usage[0].ActiveReservations != 0 {
+		t.Fatalf("restored usage = %+v, %v", usage, err)
 	}
 }
 

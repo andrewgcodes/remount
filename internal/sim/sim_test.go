@@ -25,6 +25,7 @@ import (
 
 	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/broker"
+	"remount.dev/remount/internal/budget"
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/node"
@@ -1097,6 +1098,72 @@ func TestApproveModeParksBeforeUpstreamAndResumesAfterDecision(t *testing.T) {
 	}
 	if pendingSeq == 0 || allowedSeq <= pendingSeq {
 		t.Fatalf("approval event order pending=%d allowed=%d events=%+v", pendingSeq, allowedSeq, events)
+	}
+}
+
+func TestBudgetE7DeniesBeforeUpstreamAndExposesUsage(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer up.Close()
+	upHost := strings.TrimPrefix(up.URL, "https://")
+	roots := x509.NewCertPool()
+	roots.AddCert(up.Certificate())
+	w := newWorld(t, control.Binding{ID: "b_budget", Secret: "provider-secret", Destinations: []string{upHost}, TTLSec: 60})
+	w.nodeWithBrokerRoots("n1", nil, roots)
+	c := w.client("budget-owner")
+	ws := mustWS(t, c, proto.WorkspaceSpec{
+		Bindings: []string{"b_budget"},
+		Env:      map[string]string{"API_KEY": "ref:b_budget", "API_URL": "${REMOUNT_BROKER}/d/" + upHost},
+		Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+			ID: "budgeted-api", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{upHost}, Methods: []string{http.MethodGet},
+		}}}},
+	})
+	ctx := ctxT(t, 60*time.Second)
+	created, err := c.CreateBudget(ctx, proto.Budget{
+		ID: "one-request", AttachTo: string(budget.AttachBinding), AttachID: "b_budget", Window: string(budget.WindowDay), MaxRequests: 1,
+	}, client.WithIdempotencyKey("create-e7-budget"))
+	if err != nil || created.Tenant == "" {
+		t.Fatalf("create budget = %+v, %v", created, err)
+	}
+	out, errOut, exit, err := c.Run(ctx, ws.ID, "sh", "-c", `curl --fail --silent -H "Authorization: Bearer $API_KEY" "$API_URL/one"`)
+	if err != nil || exit.Code != 0 || string(out) != "ok" {
+		t.Fatalf("first request err=%v exit=%+v stdout=%q stderr=%q", err, exit, out, errOut)
+	}
+	out, _, _, _ = c.Run(ctx, ws.ID, "sh", "-c", `curl --silent -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $API_KEY" "$API_URL/two"`)
+	if string(out) != "429" || hits.Load() != 1 {
+		t.Fatalf("over-budget status=%q upstream hits=%d", out, hits.Load())
+	}
+	var usage []proto.Usage
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		usage, err = c.Usage(ctx, proto.UsageReq{Binding: "b_budget", Window: string(budget.WindowDay)})
+		if err == nil && len(usage) == 1 && usage[0].Requests == 1 && usage[0].UnmeteredRequests == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil || len(usage) != 1 || usage[0].Requests != 1 || usage[0].UnmeteredRequests != 1 {
+		t.Fatalf("usage = %+v, %v", usage, err)
+	}
+	events, err := c.ReadEvents(ctx, 1, ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var denied int
+	for _, event := range events {
+		if event.Type != proto.EvEgressDenied {
+			continue
+		}
+		var payload map[string]any
+		if proto.Unmarshal(event.Payload, &payload) == nil && payload["reason"] == "budget_exceeded" {
+			denied++
+		}
+	}
+	if denied != 1 {
+		t.Fatalf("canonical budget denials = %d, want 1: %+v", denied, events)
 	}
 }
 

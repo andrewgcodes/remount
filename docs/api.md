@@ -71,6 +71,20 @@ any origin without credentials. Preflights are answered with the methods and
 headers the API uses (`Authorization`, `Content-Type`, `Idempotency-Key`,
 `Last-Event-ID`) and `Location`/`Idempotency-Key` are exposed.
 
+## Usage
+
+`GET /v1/usage?tenant=&ws=&principal=&binding=&window=` translates to
+`usage.get` and returns `UsageRes{usage}`. `window`, when present, is `1h`,
+`1d`, or `30d`. Each row names its budget and reports requests, tokens,
+estimated cost in micro-dollars, active reservations, unmetered requests and
+incomplete requests. The authenticated subject may read only its tenant unless
+it is a wildcard operator; an unavailable or unsupported meter is explicit and
+is never represented as zero-cost healthy usage.
+
+Budget definitions themselves are managed through the frame API and
+`remount budget`; this HTTP route is read-only so dashboards cannot turn a
+read credential into governance mutation authority.
+
 ## Agents
 
 | Route | Body → result |

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"remount.dev/remount/internal/artifact"
+	"remount.dev/remount/internal/budget"
 	"remount.dev/remount/internal/eventlog"
 	"remount.dev/remount/internal/ids"
 	"remount.dev/remount/internal/metrics"
@@ -200,6 +201,9 @@ type Options struct {
 	MaxPendingEgressApprovals int
 	ApprovalTimeout           time.Duration
 	ApprovalDecisionTTL       time.Duration
+	// BudgetConfig bounds the authoritative rolling ledger. Its clock defaults
+	// to the control-plane clock.
+	BudgetConfig budget.Config
 	// MaxExportCursorsPerTenant bounds durable destination progress records.
 	// Zero selects 256.
 	MaxExportCursorsPerTenant int
@@ -268,6 +272,8 @@ type Control struct {
 	requestCtx     context.Context
 	requestCancel  context.CancelFunc
 	acceptRequests bool
+	budgetMu       sync.Mutex
+	budgets        *budget.Manager
 
 	started   time.Time
 	stop      chan struct{}
@@ -432,6 +438,18 @@ func New(opts Options) (*Control, error) {
 		}
 		c.bindings[b.ID] = b
 	}
+	budgetConfig := opts.BudgetConfig
+	if len(budgetConfig.Budgets) != 0 {
+		return nil, errors.New("control: initial budgets must be created through the durable budget API")
+	}
+	if budgetConfig.Now == nil {
+		budgetConfig.Now = opts.Now
+	}
+	budgetManager, err := budget.NewManager(budgetConfig)
+	if err != nil {
+		return nil, fmt.Errorf("control: budget authority: %w", err)
+	}
+	c.budgets = budgetManager
 	if err := c.migrate(); err != nil {
 		return nil, err
 	}
@@ -445,6 +463,9 @@ func New(opts Options) (*Control, error) {
 	}
 	c.key = key
 	if err := c.load(); err != nil {
+		return nil, err
+	}
+	if err := c.loadBudgets(); err != nil {
 		return nil, err
 	}
 	// A previous process may have committed a resource and died before its
@@ -520,6 +541,8 @@ CREATE TABLE IF NOT EXISTS pools (tenant TEXT NOT NULL, name TEXT NOT NULL, data
 CREATE TABLE IF NOT EXISTS queues (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, data BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS budgets (tenant TEXT NOT NULL, id TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(tenant, id));
+CREATE TABLE IF NOT EXISTS budget_reservations (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS export_cursors (
   tenant TEXT NOT NULL,
   name TEXT NOT NULL,
@@ -822,8 +845,9 @@ func (c *Control) load() error {
 }
 
 // transact commits resource rows and the events describing them as one
-// SQLite transaction (ADR 0050). Callers hold c.mu; the lock order is
-// c.mu then the log's mutex, and nothing acquires them the other way round.
+// SQLite transaction (ADR 0050). Callers hold the authority lock for the
+// resource being changed (usually c.mu, or budgetMu for the budget ledger)
+// before the log's mutex; nothing acquires those locks in reverse order.
 func (c *Control) transact(fn func(tx *eventlog.Tx) error, events []*proto.Event) error {
 	err := c.log.Transact(context.Background(), c.db, func(tx *eventlog.Tx) error {
 		if err := fn(tx); err != nil {
@@ -1971,6 +1995,60 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return c.approvalDecide(ctx, subject, req)
+	case proto.OpBudgetCreate:
+		req, err := decode[proto.BudgetCreateReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.budgetCreate(ctx, subject, req)
+	case proto.OpBudgetList:
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.budgetList(ctx, subject)
+	case proto.OpBudgetRemove:
+		req, err := decode[proto.BudgetRemoveReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return struct{}{}, c.budgetRemove(ctx, subject, req)
+	case proto.OpUsageGet:
+		req, err := decode[proto.UsageReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.usageGet(ctx, subject, req)
+	case proto.OpBudgetReserve:
+		if !c.isNode(f.From) {
+			return nil, proto.Err(proto.CodeUnauthorized, "only nodes reserve budgets")
+		}
+		req, err := decode[proto.BudgetReserveReq](f)
+		if err != nil {
+			return nil, err
+		}
+		return c.budgetReserve(ctx, f.From, req)
+	case proto.OpBudgetSettle:
+		if !c.isNode(f.From) {
+			return nil, proto.Err(proto.CodeUnauthorized, "only nodes settle budgets")
+		}
+		req, err := decode[proto.BudgetSettleReq](f)
+		if err != nil {
+			return nil, err
+		}
+		return c.budgetSettle(ctx, f.From, req)
 	case proto.OpAgentReport:
 		if !c.isNode(f.From) {
 			return nil, proto.Err(proto.CodeUnauthorized, "only nodes report agent runs")
@@ -4759,6 +4837,7 @@ func (c *Control) Tick(ctx context.Context) {
 	}
 	now := c.now().UnixMilli()
 	var expired uint64
+	var lostNodes []string
 	var fire []*proto.Timer
 	c.mu.Lock()
 	for _, ws := range c.workspaces {
@@ -4806,6 +4885,7 @@ func (c *Control) Tick(ctx context.Context) {
 				continue
 			}
 			*ws = next
+			lostNodes = append(lostNodes, lost)
 			expired++
 		}
 	}
@@ -4815,6 +4895,7 @@ func (c *Control) Tick(ctx context.Context) {
 		}
 	}
 	c.mu.Unlock()
+	c.expireBudgets(ctx, time.UnixMilli(now), lostNodes)
 	metrics.WSLeaseExpired.Add(uint64(expired))
 	for _, t := range fire {
 		c.fireTimer(ctx, t)

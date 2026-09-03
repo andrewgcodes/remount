@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/proto"
 )
@@ -102,6 +103,36 @@ func TestAPITenancyMatchesControlPlaneIdentity(t *testing.T) {
 	}
 	if resp, body := apiCall(t, hs, "POST", "/v1/agents", "team-tok", `{"name":`, nil); resp.StatusCode != 400 {
 		t.Fatalf("truncated json = %d %s", resp.StatusCode, body)
+	}
+}
+
+func TestUsageAPIAuthenticatesAndPreservesTenantBoundary(t *testing.T) {
+	s, hs := newAPIServer(t, func(o *Options) {
+		o.Authenticator = control.StaticAuthenticator{
+			"team-tok":  {ID: "alice", Tenant: "team", Roles: []string{"admin"}},
+			"rival-tok": {ID: "bob", Tenant: "rivals", Roles: []string{"admin"}},
+		}
+	})
+	cl, release, err := s.clients.acquire(context.Background(), "team-tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cl.CreateBudget(context.Background(), proto.Budget{
+		ID: "team-requests", AttachTo: "tenant", AttachID: "team", Window: "1h", MaxRequests: 5,
+	}, client.WithIdempotencyKey("usage-api-budget"))
+	release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, body := apiCall(t, hs, http.MethodGet, "/v1/usage?tenant=team&window=1h", "team-tok", "", nil)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"budget_id":"team-requests"`) {
+		t.Fatalf("team usage = %d %s", resp.StatusCode, body)
+	}
+	if resp, body := apiCall(t, hs, http.MethodGet, "/v1/usage?tenant=team", "rival-tok", "", nil); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-tenant usage = %d %s", resp.StatusCode, body)
+	}
+	if resp, _ := apiCall(t, hs, http.MethodGet, "/v1/usage", "", "", nil); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated usage = %d", resp.StatusCode)
 	}
 }
 

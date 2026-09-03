@@ -174,7 +174,7 @@ func priceKey(provider, model string) string {
 }
 
 func scaledCost(tokens, rate int64) (int64, bool) {
-	if tokens < 0 || tokens > maxTokenCount || rate < 0 || rate > maxPriceMicrosPerMTok {
+	if tokens < 0 || tokens > MaxTokenCount || rate < 0 || rate > maxPriceMicrosPerMTok {
 		return 0, false
 	}
 	whole := tokens / tokensPerMillion

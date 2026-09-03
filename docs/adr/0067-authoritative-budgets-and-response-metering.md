@@ -33,6 +33,14 @@ budget. Admission is all-or-none. An exact replay returns the prior reservation
 even at capacity; reuse with changed arguments is a conflict. Node-local
 counters may reject quickly but never grant.
 
+Ordinary HTTP requests receive a fresh reservation key even when their bytes
+are identical: two intentional identical calls consume two request units. If
+the caller supplies an upstream `Idempotency-Key`, its workspace-, generation-,
+rule-, host-, method-, and target-scoped digest is reused so a transport retry
+does not double-charge; changed accounting bounds at that scope conflict.
+Opaque `CONNECT` tunnels can reserve request counts but are explicitly unknown
+for token/cost metering, so a hard token/cost policy fails closed.
+
 After forwarding the response, the broker calls `Settle` exactly once:
 
 - a complete supported usage record replaces the token/cost maximum with the
@@ -51,6 +59,10 @@ A complete usage result larger than its reservation is fully accounted and
 flagged as an overrun. The broker integration must derive a true upper bound
 from the request or refuse a supported request governed by a hard token budget;
 settlement cannot undo provider work already released upstream.
+The concrete broker uses submitted JSON bytes as a conservative text-token
+bound. A missing finite output limit, or an external URL/file reference whose
+provider-side content is absent from the request, reserves the authority's
+closed maximum and therefore refuses any smaller hard token budget.
 
 Reservations have a bounded TTL. A node-death notification or TTL sweep moves
 an unresolved reservation to `expired` and charges its reserved maximum. This
@@ -77,9 +89,12 @@ catalogue bytes, prices, tenant override sets, reservation TTL, and retention.
 It also caps the number of simultaneous budget attachments evaluated for one
 request so adversarial configuration cannot create unbounded admission work.
 Terminal reservations remain long enough to answer the 30-day window and are
-collected only by an explicit sweep. Production uses the same `budget.Store`
-contract in the single authoritative control transaction; the in-memory
-manager is for standalone mode and tests, not multi-controller authority.
+collected only by an explicit sweep. The control plane serializes the manager
+under `budgetMu`, persists each definition and reservation as a bounded SQLite
+row, and commits every transition with its event through `control.transact`.
+Startup reconstructs the exact ledger before serving requests. This is a
+single-controller authority; the manager alone is useful for standalone tests
+but is not a multi-writer database.
 
 Observable outcomes are:
 
