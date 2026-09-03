@@ -1,0 +1,47 @@
+name: Operator console
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "web/**"
+      - ".github/workflows/web.yml"
+  pull_request:
+    paths:
+      - "web/**"
+      - ".github/workflows/web.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24.15.0"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install locked dependencies
+        working-directory: web
+        run: npm ci --ignore-scripts
+      - name: Audit dependencies
+        working-directory: web
+        run: npm audit
+      - name: Unit and component tests
+        working-directory: web
+        run: npm test
+      - name: Build and enforce reproducibility and size
+        working-directory: web
+        run: |
+          npm run build
+          npm run check:dist
+          git diff --exit-code -- dist dist.sha256
+      - name: Install browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      - name: E15 browser flow
+        working-directory: web
+        run: npx playwright test

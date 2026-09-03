@@ -34,6 +34,7 @@ import (
 	"remount.dev/remount/internal/relay"
 	"remount.dev/remount/internal/secretsource"
 	"remount.dev/remount/internal/transport"
+	webui "remount.dev/remount/web"
 )
 
 // Options configure a server.
@@ -174,12 +175,17 @@ type Server struct {
 	notifiers       []*notifier.Runner
 	notifierDLQ     *notifier.SQLiteDeadLetterStore
 	notifierTenants []string
+	console         http.Handler
 }
 
 // New builds a server. Call Serve or Handler.
 func New(opts Options) (*Server, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
+	}
+	console, err := webui.NewHandler()
+	if err != nil {
+		return nil, fmt.Errorf("server: %w", err)
 	}
 	if opts.MaxArtifactBytes < 0 || opts.MaxArtifactStoreBytes < 0 || opts.MaxArtifactObjects < 0 || opts.MaxEvents < 0 {
 		return nil, errors.New("server: artifact and event limits must not be negative")
@@ -392,7 +398,7 @@ func New(opts Options) (*Server, error) {
 	ctrl.Start()
 	s := &Server{
 		opts: opts, Control: ctrl, Identity: identityManager, Relay: r, Store: store, Log: log, db: sq.DB(), logger: opts.Logger,
-		ready: make(chan struct{}),
+		ready: make(chan struct{}), console: console,
 	}
 	if opts.DataDir == "" {
 		s.tempArtDir = artDir
@@ -754,6 +760,8 @@ func validateSecurityMode(opts Options) (string, error) {
 // Handler returns the HTTP mux.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.Handle("/console/", s.console)
+	mux.Handle("/console", http.RedirectHandler("/console/", http.StatusPermanentRedirect))
 	mux.HandleFunc("/v1/link", s.handleLink)
 	mux.HandleFunc("/v1/artifacts/", s.handleArtifact)
 	mux.HandleFunc("/v1/events", s.handleEvents)

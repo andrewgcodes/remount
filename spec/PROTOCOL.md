@@ -691,7 +691,7 @@ backend boundary.
 A `FleetOperation` is a durable, selector-frozen incident response:
 
 ```
-WorkspaceSelector { all, tenant, principal, run, node, model, backend,
+WorkspaceSelector { all, workspace, tenant, principal, run, node, model, backend,
                     labels, created_after, created_before }
 
 FleetOperation { id, selector, action, requested_by, tenant, state,

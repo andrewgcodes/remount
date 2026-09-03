@@ -242,6 +242,7 @@ func idem(r *http.Request) []client.OperationOption {
 // routing; a more specific literal segment wins over a wildcard, so
 // /messages is not swallowed by /{action}.
 func (s *Server) apiRoutes(mux *http.ServeMux) {
+	s.consoleRoutes(mux)
 	mux.HandleFunc("POST /v1/session", s.handleSessionCreate)
 	mux.HandleFunc("DELETE /v1/session", s.handleSessionDelete)
 	mux.HandleFunc("GET /v1/usage", s.handleUsage)
