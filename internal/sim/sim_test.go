@@ -290,7 +290,7 @@ func TestExecEndToEnd(t *testing.T) {
 	// through an asynchronous outbox, so wait for the last command's s.exited
 	// rather than asserting on a single read.
 	var evs []proto.Event
-	types := map[string]int{}
+	var types map[string]int
 	for deadline := time.Now().Add(10 * time.Second); ; {
 		evs, err = c.ReadEvents(ctx, 1, ws.ID)
 		if err != nil {

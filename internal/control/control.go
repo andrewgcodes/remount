@@ -1416,9 +1416,7 @@ func (c *Control) PeerConnected(ctx context.Context, id string, h *proto.Hello) 
 
 // PeerGone marks a node offline. Its leases keep running until they expire,
 // so a brief reconnect loses nothing.
-func (c *Control) PeerGone(ctx context.Context, id string) {
-	// Lifecycle bookkeeping must outlive the connection that triggered it.
-	ctx = context.WithoutCancel(ctx)
+func (c *Control) PeerGone(_ context.Context, id string) {
 	c.mu.Lock()
 	if n, ok := c.nodes[id]; ok {
 		n.Status.Online = false
