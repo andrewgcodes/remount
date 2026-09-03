@@ -3,6 +3,7 @@ package control
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -27,9 +28,17 @@ type agentFixture struct {
 	ops    []string
 	fail   atomic.Bool
 	clock  atomic.Int64
+	// nodeKey is n_one's identity; a restarted fixture reuses it so the node
+	// is the same peer to the control plane, not an impostor with a new key.
+	nodeKey ed25519.PrivateKey
 }
 
 func newAgentFixture(t *testing.T, path string, configure func(*Options)) *agentFixture {
+	t.Helper()
+	return newAgentFixtureWithNode(t, path, nil, configure)
+}
+
+func newAgentFixtureWithNode(t *testing.T, path string, nodeKey ed25519.PrivateKey, configure func(*Options)) *agentFixture {
 	t.Helper()
 	af := &agentFixture{}
 	af.clock.Store(time.Now().UnixMilli())
@@ -77,7 +86,7 @@ func newAgentFixture(t *testing.T, path string, configure func(*Options)) *agent
 		return nil
 	}
 	af.c.Attach(af.sender)
-	connectNode(t, af.c, "n_one", processNodeInfo(4096))
+	af.nodeKey = connectNodeWithKey(t, af.c, "n_one", processNodeInfo(4096), nodeKey)
 	return af
 }
 
@@ -312,6 +321,34 @@ func TestAgentCreateIsIdempotentAndValidates(t *testing.T) {
 	}
 }
 
+func TestAgentAutoApproveRejectedBeforeWorkspaceExists(t *testing.T) {
+	af := newAgentFixture(t, "", nil)
+	count := func() int {
+		af.c.mu.Lock()
+		defer af.c.mu.Unlock()
+		return len(af.c.workspaces)
+	}
+	before := count()
+	if _, err := af.c.agentCreate(context.Background(), localSubject(), &proto.AgentCreateReq{
+		Spec: agentSpec(""), Policy: proto.AgentPolicy{Approve: proto.ApproveAuto},
+	}); codeOf(err) != proto.CodeDenied {
+		t.Fatalf("auto approve on a local process workspace = %v, want denied", err)
+	}
+	if after := count(); after != before {
+		t.Fatalf("a rejected create left %d workspaces, had %d", after, before)
+	}
+
+	// A deployment floor raises every workspace to isolated, so the same
+	// request is legitimate there: the early check judges the effective spec.
+	floored := newAgentFixture(t, "", func(o *Options) { o.SecurityProfileFloor = proto.SecurityIsolated })
+	a := floored.create(t, localSubject(), proto.AgentCreateReq{
+		Spec: agentSpec(""), Policy: proto.AgentPolicy{Approve: proto.ApproveAuto},
+	})
+	if ws := floored.c.snapshotWS(a.WS); ws == nil || ws.Spec.Security.Profile != proto.SecurityIsolated {
+		t.Fatalf("floored workspace = %+v", ws)
+	}
+}
+
 func TestAgentAuthorizationFollowsWorkspaceACL(t *testing.T) {
 	af := newAgentFixture(t, "", nil)
 	a := af.create(t, localSubject(), proto.AgentCreateReq{Spec: agentSpec("")})
@@ -458,8 +495,17 @@ func TestAgentRunLifecycleAndStatusDerivation(t *testing.T) {
 	if got.Status != proto.AgentIdle || got.Failures != 0 || liveRun(got) != nil {
 		t.Fatalf("after clean exit: %+v", got)
 	}
-	// A late report for the finished run is ignored, not an error.
-	af.report(t, run, 8, proto.AgentReport{Kind: proto.AgentReportToolCall, ToolCall: "tc1"})
+	// A duplicate of an applied report is ignored. A later report for the
+	// finished run tells the node its copy is no longer authoritative:
+	// conflict, not silence, so a harness the control plane gave up on stops.
+	af.report(t, run, 7, proto.AgentReport{Kind: proto.AgentReportFinished, StopReason: "exit"})
+	late := proto.AgentReport{Agent: run.Agent, Run: run.Run, WS: run.WS, Gen: run.Gen, Seq: 8, Kind: proto.AgentReportToolCall, ToolCall: "tc1"}
+	if err := af.c.agentReport(context.Background(), "n_one", &late); codeOf(err) != proto.CodeConflict {
+		t.Fatalf("late tool_call after finished: err = %v, want conflict", err)
+	}
+	if got := af.agent(t, a.ID); got.Status != proto.AgentIdle || got.Failures != 0 {
+		t.Fatalf("late report changed the agent: %+v", got)
+	}
 	// A new message starts a fresh run.
 	if _, err := af.c.agentMessage(context.Background(), localSubject(), &proto.AgentMessageReq{ID: a.ID, Text: "again"}); err != nil {
 		t.Fatal(err)
@@ -774,6 +820,154 @@ func TestAgentLostRunWhenWorkspaceMovesOrNodeDies(t *testing.T) {
 	finished := eventsOfType(t, af.log, proto.EvAgentRunFinished)
 	if len(finished) != 1 || payloadOf(t, finished[0])["stop_reason"] != "node gone" {
 		t.Fatalf("run.finished = %+v", finished)
+	}
+	// An offline node is told nothing: no cancel for the lost run and no
+	// retry dispatched to it. The retry waits for a node that can hear it.
+	af.advance(agentRetryBackoff * 2)
+	af.c.agentReconcile(context.Background())
+	if cancels, runs := af.opCount(proto.OpAgentRunCancel), af.opCount(proto.OpAgentRun); cancels != 0 || runs != 1 {
+		t.Fatalf("offline node received cancel=%d run=%d, want 0 and the original 1", cancels, runs)
+	}
+	if got := af.agent(t, a.ID); liveRun(got) != nil {
+		t.Fatalf("a run was recorded against an offline node: %+v", got)
+	}
+}
+
+// A scheduled agent survives a control-plane restart still scheduled: the
+// start time is policy, not a timer that has to be re-armed, so the restarted
+// control plane neither launches early nor forgets to launch once the clock
+// passes start_at.
+func TestScheduledAgentSurvivesRestartAndStartsOnTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.db")
+	af := newAgentFixture(t, path, nil)
+	startAt := time.UnixMilli(af.clock.Load()).Add(time.Hour)
+	a := af.create(t, localSubject(), proto.AgentCreateReq{
+		Name: "later", Spec: agentSpec("task"),
+		Policy: proto.AgentPolicy{Approve: proto.ApproveNever, StartAt: startAt.UnixMilli()},
+	})
+	af.claim(t, a.WS)
+	af.c.agentReconcile(context.Background())
+	if got := af.agent(t, a.ID); got.Status != proto.AgentScheduled || len(got.Runs) != 0 || len(got.Inbox) != 1 {
+		t.Fatalf("before start_at: %+v", got)
+	}
+	if n := af.opCount(proto.OpAgentRun); n != 0 {
+		t.Fatalf("agent.run sent %d times before start_at", n)
+	}
+	af.c.Stop()
+	_ = af.log.Close()
+
+	clock := &af.clock
+	again := newAgentFixtureWithNode(t, path, af.nodeKey, func(o *Options) {
+		o.Now = func() time.Time { return time.UnixMilli(clock.Load()) }
+	})
+	// The node re-adopts the tree it still holds; that alone must not start
+	// the agent.
+	again.claim(t, a.WS)
+	again.c.agentReconcile(context.Background())
+	if got := again.agent(t, a.ID); got.Status != proto.AgentScheduled || len(got.Runs) != 0 {
+		t.Fatalf("after restart, before start_at: %+v", got)
+	}
+	if n := again.opCount(proto.OpAgentRun); n != 0 {
+		t.Fatalf("restart launched a scheduled agent %d times early", n)
+	}
+	clock.Add((time.Hour + time.Second).Milliseconds())
+	again.c.agentReconcile(context.Background())
+	run := again.lastRun(t)
+	if run.Agent != a.ID || len(run.Messages) != 1 || run.Messages[0].Text != "task" {
+		t.Fatalf("run after start_at = %+v", run)
+	}
+	if got := again.agent(t, a.ID); len(got.Runs) != 1 || got.Status == proto.AgentScheduled {
+		t.Fatalf("after start_at: %+v", got)
+	}
+}
+
+// A run the control plane gives up on while its node is still reachable is
+// cancelled there: the durable run is over, so the harness must not keep
+// working with brokered credentials no run accounts for. The launch timeout
+// is the case where the node acknowledged but never reported started.
+func TestAgentLostRunOnOnlineNodeIsCancelledThere(t *testing.T) {
+	af := newAgentFixture(t, "", nil)
+	a := af.create(t, localSubject(), proto.AgentCreateReq{Name: "worker", Spec: agentSpec("task")})
+	af.claim(t, a.WS)
+	af.c.agentReconcile(context.Background())
+	run := af.lastRun(t)
+	// A long recipe install must not trip the launch timeout: started goes
+	// out before the install, and after it the run is active for as long as
+	// the install takes.
+	af.report(t, run, 1, proto.AgentReport{Kind: proto.AgentReportStarted, Transcript: "s_acp"})
+	af.advance(agentLaunchTimeout * 4)
+	af.c.agentReconcile(context.Background())
+	if got := af.agent(t, a.ID); liveRun(got) == nil || liveRun(got).ID != run.Run {
+		t.Fatalf("active run lost to the launch timeout: %+v", got)
+	}
+	if af.opCount(proto.OpAgentRunCancel) != 0 {
+		t.Fatal("cancel sent for a run that is active")
+	}
+	// Second agent: acknowledged, never started, node still online.
+	b := af.create(t, localSubject(), proto.AgentCreateReq{Name: "stuck", Spec: agentSpec("task")})
+	af.claim(t, b.WS)
+	af.c.agentReconcile(context.Background())
+	stuck := af.lastRun(t)
+	if stuck.Agent != b.ID {
+		t.Fatalf("last run belongs to %s, want %s", stuck.Agent, b.ID)
+	}
+	af.advance(agentLaunchTimeout + time.Second)
+	af.c.agentReconcile(context.Background())
+	af.waitOps(proto.OpAgentRunCancel, 1)
+	got := af.agent(t, b.ID)
+	if liveRun(got) != nil || got.Runs[0].StopReason != "launch timed out" || got.Status == proto.AgentFailed {
+		t.Fatalf("after launch timeout: %+v", got)
+	}
+	if af.opCount(proto.OpAgentRunCancel) != 1 {
+		t.Fatalf("agent.run.cancel sent %d times, want 1 for the online node", af.opCount(proto.OpAgentRunCancel))
+	}
+	// The agent's own run was untouched by the other agent's decision.
+	if got := af.agent(t, a.ID); liveRun(got) == nil {
+		t.Fatalf("unrelated agent lost its run: %+v", got)
+	}
+}
+
+// A reconcile decision commits before the node hears of it. When the commit
+// fails the in-memory agent is rolled back and nothing is dispatched: the
+// node never runs an attempt the database did not record, and the next tick
+// decides again from durable truth.
+func TestAgentReconcilePersistFailureDispatchesNothing(t *testing.T) {
+	af := newAgentFixture(t, "", nil)
+	a := af.create(t, localSubject(), proto.AgentCreateReq{Name: "worker", Spec: agentSpec("task")})
+	af.claim(t, a.WS)
+	if _, err := af.c.db.Exec(`ALTER TABLE agents RENAME TO agents_offline`); err != nil {
+		t.Fatal(err)
+	}
+	af.c.agentReconcile(context.Background())
+	if n := af.opCount(proto.OpAgentRun); n != 0 {
+		t.Fatalf("agent.run sent %d times after a failed commit", n)
+	}
+	got := af.agent(t, a.ID)
+	if len(got.Runs) != 0 || len(got.Inbox) != 1 {
+		t.Fatalf("in-memory agent kept the uncommitted run: %+v", got)
+	}
+	af.c.mu.Lock()
+	marks, busy := len(af.c.agentDelivered), len(af.c.agentBusy)
+	af.c.mu.Unlock()
+	if marks != 0 || busy != 0 {
+		t.Fatalf("delivery marks = %d, busy = %d after rollback, want 0", marks, busy)
+	}
+	if _, err := af.c.db.Exec(`ALTER TABLE agents_offline RENAME TO agents`); err != nil {
+		t.Fatal(err)
+	}
+	af.c.agentReconcile(context.Background())
+	run := af.lastRun(t)
+	if run.Agent != a.ID || run.Attempt != 1 || len(run.Messages) != 1 {
+		t.Fatalf("run after recovery = %+v", run)
+	}
+	if got := af.agent(t, a.ID); len(got.Runs) != 1 || got.Runs[0].ID != run.Run {
+		t.Fatalf("agent after recovery = %+v", got)
+	}
+	af.c.mu.Lock()
+	busy = len(af.c.agentBusy)
+	af.c.mu.Unlock()
+	if busy != 0 {
+		t.Fatalf("busy = %d after the work returned", busy)
 	}
 }
 
@@ -1205,5 +1399,55 @@ func TestAgentTranscriptMirrorPagesEvictsAndWaits(t *testing.T) {
 	page, err = af.c.agentTranscript(ctx, localSubject(), &proto.AgentTranscriptReq{ID: a.ID, From: 2})
 	if err != nil || len(page.Records) != 3 {
 		t.Fatalf("page after destroy from 2 = %+v err=%v", page, err)
+	}
+}
+
+// A child workspace's security contract is bounded above by its parent's on
+// every axis; an unset one inherits the parent's whole (E22).
+func TestChildSecurityNeverWeakerThanParent(t *testing.T) {
+	rule := proto.EgressRule{ID: "docs", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{"docs.example.com"}, Methods: []string{"GET"}}
+	isolated := proto.SecuritySpec{Profile: proto.SecurityIsolated, Network: proto.NetworkPolicy{Rules: []proto.EgressRule{rule}}}
+	local := proto.SecuritySpec{}
+	wider := rule
+	wider.Methods = nil
+	for name, tc := range map[string]struct {
+		child, parent proto.SecuritySpec
+		ok            bool
+	}{
+		"same":                   {isolated, isolated, true},
+		"stronger profile":       {proto.SecuritySpec{Profile: proto.SecurityMultiTenant, Network: proto.NetworkPolicy{Rules: []proto.EgressRule{rule}}}, isolated, true},
+		"subset of rules":        {proto.SecuritySpec{Profile: proto.SecurityIsolated}, isolated, true},
+		"local under local":      {local, local, true},
+		"rules under open":       {proto.SecuritySpec{Network: proto.NetworkPolicy{Rules: []proto.EgressRule{rule}}}, local, true},
+		"weaker profile":         {local, isolated, false},
+		"weaker isolation":       {proto.SecuritySpec{Profile: proto.SecurityIsolated, MinIsolation: "none"}, isolated, false},
+		"secret mode none":       {proto.SecuritySpec{Profile: proto.SecurityIsolated, SecretMode: "none"}, isolated, false},
+		"default allow":          {proto.SecuritySpec{Profile: proto.SecurityIsolated, Network: proto.NetworkPolicy{Default: proto.NetworkDefaultAllow}}, isolated, false},
+		"invented rule":          {proto.SecuritySpec{Profile: proto.SecurityIsolated, Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{ID: "other", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{"x.example.com"}}}}}, isolated, false},
+		"widened rule":           {proto.SecuritySpec{Profile: proto.SecurityIsolated, Network: proto.NetworkPolicy{Rules: []proto.EgressRule{wider}}}, isolated, false},
+		"dropped audit":          {proto.SecuritySpec{Profile: proto.SecurityIsolated, Audit: proto.AuditPolicy{Required: false}}, proto.SecuritySpec{Profile: proto.SecurityLocal, Audit: proto.AuditPolicy{Required: true}}, true},
+		"dropped audit on local": {proto.SecuritySpec{Profile: proto.SecurityLocal, MinIsolation: "none"}, proto.SecuritySpec{Audit: proto.AuditPolicy{Required: true}}, false},
+	} {
+		err := securityWithin(tc.child, tc.parent)
+		if tc.ok && err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+		if !tc.ok && !errors.Is(err, &proto.Error{Code: proto.CodeDenied}) {
+			t.Errorf("%s: err = %v, want denied", name, err)
+		}
+	}
+
+	parent := &proto.Agent{Spec: proto.AgentSpec{Providers: []string{"p"}, Primary: "p"}}
+	pws := &proto.Workspace{Spec: proto.WorkspaceSpec{Security: isolated}}
+	req := &proto.AgentCreateReq{Workspace: &proto.WorkspaceSpec{}}
+	if err := inheritFromParent(req, parent, pws); err != nil {
+		t.Fatal(err)
+	}
+	if req.Workspace.Security.Profile != proto.SecurityIsolated || len(req.Workspace.Security.Network.Rules) != 1 {
+		t.Fatalf("unset child security = %+v, want the parent's", req.Workspace.Security)
+	}
+	req = &proto.AgentCreateReq{Workspace: &proto.WorkspaceSpec{Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Default: proto.NetworkDefaultAllow}}}}
+	if err := inheritFromParent(req, parent, pws); !errors.Is(err, &proto.Error{Code: proto.CodeDenied}) {
+		t.Fatalf("partially set weaker child security: err = %v, want denied", err)
 	}
 }

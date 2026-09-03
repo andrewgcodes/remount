@@ -62,7 +62,7 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "the terminal is a WebSocket endpoint")
 		return
 	}
-	cl, release := s.apiClient(w, r, true)
+	cl, release := s.apiClient(w, r, false)
 	if cl == nil {
 		return
 	}

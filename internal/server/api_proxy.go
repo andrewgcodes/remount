@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,6 +80,16 @@ func (s *Server) handlePort(w http.ResponseWriter, r *http.Request) {
 				if c.Name != sessionCookie {
 					pr.Out.AddCookie(c)
 				}
+			}
+			pr.Out.Header.Del("Sec-WebSocket-Protocol")
+			var protos []string
+			for _, p := range wsSubprotocols(pr.In) {
+				if !strings.HasPrefix(p, wsBearerProtocol) {
+					protos = append(protos, p)
+				}
+			}
+			if len(protos) > 0 {
+				pr.Out.Header.Set("Sec-WebSocket-Protocol", strings.Join(protos, ", "))
 			}
 		},
 		Transport: &http.Transport{

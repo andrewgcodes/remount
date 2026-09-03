@@ -109,9 +109,12 @@ func badRequest(w http.ResponseWriter, format string, args ...any) {
 
 // credential extracts the caller's bearer credential. The Authorization
 // header wins; a WebSocket may carry it as a subprotocol; a browser session
-// cookie is accepted only where a browser must be the caller (safe methods,
-// WebSocket upgrades and the preview proxy), because a cookie-authenticated
-// mutation is a CSRF target and the header form is not.
+// cookie is accepted only where a browser navigation must be the caller: the
+// preview proxy and the stable /a/{id} link. Everything else takes the header
+// or subprotocol, because content served through the preview proxy is
+// same-origin with this API and a cookie honoured on the terminal, file or
+// diff routes would let one workspace's page act as the operator on every
+// agent the operator can reach.
 func credential(r *http.Request, allowCookie bool) (tok string, fromCookie, ok bool) {
 	if h := r.Header.Get("Authorization"); h != "" {
 		if tok, ok := strings.CutPrefix(h, "Bearer "); ok && tok != "" {
@@ -186,10 +189,6 @@ func wsSubprotocols(r *http.Request) []string {
 		}
 	}
 	return out
-}
-
-func isSafe(r *http.Request) bool {
-	return r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions
 }
 
 func isUpgrade(r *http.Request) bool {
@@ -360,7 +359,7 @@ func (s *Server) handleAgentCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgentList(w http.ResponseWriter, r *http.Request) {
-	cl, release := s.apiClient(w, r, true)
+	cl, release := s.apiClient(w, r, false)
 	if cl == nil {
 		return
 	}
@@ -378,7 +377,7 @@ func (s *Server) handleAgentList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgentGet(w http.ResponseWriter, r *http.Request) {
-	cl, release := s.apiClient(w, r, true)
+	cl, release := s.apiClient(w, r, false)
 	if cl == nil {
 		return
 	}
@@ -511,7 +510,7 @@ func (s *Server) handleAgentLink(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleAgentApprovals(w http.ResponseWriter, r *http.Request) {
-	cl, release := s.apiClient(w, r, true)
+	cl, release := s.apiClient(w, r, false)
 	if cl == nil {
 		return
 	}
@@ -528,7 +527,7 @@ func (s *Server) handleAgentApprovals(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleApprovalGet(w http.ResponseWriter, r *http.Request) {
-	cl, release := s.apiClient(w, r, true)
+	cl, release := s.apiClient(w, r, false)
 	if cl == nil {
 		return
 	}
@@ -634,16 +633,20 @@ func renderPage(res *proto.AgentTranscriptRes) transcriptPage {
 func parseCursor(r *http.Request) (uint64, int, error) {
 	q := r.URL.Query()
 	var from uint64
-	if v := q.Get("from"); v != "" {
-		n, err := strconv.ParseUint(v, 10, 64)
-		if err != nil {
-			return 0, 0, proto.Err(proto.CodeBadRequest, "from must be a non-negative integer")
-		}
-		from = n
-	} else if v := r.Header.Get("Last-Event-ID"); v != "" {
+	// A reconnecting EventSource resends the original URL (with its ?from)
+	// plus Last-Event-ID for the last record it saw; the header is the
+	// newer cursor, so it wins, otherwise every reconnect replays from the
+	// first cursor.
+	if v := r.Header.Get("Last-Event-ID"); v != "" {
 		n, err := strconv.ParseUint(v, 10, 64)
 		if err != nil {
 			return 0, 0, proto.Err(proto.CodeBadRequest, "Last-Event-ID must be a non-negative integer")
+		}
+		from = n
+	} else if v := q.Get("from"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return 0, 0, proto.Err(proto.CodeBadRequest, "from must be a non-negative integer")
 		}
 		from = n
 	}
@@ -664,7 +667,7 @@ func parseCursor(r *http.Request) (uint64, int, error) {
 // them touches the workspace, so a sleeping agent's transcript reads
 // without waking it.
 func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request) {
-	cl, release := s.apiClient(w, r, true)
+	cl, release := s.apiClient(w, r, false)
 	if cl == nil {
 		return
 	}
@@ -886,7 +889,7 @@ func truncateReason(s string) string {
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
-	cl, release := s.apiClient(w, r, true)
+	cl, release := s.apiClient(w, r, false)
 	if cl == nil {
 		return
 	}
@@ -908,7 +911,7 @@ func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
 // PUT writes the body (mode=0644, mkdirp implied); DELETE removes
 // (?recursive=1). Paths are workspace-relative and jailed by the node.
 func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
-	cl, release := s.apiClient(w, r, isSafe(r))
+	cl, release := s.apiClient(w, r, false)
 	if cl == nil {
 		return
 	}

@@ -22,16 +22,22 @@ request authenticates one of three ways:
 |---|---|
 | `Authorization: Bearer <credential>` | everywhere; the normal form |
 | WebSocket subprotocol `remount.bearer.<base64url(credential)>` | WebSocket routes, for browsers that cannot set a header on a socket |
-| cookie `remount_session` | safe methods (`GET`/`HEAD`/`OPTIONS`), WebSocket upgrades and the preview proxy only |
+| cookie `remount_session` | the preview proxy (`/v1/agents/{id}/ports/...`) and the stable link `GET /a/{id}` only |
 
 The credential is the same token or capability the CLI uses (§4 of the
 protocol). A cookie is minted by `POST /v1/session` with a header credential
 and cleared by `DELETE /v1/session`; it is `HttpOnly`, `SameSite=Strict`,
-`Secure` over TLS, and lives twelve hours. A cookie is never accepted on a
-mutation (`POST`/`PUT`/`DELETE` outside the proxy): a cookie-authenticated
-mutation is a CSRF target and the header form is not. A cookie-authenticated
-request whose `Origin` is neither the API's own host nor a listed CORS origin
-is refused with `403 denied`, before it reaches a workspace.
+`Secure` over TLS, and lives twelve hours. It exists so a browser can open a
+preview link or `/a/{id}` by navigation; it authenticates nothing else. In
+particular the terminal, filesystem, diff, transcript and agent routes take a
+header or WebSocket subprotocol only, because a preview page is served from
+this API's origin and is written by the untrusted program in the workspace: a
+cookie honoured on those routes would let that page act as the operator on
+every agent the operator can reach. A cookie-authenticated request whose
+`Origin` is neither the API's own host nor a listed CORS origin is refused
+with `403 denied`, before it reaches a workspace. Operators who want previews
+isolated from the API entirely should front `/v1/agents/{id}/ports/` from a
+separate hostname.
 
 Errors are one shape with the protocol's stable code:
 
@@ -86,7 +92,7 @@ agent from a recipe is:
 ```json
 {
   "name": "fix-ci",
-  "workspace": {"name": "fix-ci", "repo": {"url": "https://github.com/o/r", "branch": "main"},
+  "workspace": {"name": "fix-ci", "repo": {"url": "https://github.com/o/r", "ref": "main"},
                 "labels": {"remount.binding.b_openai": "..."}},
   "spec": {"recipe": "opencode", "recipe_yaml": "...", "task": "make CI green",
            "model": "openai/gpt-4o-mini", "sandbox": "workspace-write", "providers": ["openai"]},
@@ -115,8 +121,8 @@ one URL-safe token is `404` before any redirect is built.
  "next": 1, "gap": {"from": 0, "to": 12}, "done": false}
 ```
 
-`stream` is `acp_in`, `acp_out`, `stderr`, `exit`, `info` or `gap`. ACP
-streams carry the decoded frame (`frame`), stderr carries `text`, anything
+`stream` is `acp_in`, `acp_out`, `stdout`, `stderr`, `exit`, `info` or `gap`.
+ACP streams carry the decoded frame (`frame`), stdout and stderr carry `text`, anything
 else carries raw `data`. `gap` names an evicted range and the page starts at
 `gap.to`; `done` is set once the agent is terminal and everything is read.
 Reading the transcript never wakes a sleeping agent.
@@ -206,8 +212,9 @@ TCP `{port}` inside the workspace, the same forward `remount port` uses, for
 HTTP and WebSocket traffic. The program in the workspace sees a plain client
 on `127.0.0.1` with `X-Forwarded-Host`, `X-Forwarded-Proto` and
 `X-Forwarded-Prefix` (`/v1/agents/{id}/ports/{port}`) naming the outside.
-`Authorization` and the `remount_session` cookie are stripped before
-forwarding; other cookies pass. `/ports/{port}` without a trailing slash
+`Authorization`, the `remount_session` cookie and any `remount.bearer.*`
+WebSocket subprotocol are stripped before forwarding; other cookies and
+subprotocols pass. `/ports/{port}` without a trailing slash
 redirects to it. A sleeping agent is woken first (`agent.woken{by:
 preview}`). `remount agent open ID --ui` runs the recipe's `ui` command in
 the workspace and prints this URL.

@@ -383,7 +383,7 @@ func NormalizeSecurity(s SecuritySpec) (SecuritySpec, error) {
 	default:
 		return SecuritySpec{}, Err(CodeBadRequest, "unknown security profile %q", s.Profile)
 	}
-	if isolationRank(s.MinIsolation) < 0 {
+	if IsolationRank(s.MinIsolation) < 0 {
 		return SecuritySpec{}, Err(CodeBadRequest, "unknown minimum isolation %q", s.MinIsolation)
 	}
 	if s.SecretMode != "" && s.SecretMode != "none" && s.SecretMode != "brokered" {
@@ -635,7 +635,24 @@ func validEgressDNSName(host string) bool {
 	return true
 }
 
-func isolationRank(s string) int {
+// ProfileRank orders security profiles weakest first; an unknown profile
+// ranks below every known one so it can never satisfy a floor or ceiling.
+func ProfileRank(profile string) int {
+	switch profile {
+	case SecurityLocal:
+		return 0
+	case SecurityIsolated:
+		return 1
+	case SecurityMultiTenant:
+		return 2
+	default:
+		return -1
+	}
+}
+
+// IsolationRank orders the isolation levels a backend can offer, weakest
+// first; an unknown level ranks below every known one.
+func IsolationRank(s string) int {
 	switch s {
 	case "none", "":
 		return 0
@@ -657,7 +674,7 @@ func ValidateBackendSecurity(policy SecuritySpec, backend BackendDescriptor) err
 	if err != nil {
 		return err
 	}
-	if isolationRank(backend.Security.Isolation) < isolationRank(p.MinIsolation) {
+	if IsolationRank(backend.Security.Isolation) < IsolationRank(p.MinIsolation) {
 		return Err(CodeDenied, "isolation %s is weaker than required %s", backend.Security.Isolation, p.MinIsolation)
 	}
 	if p.RequireSiblingIsolation && !backend.Security.SiblingIsolation {
@@ -688,22 +705,10 @@ func StrengthenSecurity(requested SecuritySpec, floor string) (SecuritySpec, err
 	if err != nil {
 		return SecuritySpec{}, err
 	}
-	profileRank := func(profile string) int {
-		switch profile {
-		case SecurityLocal:
-			return 0
-		case SecurityIsolated:
-			return 1
-		case SecurityMultiTenant:
-			return 2
-		default:
-			return -1
-		}
-	}
-	if profileRank(f.Profile) > profileRank(p.Profile) {
+	if ProfileRank(f.Profile) > ProfileRank(p.Profile) {
 		p.Profile = f.Profile
 	}
-	if isolationRank(f.MinIsolation) > isolationRank(p.MinIsolation) {
+	if IsolationRank(f.MinIsolation) > IsolationRank(p.MinIsolation) {
 		p.MinIsolation = f.MinIsolation
 	}
 	p.RequireSiblingIsolation = p.RequireSiblingIsolation || f.RequireSiblingIsolation

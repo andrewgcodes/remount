@@ -564,10 +564,12 @@ GET    /a/{id}                          the stable agent URL
 
 Three rules are protocol, not presentation. A credential arrives in
 `Authorization`, or as the WebSocket subprotocol `remount.bearer.<base64url>`,
-or as the `remount_session` cookie; the cookie is accepted only on safe
-methods, WebSocket upgrades and the preview proxy, and never on a
-cookie-authenticated request from an untrusted `Origin`, because a
-cookie-authenticated mutation is a CSRF target. Reads never wake: the
+or as the `remount_session` cookie; the cookie is accepted only on the
+preview proxy and `GET /a/{id}`, and never from an untrusted `Origin`,
+because preview content is same-origin with the API and written by the
+untrusted workspace, so a cookie honoured on any route that reads a file,
+opens a terminal or wakes an agent would let one workspace act as the
+operator on every other. Reads never wake: the
 transcript reads the mirror, and the filesystem and terminal refuse a
 sleeping agent with `conflict` rather than waking it; `diff?wake=true` and
 the preview proxy wake deliberately and emit `agent.woken` with `by: diff`
@@ -833,7 +835,11 @@ substituted. `push:false` (the default) denies `git-receive-pack` at
 advertisement time so `git push` fails before a packfile is sent. A workspace
 whose `spec.repo` names a repository gets an implicit rule `repo` covering
 exactly that repository (fetch and push) when its policy declares no typed git
-rule; nothing else is opened. Audits carry `connector: git`, `op: fetch|push`
+rule; nothing else is opened. The push half is deliberate: an agent whose
+purpose is to open a pull request needs it, and the binding that carries the
+token is the operator's grant. An operator who wants a read-only checkout
+declares a typed git rule for the repository with `push:false`, which then
+governs alone. Audits carry `connector: git`, `op: fetch|push`
 and `repo: owner/name`. The `/d/<host>/` reverse proxy remains usable as a
 stopgap (`url.$REMOUNT_BROKER/d/github.com/.insteadOf`), but it is the generic
 substitution path and enforces none of the grammar above.

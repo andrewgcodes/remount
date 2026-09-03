@@ -92,12 +92,13 @@ func (s *Server) webhookSigned(r *http.Request, body []byte) bool {
 // configured webhook credential, and without one it may only append.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSON(w, http.StatusMethodNotAllowed, apiErrorBody{Error: apiError{Code: proto.CodeUnsupported, Message: "method not allowed"}})
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, webhookBodyLimit+1))
 	if err != nil || len(body) > webhookBodyLimit {
-		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+		writeJSON(w, http.StatusRequestEntityTooLarge, apiErrorBody{Error: apiError{Code: proto.CodeBadRequest, Message: fmt.Sprintf("body is larger than %d bytes", webhookBodyLimit)}})
 		return
 	}
 	bearer, _, hasBearer := credential(r, false)
@@ -117,20 +118,24 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		cl = c
 	} else if !signed && !shared {
 		metrics.WebhookRejected.Inc()
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, proto.Err(proto.CodeUnauthorized, "missing credential or signature"))
 		return
 	}
 	var in webhookRequest
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&in); err != nil || in.Type == "" {
-		http.Error(w, "bad event", http.StatusBadRequest)
+		badRequest(w, "event must be a JSON object with a non-empty type")
 		return
 	}
 	var payload any
 	if len(in.Payload) > 0 {
-		if err := json.Unmarshal(in.Payload, &payload); err != nil {
-			http.Error(w, "bad payload", http.StatusBadRequest)
+		// Numbers stay as their literals: a template that renders an issue
+		// or comment id must not turn 2147483648 into 2.147483648e+09.
+		pd := json.NewDecoder(bytes.NewReader(in.Payload))
+		pd.UseNumber()
+		if err := pd.Decode(&payload); err != nil {
+			badRequest(w, "payload must be JSON")
 			return
 		}
 	}

@@ -6,9 +6,12 @@
 #   REMOUNT_WEBHOOK_SECRET  the server's --webhook-secret
 #
 # The server needs --webhook-secret and --webhook-token (a credential the
-# agents run as). The payload is GitHub's own event, signed with HMAC-SHA256
-# the way GitHub signs webhooks, so the same JSON could be posted by a GitHub
-# App webhook directly; the Action is just the zero-infrastructure version.
+# agents run as). The body is Remount's envelope {type, payload, agent}: the
+# payload is GitHub's own event and the agent mapping says what to do with it,
+# signed with HMAC-SHA256 the way GitHub signs webhooks. A GitHub App cannot
+# post to /v1/events directly (it sends the bare event, and the server rejects
+# a body without the envelope); something must wrap it, and this Action is the
+# zero-infrastructure way to do that.
 name: remount-issue-agent
 on:
   issues:

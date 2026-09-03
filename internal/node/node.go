@@ -133,10 +133,11 @@ type Node struct {
 	leaseSec   int64
 	workspaces map[string]*ws
 	// agentRuns are the live Agent run attempts keyed by agent|run;
-	// agentRunsDone remembers the ones that finished on this node so a
-	// replayed agent.run for a dead attempt is refused rather than restarted.
+	// agentRunsDone remembers the ones that finished on this node (and
+	// when) so a replayed agent.run for a dead attempt is refused rather
+	// than restarted; entries age out, see pruneAgentRunsDoneLocked.
 	agentRuns     map[string]*agentRun
-	agentRunsDone map[string]bool
+	agentRunsDone map[string]time.Time
 	// agentReportSink replaces the uplink for agent reports in tests.
 	agentReportSink func(context.Context, *proto.AgentReport) error
 	// materializing holds workspaces this node has claimed but not finished
@@ -369,7 +370,7 @@ func New(opts Options) (*Node, error) {
 		opts: opts, id: id, priv: priv, logger: opts.Logger.With("node", id),
 		store: store, connectors: connectorStore, events: eventlog.New(eventlog.NewMemory(10000)),
 		workspaces: map[string]*ws{}, materializing: map[string]*materialization{},
-		agentRuns: map[string]*agentRun{}, agentRunsDone: map[string]bool{},
+		agentRuns: map[string]*agentRun{}, agentRunsDone: map[string]time.Time{},
 		deadlines: map[string]time.Time{}, quarantined: map[string]struct{}{},
 		grants: map[string]*proto.Grant{}, subs: map[string]*subscriber{},
 		prepared: map[string]*preparedRelease{}, committed: map[string]uint64{},

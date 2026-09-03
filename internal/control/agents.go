@@ -3,7 +3,9 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -23,8 +25,13 @@ import (
 
 const (
 	// agentLaunchTimeout bounds a run that the node acknowledged but never
-	// reported as started (the node died between the ack and the spawn).
+	// reported as started. The node reports started as soon as it accepts the
+	// run, before the recipe install, so this only fires when the node died
+	// between the ack and that first report.
 	agentLaunchTimeout = 90 * time.Second
+	// agentLifecycleTimeout bounds a policy sleep or a message wake decided by
+	// reconcile; each includes a checkpoint or restore of the workspace.
+	agentLifecycleTimeout = 10 * time.Minute
 	// agentRetryBackoff spaces launch attempts after a failure so a broken
 	// recipe does not spin.
 	agentRetryBackoff = 5 * time.Second
@@ -287,8 +294,64 @@ func inheritFromParent(req *proto.AgentCreateReq, parent *proto.Agent, parentWS 
 	} else if extra := subtractSet(req.Workspace.Bindings, parentWS.Spec.Bindings); len(extra) > 0 {
 		return proto.Err(proto.CodeDenied, "workspace.bindings %v are not among the parent workspace's", extra)
 	}
-	if req.Workspace.Security.Profile == "" && req.Workspace.Security.MinIsolation == "" {
+	if securityUnset(req.Workspace.Security) {
 		req.Workspace.Security = parentWS.Spec.Security
+		return nil
+	}
+	return securityWithin(req.Workspace.Security, parentWS.Spec.Security)
+}
+
+// securityUnset reports whether a workspace spec asked for nothing about its
+// security, so the parent's contract applies whole.
+func securityUnset(s proto.SecuritySpec) bool {
+	return s.Profile == "" && s.MinIsolation == "" && !s.RequireSiblingIsolation &&
+		!s.RequireEnforcedEgress && s.SecretMode == "" && s.Network.Default == "" &&
+		len(s.Network.Rules) == 0 && !s.Audit.Required
+}
+
+// securityWithin refuses a child workspace security contract that is weaker
+// than its parent's on any axis. A parent that runs isolated with egress
+// denied must not be able to spawn a child that runs local with egress open:
+// the child is the same operator's authority, reached through the parent's
+// harness, and the parent's contract is the ceiling on what that harness
+// may do. Egress rules are the one axis a child may only copy, never invent,
+// unless the parent had no rules and so allowed everything.
+func securityWithin(child, parent proto.SecuritySpec) error {
+	c, err := proto.NormalizeSecurity(child)
+	if err != nil {
+		return err
+	}
+	p, err := proto.NormalizeSecurity(parent)
+	if err != nil {
+		return err
+	}
+	if proto.ProfileRank(c.Profile) < proto.ProfileRank(p.Profile) {
+		return proto.Err(proto.CodeDenied, "workspace.security.profile %q is weaker than the parent's %q", c.Profile, p.Profile)
+	}
+	if proto.IsolationRank(c.MinIsolation) < proto.IsolationRank(p.MinIsolation) {
+		return proto.Err(proto.CodeDenied, "workspace.security.min_isolation %q is weaker than the parent's %q", c.MinIsolation, p.MinIsolation)
+	}
+	if p.RequireSiblingIsolation && !c.RequireSiblingIsolation {
+		return proto.Err(proto.CodeDenied, "workspace.security.require_sibling_isolation may not be dropped below the parent's")
+	}
+	if p.RequireEnforcedEgress && !c.RequireEnforcedEgress {
+		return proto.Err(proto.CodeDenied, "workspace.security.require_enforced_egress may not be dropped below the parent's")
+	}
+	if p.SecretMode == "brokered" && c.SecretMode != "brokered" {
+		return proto.Err(proto.CodeDenied, "workspace.security.secret_mode %q is weaker than the parent's brokered", c.SecretMode)
+	}
+	if p.Audit.Required && !c.Audit.Required {
+		return proto.Err(proto.CodeDenied, "workspace.security.audit.required may not be dropped below the parent's")
+	}
+	if p.Network.Default == proto.NetworkDefaultDeny && c.Network.Default != proto.NetworkDefaultDeny {
+		return proto.Err(proto.CodeDenied, "workspace.security.network.default %q is weaker than the parent's deny", c.Network.Default)
+	}
+	if p.Network.Default == proto.NetworkDefaultDeny || len(p.Network.Rules) > 0 {
+		for _, rule := range c.Network.Rules {
+			if !slices.ContainsFunc(p.Network.Rules, func(pr proto.EgressRule) bool { return reflect.DeepEqual(pr, rule) }) {
+				return proto.Err(proto.CodeDenied, "workspace.security.network rule %q is not one of the parent's", rule.ID)
+			}
+		}
 	}
 	return nil
 }
@@ -469,6 +532,23 @@ func (c *Control) agentCreate(ctx context.Context, subject Subject, req *proto.A
 		}
 		labels["remount.agent"] = id
 		spec.Labels = labels
+		// Refusing before the workspace exists spares a create/destroy pair
+		// (and its events) for a request that can never succeed. The spec is
+		// judged as wsCreate will see it, floor applied; the check on the
+		// created workspace below still covers the ws-reuse path.
+		if policy.Approve == proto.ApproveAuto {
+			effective := spec
+			if c.opts.SecurityProfileFloor != "" {
+				sec, err := proto.StrengthenSecurity(spec.Security, c.opts.SecurityProfileFloor)
+				if err != nil {
+					return nil, err
+				}
+				effective.Security = sec
+			}
+			if !approveAutoAllowed(effective) {
+				return nil, proto.Err(proto.CodeDenied, "policy.approve auto needs an isolated workspace (docker backend or a security profile above local)")
+			}
+		}
 		created, err := c.wsCreate(ctx, subject, &proto.WSCreateReq{Spec: spec, IdempotencyKey: derivedIdem(req.IdempotencyKey, "ws")})
 		if err != nil {
 			return nil, err
@@ -860,7 +940,7 @@ func (c *Control) agentCancel(ctx context.Context, subject Subject, req *proto.A
 	}
 	ws := c.workspaces[live.WS]
 	dropped := len(live.Inbox)
-	live.Inbox = live.Inbox[:0]
+	c.dropInboxLocked(live)
 	run := liveRun(live)
 	var cancelReq *proto.AgentRunCancelReq
 	node := ""
@@ -1044,7 +1124,7 @@ func (c *Control) agentDestroy(ctx context.Context, subject Subject, req *proto.
 	}
 	live.Status = proto.AgentDestroyed
 	live.StatusReason = "destroyed by " + subject.ID
-	live.Inbox = live.Inbox[:0]
+	c.dropInboxLocked(live)
 	live.IdleSince = 0
 	live.WakeTimer = ""
 	events = append(events, c.agentEvent(proto.EvAgentDestroyed, live, ws, subject.ID, "", map[string]any{"ws": live.WS, "owns_ws": live.OwnsWS}))
@@ -1247,9 +1327,20 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 		c.mu.Unlock()
 		return proto.Err(proto.CodeConflict, "report for workspace %s generation %d does not match run generation %d", rep.WS, rep.Gen, gen)
 	}
-	if run.State == proto.AgentRunDone || rep.Seq <= run.LastReport {
+	if rep.Seq <= run.LastReport {
 		c.mu.Unlock()
 		return nil
+	}
+	if run.State == proto.AgentRunDone {
+		// The control plane closed this run (gave up on it, slept or cancelled
+		// the agent) and the node is still executing it. A finished report
+		// agrees with the durable state; anything else tells the node its
+		// copy is no longer authoritative so it stops the harness.
+		c.mu.Unlock()
+		if rep.Kind == proto.AgentReportFinished {
+			return nil
+		}
+		return proto.Err(proto.CodeConflict, "run %s is finished; %s report seq %d is not authoritative", rep.Run, rep.Kind, rep.Seq)
 	}
 	ws := c.workspaces[a.WS]
 	run.LastReport = rep.Seq
@@ -1316,7 +1407,7 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 			if err := transitionAgent(a.Status, proto.AgentFinished); err == nil {
 				a.Status = proto.AgentFinished
 				a.StatusReason = fmt.Sprintf("max_turns %d reached", a.Policy.MaxTurns)
-				a.Inbox = a.Inbox[:0]
+				c.dropInboxLocked(a)
 				events = append(events, c.agentEvent(proto.EvAgentFinished, a, ws, "", node, map[string]any{"reason": a.StatusReason}))
 				metrics.AgentsFinished.Inc()
 				// The harness would otherwise idle on the node forever; its
@@ -1353,7 +1444,7 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 				if err := transitionAgent(a.Status, proto.AgentFailed); err == nil {
 					a.Status = proto.AgentFailed
 					a.StatusReason = run.Error
-					a.Inbox = a.Inbox[:0]
+					c.dropInboxLocked(a)
 					events = append(events, c.agentEvent(proto.EvAgentFailed, a, ws, "", node, map[string]any{"reason": run.Error, "run": run.ID, "attempt": run.Attempt}))
 					metrics.AgentsFailed.Inc()
 				}
@@ -1394,6 +1485,16 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 	return nil
 }
 
+// dropInboxLocked empties an agent's inbox and forgets the delivery marks of
+// what it held, so the marks map only ever holds messages that still exist.
+// Caller holds c.mu.
+func (c *Control) dropInboxLocked(a *proto.Agent) {
+	for _, m := range a.Inbox {
+		delete(c.agentDelivered, m.ID)
+	}
+	a.Inbox = a.Inbox[:0]
+}
+
 // finishRunLocked closes a run and returns its events. It is the one place
 // a run becomes done, whether the node said so, the control plane gave up
 // on it, or a lifecycle operation killed it. Caller holds c.mu.
@@ -1432,26 +1533,60 @@ type agentDispatch struct {
 	req  proto.AgentRunReq
 }
 
-type agentRedeliver struct {
-	node string
-	req  proto.AgentDeliverReq
+// agentWork is one network action a reconcile decided on: a launch, a
+// redelivery, a cancel, a wake or a sleep. It runs off the control loop, and
+// the agent it belongs to is skipped by later reconciles until it returns, so
+// a slow node stalls that one agent and nothing else.
+type agentWork struct {
+	agent string
+	run   func(ctx context.Context)
 }
 
-// agentReconcile is idempotent and runs every tick. For each live agent it
+// agentReconcile decides and then performs every action synchronously. Tests
+// drive it directly; the loop uses agentReconcileAsync.
+func (c *Control) agentReconcile(ctx context.Context) {
+	for _, w := range c.agentDecide() {
+		w.run(ctx)
+		c.agentWorkDone(w.agent)
+	}
+}
+
+// agentReconcileAsync decides under the lock and performs each action on its
+// own goroutine. The control loop must never wait on a node: lease renewals,
+// timers and the outbox share it with every agent.
+func (c *Control) agentReconcileAsync(ctx context.Context) {
+	for _, w := range c.agentDecide() {
+		c.wg.Add(1)
+		go func(w agentWork) {
+			defer c.wg.Done()
+			defer c.agentWorkDone(w.agent)
+			w.run(ctx)
+		}(w)
+	}
+}
+
+// agentWorkDone releases the agent for the next decision and asks for one.
+func (c *Control) agentWorkDone(id string) {
+	c.mu.Lock()
+	delete(c.agentBusy, id)
+	c.mu.Unlock()
+	c.kickAgents()
+}
+
+// agentDecide is idempotent and runs every tick. For each live agent it
 // decides at most one thing: start a run, wake the workspace, re-deliver a
 // message, give up on a lost run, or put the agent to sleep. Decisions that
-// change state commit before the network call they imply; the call failing
-// is recorded and retried on a later tick.
-func (c *Control) agentReconcile(ctx context.Context) {
+// change state commit before the network call they imply; a commit that
+// fails is undone in memory so the next tick decides again from the durable
+// truth and the node never hears of a run the database did not record.
+func (c *Control) agentDecide() []agentWork {
 	if c.send == nil {
-		return
+		return nil
 	}
 	now := c.now()
-	var dispatches []agentDispatch
-	var redeliveries []agentRedeliver
-	var wakes []struct{ agent, ws, timer string }
-	var sleeps []string
+	var work []agentWork
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	keys := make([]string, 0, len(c.agents))
 	for id := range c.agents {
 		keys = append(keys, id)
@@ -1465,8 +1600,21 @@ func (c *Control) agentReconcile(ctx context.Context) {
 			}
 			continue
 		}
+		if _, busy := c.agentBusy[id]; busy {
+			continue
+		}
 		ws := c.workspaces[a.WS]
-		var events []*proto.Event
+		var (
+			events  []*proto.Event
+			pending []func(context.Context)
+			marked  []string
+			saved   *proto.Agent
+		)
+		mutate := func() {
+			if saved == nil {
+				saved = copyAgent(a)
+			}
+		}
 		run := liveRun(a)
 		if run != nil {
 			lost := ""
@@ -1483,11 +1631,20 @@ func (c *Control) agentReconcile(ctx context.Context) {
 				lost = "node gone"
 			}
 			if lost != "" {
+				mutate()
 				cancelled := lost == "workspace released"
 				events = append(events, c.finishRunLocked(a, run, ws, "", lost, "", cancelled)...)
 				if !cancelled {
 					run.Error = lost
 					c.agentRetry[a.ID] = now.Add(agentRetryBackoff)
+				}
+				// The durable run is over; a harness still executing it on a
+				// reachable node must stop, or it keeps working with brokered
+				// credentials that no run accounts for.
+				if run.Node != "" && c.send.Online(run.Node) {
+					cancel := proto.AgentRunCancelReq{Agent: a.ID, Run: run.ID, Reason: lost}
+					node := run.Node
+					pending = append(pending, func(ctx context.Context) { c.cancelRun(ctx, node, &cancel) })
 				}
 				run = nil
 			}
@@ -1497,6 +1654,7 @@ func (c *Control) agentReconcile(ctx context.Context) {
 			case a.Policy.StartAt > now.UnixMilli() && run == nil:
 				// Scheduled: hold the inbox, do not launch, do not wake.
 			case run == nil && len(a.Inbox) > 0 && ws.State == proto.WSClaimed && c.send.Online(ws.Node) && !c.agentRetry[a.ID].After(now):
+				mutate()
 				attempt := 1
 				if n := len(a.Runs); n > 0 {
 					attempt = a.Runs[n-1].Attempt + 1
@@ -1506,56 +1664,76 @@ func (c *Control) agentReconcile(ctx context.Context) {
 				events = append(events, c.agentEvent(proto.EvAgentRunStarted, a, ws, "", ws.Node, map[string]any{
 					"run": newRun.ID, "attempt": attempt, "node": ws.Node, "pending": true, "inbox": len(a.Inbox),
 				}))
-				dispatches = append(dispatches, agentDispatch{node: ws.Node, req: proto.AgentRunReq{
+				d := agentDispatch{node: ws.Node, req: proto.AgentRunReq{
 					Agent: a.ID, Run: newRun.ID, Attempt: attempt, WS: a.WS, Gen: ws.Generation, Tenant: a.Tenant, Owner: a.Owner,
 					Spec: a.Spec, Policy: a.Policy, Mode: a.Mode, ACPSessionID: a.ACPSessionID,
 					Messages: append([]proto.AgentMessage(nil), a.Inbox...),
-				}})
+				}}
+				pending = append(pending, func(ctx context.Context) { c.launchRun(ctx, d) })
 				for _, m := range a.Inbox {
 					c.agentDelivered[m.ID] = now
+					marked = append(marked, m.ID)
 				}
 			case run == nil && len(a.Inbox) > 0 && ws.State == proto.WSPaused:
-				wakes = append(wakes, struct{ agent, ws, timer string }{a.ID, a.WS, a.WakeTimer})
+				agentID, wsID, timer := a.ID, a.WS, a.WakeTimer
+				pending = append(pending, func(ctx context.Context) {
+					wctx, cancel := context.WithTimeout(ctx, agentLifecycleTimeout)
+					defer cancel()
+					if err := c.agentWake(wctx, "", agentID, wsID, timer, "message", ""); err != nil {
+						c.logger.Warn("agent wake", "agent", agentID, "err", err)
+					}
+				})
 			case run != nil && run.State == proto.AgentRunActive && run.TurnMessage == "" && len(a.Inbox) > 0 && ws.State == proto.WSClaimed:
 				m := a.Inbox[0]
 				if last, ok := c.agentDelivered[m.ID]; !ok || now.Sub(last) > agentRedeliverAfter {
 					c.agentDelivered[m.ID] = now
-					redeliveries = append(redeliveries, agentRedeliver{node: run.Node, req: proto.AgentDeliverReq{Agent: a.ID, Run: run.ID, Message: m}})
+					marked = append(marked, m.ID)
+					node, req := run.Node, proto.AgentDeliverReq{Agent: a.ID, Run: run.ID, Message: m}
+					pending = append(pending, func(ctx context.Context) { c.deliverToRun(ctx, node, &req) })
 				}
 			case (a.Status == proto.AgentWaitingInput || a.Status == proto.AgentIdle) && a.Policy.SleepAfterSec > 0 && a.IdleSince > 0 && ws.State == proto.WSClaimed &&
 				now.UnixMilli()-a.IdleSince >= a.Policy.SleepAfterSec*1000 && a.PendingApprovals == 0:
-				sleeps = append(sleeps, a.ID)
+				agentID := a.ID
+				pending = append(pending, func(ctx context.Context) {
+					sctx, cancel := context.WithTimeout(ctx, agentLifecycleTimeout)
+					defer cancel()
+					if _, err := c.sleepAgent(sctx, "", agentID, "policy", ""); err != nil {
+						c.logger.Warn("agent policy sleep", "agent", agentID, "err", err)
+					}
+				})
 			}
+		}
+		if deriveAgentStatus(a, ws, now.UnixMilli()) != a.Status {
+			mutate()
 		}
 		more, err := c.refreshAgentStatusLocked(a, "")
-		if err != nil {
-			c.logger.Error("agent status", "agent", a.ID, "err", err)
-			continue
-		}
-		events = append(events, more...)
-		if len(events) > 0 {
-			if err := c.persistAgent(a, events...); err != nil {
-				c.logger.Error("persist agent", "agent", a.ID, "err", err)
+		if err == nil {
+			events = append(events, more...)
+			if len(events) > 0 {
+				err = c.persistAgent(a, events...)
 			}
 		}
-	}
-	c.mu.Unlock()
-	for _, d := range dispatches {
-		c.launchRun(ctx, d)
-	}
-	for _, r := range redeliveries {
-		go c.deliverToRun(ctx, r.node, &r.req)
-	}
-	for _, w := range wakes {
-		if err := c.agentWake(ctx, "", w.agent, w.ws, w.timer, "message", ""); err != nil {
-			c.logger.Warn("agent wake", "agent", w.agent, "err", err)
+		if err != nil {
+			c.logger.Error("reconcile agent", "agent", a.ID, "err", err)
+			if saved != nil {
+				*a = *saved
+			}
+			for _, id := range marked {
+				delete(c.agentDelivered, id)
+			}
+			continue
+		}
+		if len(pending) > 0 {
+			c.agentBusy[a.ID] = struct{}{}
+			steps := pending
+			work = append(work, agentWork{agent: a.ID, run: func(ctx context.Context) {
+				for _, step := range steps {
+					step(ctx)
+				}
+			}})
 		}
 	}
-	for _, id := range sleeps {
-		if _, err := c.sleepAgent(ctx, "", id, "policy", ""); err != nil {
-			c.logger.Warn("agent policy sleep", "agent", id, "err", err)
-		}
-	}
+	return work
 }
 
 // notifyParentLocked tells a live parent that its child reached a terminal
@@ -1631,11 +1809,18 @@ func (c *Control) nodeGone(node string) bool {
 
 // launchRun sends the run to the node. The run row is already pending; a
 // refused launch closes it with an error and lets the retry policy decide.
+// A conflict is the node saying it still holds an older run for this agent
+// or already finished this one: it supersedes the older run itself, so the
+// launch is retried after the backoff and does not count against the agent.
 func (c *Control) launchRun(ctx context.Context, d agentDispatch) {
 	rctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	var res proto.AgentRunRes
 	err := c.send.Request(rctx, d.node, proto.OpAgentRun, d.req, &res)
+	if err != nil && ctx.Err() != nil {
+		// Shutting down: the pending row is reconciled after the restart.
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	a := c.agents[d.req.Agent]
@@ -1646,17 +1831,25 @@ func (c *Control) launchRun(ctx context.Context, d agentDispatch) {
 	if run == nil || run.State == proto.AgentRunDone {
 		return
 	}
+	if err != nil && run.State == proto.AgentRunActive {
+		// The node's started report overtook a lost response; the run is up.
+		return
+	}
 	ws := c.workspaces[a.WS]
 	var events []*proto.Event
 	if err != nil {
 		text := "launch: " + err.Error()
 		events = append(events, c.finishRunLocked(a, run, ws, "", "launch_failed", text, false)...)
-		a.Failures++
+		var pe *proto.Error
+		conflict := errors.As(err, &pe) && pe.Code == proto.CodeConflict
+		if !conflict {
+			a.Failures++
+		}
 		if a.Failures >= agentMaxFailures {
 			if terr := transitionAgent(a.Status, proto.AgentFailed); terr == nil {
 				a.Status = proto.AgentFailed
 				a.StatusReason = text
-				a.Inbox = a.Inbox[:0]
+				c.dropInboxLocked(a)
 				events = append(events, c.agentEvent(proto.EvAgentFailed, a, ws, "", d.node, map[string]any{"reason": text, "run": run.ID, "attempt": run.Attempt}))
 				metrics.AgentsFailed.Inc()
 			}

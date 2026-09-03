@@ -17,6 +17,7 @@ import (
 	"remount.dev/remount/internal/broker"
 	"remount.dev/remount/internal/ids"
 	"remount.dev/remount/internal/launch"
+	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/session"
 	"remount.dev/remount/internal/transport"
@@ -68,6 +69,7 @@ type agentRun struct {
 	redact     *redactor
 	reporter   *agentReporter
 	mount      string
+	stdin      io.Closer // the harness's stdin; closed first when stopping
 
 	mu           sync.Mutex
 	inbox        []proto.AgentMessage
@@ -102,15 +104,24 @@ type agentTerminal struct {
 // sees is the order the run observed even when the uplink flapped. A report
 // the control plane refuses as stale or unknown is dropped; one it could not
 // receive at all is retried until the run's context ends.
+//
+// The queue is bounded. While the uplink is down a chatty harness could
+// otherwise grow it without limit; past the bound the oldest transcript
+// reports are dropped and the next transcript report opens with a gap chunk
+// covering them, so the mirror shows the loss instead of hiding it.
+// Lifecycle reports are never dropped: they are what the control plane's
+// state machine runs on.
 type agentReporter struct {
-	n    *Node
-	run  *agentRun
-	mu   sync.Mutex
-	seq  uint64
-	q    []*proto.AgentReport
-	kick chan struct{}
-	done chan struct{}
-	end  bool
+	n      *Node
+	run    *agentRun
+	mu     sync.Mutex
+	seq    uint64
+	q      []*proto.AgentReport
+	qBytes int
+	gap    *proto.Gap // transcript seqs dropped from the queue, unreported
+	kick   chan struct{}
+	done   chan struct{}
+	end    bool
 	// Transcript records wait here until the batch is big enough, old
 	// enough, or another report needs to overtake them; they then ship as one
 	// transcript report so the mirror keeps seq order relative to lifecycle
@@ -125,6 +136,10 @@ type agentReporter struct {
 const (
 	agentTranscriptFlushAfter = 250 * time.Millisecond
 	agentTranscriptFlushBytes = 64 << 10
+	// agentReportQueueMax and agentReportQueueBytes bound the reports one run
+	// holds for a control plane it cannot reach.
+	agentReportQueueMax   = 512
+	agentReportQueueBytes = 16 << 20
 )
 
 // chunk queues one transcript record for mirroring.
@@ -161,28 +176,112 @@ func (r *agentReporter) flushChunks() {
 }
 
 // flushChunksLocked moves the pending chunks into a transcript report. It
-// splits a batch that outgrew the report bound. Caller holds r.mu.
+// splits a batch that outgrew the report bound. A gap left over from the
+// queue trim ships even with nothing else pending, so a run that ends right
+// after the trim still reports what it lost. Caller holds r.mu.
 func (r *agentReporter) flushChunksLocked() {
 	if r.flushTimer != nil {
 		r.flushTimer.Stop()
 		r.flushTimer = nil
 	}
-	for len(r.chunks) > 0 {
+	for len(r.chunks) > 0 || r.gap != nil {
 		n, size := 0, 0
 		for n < len(r.chunks) && (n == 0 || size+len(r.chunks[n].Data) <= proto.MaxTranscriptReportBytes) {
 			size += len(r.chunks[n].Data)
 			n++
 		}
-		batch := append([]proto.TranscriptChunk(nil), r.chunks[:n]...)
+		var batch []proto.TranscriptChunk
+		if r.gap != nil {
+			batch = append(batch, proto.TranscriptChunk{Seq: r.gap.To, Stream: proto.StreamGap, At: time.Now().UnixMilli(), Data: proto.MustMarshal(*r.gap)})
+			r.gap = nil
+		}
+		batch = append(batch, r.chunks[:n]...)
 		r.chunks = r.chunks[n:]
 		r.seq++
-		r.q = append(r.q, &proto.AgentReport{
+		r.enqueueLocked(&proto.AgentReport{
 			Agent: r.run.req.Agent, Run: r.run.req.Run, WS: r.run.req.WS, Gen: r.run.req.Gen,
 			Seq: r.seq, Kind: proto.AgentReportTranscript, At: time.Now().UnixMilli(), Chunks: batch,
 		})
 	}
 	r.chunks = nil
 	r.chunkBytes = 0
+}
+
+func reportBytes(rep *proto.AgentReport) int {
+	n := 256
+	for i := range rep.Chunks {
+		n += len(rep.Chunks[i].Data) + 32
+	}
+	return n
+}
+
+// enqueueLocked appends a report and then trims the queue back under its
+// bound by dropping the oldest transcript reports behind the head. The head
+// may be in flight, so it is never touched. Caller holds r.mu.
+func (r *agentReporter) enqueueLocked(rep *proto.AgentReport) {
+	r.q = append(r.q, rep)
+	r.qBytes += reportBytes(rep)
+	for len(r.q) > agentReportQueueMax || r.qBytes > agentReportQueueBytes {
+		victim := -1
+		for i := 1; i < len(r.q); i++ {
+			if r.q[i].Kind == proto.AgentReportTranscript {
+				victim = i
+				break
+			}
+		}
+		if victim < 0 {
+			return
+		}
+		dropped := r.q[victim]
+		r.q = append(r.q[:victim], r.q[victim+1:]...)
+		r.qBytes -= reportBytes(dropped)
+		metrics.AgentTranscriptReportsDropped.Inc()
+		// The gap belongs where the dropped records were: at the front of the
+		// next transcript report still queued, or, when the victim was the
+		// newest, in the next one flushed.
+		var next *proto.AgentReport
+		for i := victim; i < len(r.q); i++ {
+			if r.q[i].Kind == proto.AgentReportTranscript {
+				next = r.q[i]
+				break
+			}
+		}
+		if next == nil {
+			r.gap = widenGap(r.gap, dropped.Chunks)
+			continue
+		}
+		g := widenGap(nil, dropped.Chunks)
+		if len(next.Chunks) > 0 && next.Chunks[0].Stream == proto.StreamGap {
+			g = widenGap(g, next.Chunks[:1])
+			r.qBytes -= len(next.Chunks[0].Data) + 32
+			next.Chunks = next.Chunks[1:]
+		}
+		gapChunk := proto.TranscriptChunk{Seq: g.To, Stream: proto.StreamGap, At: time.Now().UnixMilli(), Data: proto.MustMarshal(*g)}
+		next.Chunks = append([]proto.TranscriptChunk{gapChunk}, next.Chunks...)
+		r.qBytes += len(gapChunk.Data) + 32
+	}
+}
+
+// widenGap extends g (nil for none) to cover the session seqs of chunks,
+// reading through any gap chunk among them.
+func widenGap(g *proto.Gap, chunks []proto.TranscriptChunk) *proto.Gap {
+	for i := range chunks {
+		ch := &chunks[i]
+		from, to := ch.Seq, ch.Seq
+		if ch.Stream == proto.StreamGap {
+			var inner proto.Gap
+			if err := proto.Unmarshal(ch.Data, &inner); err == nil {
+				from, to = inner.From, inner.To
+			}
+		}
+		if g == nil {
+			g = &proto.Gap{From: from, To: to}
+			continue
+		}
+		g.From = min(g.From, from)
+		g.To = max(g.To, to)
+	}
+	return g
 }
 
 // wake nudges the loop; call it after releasing r.mu.
@@ -211,7 +310,7 @@ func (r *agentReporter) report(kind string, fill func(*proto.AgentReport)) {
 	if kind == proto.AgentReportFinished {
 		r.end = true
 	}
-	r.q = append(r.q, rep)
+	r.enqueueLocked(rep)
 	r.mu.Unlock()
 	select {
 	case r.kick <- struct{}{}:
@@ -256,13 +355,35 @@ func (r *agentReporter) loop(ctx context.Context) {
 		}
 		if err != nil {
 			r.n.logger.Warn("agent report refused", "agent", head.Agent, "run", head.Run, "kind", head.Kind, "seq", head.Seq, "err", err)
+			if agentReportSupersedes(err) && head.Kind != proto.AgentReportFinished {
+				// The control plane no longer owns this run: it closed the
+				// row, the workspace moved on, or the agent is gone. The
+				// harness must not keep working on nobody's behalf.
+				r.run.requestCancel("control plane refused " + head.Kind + " report: " + err.Error())
+			}
 		}
 		r.mu.Lock()
 		if len(r.q) > 0 && r.q[0] == head {
 			r.q = r.q[1:]
+			r.qBytes -= reportBytes(head)
 		}
 		r.mu.Unlock()
 	}
+}
+
+// agentReportSupersedes tells a refusal that means the run is not the
+// control plane's anymore from one about the report itself (too big,
+// malformed), which the run survives.
+func agentReportSupersedes(err error) bool {
+	var pe *proto.Error
+	if !errors.As(err, &pe) {
+		return false
+	}
+	switch pe.Code {
+	case proto.CodeNotFound, proto.CodeConflict, proto.CodeUnauthorized, proto.CodeDenied:
+		return true
+	}
+	return false
 }
 
 // agentReportPermanent tells a control-plane refusal (the run is gone, the
@@ -302,10 +423,41 @@ func (n *Node) sendAgentReport(ctx context.Context, rep *proto.AgentReport) erro
 
 func agentRunKey(agent, run string) string { return agent + "|" + run }
 
+// agentRunsDoneTTL and agentRunsDoneMax bound the finished-run memory. A
+// replay of agent.run for an attempt arrives within the control plane's
+// launch retry window; anything older is not a replay the node can still
+// tell apart, and the control plane opens a new attempt id regardless.
+const (
+	agentRunsDoneTTL = time.Hour
+	agentRunsDoneMax = 4096
+)
+
+// pruneAgentRunsDoneLocked ages out finished-run markers. Caller holds n.mu.
+func (n *Node) pruneAgentRunsDoneLocked() {
+	cutoff := time.Now().Add(-agentRunsDoneTTL)
+	for key, at := range n.agentRunsDone {
+		if at.Before(cutoff) {
+			delete(n.agentRunsDone, key)
+		}
+	}
+	for len(n.agentRunsDone) > agentRunsDoneMax {
+		oldestKey, oldest := "", time.Time{}
+		for key, at := range n.agentRunsDone {
+			if oldestKey == "" || at.Before(oldest) {
+				oldestKey, oldest = key, at
+			}
+		}
+		delete(n.agentRunsDone, oldestKey)
+	}
+}
+
 // agentRunStart handles agent.run. A repeat for a run that is already live
 // returns its transcript; a repeat for one that already finished is refused
 // with conflict, because the control plane must open a new attempt rather
-// than believe a dead run is still going.
+// than believe a dead run is still going. A new run for an agent whose older
+// run is still live here means the control plane closed that run without
+// the node hearing it: the node cancels the older run and refuses with
+// conflict so the launch is retried once the harness has stopped.
 func (n *Node) agentRunStart(ctx context.Context, p *transport.Peer, req *proto.AgentRunReq) (any, error) {
 	if req.Agent == "" || req.Run == "" || req.WS == "" {
 		return nil, proto.Err(proto.CodeBadRequest, "agent, run and ws are required")
@@ -335,14 +487,15 @@ func (n *Node) agentRunStart(ctx context.Context, p *transport.Peer, req *proto.
 		}
 		return proto.AgentRunRes{Transcript: existing.transcript.ID}, nil
 	}
-	if n.agentRunsDone[key] {
+	if _, done := n.agentRunsDone[key]; done {
 		n.mu.Unlock()
 		return nil, proto.Err(proto.CodeConflict, "run %s already finished on this node", req.Run)
 	}
 	for _, other := range n.agentRuns {
 		if other.req.Agent == req.Agent {
 			n.mu.Unlock()
-			return nil, proto.Err(proto.CodeConflict, "agent %s already has run %s live on this node", req.Agent, other.req.Run)
+			other.requestCancel("superseded by run " + req.Run)
+			return nil, proto.Err(proto.CodeConflict, "agent %s already has run %s live on this node; stopping it", req.Agent, other.req.Run)
 		}
 	}
 	rctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
@@ -556,8 +709,16 @@ func (r *agentRun) main() {
 		runErr     error
 		stopReason string
 	)
+	// Started goes out before the install: the control plane's launch
+	// timeout is for a node that died between the ack and here, not for a
+	// recipe that takes minutes to install.
+	r.reporter.report(proto.AgentReportStarted, func(rep *proto.AgentReport) { rep.Transcript = r.transcript.ID })
 	if err := r.installHarness(); err != nil {
 		r.finish(-1, err, "", nil)
+		return
+	}
+	if r.isCancelled() {
+		r.finish(-1, nil, "", nil)
 		return
 	}
 	cmd, client, err := r.spawn()
@@ -574,8 +735,11 @@ func (r *agentRun) main() {
 		// The kill arrived while spawning; the process must not outlive it.
 		_ = session.SignalProcess(cmd, "KILL")
 	}
-	r.reporter.report(proto.AgentReportStarted, func(rep *proto.AgentReport) { rep.Transcript = r.transcript.ID })
-	go r.consumeUpdates(client)
+	updatesDone := make(chan struct{})
+	go func() {
+		defer close(updatesDone)
+		r.consumeUpdates(client)
+	}()
 
 	if err := r.handshake(client); err != nil {
 		runErr = err
@@ -583,10 +747,14 @@ func (r *agentRun) main() {
 		stopReason, runErr = r.turns(client)
 	}
 
-	// Stop the harness: close its stdin so a well-behaved server exits, then
-	// escalate. Wait bounds the join; the process group catches children.
+	// Stop the harness: fail its pending calls, close its stdin so a
+	// well-behaved server exits, then escalate. The reader is joined before
+	// the process is waited on, because Wait closes the stdout pipe and
+	// would discard frames still in it; the update consumer is joined after
+	// the reader so every tool call it saw is reported before finished.
 	_ = client.Close()
-	exitCode = r.stopProcess(cmd)
+	exitCode = r.stopProcess(cmd, client)
+	<-updatesDone
 	r.finish(exitCode, runErr, stopReason, client)
 }
 
@@ -635,7 +803,8 @@ func (r *agentRun) finish(exitCode int, runErr error, stopReason string, client 
 	if r.n.agentRuns[r.key] == r {
 		delete(r.n.agentRuns, r.key)
 	}
-	r.n.agentRunsDone[r.key] = true
+	r.n.agentRunsDone[r.key] = time.Now()
+	r.n.pruneAgentRunsDoneLocked()
 	r.n.mu.Unlock()
 
 	r.reporter.report(proto.AgentReportFinished, func(rep *proto.AgentReport) {
@@ -665,11 +834,14 @@ func (r *agentRun) spawn() (*exec.Cmd, *acp.Client, error) {
 		WS: r.w.ID, Kind: proto.SessionExec, Program: program, Cwd: ".", Env: r.n.sessionEnv(r.w, extraEnv),
 		Principal: r.req.Owner, Tenant: r.req.Tenant, Stdin: true,
 	}
+	// The redactor learns the workspace's environment as declared, before a
+	// backend rewrites spec.Env into the host command it actually execs
+	// (docker moves the container's variables into -e flags).
+	r.redact = newRedactor(r.secretLiterals(spec.Env))
 	if err := r.w.handle.Prepare(&spec); err != nil {
 		return nil, nil, err
 	}
 	r.mount = workspace.MountPathOf(r.w.handle)
-	r.redact = newRedactor(r.secretLiterals(spec.Env))
 
 	cmd := exec.Command(spec.Program[0], spec.Program[1:]...)
 	cmd.Dir = spec.Cwd
@@ -690,6 +862,7 @@ func (r *agentRun) spawn() (*exec.Cmd, *acp.Client, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, nil, proto.Err(proto.CodeInternal, "start harness: %v", err)
 	}
+	r.stdin = stdin
 	go r.drainStderr(stderr)
 	client := acp.NewClient(stdout, stdin, acp.Options{
 		Handler: &agentHandler{r: r},
@@ -824,11 +997,11 @@ func (r *agentRun) installHarness() error {
 		Timeout: agentInstallTimeout,
 		Run:     &proto.RunInfo{Recipe: recipe.Name, TaskHash: launch.TaskHash(r.req.Spec.Task), Sandbox: r.req.Spec.Sandbox, Auth: r.req.Spec.Auth},
 	}
+	redact := newRedactor(r.secretLiterals(spec.Env))
 	if err := r.w.handle.Prepare(&spec); err != nil {
 		unlock()
 		return err
 	}
-	redact := newRedactor(r.secretLiterals(spec.Env))
 	s, err := r.n.sessions.Open(spec)
 	unlock()
 	if err != nil {
@@ -943,36 +1116,49 @@ func (r *agentRun) drainStderr(rd io.Reader) {
 	}
 }
 
-// stopProcess ends the harness and returns its exit code. Closing stdin
-// already happened; a server that ignores EOF gets TERM then KILL.
-func (r *agentRun) stopProcess(cmd *exec.Cmd) int {
-	waited := make(chan error, 1)
-	go func() { waited <- cmd.Wait() }()
+// stopProcess ends the harness and returns its exit code. It closes stdin
+// and waits for the reader to see the harness's stdout close, escalating
+// TERM then KILL for a server that ignores EOF. Only then is the process
+// waited on: exec.Cmd.Wait closes the stdout pipe, and a frame still in the
+// pipe at that moment would never reach the transcript. A descendant that
+// kept stdout open past the kill is bounded by one more grace period.
+func (r *agentRun) stopProcess(cmd *exec.Cmd, client *acp.Client) int {
+	if r.stdin != nil {
+		_ = r.stdin.Close()
+	}
 	r.mu.Lock()
 	hard := r.hardStop
 	r.mu.Unlock()
 	if hard {
 		_ = session.SignalProcess(cmd, "KILL")
-		err := <-waited
-		code, _ := session.ExitStatus(err)
-		return code
+		r.awaitReader(client, agentStopGrace)
+		return harnessExit(cmd)
 	}
-	select {
-	case err := <-waited:
-		code, _ := session.ExitStatus(err)
-		return code
-	case <-time.After(2 * time.Second):
+	if r.awaitReader(client, 2*time.Second) {
+		return harnessExit(cmd)
 	}
 	_ = session.SignalProcess(cmd, "TERM")
-	select {
-	case err := <-waited:
-		code, _ := session.ExitStatus(err)
-		return code
-	case <-time.After(agentStopGrace):
+	if r.awaitReader(client, agentStopGrace) {
+		return harnessExit(cmd)
 	}
 	_ = session.SignalProcess(cmd, "KILL")
-	err := <-waited
-	code, _ := session.ExitStatus(err)
+	r.awaitReader(client, agentStopGrace)
+	return harnessExit(cmd)
+}
+
+// awaitReader reports whether the ACP reader reached the end of the
+// harness's stdout within d.
+func (r *agentRun) awaitReader(client *acp.Client, d time.Duration) bool {
+	select {
+	case <-client.Done():
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+func harnessExit(cmd *exec.Cmd) int {
+	code, _ := session.ExitStatus(cmd.Wait())
 	return code
 }
 
@@ -1136,60 +1322,52 @@ func (r *agentRun) turn(client *acp.Client, sid acp.SessionId, m proto.AgentMess
 // only in the transcript; they are the bulk of a run and belong to the
 // session log, not the event log.
 func (r *agentRun) consumeUpdates(client *acp.Client) {
-	for {
-		select {
-		case u, ok := <-client.Updates():
-			if !ok {
-				return
-			}
-			r.mu.Lock()
-			replaying := r.replaying
-			r.mu.Unlock()
-			if replaying {
+	for u := range client.Updates() {
+		r.mu.Lock()
+		replaying := r.replaying
+		r.mu.Unlock()
+		if replaying {
+			continue
+		}
+		switch u.Update.Kind {
+		case acp.SessionUpdateKindToolCall:
+			tc, err := u.Update.AsToolCall()
+			if err != nil {
 				continue
 			}
-			switch u.Update.Kind {
-			case acp.SessionUpdateKindToolCall:
-				tc, err := u.Update.AsToolCall()
-				if err != nil {
-					continue
-				}
-				r.reporter.report(proto.AgentReportToolCall, func(rep *proto.AgentReport) {
-					rep.ToolCall = string(tc.ToolCallID)
-					rep.ToolKind = string(tc.Kind)
-					rep.ToolTitle = truncateString(tc.Title, 256)
-					rep.ToolStatus = string(tc.Status)
-					rep.Locations = locations(tc.Locations)
-				})
-			case acp.SessionUpdateKindToolCallUpdate:
-				tc, err := u.Update.AsToolCallUpdate()
-				if err != nil || tc.Status == nil {
-					continue
-				}
-				r.reporter.report(proto.AgentReportToolCall, func(rep *proto.AgentReport) {
-					rep.ToolCall = string(tc.ToolCallID)
-					if tc.Kind != nil {
-						rep.ToolKind = string(*tc.Kind)
-					}
-					if tc.Title != nil {
-						rep.ToolTitle = truncateString(*tc.Title, 256)
-					}
-					rep.ToolStatus = string(*tc.Status)
-					rep.Locations = locations(tc.Locations)
-				})
-			case acp.SessionUpdateKindUsageUpdate:
-				var uu acp.UsageUpdate
-				if err := json.Unmarshal(u.Update.Raw, &uu); err != nil {
-					continue
-				}
-				// ACP reports context occupancy (used of size), not per-turn
-				// token counts; the turn report carries the latest reading.
-				r.mu.Lock()
-				r.usage = &proto.AgentUsage{Input: uu.Used, Output: uu.Size}
-				r.mu.Unlock()
+			r.reporter.report(proto.AgentReportToolCall, func(rep *proto.AgentReport) {
+				rep.ToolCall = string(tc.ToolCallID)
+				rep.ToolKind = string(tc.Kind)
+				rep.ToolTitle = truncateString(tc.Title, 256)
+				rep.ToolStatus = string(tc.Status)
+				rep.Locations = locations(tc.Locations)
+			})
+		case acp.SessionUpdateKindToolCallUpdate:
+			tc, err := u.Update.AsToolCallUpdate()
+			if err != nil || tc.Status == nil {
+				continue
 			}
-		case <-r.ctx.Done():
-			return
+			r.reporter.report(proto.AgentReportToolCall, func(rep *proto.AgentReport) {
+				rep.ToolCall = string(tc.ToolCallID)
+				if tc.Kind != nil {
+					rep.ToolKind = string(*tc.Kind)
+				}
+				if tc.Title != nil {
+					rep.ToolTitle = truncateString(*tc.Title, 256)
+				}
+				rep.ToolStatus = string(*tc.Status)
+				rep.Locations = locations(tc.Locations)
+			})
+		case acp.SessionUpdateKindUsageUpdate:
+			var uu acp.UsageUpdate
+			if err := json.Unmarshal(u.Update.Raw, &uu); err != nil {
+				continue
+			}
+			// ACP reports context occupancy (used of size), not per-turn
+			// token counts; the turn report carries the latest reading.
+			r.mu.Lock()
+			r.usage = &proto.AgentUsage{Input: uu.Used, Output: uu.Size}
+			r.mu.Unlock()
 		}
 	}
 }

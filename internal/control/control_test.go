@@ -98,6 +98,13 @@ func signedNodeHello(t *testing.T, id, token string, info proto.NodeInfo) (proto
 	if err != nil {
 		t.Fatal(err)
 	}
+	return signedNodeHelloWithKey(t, id, token, info, key), key
+}
+
+// signedNodeHelloWithKey signs with a caller-held key so a node can come back
+// after a control-plane restart as itself: the pinned key is durable.
+func signedNodeHelloWithKey(t *testing.T, id, token string, info proto.NodeInfo, key ed25519.PrivateKey) proto.Hello {
+	t.Helper()
 	h := proto.Hello{
 		Peer: id, Role: proto.RoleNode, Token: token, Caps: proto.PeerCapabilities(), PubKey: key.Public().(ed25519.PublicKey),
 		Node: &info, IssuedAt: time.Now().UnixMilli(), Nonce: make([]byte, 32),
@@ -106,17 +113,30 @@ func signedNodeHello(t *testing.T, id, token string, info proto.NodeInfo) (proto
 		t.Fatal(err)
 	}
 	h.Proof = ed25519.Sign(key, proto.HelloProofBytes(h))
-	return h, key
+	return h
 }
 
 func connectNode(t *testing.T, c *Control, id string, info proto.NodeInfo) {
 	t.Helper()
-	h, _ := signedNodeHello(t, id, "node-token", info)
+	connectNodeWithKey(t, c, id, info, nil)
+}
+
+// connectNodeWithKey connects id signing with key, or a fresh key when nil,
+// and returns the key used.
+func connectNodeWithKey(t *testing.T, c *Control, id string, info proto.NodeInfo, key ed25519.PrivateKey) ed25519.PrivateKey {
+	t.Helper()
+	var h proto.Hello
+	if key == nil {
+		h, key = signedNodeHello(t, id, "node-token", info)
+	} else {
+		h = signedNodeHelloWithKey(t, id, "node-token", info, key)
+	}
 	got, _, err := c.Authenticate(context.Background(), &h)
 	if err != nil || got != id {
 		t.Fatalf("Authenticate node = (%q, %v)", got, err)
 	}
 	c.PeerConnected(context.Background(), id, &h)
+	return key
 }
 
 func localSubject() Subject {
