@@ -14,10 +14,6 @@ func configureProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func isPTYEOF(err error) bool {
-	return errors.Is(err, syscall.EIO)
-}
-
 func signalProcess(cmd *exec.Cmd, name string) error {
 	signals := map[string]syscall.Signal{
 		"TERM": syscall.SIGTERM, "KILL": syscall.SIGKILL, "INT": syscall.SIGINT,
