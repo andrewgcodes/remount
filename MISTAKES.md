@@ -425,7 +425,7 @@ anything reproducible from a lockfile.
 
 ---
 
-## Patterns in these mistakes
+## Patterns in the first build/debugging pass
 
 Almost all of them fall into four groups.
 
@@ -557,3 +557,263 @@ the fixed tree. It found one further instance of the same class in `wsCreate`,
 where the newly created workspace was published to the shared map and then
 read after unlocking, which was fixed the same way. Two annotated exceptions
 carry `lint:locks-ok` with the reason.
+
+## 26. A partial stdin write consumed the retry sequence
+
+**Symptom.** An injected writer accepted the first two bytes of `hello` and
+then failed. Retrying the same input sequence could be treated as a duplicate,
+so the missing suffix would never reach the process.
+
+**Cause.** Session input associated the idempotency sequence with the call
+rather than the completed byte-and-EOF effect. A single `Write` is allowed to
+return fewer bytes than requested.
+
+**Fix.** `internal/session/session.go` writes the full buffer and advances
+`lastISeq` only after all bytes and any requested EOF action succeed.
+`TestInputSequenceAdvancesOnlyAfterCompleteWrite` fails the first write and
+proves an identical retry is still applied.
+
+**Lesson.** Deduplication state is a commit record. Publish it after the whole
+effect, never after an attempt.
+
+## 27. A failed snapshot returned before its producer stopped
+
+**Symptom.** A size-limited or failed artifact write could return from snapshot
+creation while the backend's archive-producing goroutine was still walking the
+workspace. The caller would then release the workspace tree lock.
+
+**Cause.** Closing the consumer side of an `io.Pipe` requested the producer to
+stop but did not prove it had stopped. The failure path did not join the
+producer.
+
+**Fix.** `node.snapshotRaw` closes the pipe with the terminal error and waits
+on `producerDone` before returning on both success and failure. The tree
+boundary therefore outlives every archive read.
+
+**Lesson.** Cancellation is a request. Joining is evidence. A critical section
+that delegates work to a goroutine lasts until that goroutine exits.
+
+## 28. An authorized operation could wake after its workspace was gone
+
+**Symptom.** A filesystem or session operation could validate a grant, queue
+behind a release, quarantine, fence or checkpoint, and then touch a stale
+handle after the lifecycle operation removed or closed it.
+
+**Cause.** Authorization and resource use were separated by a blocking lock.
+The authorization result described the workspace before the wait, not after
+it.
+
+**Fix.** `node.lockWorkspaceTree` acquires the tree boundary and then checks
+that the same workspace handle and generation are still serviceable. Removal
+takes the exclusive boundary to drain in-flight work. Focused tests queue work
+before removal and prove it returns a conflict without touching the handle.
+
+**Lesson.** Authorization has a time dimension. Revalidate at the point of use
+after every wait during which authority or object identity can change.
+
+## 29. A checkpoint had a write window between archive and commit
+
+**Symptom.** An explicit authoritative checkpoint could finish producing its
+archive, allow a filesystem mutation, and only afterward commit the old digest
+as failover state. The acknowledged checkpoint did not necessarily represent
+the workspace at its commit point.
+
+**Cause.** The exclusive tree lock covered archive production but not the
+generation-specific control-plane commit.
+
+**Fix.** An authoritative checkpoint holds the tree boundary through the
+control commit. `TestAuthoritativeCheckpointHoldsTreeUntilControlCommit`
+blocks the commit deliberately and proves a writer cannot cross that interval.
+Concurrent lifecycle removal also makes the checkpoint lose rather than revive
+stale state.
+
+**Lesson.** The consistency boundary ends at the durable authority commit, not
+when serialization reaches EOF.
+
+## 30. Failed quiescence could still look safe to snapshot or release
+
+**Symptom.** Session termination failures could be ignored before a checkpoint,
+release or quarantine. A failed release path could also restore the workspace
+without restoring its local lease deadline, causing it to self-fence later.
+
+**Cause.** Process termination was treated as best effort even though
+`quiesced` is a correctness claim. Rollback restored the resource map but not
+all of the ownership state removed during prepare.
+
+**Fix.** `session.Manager.KillWorkspace` reports any process it cannot confirm
+stopped. Lifecycle callers abort on that error. Failed prepare/snapshot paths
+restore the source, serving record and a fresh local lease window without
+destroying the handle.
+
+**Lesson.** A failed precondition invalidates every claim built on it. Rollback
+must restore the complete invariant, not merely the most visible pointer.
+
+## 31. Workspace authority could cross the database's numeric boundary
+
+**Symptom.** The wire model allowed a `uint64` generation while SQLite stores
+signed integers. Advancing authority past `MaxInt64` could wrap, fail to
+persist, or make protocol and recovery code disagree.
+
+**Cause.** Each increment was locally reasonable, but no one owned the
+cross-representation boundary.
+
+**Fix.** `nextWorkspaceGeneration` and `canAdvanceWorkspaceAuthority`
+reject exhaustion. Lease expiry at the boundary transitions the workspace to
+durable `failed` without changing its generation. Exhaustive and property
+tests cover the transition table and authority checks.
+
+**Lesson.** Monotonic authority counters need an explicit terminal state.
+Never wrap a fence token.
+
+## 32. Bounded history could retain its bookkeeping forever
+
+**Symptom.** Reference-aware assignment pruning could repeatedly inspect a
+protected oldest prefix and never reach deletable history behind it. Separately,
+keyed lifecycle, producer, mutation and fleet locks retained arbitrary keys
+after the work completed.
+
+**Cause.** The visible data had limits, but the selection algorithm and
+synchronization indexes did not share the same lifecycle. Applying a deletion
+limit before excluding protected rows caused starvation.
+
+**Fix.** SQL excludes the current live-authority set before applying the
+bounded deletion limit. Keyed mutex entries are reference counted and removed
+after their last waiter leaves. Tests populate protected prefixes and churn
+unique lock keys to prove both collections shrink.
+
+**Lesson.** Boundedness includes metadata and algorithmic progress. A maximum
+row count is not useful if collection can scan the same undeletable rows
+forever.
+
+## 33. An authoritative checkpoint could have nowhere authoritative to go
+
+**Symptom.** A caller could request an authoritative uploaded checkpoint from a
+node with no control-plane artifact endpoint. Local snapshot work could succeed
+but the result could not become portable failover state.
+
+**Cause.** The operation validated storage availability after adopting the
+semantic promise of an authoritative checkpoint.
+
+**Fix.** The node returns typed `unsupported` before snapshot work when the
+artifact endpoint or commit callback is absent.
+`TestAuthoritativeCheckpointRequiresControlPlaneArtifactStore` preserves the
+boundary.
+
+**Lesson.** Validate the capability needed to fulfill a promise before doing
+the work. A local artifact ID is not an authoritative checkpoint.
+
+## 34. Public output helpers hid an eviction gap
+
+**Symptom.** A session whose oldest output had been evicted could be copied into
+a buffer and presented as complete output. The low-level stream contained a
+`gap` marker, but the convenient public helper did not turn it into failure.
+
+**Cause.** The helper treated every non-stdout/stderr chunk as ignorable
+metadata. That interpretation destroyed the log's completeness signal.
+
+**Fix.** Public `Copy` and aggregate `Run` validate the gap payload, render
+an elision marker where possible, and return the typed `evicted` error.
+`TestOutputGapIsNeverReportedAsComplete` covers valid and malformed gaps.
+
+**Lesson.** Missing data is data. Convenience APIs must preserve completeness
+and uncertainty signals from lower layers.
+
+## 35. A green fuzz step selected no fuzz targets
+
+**Symptom.** A seeded-fuzz CI command completed successfully without executing
+the registered fuzz functions it was meant to exercise.
+
+**Cause.** The test-selection expression did not match the `Fuzz...` entry
+points. Package discovery and a zero exit status looked like useful work.
+
+**Fix.** CI runs `go test ./... -run='^Fuzz'` for every seed corpus, while
+`make fuzz` explicitly names and actively fuzzes all eight targets.
+
+**Lesson.** Validate test selection as well as test results. A green harness
+that ran zero intended cases is a false diagnostic.
+
+## 36. Encoding a frame changed the caller's object
+
+**Symptom.** Serializing a frame with an omitted version wrote the default
+version back into the caller-owned frame. Concurrent reuse could observe a
+mutation caused by what looked like a read-only operation.
+
+**Cause.** `EncodeFrame` filled defaults directly on its pointer argument for
+convenience.
+
+**Fix.** Encoding defaults a private copy.
+`TestEncodeFrameDefaultsVersionWithoutMutatingCaller` checks both sides: the
+wire frame has V1 and the input remains unchanged.
+
+**Lesson.** Serialization should not acquire hidden ownership of caller state.
+Copy before normalization at concurrency boundaries.
+
+## 37. Session exit became visible before its capacity was reusable
+
+**Symptom.** `Session.Wait` returned, but an immediate replacement session
+could still receive `resource_exhausted`. Waiting or polling briefly made the
+same open succeed.
+
+**Cause.** Exit notification woke callers before an asynchronous manager
+observer decremented active-session accounting.
+
+**Fix.** Session finish performs manager accounting before closing the exited
+signal. The quota test opens the replacement immediately after `Wait`, and a
+concurrent-open test proves the limit cannot be overcommitted.
+
+**Lesson.** Define the handoff event for a quota. If callers reasonably treat
+completion as capacity release, accounting must happen before completion is
+observable.
+
+## 38. A fixed port made port forwarding look broken
+
+**Symptom.** The simulator's port-forward test timed out on a hosted macOS
+runner even though the forwarding implementation was sound.
+
+**Cause.** The test launched a separate server on a fixed development port that
+could already be occupied or reserved. The resulting dial failure surfaced far
+from setup.
+
+**Fix.** The test uses an in-process HTTP server on an OS-assigned loopback
+port and passes the selected port into `OpenPort`.
+
+**Lesson.** Tests should ask the operating system for scarce resources and keep
+their ownership in process. A fixed port is shared global state.
+
+## 39. The cloud smoke test proved the wrong Modal app
+
+**Symptom.** `modal run` could report a successful smoke result even though
+the named persistent deployment was unhealthy or absent. Earlier readiness
+could also succeed when only the HTTP listener was up and the node had not
+enrolled.
+
+**Cause.** `modal run` creates an ephemeral source app. The smoke used that
+execution context as if it were the deployed object. The deployment also
+conflated import-time and container-time binary checks, guessed the JSON shape
+of `nodes --json`, and explicitly committed a Volume during shutdown when the
+provider lifecycle should own it.
+
+**Fix.** Smoke resolves `modal.Function.from_name` and tests the named
+deployment's URL. Startup waits for an authenticated node listing, decodes the
+actual array/object shapes, validates dependencies in the container lifecycle,
+and relies on the supported Volume lifecycle. The live exercise then stopped
+the app and removed its unique volume and secret.
+
+**Lesson.** Cloud tests must name the deployed object and prove the full
+readiness chain. Provider source code, an ephemeral invocation, an HTTP socket
+and a persistent deployment are four different things.
+
+---
+
+The smaller fixes from the same hardening pass—error shadowing in persistence
+helpers, short local file writes, connector object-count limits, owned-only
+orphan cleanup, module-metadata drift and incomplete validation messages—are
+indexed in the [implementation
+closure](docs/engineering/implementation-closure-2026-09-03.md#additional-defects-found-during-implementation-review).
+Their reusable implications are folded into the [hardening
+playbook](docs/engineering/hardening-lessons.md).
+
+That playbook is also the cross-cutting pattern analysis for mistakes 23-39:
+truth must survive asynchronous boundaries, authorization must be revalidated
+at use, destructive work waits for durable commit, every retained structure is
+bounded, and verification must distinguish success from work that never ran.

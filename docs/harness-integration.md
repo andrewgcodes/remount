@@ -182,20 +182,29 @@ Plain HTTP through the proxy, where the request line carries an absolute URL,
 is handled exactly like the `/d/` path. Headers are inspected and placeholders
 are substituted for a matching binding.
 
-HTTPS through the proxy uses CONNECT. The broker checks the destination against
-the bindings and the allow list, and if permitted it opens a TCP tunnel and
-copies bytes in both directions. It cannot see or rewrite the headers inside
-that tunnel. Substituting a credential there would require the broker to
-terminate TLS with a certificate authority installed in the workspace. Version
-zero deliberately does not do that, because a per-workspace CA is the single
-most valuable secret in the system and we would rather ship without it than ship
-it carelessly.
+HTTPS through the proxy uses CONNECT. A binding never grants tunnel authority:
+legacy local mode requires the node's `--allow`, while typed mode requires an
+explicit `protocol:"connect"` rule. If permitted, the broker opens a TCP
+tunnel and copies bytes in both directions. It cannot see or rewrite the
+headers inside that tunnel. Substituting a credential there would require the
+broker to terminate TLS with a certificate authority installed in the
+workspace. Protocol v1 deliberately does not do that, because a per-workspace
+CA would be one of the most valuable secrets in the system.
 
-So the division of labor is simple. Model keys go through the `/d/` reverse
-proxy path where they can be substituted. Package installs and other
-credential-free HTTPS go through CONNECT to allow-listed hosts. The Codex
-install above used the second path for `registry.npmjs.org` and the first for
-`api.openai.com`.
+So the division of labor is explicit. Model keys go through the `/d/` reverse
+proxy path where they can be substituted. The verified legacy-local Codex
+install above used an allow-listed CONNECT tunnel for
+`registry.npmjs.org` and the reverse proxy for `api.openai.com`.
+
+For a hostile or production-oriented workspace, use a typed
+`connector:"package"` rule for immutable registry GET/HEAD requests and call
+`${REMOUNT_PACKAGE_CONNECTOR}/<registry-host>/<path>`. The managed connector
+rechecks workspace and generation policy, supports an expected SHA-256 digest,
+and does not expose cache paths or hit state. It is intentionally not a general
+CONNECT proxy; a package manager needs an integration that can use its explicit
+read endpoint. The built-in process and Docker backends remain
+`cooperative_proxy`, so they cannot satisfy `isolated` or `multi_tenant`
+profiles.
 
 ## Writing your own loop
 

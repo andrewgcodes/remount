@@ -27,6 +27,39 @@ Tests must pass under `-race`. Several real bugs in this codebase were found
 only there, including a lease that expired while a node was restoring the
 workspace it had just claimed.
 
+## Choose proof by boundary
+
+Start with a focused regression and widen according to what changed. A
+lifecycle, reconnect, ordering or concurrency change needs repeated focused
+`-race` runs and a simulation test that injects the relevant cut, replay,
+delay, restart or failed commit. A protocol change needs negotiation and wire
+compatibility tests. An exported SDK change needs `make public-api`, which
+compiles from a separate Go module. Capacity and retention changes need
+concurrent overcommit, idempotent-at-capacity, restart and protected-reference
+cases.
+
+A deployment change is not proven by repository tests alone. Build the exact
+candidate, exercise the named deployed service, verify authenticated readiness
+and node enrollment, inspect events/metrics/doctor, test restart when
+persistence is involved, and remove all test resources afterward. Never print
+or place a real credential in a command argument, workspace, log, fixture or
+commit.
+
+The complete method and change-to-test matrix are in
+[the hardening playbook](docs/engineering/hardening-lessons.md). Agents doing a
+hardening or production-readiness pass should use the repo-scoped
+`remount-hardening-review` skill in
+`.agents/skills/remount-hardening-review/`.
+
+## Changing an active checkout
+
+This repository is sometimes edited by multiple agents at once. Fetch and
+record the current `HEAD` and `origin/main` before starting. Treat unfamiliar
+dirty files as somebody else's work, use narrow patches and commits, and
+inspect the complete diff before staging. Fetch again before integration or
+push, and rerun affected tests after resolving upstream changes. Never erase
+another contributor's edits with reset or checkout.
+
 ## Design changes
 
 If you are changing something the ADRs decided, add an ADR rather than editing
