@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1051,10 +1052,11 @@ func (n *Node) fenceLoop(ctx context.Context) {
 func (n *Node) renew(ctx context.Context) {
 	n.mu.Lock()
 	p := n.peer
-	req := proto.WSRenewReq{Gen: map[string]uint64{}}
+	req := proto.WSRenewReq{Gen: map[string]uint64{}, Authz: map[string]uint64{}}
 	for id, w := range n.workspaces {
 		req.IDs = append(req.IDs, id)
 		req.Gen[id] = w.Generation
+		req.Authz[id] = w.AuthzRevision
 	}
 	for id, materializing := range n.materializing {
 		if _, done := n.workspaces[id]; !done && materializing.generation != 0 {
@@ -1108,15 +1110,81 @@ func (n *Node) applyRenewResults(req proto.WSRenewReq, res *proto.WSRenewRes) {
 		}
 		deadline := time.Now().Add(n.localLeaseWindow())
 		n.mu.Lock()
+		var revoke *revocation
 		if w := n.workspaces[id]; w != nil && w.Generation == result.Generation {
 			n.deadlines[id] = deadline
 			w.LeaseUntil = result.LeaseUntil
+			revoke = n.applyAuthzLocked(w, result)
 		}
 		if materializing := n.materializing[id]; materializing != nil && materializing.generation == result.Generation {
 			materializing.deadline = deadline
 		}
 		n.mu.Unlock()
+		if revoke != nil {
+			n.closeRevokedSessions(revoke)
+		}
 	}
+}
+
+// revocation is the work an authorization push leaves for after n.mu is
+// released: whose sessions to end and what to record.
+type revocation struct {
+	ws         *ws
+	revision   uint64
+	principals []string
+	reset      bool
+}
+
+// applyAuthzLocked adopts the authoritative authorization revision pushed on
+// renew (authz-push). Every cached grant minted under an older revision stops
+// verifying at once; the sessions of principals control names as revoked are
+// collected for closure. A reset means control could not name them, so every
+// session of the workspace is closed and still-authorized principals reopen
+// with fresh grants. Callers hold n.mu.
+func (n *Node) applyAuthzLocked(w *ws, result proto.WSRenewResult) *revocation {
+	if result.AuthzRevision <= w.AuthzRevision {
+		return nil
+	}
+	w.AuthzRevision = result.AuthzRevision
+	for key, g := range n.grants {
+		if g.Claims.WS == w.ID && g.Claims.AuthzRevision != w.AuthzRevision {
+			delete(n.grants, key)
+		}
+	}
+	if len(result.Revoked) == 0 && !result.AuthzReset {
+		return nil
+	}
+	return &revocation{ws: w, revision: result.AuthzRevision, principals: result.Revoked, reset: result.AuthzReset}
+}
+
+// confirmOpenAuthz closes the window between authorizing an open and the
+// session existing. A revision pushed in that window has already listed the
+// workspace's sessions, so a session started under the older grant would
+// outlive its principal's access; end it and answer as the grant check would.
+func (n *Node) confirmOpenAuthz(w *ws, claims proto.GrantClaims, s *session.Session) error {
+	n.mu.Lock()
+	current := w.AuthzRevision
+	n.mu.Unlock()
+	if claims.AuthzRevision == current {
+		return nil
+	}
+	n.sessions.Terminate(s.ID, proto.ExitReasonRevoked)
+	return proto.Err(proto.CodeUnauthorized, "grant authorization revision is stale")
+}
+
+func (n *Node) closeRevokedSessions(r *revocation) {
+	var closed []string
+	for _, s := range n.sessions.List(r.ws.ID) {
+		if !r.reset && !slices.Contains(r.principals, s.Principal) {
+			continue
+		}
+		if n.sessions.Terminate(s.ID, proto.ExitReasonRevoked) {
+			closed = append(closed, s.ID)
+		}
+	}
+	n.emit(proto.EvAuthzRevoked, r.ws.ID, r.ws.Spec.Principal, map[string]any{
+		"authz_revision": r.revision, "principals": r.principals, "reset": r.reset, "sessions": closed,
+	})
 }
 
 func (n *Node) localLeaseWindow() time.Duration {
@@ -2364,6 +2432,9 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 	if err != nil {
 		return nil, err
 	}
+	if err := n.confirmOpenAuthz(w, claims, s); err != nil {
+		return nil, err
+	}
 	n.emitSession(proto.EvSOpened, w.ID, claims.Principal, s.ID, map[string]any{"s": s.ID, "kind": req.Kind, "program": req.Program, "client": client})
 	if !req.NoSubscribe {
 		n.subscribe(p, client, s, 0)
@@ -2392,6 +2463,9 @@ func (n *Node) portOpen(ctx context.Context, p *transport.Peer, client string, c
 	}
 	s, err := n.sessions.Open(spec)
 	if err != nil {
+		return nil, err
+	}
+	if err := n.confirmOpenAuthz(w, claims, s); err != nil {
 		return nil, err
 	}
 	// A port session is a connection, not a program: if the dial failed there

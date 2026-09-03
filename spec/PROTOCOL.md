@@ -157,6 +157,39 @@ change.
 
 Clients obtain grants with `op: grant` against `control` and cache them.
 
+### 4.1 Revocation epochs (`authz-push`)
+
+A grant is verified offline, so on its own a revoked principal would keep
+access until the grant expired. With `authz-push` negotiated the workspace's
+`authz_revision` is a **revocation epoch**: control advances it on every ACL
+change (`ws.acl`, including one that re-states the current ACL) and on every
+generation change, and refuses at once to mint a grant for a principal the new
+ACL excludes. The ACL is how a principal's access to a workspace is revoked;
+a deployment whose external authorizer withdraws a principal re-states the ACL
+to force every grant to re-verify. Nodes learn the revision on renew: `WSRenewReq.authz[id]` carries
+the revision the node currently enforces and `WSRenewResult.authz_revision`
+carries the authoritative one. When they differ the node adopts the new
+revision, so every outstanding grant minted under the old one fails the
+`authz_revision` check in §4, and the result also names the principals revoked
+since the node's revision in `revoked`. The node MUST end every live session of
+a named principal with `exit{reason: "revoked"}`; other principals' sessions
+continue and their clients fetch fresh grants transparently.
+
+Control retains the last 64 revocations per workspace (`Workspace.revocations`)
+and records the newest pruned revision as `revocation_floor`. A node whose
+known revision is below the floor receives `authz_reset: true` instead of a
+list and MUST end every session of the workspace; still-authorized principals
+reopen with fresh grants. Fail closed is the rule throughout: a node that
+cannot tell who was revoked revokes everyone.
+
+The latency bound is one renew interval. A node renews at no more than a third
+of the lease (§5), so with the default 30 s lease a revoked principal loses
+access to the node within 10 s and is refused a new grant immediately. A node
+that has not renewed within the lease is fenced anyway, so no revoked grant
+outlives the lease. An old node that ignores these fields is exactly the
+failure the capability names, which is why `isolated` and `multi_tenant`
+require it (§3.1).
+
 ## 5. Workspaces and the claim queue
 
 A workspace is a movable computer. Its lifecycle is a small state machine, and
@@ -263,6 +296,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `ws.move` | C | `WSMoveReq{id, requires?, placement?, idem}` → `Workspace` |
 | `ws.sleep` | C | `WSSleepReq{id, after_sec\|at\|on, idem}` → `Timer` |
 | `ws.wake` | C | `WSGetReq{id, idem}` → `Workspace` |
+| `ws.acl` | C | `WSACLReq{id, acl{readers, writers}, idem}` → `Workspace`; owner or admin only; replaces the ACL and advances `authz_revision` (§4.1) |
 | `grant` | C | `GrantReq{ws}` → `Grant` |
 | `node.list` | C | → `NodeListRes{nodes}` |
 | `timer.list` | C | → `TimerListRes{timers}` |
@@ -274,7 +308,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `events.post` | C N | `EventPost{events}` → `{}` |
 | `ws.claim` | N | `WSClaimReq{id}` → `WSClaimRes{workspace, lease_sec}` |
 | `ws.ready` | N | `WSReadyReq{id, gen}` → `{}` |
-| `ws.renew` | N | `WSRenewReq{ids, gen}` → `WSRenewRes{results}`; each result explicitly says continue/fence/destroy/reconcile |
+| `ws.renew` | N | `WSRenewReq{ids, gen, authz}` → `WSRenewRes{results}`; each result explicitly says continue/fence/destroy/reconcile and, for a continued lease, carries `authz_revision`, `revoked`, `authz_reset` (§4.1) |
 | `ws.released` | N | `WSReleasedReq{id, gen, snapshot, reason}` → `{}` |
 | `ws.snapshot.commit` | N | `WSSnapshotCommitReq{id, gen, snapshot}` → `{}` |
 | `binding.lease` | N | `BindingLeaseReq{ws}` → `BindingLeaseRes{leases}` |
@@ -408,7 +442,7 @@ ChunkBody { st: uint8, d: bytes }
 
 st = 1 stdout        the process wrote this
      2 stderr
-     3 exit          d is CBOR ExitInfo{code, signal, error}
+     3 exit          d is CBOR ExitInfo{code, signal, error, reason?}; reason "revoked" means the node ended it (§4.1)
      4 info          d is CBOR SessionInfo; always seq 0
      5 gap           d is CBOR Gap{from, to}; these seqs are gone forever
 ```
@@ -583,11 +617,17 @@ infer it from timestamps.
 Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `ws.claiming`, `ws.claimed`, `ws.released`, `ws.moved`, `ws.paused`,
 `ws.resumed`, `ws.snapshot`, `ws.restored`, `ws.destroyed`,
-`ws.lease_expired`, `s.opened`, `s.exited`, `fs.write`, `fs.edit`, `fs.remove`,
+`ws.lease_expired`, `ws.acl`, `authz.revoked`, `s.opened`, `s.exited`,
+`fs.write`, `fs.edit`, `fs.remove`,
 `cred.used`, `egress.allowed`, `egress.denied`, `timer.set`, `timer.fired`,
 `peer.gone`, `ws.fenced`, `ws.state_changed`, `event.producer_gap`,
 `fleet.quarantine.requested`, `fleet.quarantine.target`, and
 `fleet.quarantine.completed`.
+
+`ws.acl` records an ACL change with the new lists, the principals it revoked
+and the resulting `authz_revision`. `authz.revoked` is the node's record of
+acting on a pushed revision: the revision, the principals (or `reset`), and the
+sessions it closed.
 
 `cred.used` is the record of what a released credential bought. The node
 emits it once per released binding after the upstream outcome is known: the

@@ -87,6 +87,9 @@ const (
 	ActionWrite   = "write"
 	ActionAdmin   = "admin"
 	ActionExecute = "execute"
+	// ActionACL is changing who may use a resource. Only its owner or an
+	// administrator may do that; a writer may not widen or narrow the ACL.
+	ActionACL = "acl"
 )
 
 // StaticAuthenticator is useful for small deployments and integration tests.
@@ -1396,6 +1399,9 @@ func (c *Control) check(ctx context.Context, subject Subject, action string, res
 	if subject.ID == resource.Owner {
 		return nil
 	}
+	if action == ActionACL {
+		return proto.Err(proto.CodeDenied, "subject %s does not own %s %s", subject.ID, resource.Kind, resource.ID)
+	}
 	if action == ActionRead {
 		if contains(resource.Readers, subject.ID) || contains(resource.Writers, subject.ID) {
 			return nil
@@ -1499,6 +1505,15 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return c.wsWake(ctx, c.principalOf(f.From), req.ID, "", req.IdempotencyKey)
+	case proto.OpWSACL:
+		req, err := decode[proto.WSACLReq](f)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := c.authorizeWorkspace(ctx, f.From, req.ID, ActionACL); err != nil {
+			return nil, err
+		}
+		return c.wsACL(ctx, c.principalOf(f.From), req)
 	case proto.OpWSClaim:
 		if !c.isNode(f.From) {
 			return nil, proto.Err(proto.CodeUnauthorized, "only nodes claim")
@@ -2467,6 +2482,81 @@ func (c *Control) wsSleep(ctx context.Context, principal string, req *proto.WSSl
 	return &tcp, nil
 }
 
+// wsACL replaces the ACL and advances the authorization revision so every
+// outstanding grant stops verifying. Principals that lost access are recorded
+// so nodes learn whose sessions to close on their next renew; everyone else
+// simply fetches a fresh grant.
+func (c *Control) wsACL(ctx context.Context, principal string, req *proto.WSACLReq) (*proto.Workspace, error) {
+	for _, name := range append(append([]string(nil), req.ACL.Readers...), req.ACL.Writers...) {
+		if name == "" {
+			return nil, proto.Err(proto.CodeBadRequest, "acl entries must name a principal")
+		}
+	}
+	scope := principal + "|" + req.ID + "|workspace.acl"
+	unlockMutation := c.lockMutation(scope, req.IdempotencyKey)
+	defer unlockMutation()
+	var prior proto.Workspace
+	if hit, err := c.mutationLookup(scope, req.IdempotencyKey, proto.OpWSACL, req, &prior); err != nil {
+		return nil, err
+	} else if hit {
+		return &prior, nil
+	}
+	c.mu.Lock()
+	ws := c.workspaces[req.ID]
+	if ws == nil {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeNotFound, "workspace %s", req.ID)
+	}
+	if ws.State == proto.WSDestroyed {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace destroyed")
+	}
+	next := *ws
+	next.Spec.ACL = proto.WorkspaceACL{
+		Readers: append([]string(nil), req.ACL.Readers...),
+		Writers: append([]string(nil), req.ACL.Writers...),
+	}
+	next.AuthzRevision++
+	revoked := revokedPrincipals(ws.Spec.ACL, next.Spec.ACL, ws.Owner)
+	next.Revocations = append([]proto.AuthzRevocation(nil), ws.Revocations...)
+	for _, name := range revoked {
+		next.Revocations = append(next.Revocations, proto.AuthzRevocation{Revision: next.AuthzRevision, Principal: name})
+	}
+	for len(next.Revocations) > proto.MaxRetainedRevocations {
+		next.RevocationFloor = next.Revocations[0].Revision
+		next.Revocations = next.Revocations[1:]
+	}
+	payload := map[string]any{
+		"readers": next.Spec.ACL.Readers, "writers": next.Spec.ACL.Writers,
+		"revoked": revoked, "authz_revision": next.AuthzRevision,
+	}
+	if err := c.persistWorkspaceTimerAndMutation(&next, nil, scope, req.IdempotencyKey, proto.OpWSACL, req, &next,
+		c.wsEvent(&next, proto.EvWSACL, principal, "", payload)); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	*ws = next
+	result := next
+	c.mu.Unlock()
+	return &result, nil
+}
+
+// revokedPrincipals names the subjects that could use the workspace under
+// before and cannot under after. The owner never appears: ownership is not an
+// ACL entry.
+func revokedPrincipals(before, after proto.WorkspaceACL, owner string) []string {
+	var revoked []string
+	seen := map[string]bool{}
+	for _, name := range append(append([]string(nil), before.Readers...), before.Writers...) {
+		if name == owner || seen[name] || contains(after.Readers, name) || contains(after.Writers, name) {
+			continue
+		}
+		seen[name] = true
+		revoked = append(revoked, name)
+	}
+	return revoked
+}
+
 func (c *Control) wsWake(ctx context.Context, principal, id, timerID, idem string) (*proto.Workspace, error) {
 	unlock := c.lockLifecycle(id)
 	defer unlock()
@@ -2706,12 +2796,31 @@ func (c *Control) wsRenew(ctx context.Context, node string, req *proto.WSRenewRe
 		result.Accepted = true
 		result.LeaseUntil = until
 		result.Action = "continue"
+		result.AuthzRevision = ws.AuthzRevision
+		if known, ok := req.Authz[id]; ok && known < ws.AuthzRevision {
+			result.Revoked, result.AuthzReset = revokedSince(ws, known)
+		}
 		res.Results = append(res.Results, result)
 	}
 	if n := c.nodes[node]; n != nil {
 		n.Status.LastSeen = c.now().UnixMilli()
 	}
 	return res, nil
+}
+
+// revokedSince lists principals revoked after revision known, or reports a
+// reset when the retained history no longer reaches back that far.
+func revokedSince(ws *proto.Workspace, known uint64) ([]string, bool) {
+	if known < ws.RevocationFloor {
+		return nil, true
+	}
+	var revoked []string
+	for _, r := range ws.Revocations {
+		if r.Revision > known && !contains(revoked, r.Principal) {
+			revoked = append(revoked, r.Principal)
+		}
+	}
+	return revoked, false
 }
 
 func (c *Control) wsSnapshotCommit(ctx context.Context, node string, req *proto.WSSnapshotCommitReq) error {
