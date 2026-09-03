@@ -1,9 +1,11 @@
 package broker
 
 import (
+	"bufio"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,6 +84,16 @@ func (r *recorder) count(dec string) int {
 	}
 	return n
 }
+func (r *recorder) lastDecision(dec string) (Audit, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := len(r.ev) - 1; i >= 0; i-- {
+		if r.ev[i].Decision == dec {
+			return r.ev[i], true
+		}
+	}
+	return Audit{}, false
+}
 
 func start(t *testing.T, up *upstream, leases []proto.BindingLease, allow []string, rec *recorder) *Broker {
 	t.Helper()
@@ -122,8 +135,8 @@ func TestSubstitutesBearerForBoundHost(t *testing.T) {
 	if up.paths[0] != "/repos/x?y=1" {
 		t.Fatal(up.paths)
 	}
-	a := rec.last()
-	if a.Decision != DecisionSubstituted || a.Binding != "b_gh" || a.Status != 0 || a.WS != "ws_t" {
+	a, ok := rec.lastDecision(DecisionSubstituted)
+	if !ok || a.Binding != "b_gh" || a.Status != 0 || a.WS != "ws_t" || rec.last().Decision != DecisionAllowed {
 		t.Fatalf("%+v", a)
 	}
 	// Placeholder inside a Basic credential (git over HTTP).
@@ -288,7 +301,7 @@ func TestHostMatchAndEnvResolution(t *testing.T) {
 		{"API.GITHUB.COM", []string{"api.github.com"}, true},
 		{"127.0.0.1:8443", []string{"127.0.0.1:9443"}, false},
 		{"127.0.0.1:8443", []string{"127.0.0.1"}, true},
-		{"127.0.0.1", []string{"127.0.0.1:9443"}, true},
+		{"127.0.0.1", []string{"127.0.0.1:9443"}, false},
 	}
 	for _, c := range cases {
 		if hostMatches(c.host, c.pats) != c.want {
@@ -362,19 +375,21 @@ func TestBrokerRequiresWorkspaceCapability(t *testing.T) {
 	}
 }
 
-func TestExpiredBindingDoesNotAuthorizeConnect(t *testing.T) {
+func TestBindingDoesNotAuthorizeConnect(t *testing.T) {
 	up := newUpstream(t)
-	rec := &recorder{}
-	lease := proto.BindingLease{ID: "b_old", Destinations: []string{up.host}, ExpiresAt: time.Now().Add(-time.Second).UnixMilli()}
-	b := start(t, up, []proto.BindingLease{lease}, nil, rec)
-	proxyURL, _ := url.Parse(b.ProxyURL())
-	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL), TLSClientConfig: &tls.Config{RootCAs: up.pool()}}}
-	_, err := client.Get(up.srv.URL + "/expired")
-	if err == nil || !strings.Contains(err.Error(), "Forbidden") {
-		t.Fatalf("expected expired CONNECT rejection, got %v", err)
-	}
-	if rec.last().Decision != DecisionExpired {
-		t.Fatalf("audit=%+v", rec.last())
+	for _, expiresAt := range []int64{time.Now().Add(time.Hour).UnixMilli(), time.Now().Add(-time.Second).UnixMilli()} {
+		rec := &recorder{}
+		lease := proto.BindingLease{ID: "b_bound", Destinations: []string{up.host}, ExpiresAt: expiresAt}
+		b := start(t, up, []proto.BindingLease{lease}, nil, rec)
+		proxyURL, _ := url.Parse(b.ProxyURL())
+		client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL), TLSClientConfig: &tls.Config{RootCAs: up.pool()}}}
+		_, err := client.Get(up.srv.URL + "/binding-only")
+		if err == nil || !strings.Contains(err.Error(), "Forbidden") {
+			t.Fatalf("binding expiry=%d implicitly authorized CONNECT: %v", expiresAt, err)
+		}
+		if rec.last().Decision != DecisionDenied {
+			t.Fatalf("expiry=%d audit=%+v", expiresAt, rec.last())
+		}
 	}
 }
 
@@ -387,5 +402,405 @@ func TestCarrierGradeNATIsNonPublic(t *testing.T) {
 		if !isPrivate(ip) {
 			t.Errorf("%s was treated as public", raw)
 		}
+	}
+}
+
+func TestBodyBudgetArithmeticDoesNotOverflow(t *testing.T) {
+	maxInt64 := int64(^uint64(0) >> 1)
+	reader := &budgetReadCloser{ReadCloser: io.NopCloser(strings.NewReader("ok")), remaining: maxInt64}
+	got, err := io.ReadAll(reader)
+	if err != nil || string(got) != "ok" {
+		t.Fatalf("response reader=%q err=%v", got, err)
+	}
+	body, n, err := bufferRequestBody(io.NopCloser(strings.NewReader("ok")), maxInt64)
+	if err != nil || n != 2 {
+		t.Fatalf("request buffer bytes=%d err=%v", n, err)
+	}
+	defer body.Close()
+}
+
+func TestTypedEgressRuleEnforcesMethodPathPortAndRequestCount(t *testing.T) {
+	up := newUpstream(t)
+	rec := &recorder{}
+	parsed, err := url.Parse(up.srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rawPort, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := net.LookupPort("tcp", rawPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := New(Options{
+		WS: "ws_policy", Generation: 9, Principal: "agent", Allow: []string{"*"},
+		AllowPrivate: []string{"127.0.0.1"}, RootCAs: up.pool(), Audit: rec.add,
+		Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+			ID: "registry-read", Protocol: proto.EgressProtocolHTTPS,
+			Hosts: []string{"127.0.0.1"}, Ports: []uint16{uint16(port)},
+			Methods: []string{"GET"}, PathPrefixes: []string{"/v2/"}, MaxRequests: 2,
+			SharedState: proto.SharedStateImmutableRead,
+		}}},
+	})
+	if _, err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	resp, _ := get(t, DestURL(b.BaseURL(), up.host)+"/v2/one", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("allowed status=%d", resp.StatusCode)
+	}
+	req, _ := http.NewRequest(http.MethodPost, DestURL(b.BaseURL(), up.host)+"/v2/write", strings.NewReader("x"))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("method status=%d", resp.StatusCode)
+	}
+	resp, _ = get(t, DestURL(b.BaseURL(), up.host)+"/admin", nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("path status=%d", resp.StatusCode)
+	}
+	resp, _ = get(t, DestURL(b.BaseURL(), up.host)+"/v2/two", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second allowed status=%d", resp.StatusCode)
+	}
+	resp, _ = get(t, DestURL(b.BaseURL(), up.host)+"/v2/three", nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("limit status=%d", resp.StatusCode)
+	}
+	audit := rec.last()
+	if audit.Decision != DecisionLimitExceeded || audit.Rule != "registry-read" ||
+		audit.Generation != 9 || audit.Protocol != proto.EgressProtocolHTTPS ||
+		audit.SharedState != proto.SharedStateImmutableRead {
+		t.Fatalf("audit=%+v", audit)
+	}
+	up.mu.Lock()
+	seen := len(up.seen)
+	up.mu.Unlock()
+	if seen != 2 {
+		t.Fatalf("upstream requests=%d, want 2", seen)
+	}
+}
+
+func TestBrokerAdmissionIsBoundedPerWorkspace(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+		_, _ = io.WriteString(w, "done")
+	}))
+	defer upstream.Close()
+	parsed, _ := url.Parse(upstream.URL)
+	roots := x509.NewCertPool()
+	roots.AddCert(upstream.Certificate())
+	rec := &recorder{}
+	b := New(Options{
+		WS: "ws_bounded", MaxConnections: 4, MaxConcurrentRequests: 1,
+		AllowPrivate: []string{"127.0.0.1"}, RootCAs: roots, Audit: rec.add,
+		Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+			ID: "bounded", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{parsed.Host},
+			Methods: []string{"GET"},
+		}}},
+	})
+	if _, err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	firstDone := make(chan error, 1)
+	go func() {
+		resp, err := http.Get(DestURL(b.BaseURL(), parsed.Host) + "/first")
+		if err == nil {
+			_, err = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		firstDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not reach upstream")
+	}
+	resp, err := http.Get(DestURL(b.BaseURL(), parsed.Host) + "/second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests || rec.last().Decision != DecisionLimitExceeded {
+		t.Fatalf("overload status=%d audit=%+v", resp.StatusCode, rec.last())
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTypedEgressRuleEnforcesRequestAndResponseBytes(t *testing.T) {
+	var received atomic.Int64
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		received.Add(int64(len(body)))
+		if r.URL.Path == "/large" {
+			w.Header().Set("Content-Length", "8")
+			_, _ = io.WriteString(w, "12345678")
+			return
+		}
+		if r.URL.Path == "/chunked-large" {
+			_, _ = io.WriteString(w, "123")
+			w.(http.Flusher).Flush()
+			_, _ = io.WriteString(w, "45678")
+			return
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+	parsed, _ := url.Parse(srv.URL)
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+	rec := &recorder{}
+	b := New(Options{
+		WS: "ws_budget", Generation: 3, Principal: "agent", AllowPrivate: []string{"127.0.0.1"},
+		RootCAs: pool, Audit: rec.add,
+		Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+			ID: "bounded-api", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{parsed.Host},
+			Methods: []string{"GET", "POST"}, MaxRequestBytes: 4, MaxResponseBytes: 4,
+			SharedState: proto.SharedStateScopedWrite,
+		}}},
+	})
+	if _, err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	resp, err := http.Post(DestURL(b.BaseURL(), parsed.Host)+"/upload", "text/plain", strings.NewReader("12345"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge || received.Load() != 0 {
+		t.Fatalf("oversized request status=%d received=%d", resp.StatusCode, received.Load())
+	}
+	unknownLength := io.NopCloser(strings.NewReader("12345"))
+	req, err := http.NewRequest(http.MethodPost, DestURL(b.BaseURL(), parsed.Host)+"/upload", unknownLength)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = -1
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge || received.Load() != 0 {
+		t.Fatalf("chunked oversized request status=%d received=%d", resp.StatusCode, received.Load())
+	}
+	resp, err = http.Post(DestURL(b.BaseURL(), parsed.Host)+"/upload", "text/plain", strings.NewReader("1234"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || received.Load() != 4 {
+		t.Fatalf("bounded request status=%d received=%d", resp.StatusCode, received.Load())
+	}
+	resp, err = http.Get(DestURL(b.BaseURL(), parsed.Host) + "/large")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway || rec.last().Decision != DecisionLimitExceeded {
+		t.Fatalf("oversized response status=%d audit=%+v", resp.StatusCode, rec.last())
+	}
+	resp, err = http.Get(DestURL(b.BaseURL(), parsed.Host) + "/chunked-large")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if len(body) > 4 || readErr == nil || rec.last().Decision != DecisionLimitExceeded || rec.last().ResponseBytes != 5 {
+		t.Fatalf("chunked response status=%d body=%q read_err=%v audit=%+v", resp.StatusCode, body, readErr, rec.last())
+	}
+}
+
+func TestTypedPolicyRejectsPathAndAuthorityAmbiguity(t *testing.T) {
+	up := newUpstream(t)
+	b := New(Options{
+		WS: "ws_paths", AllowPrivate: []string{"127.0.0.1"}, RootCAs: up.pool(),
+		Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+			ID: "safe", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{up.host},
+			Methods: []string{"GET"}, PathPrefixes: []string{"/safe"},
+		}}},
+	})
+	if _, err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for rawURL, want := range map[string]int{
+		DestURL(b.BaseURL(), up.host) + "/safe/ok":                http.StatusOK,
+		DestURL(b.BaseURL(), up.host) + "/safe-but-not-a-segment": http.StatusForbidden,
+		DestURL(b.BaseURL(), up.host) + "/safe%252f..%252fadmin":  http.StatusBadRequest,
+		b.BaseURL() + "/d/user@" + up.host + "/safe":              http.StatusBadRequest,
+		b.BaseURL() + "/d/" + up.host + ":not-a-port/safe":        http.StatusBadRequest,
+	} {
+		resp, err := http.Get(rawURL)
+		if err != nil {
+			t.Fatalf("GET %s: %v", rawURL, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("GET %s status=%d want=%d", rawURL, resp.StatusCode, want)
+		}
+	}
+	up.mu.Lock()
+	paths := append([]string(nil), up.paths...)
+	up.mu.Unlock()
+	if len(paths) != 1 || paths[0] != "/safe/ok" {
+		t.Fatalf("ambiguous request reached upstream: %v", paths)
+	}
+}
+
+func TestSuspendingBrokerClosesEstablishedConnectTunnels(t *testing.T) {
+	up := newUpstream(t)
+	b := start(t, up, nil, []string{up.host}, &recorder{})
+	conn, err := net.Dial("tcp", b.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	auth := base64.StdEncoding.EncodeToString([]byte(b.token + ":"))
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: Basic %s\r\n\r\n", up.host, up.host, auth); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	status, err := reader.ReadString('\n')
+	if err != nil || !strings.Contains(status, " 200 ") {
+		t.Fatalf("CONNECT status=%q err=%v", status, err)
+	}
+	for {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	b.Suspend()
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ReadByte(); err == nil {
+		t.Fatal("CONNECT tunnel remained readable after broker suspension")
+	}
+	b.mu.RLock()
+	remaining := len(b.tunnels)
+	b.mu.RUnlock()
+	if remaining != 0 {
+		t.Fatalf("tracked tunnels after suspension=%d", remaining)
+	}
+}
+
+func TestTypedConnectRequiresExplicitConnectCapability(t *testing.T) {
+	up := newUpstream(t)
+	startBroker := func(policy proto.NetworkPolicy) *Broker {
+		b := New(Options{
+			WS: "ws_connect", Generation: 1, Network: policy, Allow: []string{"*"},
+			AllowPrivate: []string{"127.0.0.1"}, RootCAs: up.pool(),
+		})
+		if _, err := b.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = b.Close() })
+		return b
+	}
+	allowed := startBroker(proto.NetworkPolicy{Rules: []proto.EgressRule{{
+		ID: "tls-tunnel", Protocol: proto.EgressProtocolConnect, Hosts: []string{up.host},
+		Methods: []string{"CONNECT"}, SharedState: proto.SharedStateNone,
+	}}})
+	proxyURL, _ := url.Parse(allowed.ProxyURL())
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL), TLSClientConfig: &tls.Config{RootCAs: up.pool()}}}
+	resp, err := client.Get(up.srv.URL + "/explicit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	denied := startBroker(proto.NetworkPolicy{Rules: []proto.EgressRule{{
+		ID: "reverse-only", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{up.host},
+	}}})
+	proxyURL, _ = url.Parse(denied.ProxyURL())
+	client = &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL), TLSClientConfig: &tls.Config{RootCAs: up.pool()}}}
+	if _, err := client.Get(up.srv.URL + "/implicit"); err == nil || !strings.Contains(err.Error(), "Forbidden") {
+		t.Fatalf("HTTPS rule implicitly authorized CONNECT: %v", err)
+	}
+}
+
+func TestBrokerRejectsUnenforceablePolicyBeforeListening(t *testing.T) {
+	b := New(Options{Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+		ID: "bad-tunnel", Protocol: proto.EgressProtocolConnect, Hosts: []string{"example.com"},
+		MaxResponseBytes: 10,
+	}}}})
+	if _, err := b.Start(); err == nil {
+		t.Fatal("broker accepted byte-limited opaque CONNECT rule")
+	}
+	if b.ln != nil {
+		t.Fatal("broker listened before validating policy")
+	}
+}
+
+func TestReverseProxyRedirectsAreRewrittenAndReauthorized(t *testing.T) {
+	var escapedHits atomic.Int32
+	escaped := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		escapedHits.Add(1)
+	}))
+	defer escaped.Close()
+	upstreamTLS := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, escaped.URL+"/exfil", http.StatusFound)
+	}))
+	defer upstreamTLS.Close()
+	upstreamURL, _ := url.Parse(upstreamTLS.URL)
+	pool := x509.NewCertPool()
+	pool.AddCert(upstreamTLS.Certificate())
+	rec := &recorder{}
+	b := New(Options{
+		WS: "ws_redirect", Generation: 5, Allow: []string{"*"}, AllowPrivate: []string{"127.0.0.1"},
+		RootCAs: pool, Audit: rec.add,
+		Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+			ID: "one-hop", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{upstreamURL.Host},
+			Methods: []string{"GET"}, PathPrefixes: []string{"/start"},
+		}}},
+	})
+	if _, err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	resp, err := http.Get(DestURL(b.BaseURL(), upstreamURL.Host) + "/start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden || escapedHits.Load() != 0 {
+		t.Fatalf("redirect status=%d escaped_hits=%d", resp.StatusCode, escapedHits.Load())
+	}
+	if audit := rec.last(); audit.Decision != DecisionDenied || audit.Generation != 5 ||
+		!strings.Contains(audit.Reason, "no typed egress rule") {
+		t.Fatalf("redirect audit=%+v", audit)
 	}
 }

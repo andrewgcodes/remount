@@ -18,6 +18,7 @@
 package broker
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -32,6 +33,7 @@ import (
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
+	pathpkg "path"
 	"sort"
 	"strconv"
 	"strings"
@@ -50,27 +52,36 @@ const (
 	DecisionLeakBlocked     = "leak_blocked"    // placeholder aimed at a foreign host
 	DecisionExpired         = "expired"         // lease TTL passed; fail closed
 	DecisionUnauthenticated = "unauthenticated" // caller lacks this workspace broker's capability
+	DecisionLimitExceeded   = "limit_exceeded"  // a typed rule exhausted its request or byte budget
 )
 
 // Audit is one broker decision.
 type Audit struct {
-	At        time.Time
-	WS        string
-	Principal string
-	Decision  string
-	Binding   string // binding id when a placeholder was involved
-	Host      string
-	Method    string
-	Path      string
-	Reason    string
-	Status    int // upstream status when known
+	At            time.Time
+	WS            string
+	Generation    uint64
+	Principal     string
+	Decision      string
+	Binding       string // binding id when a placeholder was involved
+	Rule          string // typed egress rule id when policy selected one
+	Protocol      string
+	SharedState   string
+	Host          string
+	Method        string
+	Path          string
+	Reason        string
+	Status        int // upstream status when known
+	RequestBytes  int64
+	ResponseBytes int64
 }
 
 // Options configure a per-workspace broker.
 type Options struct {
-	WS        string
-	Principal string
-	Leases    []proto.BindingLease
+	WS         string
+	Generation uint64
+	Principal  string
+	Leases     []proto.BindingLease
+	Network    proto.NetworkPolicy
 	// Allow lists hosts reachable without any credential. Patterns: exact
 	// host, "*.suffix" (subdomains only), optional ":port".
 	Allow []string
@@ -86,25 +97,104 @@ type Options struct {
 	// AdvertiseHost overrides the host placed in workspace URLs while keeping
 	// the selected listener port (for example host.docker.internal).
 	AdvertiseHost string
+	// MaxConnections bounds accepted client sockets for this workspace. Zero
+	// selects 128. MaxConcurrentRequests similarly defaults to 64 and includes
+	// the full lifetime of CONNECT tunnels and streaming responses.
+	MaxConnections        int
+	MaxConcurrentRequests int
 }
 
 // Broker serves one workspace.
 type Broker struct {
-	opts      Options
-	mu        sync.RWMutex
-	leases    []proto.BindingLease
-	srv       *http.Server
-	ln        net.Listener
-	base      string
-	proxyBase string
-	token     string
-	client    *http.Transport
-	suspended bool
+	opts         Options
+	mu           sync.RWMutex
+	leases       []proto.BindingLease
+	srv          *http.Server
+	ln           net.Listener
+	base         string
+	proxyBase    string
+	token        string
+	client       *http.Transport
+	suspended    bool
+	ruleRequests map[string]int64
+	tunnels      map[*brokerTunnel]struct{}
+	requestSlots chan struct{}
+}
+
+type brokerTunnel struct {
+	downstream net.Conn
+	upstream   net.Conn
+}
+
+type limitedListener struct {
+	net.Listener
+	slots chan struct{}
+	done  chan struct{}
+	once  sync.Once
+}
+
+type limitedConn struct {
+	net.Conn
+	release func()
+	once    sync.Once
+}
+
+func (l *limitedListener) Accept() (net.Conn, error) {
+	select {
+	case l.slots <- struct{}{}:
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		<-l.slots
+		return nil, err
+	}
+	return &limitedConn{Conn: conn, release: func() { <-l.slots }}, nil
+}
+
+func (l *limitedListener) Close() error {
+	l.once.Do(func() { close(l.done) })
+	return l.Listener.Close()
+}
+
+func (c *limitedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
+}
+
+func cloneLeases(leases []proto.BindingLease) []proto.BindingLease {
+	out := append([]proto.BindingLease(nil), leases...)
+	for i := range out {
+		out[i].Destinations = append([]string(nil), out[i].Destinations...)
+	}
+	return out
 }
 
 // New builds a broker; call Start to listen.
 func New(opts Options) *Broker {
-	b := &Broker{opts: opts, leases: opts.Leases}
+	if opts.MaxConnections <= 0 {
+		opts.MaxConnections = 128
+	}
+	if opts.MaxConcurrentRequests <= 0 {
+		opts.MaxConcurrentRequests = 64
+	}
+	opts.Leases = cloneLeases(opts.Leases)
+	opts.Allow = append([]string(nil), opts.Allow...)
+	opts.AllowPrivate = append([]string(nil), opts.AllowPrivate...)
+	opts.Network.Rules = append([]proto.EgressRule(nil), opts.Network.Rules...)
+	for i := range opts.Network.Rules {
+		rule := &opts.Network.Rules[i]
+		rule.Hosts = append([]string(nil), rule.Hosts...)
+		rule.Ports = append([]uint16(nil), rule.Ports...)
+		rule.Methods = append([]string(nil), rule.Methods...)
+		rule.PathPrefixes = append([]string(nil), rule.PathPrefixes...)
+	}
+	b := &Broker{
+		opts: opts, leases: cloneLeases(opts.Leases), ruleRequests: map[string]int64{},
+		tunnels: map[*brokerTunnel]struct{}{}, requestSlots: make(chan struct{}, opts.MaxConcurrentRequests),
+	}
 	dialer := &net.Dialer{Timeout: 15 * time.Second, Control: nil}
 	b.client = &http.Transport{
 		Proxy: nil, // never chain through an ambient proxy
@@ -114,6 +204,8 @@ func New(opts Options) *Broker {
 		TLSClientConfig:       &tls.Config{RootCAs: opts.RootCAs, MinVersion: tls.VersionTLS12},
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   16,
+		MaxConnsPerHost:       opts.MaxConcurrentRequests,
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 5 * time.Minute, // LLM streaming responses can take a while to start
@@ -124,6 +216,18 @@ func New(opts Options) *Broker {
 
 // Start listens and returns the base URL (http://127.0.0.1:PORT).
 func (b *Broker) Start() (string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.ln != nil {
+		return "", errors.New("broker: already started")
+	}
+	security, err := proto.NormalizeSecurity(proto.SecuritySpec{
+		Profile: proto.SecurityLocal, Network: b.opts.Network,
+	})
+	if err != nil {
+		return "", fmt.Errorf("broker: network policy: %w", err)
+	}
+	b.opts.Network = security.Network
 	addr := b.opts.Listen
 	if addr == "" {
 		addr = "127.0.0.1:0"
@@ -137,7 +241,10 @@ func (b *Broker) Start() (string, error) {
 		_ = ln.Close()
 		return "", err
 	}
-	b.ln = ln
+	limited := &limitedListener{
+		Listener: ln, slots: make(chan struct{}, b.opts.MaxConnections), done: make(chan struct{}),
+	}
+	b.ln = limited
 	b.token = base64.RawURLEncoding.EncodeToString(token)
 	advertised := ln.Addr().String()
 	if b.opts.AdvertiseHost != "" {
@@ -152,8 +259,11 @@ func (b *Broker) Start() (string, error) {
 	b.base = raw + "/c/" + b.token
 	proxyURL := &url.URL{Scheme: "http", Host: advertised, User: url.User(b.token)}
 	b.proxyBase = proxyURL.String()
-	b.srv = &http.Server{Handler: b, ReadHeaderTimeout: 30 * time.Second}
-	go func() { _ = b.srv.Serve(ln) }()
+	b.srv = &http.Server{
+		Handler: b, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute,
+		MaxHeaderBytes: 1 << 20,
+	}
+	go func() { _ = b.srv.Serve(limited) }()
 	return b.base, nil
 }
 
@@ -166,12 +276,18 @@ func (b *Broker) ProxyURL() string { return b.proxyBase }
 
 // Close stops the listener.
 func (b *Broker) Close() error {
-	if b.srv == nil {
+	b.mu.Lock()
+	srv := b.srv
+	tunnels := b.takeTunnelsLocked()
+	b.suspended = true
+	b.mu.Unlock()
+	closeBrokerTunnels(tunnels)
+	if srv == nil {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	err := b.srv.Shutdown(ctx)
+	err := srv.Shutdown(ctx)
 	b.client.CloseIdleConnections()
 	return err
 }
@@ -179,7 +295,7 @@ func (b *Broker) Close() error {
 // SetLeases replaces the binding leases (renewal).
 func (b *Broker) SetLeases(leases []proto.BindingLease) {
 	b.mu.Lock()
-	b.leases = leases
+	b.leases = cloneLeases(leases)
 	b.mu.Unlock()
 }
 
@@ -188,13 +304,31 @@ func (b *Broker) SetLeases(leases []proto.BindingLease) {
 func (b *Broker) Suspend() {
 	b.mu.Lock()
 	b.suspended = true
+	tunnels := b.takeTunnelsLocked()
 	b.mu.Unlock()
+	closeBrokerTunnels(tunnels)
 }
 
 func (b *Broker) Resume() {
 	b.mu.Lock()
 	b.suspended = false
 	b.mu.Unlock()
+}
+
+func (b *Broker) takeTunnelsLocked() []*brokerTunnel {
+	tunnels := make([]*brokerTunnel, 0, len(b.tunnels))
+	for tunnel := range b.tunnels {
+		tunnels = append(tunnels, tunnel)
+		delete(b.tunnels, tunnel)
+	}
+	return tunnels
+}
+
+func closeBrokerTunnels(tunnels []*brokerTunnel) {
+	for _, tunnel := range tunnels {
+		_ = tunnel.downstream.Close()
+		_ = tunnel.upstream.Close()
+	}
 }
 
 // Placeholder is the string a workspace holds for a binding.
@@ -224,11 +358,23 @@ func (b *Broker) EnvFor() []string {
 // ---------------------------------------------------------------------------
 
 func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	select {
+	case b.requestSlots <- struct{}{}:
+		defer func() { <-b.requestSlots }()
+	default:
+		audit := b.auditFor(r.Method, "", r.Host, r.URL.Path)
+		audit.Decision, audit.Reason = DecisionLimitExceeded, "concurrent request limit exhausted"
+		b.emit(audit)
+		http.Error(w, "remount broker: concurrent request limit exhausted", http.StatusTooManyRequests)
+		return
+	}
 	b.mu.RLock()
 	suspended := b.suspended
 	b.mu.RUnlock()
 	if suspended {
-		b.emit(Audit{At: time.Now(), WS: b.opts.WS, Principal: b.opts.Principal, Decision: DecisionDenied, Method: r.Method, Path: r.URL.Path, Reason: "workspace is quiesced"})
+		audit := b.auditFor(r.Method, "", r.Host, r.URL.Path)
+		audit.Decision, audit.Reason = DecisionDenied, "workspace is quiesced"
+		b.emit(audit)
 		http.Error(w, "remount broker: workspace is quiesced", http.StatusServiceUnavailable)
 		return
 	}
@@ -242,11 +388,22 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.rejectUnauthenticated(w, r, false)
 		return
 	}
+	if b.typedPolicyEnabled() && ambiguousPolicyPath(r.URL.EscapedPath()) {
+		audit := b.auditFor(r.Method, "", r.Host, r.URL.Path)
+		audit.Decision, audit.Reason = DecisionDenied, "ambiguous encoded path is not permitted by typed policy"
+		b.emit(audit)
+		http.Error(w, "remount broker: ambiguous encoded path", http.StatusBadRequest)
+		return
+	}
 	switch {
 	case r.Method == http.MethodConnect:
 		b.handleConnect(w, r)
 	case r.URL.IsAbs():
 		// Forward-proxy form: GET http://host/path
+		if r.URL.User != nil {
+			http.Error(w, "remount broker: destination userinfo is not permitted", http.StatusBadRequest)
+			return
+		}
 		b.proxy(w, r, r.URL.Scheme, r.URL.Host, r.URL.Path, r.URL.RawQuery)
 	case strings.HasPrefix(r.URL.Path, "/d/"):
 		host, rest := splitDest(strings.TrimPrefix(r.URL.Path, "/d/"))
@@ -260,6 +417,17 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "remount broker: use /d/<host>/<path>, /http/<host>/<path>, or HTTP proxy mode", http.StatusNotFound)
 	}
+}
+
+func (b *Broker) typedPolicyEnabled() bool {
+	return b.opts.Network.Default != "" || len(b.opts.Network.Rules) != 0
+}
+
+func ambiguousPolicyPath(escapedPath string) bool {
+	escapedPath = strings.ToLower(escapedPath)
+	return strings.Contains(escapedPath, "\\") || strings.Contains(escapedPath, "%2f") ||
+		strings.Contains(escapedPath, "%5c") || strings.Contains(escapedPath, "%2e") ||
+		strings.Contains(escapedPath, "%25")
 }
 
 func (b *Broker) consumeCapabilityPath(r *http.Request) bool {
@@ -293,11 +461,9 @@ func (b *Broker) validProxyAuthorization(value string) bool {
 }
 
 func (b *Broker) rejectUnauthenticated(w http.ResponseWriter, r *http.Request, proxyRequest bool) {
-	audit := Audit{
-		At: time.Now(), WS: b.opts.WS, Principal: b.opts.Principal,
-		Decision: DecisionUnauthenticated, Host: r.Host, Method: r.Method, Path: r.URL.Path,
-		Reason: "workspace broker capability missing or invalid",
-	}
+	audit := b.auditFor(r.Method, "", r.Host, r.URL.Path)
+	audit.Decision = DecisionUnauthenticated
+	audit.Reason = "workspace broker capability missing or invalid"
 	b.emit(audit)
 	if proxyRequest {
 		w.Header().Set("Proxy-Authenticate", `Basic realm="remount"`)
@@ -315,15 +481,283 @@ func splitDest(p string) (host, rest string) {
 	return p[:i], p[i:]
 }
 
+func (b *Broker) auditFor(method, protocol, host, requestPath string) Audit {
+	return Audit{
+		At: time.Now(), WS: b.opts.WS, Generation: b.opts.Generation, Principal: b.opts.Principal,
+		Host: host, Method: strings.ToUpper(method), Protocol: protocol, Path: requestPath,
+	}
+}
+
+type policyAuthorization struct {
+	enabled bool
+	allowed bool
+	rule    proto.EgressRule
+	reason  string
+}
+
+var errResponseLimit = errors.New("response body exceeds rule limit")
+
+type budgetReadCloser struct {
+	io.ReadCloser
+	remaining  int64
+	exceeded   bool
+	onExceeded func()
+	once       sync.Once
+}
+
+func (r *budgetReadCloser) notifyExceeded() {
+	if r.onExceeded != nil {
+		r.once.Do(r.onExceeded)
+	}
+}
+
+func (r *budgetReadCloser) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.exceeded {
+		return 0, errResponseLimit
+	}
+	if r.remaining == 0 {
+		var probe [1]byte
+		n, err := r.ReadCloser.Read(probe[:])
+		if n == 0 {
+			return 0, err
+		}
+		r.exceeded = true
+		r.notifyExceeded()
+		return 0, errResponseLimit
+	}
+	limit := len(p)
+	if int64(limit) > r.remaining {
+		// The branch proves remaining < len(p), so +1 and int conversion
+		// cannot overflow even when a policy uses math.MaxInt64.
+		limit = int(r.remaining) + 1
+	}
+	n, err := r.ReadCloser.Read(p[:limit])
+	if int64(n) <= r.remaining {
+		r.remaining -= int64(n)
+		return n, err
+	}
+	allowed := int(r.remaining)
+	r.remaining = 0
+	r.exceeded = true
+	r.notifyExceeded()
+	if allowed == 0 {
+		return 0, errResponseLimit
+	}
+	return allowed, nil
+}
+
+func bufferRequestBody(body io.ReadCloser, limit int64) (io.ReadCloser, int64, error) {
+	if body == nil || body == http.NoBody {
+		return http.NoBody, 0, nil
+	}
+	defer body.Close()
+	var buffered bytes.Buffer
+	probeLimit := limit
+	if limit < int64(^uint64(0)>>1) {
+		probeLimit++
+	}
+	n, err := io.Copy(&buffered, io.LimitReader(body, probeLimit))
+	if err != nil {
+		return nil, n, err
+	}
+	if n > limit {
+		return nil, n, errRequestLimit
+	}
+	return io.NopCloser(bytes.NewReader(buffered.Bytes())), n, nil
+}
+
+var errRequestLimit = errors.New("request body exceeds rule limit")
+
+// authorizePolicy evaluates rules in declaration order and consumes a rule's
+// request budget atomically. An explicit typed policy replaces the legacy
+// node allow-list decision; it never falls through to that broader mechanism.
+func (b *Broker) authorizePolicy(protocol, host, method, requestPath string) policyAuthorization {
+	policy := b.opts.Network
+	if policy.Default == "" && len(policy.Rules) == 0 {
+		return policyAuthorization{}
+	}
+	authorization := policyAuthorization{enabled: true}
+	method = strings.ToUpper(method)
+	requestPath = pathpkg.Clean("/" + strings.TrimPrefix(requestPath, "/"))
+	port, portOK := destinationPort(host, protocol)
+	for _, rule := range policy.Rules {
+		if rule.Protocol != protocol || !hostMatches(host, rule.Hosts) || !portOK ||
+			!containsPort(rule.Ports, port) || !containsStringFold(rule.Methods, method) ||
+			!pathPrefixMatches(requestPath, rule.PathPrefixes) {
+			continue
+		}
+		authorization.rule = rule
+		if rule.SharedState == proto.SharedStateImmutableRead && method != http.MethodGet && method != http.MethodHead {
+			authorization.reason = "immutable-read capability forbids mutating method"
+			return authorization
+		}
+		b.mu.Lock()
+		used := b.ruleRequests[rule.ID]
+		if rule.MaxRequests > 0 && used >= rule.MaxRequests {
+			b.mu.Unlock()
+			authorization.reason = "request limit exhausted"
+			return authorization
+		}
+		b.ruleRequests[rule.ID] = used + 1
+		b.mu.Unlock()
+		authorization.allowed = true
+		return authorization
+	}
+	if policy.Default == proto.NetworkDefaultAllow {
+		authorization.allowed = true
+		return authorization
+	}
+	authorization.reason = "no typed egress rule matched"
+	return authorization
+}
+
+func destinationPort(host, protocol string) (uint16, bool) {
+	if _, rawPort, err := net.SplitHostPort(host); err == nil {
+		port, err := strconv.ParseUint(rawPort, 10, 16)
+		return uint16(port), err == nil && port != 0
+	}
+	switch protocol {
+	case proto.EgressProtocolHTTP:
+		return 80, true
+	case proto.EgressProtocolHTTPS, proto.EgressProtocolConnect:
+		return 443, true
+	default:
+		return 0, false
+	}
+}
+
+// normalizeAuthority returns a lower-case, explicit host:port authority. It
+// rejects userinfo, Unicode and malformed/ambiguous port spellings before the
+// same value is used for both policy matching and the outbound dial.
+func normalizeAuthority(raw, protocol string) (string, error) {
+	if raw == "" || raw != strings.TrimSpace(raw) || strings.ContainsAny(raw, "/?#@\\\x00\t\r\n ") {
+		return "", errors.New("invalid destination authority")
+	}
+	for _, r := range raw {
+		if r > 0x7f {
+			return "", errors.New("destination authority must be ASCII")
+		}
+	}
+	host, rawPort := raw, ""
+	if splitHost, splitPort, err := net.SplitHostPort(raw); err == nil {
+		host, rawPort = splitHost, splitPort
+	} else {
+		if strings.HasPrefix(raw, "[") {
+			if !strings.HasSuffix(raw, "]") {
+				return "", errors.New("invalid bracketed destination authority")
+			}
+			host = strings.TrimSuffix(strings.TrimPrefix(raw, "["), "]")
+		} else if strings.Count(raw, ":") == 1 {
+			return "", errors.New("destination port must be numeric")
+		}
+	}
+	if strings.HasSuffix(raw, ":") && rawPort == "" {
+		return "", errors.New("destination port must not be empty")
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if !validDestinationHost(host) {
+		return "", errors.New("invalid destination host")
+	}
+	if rawPort == "" {
+		port, ok := destinationPort(host, protocol)
+		if !ok {
+			return "", errors.New("destination has no valid port")
+		}
+		rawPort = strconv.Itoa(int(port))
+	} else {
+		port, err := strconv.ParseUint(rawPort, 10, 16)
+		if err != nil || port == 0 {
+			return "", errors.New("destination port must be between 1 and 65535")
+		}
+		rawPort = strconv.FormatUint(port, 10)
+	}
+	return net.JoinHostPort(host, rawPort), nil
+}
+
+func validDestinationHost(host string) bool {
+	if host == "" || strings.Contains(host, "%") {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return true
+	}
+	if len(host) > 253 || strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' && r != '_' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func containsPort(ports []uint16, port uint16) bool {
+	if len(ports) == 0 {
+		return true
+	}
+	for _, candidate := range ports {
+		if candidate == port {
+			return true
+		}
+	}
+	return false
+}
+
+func containsStringFold(values []string, value string) bool {
+	if len(values) == 0 {
+		return true
+	}
+	for _, candidate := range values {
+		if strings.EqualFold(candidate, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathPrefixMatches(requestPath string, prefixes []string) bool {
+	if len(prefixes) == 0 {
+		return true
+	}
+	for _, prefix := range prefixes {
+		if prefix == "/" || requestPath == prefix ||
+			(strings.HasSuffix(prefix, "/") && strings.HasPrefix(requestPath, prefix)) ||
+			strings.HasPrefix(requestPath, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // proxy rewrites and forwards one request.
 func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, path, query string) {
 	scheme = strings.ToLower(scheme)
-	host = strings.ToLower(host)
-	if host == "" || (scheme != "http" && scheme != "https") {
+	audit := b.auditFor(r.Method, scheme, host, path)
+	if scheme != proto.EgressProtocolHTTP && scheme != proto.EgressProtocolHTTPS {
+		audit.Decision, audit.Reason = DecisionDenied, "invalid destination scheme"
+		b.emit(audit)
 		http.Error(w, "remount broker: invalid destination", http.StatusBadRequest)
 		return
 	}
-	audit := Audit{At: time.Now(), WS: b.opts.WS, Principal: b.opts.Principal, Host: host, Method: r.Method, Path: path}
+	authority, err := normalizeAuthority(host, scheme)
+	if err != nil {
+		audit.Decision, audit.Reason = DecisionDenied, err.Error()
+		b.emit(audit)
+		http.Error(w, "remount broker: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	host = authority
+	matchHost := authority
+	audit.Host = authority
 	b.mu.RLock()
 	leases := append([]proto.BindingLease(nil), b.leases...)
 	b.mu.RUnlock()
@@ -342,7 +776,7 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 				if !containsToken(plain, ph) {
 					continue
 				}
-				if !hostMatches(host, l.Destinations) {
+				if !hostMatches(matchHost, l.Destinations) {
 					audit.Decision, audit.Binding, audit.Reason = DecisionLeakBlocked, l.ID, "placeholder for "+l.ID+" sent to "+host
 					b.emit(audit)
 					http.Error(w, "remount broker: credential "+l.ID+" is not bound to "+host, http.StatusForbidden)
@@ -373,13 +807,59 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 		}
 		r.Header[name] = vals
 	}
-	// 2. Destination policy: a used binding permits its host; otherwise the allow list must.
-	allowed := len(used) > 0 || hostMatches(host, b.opts.Allow)
+	// 2. Destination policy. Typed workspace rules replace the legacy
+	// binding/node allow-list decision and are evaluated on every request.
+	policy := b.authorizePolicy(scheme, matchHost, r.Method, path)
+	if policy.rule.ID != "" {
+		audit.Rule = policy.rule.ID
+		audit.SharedState = policy.rule.SharedState
+	}
+	if policy.enabled && !policy.allowed {
+		audit.Decision, audit.Reason = DecisionDenied, policy.reason
+		status := http.StatusForbidden
+		if policy.reason == "request limit exhausted" {
+			audit.Decision = DecisionLimitExceeded
+			status = http.StatusTooManyRequests
+		}
+		b.emit(audit)
+		http.Error(w, "remount broker: "+policy.reason, status)
+		return
+	}
+	allowed := policy.allowed
+	if !policy.enabled {
+		allowed = len(used) > 0 || hostMatches(matchHost, b.opts.Allow)
+	}
 	if !allowed {
 		audit.Decision, audit.Reason = DecisionDenied, "destination not in bindings or allow list"
 		b.emit(audit)
 		http.Error(w, "remount broker: egress to "+host+" is not permitted for this workspace", http.StatusForbidden)
 		return
+	}
+	if policy.rule.MaxRequestBytes > 0 {
+		if r.ContentLength > policy.rule.MaxRequestBytes {
+			audit.RequestBytes = r.ContentLength
+			audit.Decision, audit.Reason = DecisionLimitExceeded, "request body exceeds rule limit"
+			b.emit(audit)
+			http.Error(w, "remount broker: request body exceeds rule limit", http.StatusRequestEntityTooLarge)
+			return
+		}
+		body, bodyBytes, bodyErr := bufferRequestBody(r.Body, policy.rule.MaxRequestBytes)
+		audit.RequestBytes = bodyBytes
+		if bodyErr != nil {
+			if errors.Is(bodyErr, errRequestLimit) {
+				audit.Decision, audit.Reason = DecisionLimitExceeded, errRequestLimit.Error()
+				b.emit(audit)
+				http.Error(w, "remount broker: "+errRequestLimit.Error(), http.StatusRequestEntityTooLarge)
+				return
+			}
+			audit.Decision, audit.Reason = DecisionDenied, "read request body: "+bodyErr.Error()
+			b.emit(audit)
+			http.Error(w, "remount broker: invalid request body", http.StatusBadRequest)
+			return
+		}
+		r.Body = body
+		r.ContentLength = bodyBytes
+		r.GetBody = nil
 	}
 	// Record credential release before attempting outbound I/O. An upstream
 	// reset or a cancelled workspace request cannot erase this forensic fact.
@@ -389,7 +869,7 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 		b.emit(a)
 	}
 	// 3. Forward.
-	target := &url.URL{Scheme: scheme, Host: host}
+	target := &url.URL{Scheme: scheme, Host: authority}
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme = target.Scheme
@@ -408,57 +888,122 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 		Transport:     b.client,
 		FlushInterval: -1, // stream SSE / chunked LLM responses immediately
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			audit.Decision, audit.Reason, audit.Status = DecisionDenied, "upstream: "+err.Error(), http.StatusBadGateway
-			b.emit(audit)
-			http.Error(w, "remount broker: upstream error: "+err.Error(), http.StatusBadGateway)
+			emit := true
+			if errors.Is(err, errResponseLimit) {
+				audit.Decision, audit.Reason, audit.Status = DecisionLimitExceeded, errResponseLimit.Error(), http.StatusBadGateway
+				emit = false // ModifyResponse recorded the rejected response.
+			} else {
+				audit.Decision, audit.Reason, audit.Status = DecisionDenied, "upstream: "+err.Error(), http.StatusBadGateway
+			}
+			if emit {
+				b.emit(audit)
+			}
+			http.Error(w, "remount broker: "+audit.Reason, audit.Status)
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			audit.Status = resp.StatusCode
-			if len(used) == 0 {
-				a := audit
-				a.Decision = DecisionAllowed
-				b.emit(a)
+			if err := b.rewriteRedirect(resp); err != nil {
+				audit.Decision, audit.Reason = DecisionDenied, err.Error()
+				b.emit(audit)
+				return err
 			}
+			if policy.rule.MaxResponseBytes > 0 {
+				audit.ResponseBytes = resp.ContentLength
+				if resp.ContentLength > policy.rule.MaxResponseBytes {
+					resp.Body.Close()
+					audit.Decision, audit.Reason = DecisionLimitExceeded, "response body exceeds rule limit"
+					b.emit(audit)
+					return errResponseLimit
+				}
+				resp.Body = &budgetReadCloser{
+					ReadCloser: resp.Body, remaining: policy.rule.MaxResponseBytes,
+					onExceeded: func() {
+						a := audit
+						a.Decision, a.Reason = DecisionLimitExceeded, "response body exceeds rule limit"
+						a.ResponseBytes = policy.rule.MaxResponseBytes + 1
+						b.emit(a)
+					},
+				}
+			}
+			a := audit
+			a.Decision = DecisionAllowed
+			b.emit(a)
 			return nil
 		},
 	}
 	rp.ServeHTTP(w, r)
 }
 
+// rewriteRedirect keeps every hop on the capability-bearing broker URL. An
+// absolute or scheme-relative Location would otherwise let a reverse-proxy
+// client follow the next hop directly and skip destination policy.
+func (b *Broker) rewriteRedirect(resp *http.Response) error {
+	if resp.StatusCode < 300 || resp.StatusCode >= 400 || resp.Header.Get("Location") == "" {
+		return nil
+	}
+	destination, err := resp.Location()
+	if err != nil {
+		return fmt.Errorf("invalid upstream redirect: %w", err)
+	}
+	if destination.Scheme != "http" && destination.Scheme != "https" {
+		return fmt.Errorf("upstream redirect uses unsupported scheme %q", destination.Scheme)
+	}
+	if destination.Host == "" || destination.User != nil {
+		return errors.New("upstream redirect has an invalid authority")
+	}
+	prefix := "/d/"
+	if destination.Scheme == "http" {
+		prefix = "/http/"
+	}
+	raw := strings.TrimSuffix(b.base, "/") + prefix + destination.Host + destination.EscapedPath()
+	if destination.RawQuery != "" {
+		raw += "?" + destination.RawQuery
+	}
+	if destination.Fragment != "" {
+		raw += "#" + destination.Fragment
+	}
+	resp.Header.Set("Location", raw)
+	return nil
+}
+
 // handleConnect tunnels TCP to a permitted host without inspection.
 func (b *Broker) handleConnect(w http.ResponseWriter, r *http.Request) {
-	host := strings.ToLower(r.Host)
-	h, _, err := net.SplitHostPort(host)
+	audit := b.auditFor(r.Method, proto.EgressProtocolConnect, r.Host, "")
+	host, err := normalizeAuthority(r.Host, proto.EgressProtocolConnect)
 	if err != nil {
-		h = host
-		host = net.JoinHostPort(host, "443")
+		audit.Decision, audit.Reason = DecisionDenied, err.Error()
+		b.emit(audit)
+		http.Error(w, "remount broker: "+err.Error(), http.StatusBadRequest)
+		return
 	}
-	audit := Audit{At: time.Now(), WS: b.opts.WS, Principal: b.opts.Principal, Host: h, Method: r.Method, Path: ""}
-	b.mu.RLock()
-	leases := append([]proto.BindingLease(nil), b.leases...)
-	b.mu.RUnlock()
-	allowed := hostMatches(host, b.opts.Allow)
-	expiredBinding := ""
-	for _, l := range leases {
-		if !hostMatches(host, l.Destinations) {
-			continue
+	audit.Host = host
+	policy := b.authorizePolicy(proto.EgressProtocolConnect, host, r.Method, "")
+	if policy.rule.ID != "" {
+		audit.Rule = policy.rule.ID
+		audit.SharedState = policy.rule.SharedState
+	}
+	if policy.enabled && !policy.allowed {
+		audit.Decision, audit.Reason = DecisionDenied, policy.reason
+		status := http.StatusForbidden
+		if policy.reason == "request limit exhausted" {
+			audit.Decision = DecisionLimitExceeded
+			status = http.StatusTooManyRequests
 		}
-		if l.ExpiresAt != 0 && time.Now().UnixMilli() > l.ExpiresAt {
-			expiredBinding = l.ID
-			continue
-		}
-		allowed = true
+		b.emit(audit)
+		http.Error(w, "remount broker: "+policy.reason, status)
+		return
+	}
+	allowed := policy.allowed
+	if !policy.enabled {
+		// A credential binding authorizes substitution, not an opaque TCP
+		// tunnel. Legacy/local mode still requires the node's explicit allow
+		// list; typed policies require a CONNECT rule.
+		allowed = hostMatches(host, b.opts.Allow)
 	}
 	if !allowed {
-		if expiredBinding != "" {
-			audit.Decision, audit.Binding, audit.Reason = DecisionExpired, expiredBinding, "CONNECT binding lease expired"
-			b.emit(audit)
-			http.Error(w, "remount broker: binding lease expired", http.StatusForbidden)
-			return
-		}
-		audit.Decision, audit.Reason = DecisionDenied, "CONNECT destination not permitted"
+		audit.Decision, audit.Reason = DecisionDenied, "CONNECT requires an explicit allow or typed CONNECT rule"
 		b.emit(audit)
-		http.Error(w, "remount broker: CONNECT to "+h+" is not permitted", http.StatusForbidden)
+		http.Error(w, "remount broker: CONNECT to "+host+" is not permitted", http.StatusForbidden)
 		return
 	}
 	dialer := &net.Dialer{Timeout: 15 * time.Second}
@@ -475,25 +1020,49 @@ func (b *Broker) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
 	down, buf, err := hj.Hijack()
 	if err != nil {
 		up.Close()
 		return
 	}
+	if _, err := buf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		_ = down.Close()
+		_ = up.Close()
+		return
+	}
+	if err := buf.Flush(); err != nil {
+		_ = down.Close()
+		_ = up.Close()
+		return
+	}
+	tunnel := &brokerTunnel{downstream: down, upstream: up}
+	b.mu.Lock()
+	if b.suspended {
+		b.mu.Unlock()
+		_ = down.Close()
+		_ = up.Close()
+		return
+	}
+	b.tunnels[tunnel] = struct{}{}
+	b.mu.Unlock()
 	audit.Decision = DecisionAllowed
 	b.emit(audit)
+	defer func() {
+		b.mu.Lock()
+		delete(b.tunnels, tunnel)
+		b.mu.Unlock()
+		_ = up.Close()
+		_ = down.Close()
+	}()
 	go func() {
-		defer up.Close()
-		defer down.Close()
 		if buf.Reader.Buffered() > 0 {
 			_, _ = io.CopyN(up, buf, int64(buf.Reader.Buffered()))
 		}
 		_, _ = io.Copy(up, down)
+		_ = up.Close()
+		_ = down.Close()
 	}()
 	_, _ = io.Copy(down, up)
-	up.Close()
-	down.Close()
 }
 
 // dial resolves and connects, refusing private/loopback/link-local targets
@@ -566,7 +1135,7 @@ func (b *Broker) emit(a Audit) {
 	case DecisionExpired:
 		metrics.LeaseExpired.Inc()
 		metrics.EgressDeny.Inc()
-	case DecisionDenied:
+	case DecisionDenied, DecisionLimitExceeded:
 		metrics.EgressDeny.Inc()
 	}
 	if b.opts.Audit != nil {
@@ -590,7 +1159,7 @@ func hostMatches(host string, patterns []string) bool {
 		if ph, pp, err := net.SplitHostPort(p); err == nil {
 			p, pport = ph, pp
 		}
-		if pport != "" && hport != "" && pport != hport {
+		if pport != "" && pport != hport {
 			continue
 		}
 		if p == "*" {

@@ -336,6 +336,25 @@ func TestBackendSecurityIsPerBackendAndUnknownMemoryFailsClosed(t *testing.T) {
 	}
 }
 
+func TestGlobalWriteEgressRuleRequiresAdministrator(t *testing.T) {
+	f := newControlFixture(t, "", nil)
+	user := Subject{ID: "user", Tenant: "tenant-a"}
+	globalWrite := proto.WorkspaceSpec{Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+		ID: "global-package-write", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{"packages.example"},
+		Methods: []string{"POST"}, SharedState: proto.SharedStateGlobalWrite,
+	}}}}}
+	if _, err := f.c.wsCreate(context.Background(), user, &proto.WSCreateReq{Spec: globalWrite}); err == nil {
+		t.Fatal("non-administrator created a global-write egress capability")
+	}
+	scopedWrite := globalWrite
+	scopedWrite.Security.Network.Rules = append([]proto.EgressRule(nil), globalWrite.Security.Network.Rules...)
+	scopedWrite.Security.Network.Rules[0].ID = "scoped-package-write"
+	scopedWrite.Security.Network.Rules[0].SharedState = proto.SharedStateScopedWrite
+	if _, err := f.c.wsCreate(context.Background(), user, &proto.WSCreateReq{Spec: scopedWrite}); err != nil {
+		t.Fatalf("owner-scoped write capability: %v", err)
+	}
+}
+
 func TestReleaseFailureRetainsAuthoritativeSource(t *testing.T) {
 	f := newControlFixture(t, "", nil)
 	sender := &fakeSender{online: map[string]bool{"n_one": true}}
@@ -452,7 +471,8 @@ func TestNodeEventsDetectGapsDeduplicateAndUseAssignmentHistory(t *testing.T) {
 
 	event := proto.Event{
 		Seq: 3, At: 1234, Stream: ws.ID, Workspace: ws.ID, Generation: gen,
-		Type: proto.EvFSWrite, Payload: proto.MustMarshal(map[string]any{"path": "a"}),
+		Principal: "forged-principal",
+		Type:      proto.EvFSWrite, Payload: proto.MustMarshal(map[string]any{"path": "a"}),
 	}
 	if err := f.c.eventsPost(context.Background(), "n_one", &proto.EventPost{Events: []proto.Event{event}}); err != nil {
 		t.Fatal(err)
@@ -483,7 +503,8 @@ func TestNodeEventsDetectGapsDeduplicateAndUseAssignmentHistory(t *testing.T) {
 		case proto.EvFSWrite:
 			if e.Origin == "node" {
 				writes++
-				if e.Tenant != ws.Tenant || e.Workspace != ws.ID || e.Generation != gen || e.Actor != "n_one" {
+				if e.Tenant != ws.Tenant || e.Workspace != ws.ID || e.Generation != gen ||
+					e.Actor != "n_one" || e.Principal != ws.Owner {
 					t.Fatalf("node event metadata = %#v", e)
 				}
 			}

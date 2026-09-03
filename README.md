@@ -11,10 +11,11 @@ rather than a machine. Its files can be snapshotted, paused for days at
 storage-only cost, resumed on a different node, and reattached mid-command, while
 the agent sees one unbroken stream with output replayed from where it left off.
 
-The workspace never holds a real credential. It sees only references; the node's
-egress broker swaps in the real key per destination, per agent, with a TTL and a
-full audit trail. An agent can have root on your infrastructure and a compromised
-box has nothing to leak.
+The workspace process receives credential references rather than reusable
+secrets. The node's egress broker swaps a reference for the real value only on
+an authorized TLS request, with a TTL and audit trail. This removes static keys
+from the workspace, but it does not make an authorized API harmless: a
+compromised workspace can still abuse capabilities it was granted.
 
 ```
    your laptop                  control plane                 a GPU box
@@ -29,8 +30,9 @@ box has nothing to leak.
   └────────────┘
 ```
 
-Nothing listens. Nodes and clients both dial out. The control plane carries
-coordination only — session bytes never pass through it.
+Nodes and clients require no public inbound listener; both dial the server.
+Session frames transit the relay in the server process, while the control-plane
+handler does not interpret their bodies.
 
 ---
 
@@ -89,7 +91,7 @@ curl -X POST $REMOUNT_SERVER/v1/events -H "Authorization: Bearer $REMOUNT_TOKEN"
      -d '{"type":"github.pr.merged","payload":{"pr":42}}'
 ```
 
-## Secrets the agent can never leak
+## Brokered credentials without placing keys in the workspace
 
 Define a binding once, on the server:
 
@@ -121,8 +123,8 @@ $ ./remount exec $WS -- sh -c 'curl -s $OPENAI_BASE_URL/chat/completions \
 {"choices":[{"message":{"content":"..."}}]}
 ```
 
-Send that same placeholder anywhere else and it is refused before a byte leaves
-the machine:
+Send that same placeholder through the broker to any other destination and the
+broker refuses it before making the outbound request:
 
 ```
 $ ./remount exec $WS -- sh -c 'curl -s -o /dev/null -w "%{http_code}" \
@@ -148,8 +150,8 @@ egress.denied  {"decision":"leak_blocked","host":"api.anthropic.com",
   12 13:24:59.942 egress.denied   ws_06g6…  andrewgao  {"decision":"leak_blocked","host":"api.anthropic.com"}
 ```
 
-The log is the source of truth. Workspace state, the UI, audit and replay are
-all consumers of it.
+SQLite resource rows are the transactional source of lifecycle state; the
+append-only event log is the durable audit and observation record.
 
 ---
 
@@ -193,14 +195,18 @@ verdict. See [docs/observability.md](docs/observability.md).
 
 ## Status
 
-Working and tested: exec and pty sessions with lossless reconnect, workspace
+Working and tested: exec and pty sessions with replayable reconnect, workspace
 filesystem with server-side search and atomic edits, snapshots and cross-node
 moves, sleep and wake with durable timers, the credential broker, the claim
 queue with leases, the event log, port forwarding, and both `process` and
-`docker` backends.
+`docker` backends. Typed broker policy can restrict host, port, HTTP method,
+path and request/response budgets. Both built-in backends provide cooperative
+proxying rather than non-bypassable egress, so production security profiles
+reject them.
 
-Not built yet, and honestly named as such: microVM backends (Firecracker,
-Apple Virtualization), the display and browser session kinds, and the web UI.
+Not built yet, and honestly named as such: a production backend with enforced
+egress, microVM backends (Firecracker, Apple Virtualization), the display and
+browser session kinds, and the web UI.
 See [docs/design.md](docs/design.md#not-built-yet).
 
 ## License

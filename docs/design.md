@@ -83,11 +83,13 @@ Input carries a client-side sequence and duplicates are dropped, so a keystroke
 retried after a dropped connection is not typed twice.
 ([ADR 3](adr/0003-session-is-a-log.md))
 
-### 4.2 The workspace never holds a credential
+### 4.2 The workspace does not receive a reusable credential
 
-A workspace holds references. A binding maps a reference to a real secret,
+A workspace receives references. A binding maps a reference to a real secret,
 scoped to destination hosts, a principal and a TTL. The node's broker
-substitutes the real value at the network edge and records it.
+substitutes the real value at the network edge and records it. The workspace
+can still exercise whatever broker capability it has been granted; removing a
+static key is not the same as removing API authority.
 
 The important rule is what happens when a reference goes somewhere it should
 not: the request is **blocked**, not forwarded, and recorded as `leak_blocked`.
@@ -147,15 +149,17 @@ not lose the workspace it is restoring.
 | control plane | policy, bindings, grant signing key | everything; true of every system in this category |
 | node supervisor and broker | real credentials, egress decisions | that node's workspaces, and its leases until TTL |
 | relay | routing metadata | metadata, and today frame contents |
-| **workspace** | **nothing** | **nothing worth having** |
+| **workspace** | its files, references and granted capabilities | workspace data and abuse of those capabilities; broker-held secrets remain outside it |
 
 Concretely enforced:
 
 - **Filesystem jail.** Paths resolve through symlinks and anything landing
   outside the workspace root is denied, including a symlink inside the workspace
   that points out of it. Archive extraction refuses parent-directory components.
-- **Egress default deny.** A destination is permitted only by a binding or the
-  node's allow list.
+- **Broker policy.** Explicit typed rules default deny and constrain protocol,
+  host, port, method, path, request counts and body sizes. With no typed policy,
+  local mode permits reverse-proxy destinations named by a used binding or the
+  node allow list. This is mediation, not proof that direct sockets are blocked.
 - **No private addresses.** Any host resolving to loopback, private, link-local
   or multicast is refused unless explicitly allowed, which closes cloud metadata
   endpoints by default. The broker dials the validated IP literal, not the name,
@@ -177,13 +181,14 @@ One recovery path. "Graceful shutdown" is a snapshot followed by a crash.
 | node restarts | it re-adopts its local copies at the same generation, so outstanding grants stay valid | nothing |
 | control plane restarts | held workspaces re-queue; nodes re-adopt local copies; sessions in flight are lost with the node process only if it also restarted | in-flight session output |
 | materialize fails | node releases the claim; another node tries | nothing |
-| workspace compromised | sees references only; egress mediated; leak attempts blocked and recorded | allow-listed destinations until revoked |
+| workspace compromised | cannot read broker-held keys; broker requests are scoped and recorded | its files, granted destinations, and—on cooperative built-in backends—direct network access |
 | node compromised | leases are short; certs and secrets bounded by TTL | that node's workspaces |
 | relay compromised | metadata, and today frame contents | see gaps below |
 
-Every row above has a test in `internal/sim`, driven through in-memory
-transports with fault injection, so the failure paths run on every commit rather
-than only in production.
+Core lifecycle rows above have tests in `internal/sim`, driven through
+in-memory transports with fault injection. Package-level tests additionally
+exercise races, policy limits, malformed inputs and failure injection. These do
+not substitute for backend-specific hostile-workspace conformance tests.
 
 ## 9. What is built, and tested
 
@@ -199,7 +204,7 @@ than only in production.
 | Snapshots, content-addressed artifacts, cross-node restore | built, tested |
 | Claim queue, leases, generations, re-adoption | built, tested |
 | Durable timers, sleep and wake, webhook wake | built, tested |
-| Egress broker with substitution, leak blocking, audit | built, tested against the live OpenAI API |
+| Typed egress broker with substitution, leak blocking, redirect reauthorization, budgets and audit | built, unit/race/simulation tested; live-provider evidence is point-in-time |
 | Event log, SQLite and in-memory, subscriptions with backfill | built, tested |
 | Grants: ed25519, expiry, generation binding | built, tested |
 | Backends: process and docker | built, tested |
@@ -221,6 +226,10 @@ Named honestly, because a roadmap presented as a feature list is a lie.
 - **microVM backends.** Firecracker on Linux, Apple Virtualization on macOS.
   Today the strongest isolation is a container. The `process` backend is
   `isolation: none` and is only appropriate on a machine you own.
+- **A built-in enforced-egress backend.** The policy and backend controller
+  contract exist and production profiles reject weaker descriptors, but the
+  shipped process and Docker implementations are cooperative proxies. Neither
+  is a firewall or a non-bypassable multi-tenant boundary.
 - **Display and browser sessions.** The protocol has the session kind reserved
   and the shape is understood, but there is no implementation.
 - **End-to-end encryption through the relay.** Frames are TLS to the relay, so a

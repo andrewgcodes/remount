@@ -140,6 +140,18 @@ const (
 	SecurityLocal       = "local"
 	SecurityIsolated    = "isolated"
 	SecurityMultiTenant = "multi_tenant"
+
+	NetworkDefaultDeny  = "deny"
+	NetworkDefaultAllow = "allow"
+
+	EgressProtocolHTTP    = "http"
+	EgressProtocolHTTPS   = "https"
+	EgressProtocolConnect = "connect"
+
+	SharedStateNone          = "none"
+	SharedStateImmutableRead = "immutable_read"
+	SharedStateScopedWrite   = "scoped_write"
+	SharedStateGlobalWrite   = "global_write"
 )
 
 // SecuritySpec is an enforceable placement contract, not a documentation
@@ -154,11 +166,14 @@ type SecuritySpec struct {
 	Audit                   AuditPolicy   `cbor:"audit,omitempty" json:"audit,omitempty"`
 }
 
+// NetworkPolicy is a first-match list of typed egress capabilities. When at
+// least one rule exists, an omitted default is normalized to deny.
 type NetworkPolicy struct {
 	Default string       `cbor:"default,omitempty" json:"default,omitempty"` // deny | allow (local only)
 	Rules   []EgressRule `cbor:"rules,omitempty" json:"rules,omitempty"`
 }
 
+// EgressRule constrains one outbound HTTP, HTTPS, or CONNECT capability.
 type EgressRule struct {
 	ID               string   `cbor:"id" json:"id"`
 	Protocol         string   `cbor:"protocol" json:"protocol"`
@@ -840,12 +855,13 @@ type WSReleaseReq struct {
 // WSQuarantineReq asks the recorded holder to fence and optionally checkpoint
 // a workspace as phase one of a fleet operation.
 type WSQuarantineReq struct {
-	OperationID string   `cbor:"operation" json:"operation"`
-	WS          string   `cbor:"ws" json:"ws"`
-	Gen         uint64   `cbor:"gen" json:"gen"`
-	Action      string   `cbor:"action" json:"action"`
-	Backend     string   `cbor:"backend,omitempty" json:"backend,omitempty"`
-	Exclude     []string `cbor:"exclude,omitempty" json:"exclude,omitempty"`
+	OperationID string       `cbor:"operation" json:"operation"`
+	WS          string       `cbor:"ws" json:"ws"`
+	Gen         uint64       `cbor:"gen" json:"gen"`
+	Action      string       `cbor:"action" json:"action"`
+	Backend     string       `cbor:"backend,omitempty" json:"backend,omitempty"`
+	Exclude     []string     `cbor:"exclude,omitempty" json:"exclude,omitempty"`
+	Security    SecuritySpec `cbor:"security,omitempty" json:"security,omitempty"`
 }
 
 // WSQuarantineRes is the node's durable phase-one containment proof.

@@ -1317,6 +1317,22 @@ func (c *Control) wsCreate(ctx context.Context, subject Subject, req *proto.WSCr
 	if len(req.Spec.Bindings) > 0 && security.SecretMode == "" {
 		security.SecretMode = "brokered"
 	}
+	for _, rule := range security.Network.Rules {
+		action := ActionExecute
+		switch rule.SharedState {
+		case proto.SharedStateImmutableRead:
+			action = ActionRead
+		case proto.SharedStateScopedWrite:
+			action = ActionWrite
+		case proto.SharedStateGlobalWrite:
+			action = ActionAdmin
+		}
+		if err := c.check(ctx, subject, action, Resource{
+			Kind: "egress-rule", ID: rule.ID, Tenant: subject.Tenant, Owner: subject.ID,
+		}); err != nil {
+			return nil, err
+		}
+	}
 	req.Spec.Security = security
 	// Authority comes only from the authenticated subject. A client may not
 	// select a different identity to gain bindings or ACL access.
@@ -2836,12 +2852,13 @@ func (c *Control) processFleetTarget(ctx context.Context, operationID string, in
 		c.fleetOps[operationID] = operation
 	}
 	exclude := append([]string(nil), ws.Spec.Exclude...)
+	security := ws.Spec.Security
 	c.mu.Unlock()
 
 	var response proto.WSQuarantineRes
 	request := proto.WSQuarantineReq{
 		OperationID: operationID, WS: target.Workspace, Gen: target.Generation, Action: operation.Action,
-		Backend: target.Backend, Exclude: exclude,
+		Backend: target.Backend, Exclude: exclude, Security: security,
 	}
 	var requestErr error
 	if c.send == nil || !c.send.Online(target.Node) {
@@ -2883,6 +2900,9 @@ func (c *Control) processFleetTarget(ctx context.Context, operationID string, in
 		target.State = proto.FleetTargetPending
 	} else if !response.Fenced {
 		target.Error = "node did not affirm fencing"
+		if response.Warning != "" {
+			target.Error += ": " + response.Warning
+		}
 		target.State = proto.FleetTargetFailed
 	} else if response.Generation != target.Generation || response.Action != operation.Action {
 		target.Error = "node quarantine acknowledgement does not match request"
@@ -3170,6 +3190,7 @@ func (c *Control) eventsPost(ctx context.Context, from string, req *proto.EventP
 			if err != nil {
 				return err
 			}
+			principal := c.workspacePrincipal(workspace)
 			c.mu.Lock()
 			last := c.producerSeq[from]
 			c.mu.Unlock()
@@ -3188,7 +3209,7 @@ func (c *Control) eventsPost(ctx context.Context, from string, req *proto.EventP
 					EventID:    fmt.Sprintf("gap:%s:%d:%d", from, last+1, producerSeq-1),
 					ReceivedAt: c.now().UnixMilli(), ObservedAt: observedAt,
 					Origin: "control", Actor: "control", Node: from,
-					Tenant: tenant, Workspace: workspace, Generation: generation,
+					Tenant: tenant, Workspace: workspace, Generation: generation, Principal: principal,
 					Stream: from, Type: proto.EvEventGap, ProducerSeq: producerSeq - 1,
 					Payload: proto.MustMarshal(map[string]any{"producer": from, "missing_from": last + 1, "missing_through": producerSeq - 1}),
 				}
@@ -3203,7 +3224,9 @@ func (c *Control) eventsPost(ctx context.Context, from string, req *proto.EventP
 			e.Origin = "node"
 			e.Actor = from
 			e.Node = from
-			e.Principal = ""
+			// A node is authoritative for observations, never for user
+			// identity. Derive the workspace principal from control state.
+			e.Principal = principal
 			e.Tenant, e.Workspace, e.Generation = tenant, workspace, generation
 		} else {
 			e.Origin = "client"
@@ -3233,6 +3256,18 @@ func (c *Control) eventsPost(ctx context.Context, from string, req *proto.EventP
 		c.fireEventTimers(ctx, e.Type, e.Tenant, e.Stream)
 	}
 	return nil
+}
+
+func (c *Control) workspacePrincipal(workspace string) string {
+	if workspace == "" {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ws := c.workspaces[workspace]; ws != nil {
+		return ws.Owner
+	}
+	return ""
 }
 
 func (c *Control) authorizeNodeEvent(node, workspace string, generation uint64) (string, string, uint64, error) {

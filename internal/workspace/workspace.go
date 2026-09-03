@@ -72,6 +72,23 @@ type Handle interface {
 	Destroy(ctx context.Context) error
 }
 
+// NetworkEndpoint identifies the generation-specific broker that an enforced
+// workspace network must use as its only egress path.
+type NetworkEndpoint struct {
+	Workspace       string
+	Generation      uint64
+	ReverseProxyURL string
+	ForwardProxyURL string
+}
+
+// NetworkController is required when a backend advertises
+// EgressMode=enforced_gateway. Applying policy must fail closed, and revoke
+// must synchronously remove the workspace's network capability.
+type NetworkController interface {
+	ApplyNetworkPolicy(context.Context, proto.NetworkPolicy, NetworkEndpoint) error
+	RevokeNetwork(context.Context) error
+}
+
 // BaseEnv is the environment every session starts from, before workspace
 // and session env. HOME is the workspace root so dotfiles live with it.
 func BaseEnv(root string) []string {

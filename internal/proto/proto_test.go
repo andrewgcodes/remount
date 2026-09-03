@@ -2,6 +2,7 @@ package proto
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/fxamacker/cbor/v2"
@@ -100,5 +101,75 @@ func TestChunkBody(t *testing.T) {
 	}
 	if f.Seq != 42 || cb.Stream != StreamStdout || string(cb.Data) != "hello\n" {
 		t.Fatalf("%+v %+v", f, cb)
+	}
+}
+
+func TestNormalizeSecurityMakesTypedEgressFailClosed(t *testing.T) {
+	original := SecuritySpec{Network: NetworkPolicy{Rules: []EgressRule{{
+		ID: " packages ", Protocol: "HTTPS", Hosts: []string{"REGISTRY.EXAMPLE:443"},
+		Methods: []string{"head", "get"}, PathPrefixes: []string{"/v2"},
+		SharedState: SharedStateImmutableRead,
+	}}}}
+	security, err := NormalizeSecurity(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := security.Network.Rules[0]
+	if security.Network.Default != NetworkDefaultDeny || rule.ID != "packages" ||
+		rule.Protocol != EgressProtocolHTTPS || rule.Hosts[0] != "registry.example:443" ||
+		!reflect.DeepEqual(rule.Methods, []string{"GET", "HEAD"}) {
+		t.Fatalf("normalized security=%#v", security)
+	}
+	if original.Network.Default != "" || original.Network.Rules[0].ID != " packages " ||
+		original.Network.Rules[0].Protocol != "HTTPS" || original.Network.Rules[0].Hosts[0] != "REGISTRY.EXAMPLE:443" ||
+		!reflect.DeepEqual(original.Network.Rules[0].Methods, []string{"head", "get"}) {
+		t.Fatalf("normalization mutated caller-owned policy: %#v", original)
+	}
+	security.Network.Rules[0].Hosts[0] = "changed.example"
+	security.Network.Rules[0].Methods[0] = "POST"
+	if original.Network.Rules[0].Hosts[0] != "REGISTRY.EXAMPLE:443" || original.Network.Rules[0].Methods[0] != "head" {
+		t.Fatalf("normalized policy aliases caller-owned slices: %#v", original)
+	}
+}
+
+func TestNormalizeSecurityRejectsUnenforceableEgressRules(t *testing.T) {
+	tests := []struct {
+		name string
+		rule EgressRule
+	}{
+		{"missing id", EgressRule{Protocol: "https", Hosts: []string{"example.com"}}},
+		{"unknown protocol", EgressRule{ID: "x", Protocol: "udp", Hosts: []string{"example.com"}}},
+		{"missing host", EgressRule{ID: "x", Protocol: "https"}},
+		{"invalid host", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"https://example.com"}}},
+		{"userinfo host", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"user@example.com"}}},
+		{"unicode host", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"café.example"}}},
+		{"interior wildcard", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"api.*.example"}}},
+		{"zero port", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"example.com"}, Ports: []uint16{0}}},
+		{"unclean path", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"example.com"}, PathPrefixes: []string{"/ok/../admin"}}},
+		{"encoded path", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"example.com"}, PathPrefixes: []string{"/ok%2fadmin"}}},
+		{"negative limit", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"example.com"}, MaxRequests: -1}},
+		{"unknown shared state", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"example.com"}, SharedState: "mystery"}},
+		{"connect byte claim", EgressRule{ID: "x", Protocol: "connect", Hosts: []string{"example.com"}, MaxResponseBytes: 1}},
+		{"connect shared state", EgressRule{ID: "x", Protocol: "connect", Hosts: []string{"example.com"}, SharedState: SharedStateGlobalWrite}},
+		{"immutable write", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"example.com"}, Methods: []string{"POST"}, SharedState: SharedStateImmutableRead}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NormalizeSecurity(SecuritySpec{Network: NetworkPolicy{Rules: []EgressRule{tt.rule}}})
+			if err == nil {
+				t.Fatal("invalid rule accepted")
+			}
+			var protocolErr *Error
+			if !errors.As(err, &protocolErr) || protocolErr.Code != CodeBadRequest {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+	_, err := NormalizeSecurity(SecuritySpec{Network: NetworkPolicy{Rules: []EgressRule{
+		{ID: "duplicate", Protocol: "https", Hosts: []string{"a.example"}},
+		{ID: "duplicate", Protocol: "https", Hosts: []string{"b.example"}},
+	}}})
+	if err == nil {
+		t.Fatal("duplicate rule id accepted")
 	}
 }

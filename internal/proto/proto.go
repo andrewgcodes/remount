@@ -18,6 +18,11 @@ package proto
 import (
 	"errors"
 	"fmt"
+	"net"
+	"path"
+	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/fxamacker/cbor/v2"
 )
@@ -204,6 +209,20 @@ func NewEvent(to, typ string, body any) *Frame {
 // NormalizeSecurity applies profile defaults without weakening explicit
 // requirements. Callers must still validate the selected backend.
 func NormalizeSecurity(s SecuritySpec) (SecuritySpec, error) {
+	// Security policies are commonly read directly from a live workspace while
+	// other goroutines are serializing that workspace for events or responses.
+	// Clone every mutable layer before canonicalizing rules: accepting the
+	// struct by value does not copy its slice backing arrays.
+	if len(s.Network.Rules) > 0 {
+		s.Network.Rules = append([]EgressRule(nil), s.Network.Rules...)
+		for i := range s.Network.Rules {
+			rule := &s.Network.Rules[i]
+			rule.Hosts = append([]string(nil), rule.Hosts...)
+			rule.Ports = append([]uint16(nil), rule.Ports...)
+			rule.Methods = append([]string(nil), rule.Methods...)
+			rule.PathPrefixes = append([]string(nil), rule.PathPrefixes...)
+		}
+	}
 	if s.Profile == "" {
 		s.Profile = SecurityLocal
 	}
@@ -217,7 +236,11 @@ func NormalizeSecurity(s SecuritySpec) (SecuritySpec, error) {
 			s.MinIsolation = "container"
 		}
 		if s.Network.Default == "" {
-			s.Network.Default = "deny"
+			s.Network.Default = NetworkDefaultDeny
+		}
+		s.RequireEnforcedEgress = true
+		if s.SecretMode == "" {
+			s.SecretMode = "brokered"
 		}
 		s.Audit.Required = true
 	case SecurityMultiTenant:
@@ -229,7 +252,7 @@ func NormalizeSecurity(s SecuritySpec) (SecuritySpec, error) {
 		if s.SecretMode == "" {
 			s.SecretMode = "brokered"
 		}
-		s.Network.Default = "deny"
+		s.Network.Default = NetworkDefaultDeny
 		s.Audit.Required = true
 	default:
 		return SecuritySpec{}, Err(CodeBadRequest, "unknown security profile %q", s.Profile)
@@ -240,13 +263,193 @@ func NormalizeSecurity(s SecuritySpec) (SecuritySpec, error) {
 	if s.SecretMode != "" && s.SecretMode != "none" && s.SecretMode != "brokered" {
 		return SecuritySpec{}, Err(CodeBadRequest, "unknown secret mode %q", s.SecretMode)
 	}
-	if s.Network.Default != "" && s.Network.Default != "deny" && s.Network.Default != "allow" {
+	if len(s.Network.Rules) > 0 && s.Network.Default == "" {
+		s.Network.Default = NetworkDefaultDeny
+	}
+	if s.Network.Default != "" && s.Network.Default != NetworkDefaultDeny && s.Network.Default != NetworkDefaultAllow {
 		return SecuritySpec{}, Err(CodeBadRequest, "unknown network default %q", s.Network.Default)
 	}
-	if s.Profile != SecurityLocal && s.Network.Default == "allow" {
+	if s.Profile != SecurityLocal && s.Network.Default == NetworkDefaultAllow {
 		return SecuritySpec{}, Err(CodeDenied, "non-local security profiles cannot default-allow egress")
 	}
+	seenRules := make(map[string]struct{}, len(s.Network.Rules))
+	for i := range s.Network.Rules {
+		if err := normalizeEgressRule(&s.Network.Rules[i], seenRules); err != nil {
+			return SecuritySpec{}, err
+		}
+	}
 	return s, nil
+}
+
+func normalizeEgressRule(rule *EgressRule, seen map[string]struct{}) error {
+	rule.ID = strings.TrimSpace(rule.ID)
+	if rule.ID == "" {
+		return Err(CodeBadRequest, "egress rule id is required")
+	}
+	if _, exists := seen[rule.ID]; exists {
+		return Err(CodeBadRequest, "duplicate egress rule id %q", rule.ID)
+	}
+	seen[rule.ID] = struct{}{}
+	rule.Protocol = strings.ToLower(strings.TrimSpace(rule.Protocol))
+	switch rule.Protocol {
+	case EgressProtocolHTTP, EgressProtocolHTTPS, EgressProtocolConnect:
+	default:
+		return Err(CodeBadRequest, "egress rule %q has unsupported protocol %q", rule.ID, rule.Protocol)
+	}
+	if len(rule.Hosts) == 0 {
+		return Err(CodeBadRequest, "egress rule %q requires at least one host", rule.ID)
+	}
+	for i, rawHost := range rule.Hosts {
+		host, err := normalizeEgressHostPattern(rawHost)
+		if err != nil {
+			return Err(CodeBadRequest, "egress rule %q has invalid host pattern %q", rule.ID, rawHost)
+		}
+		rule.Hosts[i] = host
+	}
+	for _, port := range rule.Ports {
+		if port == 0 {
+			return Err(CodeBadRequest, "egress rule %q contains port zero", rule.ID)
+		}
+	}
+	for i, method := range rule.Methods {
+		method = strings.ToUpper(strings.TrimSpace(method))
+		if method == "" || strings.ContainsAny(method, " \t\r\n") {
+			return Err(CodeBadRequest, "egress rule %q has invalid method %q", rule.ID, method)
+		}
+		rule.Methods[i] = method
+	}
+	for i, prefix := range rule.PathPrefixes {
+		cleanTarget := prefix
+		if len(cleanTarget) > 1 {
+			cleanTarget = strings.TrimSuffix(cleanTarget, "/")
+		}
+		if prefix == "" || !strings.HasPrefix(prefix, "/") || strings.ContainsAny(prefix, "?#\\%\x00") || path.Clean(cleanTarget) != cleanTarget {
+			return Err(CodeBadRequest, "egress rule %q has invalid path prefix %q", rule.ID, prefix)
+		}
+		rule.PathPrefixes[i] = prefix
+	}
+	if rule.MaxRequests < 0 || rule.MaxRequestBytes < 0 || rule.MaxResponseBytes < 0 {
+		return Err(CodeBadRequest, "egress rule %q has a negative limit", rule.ID)
+	}
+	if rule.SharedState == "" {
+		rule.SharedState = SharedStateNone
+	}
+	switch rule.SharedState {
+	case SharedStateNone, SharedStateImmutableRead, SharedStateScopedWrite, SharedStateGlobalWrite:
+	default:
+		return Err(CodeBadRequest, "egress rule %q has unknown shared state %q", rule.ID, rule.SharedState)
+	}
+	if rule.Protocol == EgressProtocolConnect {
+		if len(rule.PathPrefixes) != 0 || rule.MaxRequestBytes != 0 || rule.MaxResponseBytes != 0 {
+			return Err(CodeBadRequest, "CONNECT rule %q cannot claim unenforceable path or byte limits", rule.ID)
+		}
+		if rule.SharedState != SharedStateNone {
+			return Err(CodeBadRequest, "CONNECT rule %q cannot claim enforceable shared-state semantics", rule.ID)
+		}
+		for _, method := range rule.Methods {
+			if method != "CONNECT" {
+				return Err(CodeBadRequest, "CONNECT rule %q may only name method CONNECT", rule.ID)
+			}
+		}
+		if len(rule.Methods) == 0 {
+			rule.Methods = []string{"CONNECT"}
+		}
+	}
+	if rule.SharedState == SharedStateImmutableRead {
+		if len(rule.Methods) == 0 {
+			rule.Methods = []string{"GET", "HEAD"}
+		}
+		for _, method := range rule.Methods {
+			if method != "GET" && method != "HEAD" {
+				return Err(CodeBadRequest, "immutable-read rule %q permits mutating method %s", rule.ID, method)
+			}
+		}
+	}
+	sort.Slice(rule.Ports, func(i, j int) bool { return rule.Ports[i] < rule.Ports[j] })
+	sort.Strings(rule.Methods)
+	return nil
+}
+
+func normalizeEgressHostPattern(raw string) (string, error) {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" || strings.ContainsAny(raw, "/?#@\\%\x00\t\r\n ") {
+		return "", errors.New("invalid host pattern")
+	}
+	for _, r := range raw {
+		if r > 0x7f {
+			return "", errors.New("host pattern must be ASCII")
+		}
+	}
+	host, port := raw, ""
+	if splitHost, splitPort, err := net.SplitHostPort(raw); err == nil {
+		host, port = splitHost, splitPort
+	} else if strings.HasPrefix(raw, "[") {
+		if !strings.HasSuffix(raw, "]") {
+			return "", errors.New("invalid bracketed host")
+		}
+		host = strings.TrimSuffix(strings.TrimPrefix(raw, "["), "]")
+	} else if strings.Count(raw, ":") == 1 {
+		return "", errors.New("invalid port")
+	} else if strings.Count(raw, ":") > 1 && net.ParseIP(raw) == nil {
+		return "", errors.New("invalid IPv6 host")
+	}
+	if strings.HasSuffix(raw, ":") && port == "" {
+		return "", errors.New("invalid empty port")
+	}
+	if port != "" {
+		parsed, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || parsed == 0 {
+			return "", errors.New("invalid port")
+		}
+		port = strconv.FormatUint(parsed, 10)
+	}
+	host = strings.TrimSuffix(host, ".")
+	wildcard := false
+	switch {
+	case host == "*":
+	case strings.HasPrefix(host, "*."):
+		wildcard = true
+		host = strings.TrimPrefix(host, "*.")
+	case strings.Contains(host, "*"):
+		return "", errors.New("invalid wildcard")
+	}
+	if host != "*" {
+		if ip := net.ParseIP(host); ip != nil {
+			if wildcard {
+				return "", errors.New("IP wildcard is invalid")
+			}
+			host = ip.String()
+		} else if !validEgressDNSName(host) {
+			return "", errors.New("invalid DNS name")
+		}
+	}
+	if wildcard {
+		host = "*." + host
+	}
+	if port == "" {
+		return host, nil
+	}
+	if strings.Contains(host, ":") {
+		return net.JoinHostPort(host, port), nil
+	}
+	return host + ":" + port, nil
+}
+
+func validEgressDNSName(host string) bool {
+	if host == "" || len(host) > 253 || strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' && r != '_' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func isolationRank(s string) int {
