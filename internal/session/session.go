@@ -73,6 +73,39 @@ type Session struct {
 	logErr      error
 	onFinish    func() // commits manager accounting before exited is closed
 	closeReason string // recorded in the exit chunk when the node ends the session
+	// onSignal is how a record-only session (kind acp) hears a kill: there is
+	// no process, so the owner that appends to it decides what stopping means.
+	onSignal func(name string)
+}
+
+// Record appends one chunk to a record-only session. Kinds with a process
+// own their streams and refuse it.
+func (s *Session) Record(stream uint8, data []byte) (uint64, error) {
+	if s.Kind != proto.SessionACP {
+		return 0, proto.Err(proto.CodeBadRequest, "session %s is not record-only", s.ID)
+	}
+	<-s.startDone
+	if s.Exited() {
+		return 0, proto.Err(proto.CodeClosed, "session already exited")
+	}
+	return s.Log.Append(stream, data)
+}
+
+// End finishes a record-only session with info as its exit chunk.
+func (s *Session) End(info proto.ExitInfo) {
+	if s.Kind != proto.SessionACP {
+		return
+	}
+	<-s.startDone
+	s.finish(info)
+}
+
+// OnSignal registers what Signal does to a record-only session. Without a
+// handler a signal ends the session immediately.
+func (s *Session) OnSignal(fn func(name string)) {
+	s.mu.Lock()
+	s.onSignal = fn
+	s.mu.Unlock()
 }
 
 // Exited reports whether the process has finished.
@@ -193,6 +226,18 @@ func (s *Session) Signal(name string) error {
 		if s.conn != nil {
 			return s.conn.Close()
 		}
+		return nil
+	}
+	if s.Kind == proto.SessionACP {
+		if fn := s.onSignal; fn != nil {
+			s.mu.Unlock()
+			fn(name)
+			s.mu.Lock()
+			return nil
+		}
+		s.mu.Unlock()
+		s.finish(proto.ExitInfo{Code: -1, Error: "signal " + name})
+		s.mu.Lock()
 		return nil
 	}
 	if s.cmd == nil || s.cmd.Process == nil {
@@ -558,6 +603,8 @@ func (m *Manager) OpenOrReplay(spec Spec) (s *Session, created bool, err error) 
 		startErr = s.startPTY(spec)
 	case proto.SessionPort:
 		startErr = s.startPort(spec)
+	case proto.SessionACP:
+		// Record-only: the agent runner appends protocol frames and ends it.
 	default:
 		startErr = proto.Err(proto.CodeBadRequest, "unknown session kind %q", spec.Kind)
 	}

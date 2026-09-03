@@ -159,6 +159,13 @@ type Options struct {
 	// MaxQueuesPerTenant bounds task queues, which are pruned with their
 	// workspace. Zero selects 4096.
 	MaxQueuesPerTenant int
+	// MaxAgentsPerTenant bounds live (non-terminal) agents. Zero selects 1024.
+	MaxAgentsPerTenant int
+	// MaxApprovalsPerAgent bounds parked approvals per agent. Zero selects 64.
+	MaxApprovalsPerAgent int
+	// PublicURL is the server's externally reachable base (https://host), used
+	// to mint stable agent URLs. Empty leaves Agent.URL empty.
+	PublicURL string
 }
 
 // ArtifactStore is the part of the blob store the control plane inspects.
@@ -196,6 +203,12 @@ type Control struct {
 	fleetLocks            map[string]*keyedMutex
 	bases                 map[string]*proto.Base // baseKey(tenant, name) -> pinned snapshot
 	queues                map[string]*proto.Queue
+	agents                map[string]*proto.Agent
+	approvals             map[string]*proto.Approval
+	dirtyApprovals        map[string]*proto.Approval // touched under c.mu, flushed by the next agent commit
+	agentRetry            map[string]time.Time       // agent -> no launch before
+	agentDelivered        map[string]time.Time       // inbox message -> last deliver attempt
+	agentKick             chan struct{}
 	retries               map[string]*materializeRetry // ws -> hold-back after a failed materialization
 	fleetWake             chan struct{}
 	timerReservations     int
@@ -306,6 +319,12 @@ func New(opts Options) (*Control, error) {
 	if opts.MaxQueuesPerTenant <= 0 {
 		opts.MaxQueuesPerTenant = 4096
 	}
+	if opts.MaxAgentsPerTenant <= 0 {
+		opts.MaxAgentsPerTenant = 1024
+	}
+	if opts.MaxApprovalsPerAgent <= 0 {
+		opts.MaxApprovalsPerAgent = 64
+	}
 	requestCtx, requestCancel := context.WithCancel(context.Background())
 	overloadLimit := opts.MaxConcurrentRequests / 8
 	if overloadLimit < 8 {
@@ -324,6 +343,12 @@ func New(opts Options) (*Control, error) {
 		fleetOps: map[string]*proto.FleetOperation{}, fleetLocks: map[string]*keyedMutex{}, fleetWake: make(chan struct{}, 1),
 		bases:                 map[string]*proto.Base{},
 		queues:                map[string]*proto.Queue{},
+		agents:                map[string]*proto.Agent{},
+		approvals:             map[string]*proto.Approval{},
+		dirtyApprovals:        map[string]*proto.Approval{},
+		agentRetry:            map[string]time.Time{},
+		agentDelivered:        map[string]time.Time{},
+		agentKick:             make(chan struct{}, 1),
 		retries:               map[string]*materializeRetry{},
 		timerReservationsByWS: map[string]int{},
 		requestSlots:          make(chan struct{}, opts.MaxConcurrentRequests), overloadSlots: make(chan struct{}, overloadLimit),
@@ -424,6 +449,8 @@ CREATE TABLE IF NOT EXISTS assignments (
 CREATE TABLE IF NOT EXISTS fleet_operations (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS bases (tenant TEXT NOT NULL, name TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(tenant, name));
 CREATE TABLE IF NOT EXISTS queues (id TEXT PRIMARY KEY, data BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, data BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS keys (name TEXT PRIMARY KEY, priv BLOB NOT NULL);
 `)
 	return err
@@ -652,6 +679,9 @@ func (c *Control) load() error {
 		return err
 	}
 	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := c.loadAgents(); err != nil {
 		return err
 	}
 	rows, err = c.db.Query(`SELECT id, pubkey, data FROM nodes`)
@@ -950,6 +980,29 @@ func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int)
 			return RecordPruneResult{}, err
 		}
 	}
+	var agentCandidates, approvalCandidates []string
+	for _, candidate := range workspaceCandidates {
+		for id, a := range c.agents {
+			if a.WS == candidate.id {
+				agentCandidates = append(agentCandidates, id)
+			}
+		}
+		for id, ap := range c.approvals {
+			if ap.WS == candidate.id {
+				approvalCandidates = append(approvalCandidates, id)
+			}
+		}
+	}
+	for _, id := range agentCandidates {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE id=?`, id); err != nil {
+			return RecordPruneResult{}, err
+		}
+	}
+	for _, id := range approvalCandidates {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM approvals WHERE id=?`, id); err != nil {
+			return RecordPruneResult{}, err
+		}
+	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM mutations WHERE rowid IN (
 		SELECT rowid FROM mutations WHERE completed_at < ? ORDER BY completed_at, rowid LIMIT ?
 	)`, cutoff, limit)
@@ -1051,6 +1104,13 @@ func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int)
 	}
 	for _, id := range queueCandidates {
 		delete(c.queues, id)
+	}
+	for _, id := range agentCandidates {
+		delete(c.agents, id)
+		delete(c.agentRetry, id)
+	}
+	for _, id := range approvalCandidates {
+		delete(c.approvals, id)
 	}
 	result := RecordPruneResult{
 		Mutations: mutations, Timers: int64(len(timerCandidates)),
@@ -1746,6 +1806,125 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return c.queueAdvance(ctx, subject, req)
+	case proto.OpAgentCreate:
+		req, err := decode[proto.AgentCreateReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.agentCreate(ctx, subject, req)
+	case proto.OpAgentGet:
+		req, err := decode[proto.AgentGetReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.agentGet(ctx, subject, req.ID)
+	case proto.OpAgentList:
+		req, err := decode[proto.AgentListReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.agentList(ctx, subject, req)
+	case proto.OpAgentMessage:
+		req, err := decode[proto.AgentMessageReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.agentMessage(ctx, subject, req)
+	case proto.OpAgentCancel:
+		req, err := decode[proto.AgentGetReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.agentCancel(ctx, subject, req)
+	case proto.OpAgentSleep:
+		req, err := decode[proto.AgentGetReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.agentSleep(ctx, subject, req)
+	case proto.OpAgentFork:
+		req, err := decode[proto.AgentForkReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.agentFork(ctx, subject, req)
+	case proto.OpAgentDestroy:
+		req, err := decode[proto.AgentGetReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return struct{}{}, c.agentDestroy(ctx, subject, req)
+	case proto.OpApprovalList:
+		req, err := decode[proto.ApprovalListReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.approvalList(ctx, subject, req)
+	case proto.OpApprovalGet:
+		req, err := decode[proto.ApprovalGetReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.approvalGet(ctx, subject, req.ID)
+	case proto.OpApprovalDecide:
+		req, err := decode[proto.ApprovalDecideReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.approvalDecide(ctx, subject, req)
+	case proto.OpAgentReport:
+		if !c.isNode(f.From) {
+			return nil, proto.Err(proto.CodeUnauthorized, "only nodes report agent runs")
+		}
+		req, err := decode[proto.AgentReport](f)
+		if err != nil {
+			return nil, err
+		}
+		return struct{}{}, c.agentReport(ctx, f.From, req)
 	case proto.OpNodeList:
 		subject, err := c.subjectOf(f.From)
 		if err != nil {
@@ -4471,6 +4650,8 @@ func (c *Control) loop() {
 			return
 		case <-tick.C:
 			c.Tick(context.Background())
+		case <-c.agentKick:
+			c.agentReconcile(context.Background())
 		}
 	}
 }
@@ -4544,6 +4725,8 @@ func (c *Control) Tick(ctx context.Context) {
 		c.fireTimer(ctx, t)
 	}
 	c.offerPending(ctx)
+	c.agentReconcile(ctx)
+	c.expireStaleApprovals(ctx)
 }
 
 // Bindings returns the configured binding ids (for the CLI).

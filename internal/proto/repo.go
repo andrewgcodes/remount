@@ -25,6 +25,10 @@ type RepoSpec struct {
 	Ref string `cbor:"ref,omitempty" json:"ref,omitempty"`
 	// Depth truncates history to this many commits; 0 clones everything.
 	Depth int `cbor:"depth,omitempty" json:"depth,omitempty"`
+	// Branch is a new local branch created from the checked-out commit after
+	// the clone (an agent's agent/<id>). It must not already exist upstream;
+	// the clone's own branch is Ref.
+	Branch string `cbor:"branch,omitempty" json:"branch,omitempty"`
 }
 
 // MaxRepoRefSize bounds a ref name as hosting services do in practice.
@@ -114,8 +118,8 @@ func ValidateRepoRef(ref string) error {
 // RepoSpec is valid and means "no clone".
 func (r RepoSpec) Normalize() (RepoSpec, error) {
 	if r.URL == "" {
-		if r.Ref != "" || r.Depth != 0 {
-			return RepoSpec{}, Err(CodeBadRequest, "repo ref and depth need a repo url")
+		if r.Ref != "" || r.Depth != 0 || r.Branch != "" {
+			return RepoSpec{}, Err(CodeBadRequest, "repo ref, branch and depth need a repo url")
 		}
 		return RepoSpec{}, nil
 	}
@@ -126,10 +130,16 @@ func (r RepoSpec) Normalize() (RepoSpec, error) {
 	if err := ValidateRepoRef(r.Ref); err != nil {
 		return RepoSpec{}, err
 	}
+	if err := ValidateRepoRef(r.Branch); err != nil {
+		return RepoSpec{}, err
+	}
+	if r.Branch != "" && r.Branch == r.Ref {
+		return RepoSpec{}, Err(CodeBadRequest, "repo branch %q is the ref being cloned", r.Branch)
+	}
 	if r.Depth < 0 {
 		return RepoSpec{}, Err(CodeBadRequest, "repo depth must not be negative")
 	}
-	return RepoSpec{URL: canonical, Ref: r.Ref, Depth: r.Depth}, nil
+	return RepoSpec{URL: canonical, Ref: r.Ref, Depth: r.Depth, Branch: r.Branch}, nil
 }
 
 // ValidateRepoPattern checks a connector rule's repos entry: "owner/name" or

@@ -836,6 +836,11 @@ const (
 	SessionExec = "exec" // pipes: stdout/stderr separate
 	SessionPTY  = "pty"  // pseudo-terminal: single stream
 	SessionPort = "port" // TCP forward: bytes both ways
+	// SessionACP is a record-only transcript: the node's agent runner appends
+	// every ACP frame it exchanges with the harness (StreamACPIn from the
+	// harness, StreamACPOut to it) plus the harness's stderr. Clients cannot
+	// open one; they attach to the one an agent run created.
+	SessionACP = "acp"
 )
 
 // Chunk streams.
@@ -845,6 +850,8 @@ const (
 	StreamExit   = 3 // Data = CBOR ExitInfo
 	StreamInfo   = 4 // Data = CBOR SessionInfo (emitted once at open, replayable)
 	StreamGap    = 5 // Data = CBOR Gap: chunks before this were evicted
+	StreamACPIn  = 6 // Data = ACPFrameRecord: a JSON-RPC line the harness sent
+	StreamACPOut = 7 // Data = ACPFrameRecord: a JSON-RPC line Remount sent to the harness
 )
 
 // ChunkBody is the payload of a chunk frame.
@@ -1166,6 +1173,10 @@ type WSSnapshotReq struct {
 	Authoritative  bool   `cbor:"authoritative,omitempty" json:"authoritative,omitempty"`
 	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
 	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+	// Gen fences a control-plane-issued snapshot (agent fork) to the workspace
+	// generation the control plane believes the node holds. Clients leave it
+	// zero; their grant carries the generation.
+	Gen uint64 `cbor:"gen,omitempty" json:"gen,omitempty"`
 }
 
 type WSSnapshotRes struct {
