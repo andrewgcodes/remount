@@ -206,6 +206,46 @@ type ACPFrameRecord struct {
 // node's session log with it.
 const MaxACPTranscriptFrame = 256 << 10
 
+// ACPRecordAssembler rebuilds ACPFrameRecords from transcript chunks. The
+// session log splits one Record call into several chunks above its chunk
+// size, so a record can span consecutive chunks of the same stream; the
+// assembler concatenates until the bytes decode as one record. A definite
+// CBOR map never decodes from a strict prefix of itself, so the boundary is
+// unambiguous without a length header.
+type ACPRecordAssembler struct {
+	stream uint8
+	buf    []byte
+}
+
+// Push adds one chunk. It returns the completed record and true when data
+// finished one, false when more chunks are needed. A chunk on a different
+// stream than the partial record discards the partial bytes and reports
+// them as an error, since the transcript is then already inconsistent.
+func (a *ACPRecordAssembler) Push(stream uint8, data []byte) (ACPFrameRecord, bool, error) {
+	if stream != StreamACPIn && stream != StreamACPOut {
+		return ACPFrameRecord{}, false, Err(CodeBadRequest, "stream %d is not an ACP transcript stream", stream)
+	}
+	if len(a.buf) > 0 && stream != a.stream {
+		a.buf = a.buf[:0]
+		return ACPFrameRecord{}, false, Err(CodeInternal, "acp transcript: stream %d interleaved a partial record on stream %d", stream, a.stream)
+	}
+	a.stream = stream
+	a.buf = append(a.buf, data...)
+	var rec ACPFrameRecord
+	if err := Unmarshal(a.buf, &rec); err != nil {
+		if len(a.buf) > MaxACPTranscriptFrame+4096 {
+			a.buf = a.buf[:0]
+			return ACPFrameRecord{}, false, Err(CodeInternal, "acp transcript: record exceeds %d bytes without decoding: %v", MaxACPTranscriptFrame, err)
+		}
+		return ACPFrameRecord{}, false, nil
+	}
+	a.buf = a.buf[:0]
+	return rec, true, nil
+}
+
+// Pending reports whether a partial record is buffered.
+func (a *ACPRecordAssembler) Pending() bool { return len(a.buf) > 0 }
+
 // Agent bounds.
 const (
 	MaxAgentMessageSize = 256 << 10

@@ -132,6 +132,13 @@ type Node struct {
 	ctrlPub    ed25519.PublicKey
 	leaseSec   int64
 	workspaces map[string]*ws
+	// agentRuns are the live Agent run attempts keyed by agent|run;
+	// agentRunsDone remembers the ones that finished on this node so a
+	// replayed agent.run for a dead attempt is refused rather than restarted.
+	agentRuns     map[string]*agentRun
+	agentRunsDone map[string]bool
+	// agentReportSink replaces the uplink for agent reports in tests.
+	agentReportSink func(context.Context, *proto.AgentReport) error
 	// materializing holds workspaces this node has claimed but not finished
 	// restoring: their leases must be renewed too, or a slow restore loses
 	// the claim it is working on.
@@ -362,6 +369,7 @@ func New(opts Options) (*Node, error) {
 		opts: opts, id: id, priv: priv, logger: opts.Logger.With("node", id),
 		store: store, connectors: connectorStore, events: eventlog.New(eventlog.NewMemory(10000)),
 		workspaces: map[string]*ws{}, materializing: map[string]*materialization{},
+		agentRuns: map[string]*agentRun{}, agentRunsDone: map[string]bool{},
 		deadlines: map[string]time.Time{}, quarantined: map[string]struct{}{},
 		grants: map[string]*proto.Grant{}, subs: map[string]*subscriber{},
 		prepared: map[string]*preparedRelease{}, committed: map[string]uint64{},
@@ -1365,8 +1373,12 @@ func appendWarning(existing, warning string) string {
 // first so queued starters fail their post-lock serviceability check.
 func (n *Node) stopWorkspaceSessions(w *ws) error {
 	w.treeMu.Lock()
-	defer w.treeMu.Unlock()
-	return n.sessions.KillWorkspace(w.ID)
+	err := n.sessions.KillWorkspace(w.ID)
+	w.treeMu.Unlock()
+	// Agent runs join after the tree boundary is released: a run still
+	// waiting to spawn needs the boundary to observe the workspace is gone.
+	n.stopAgentRuns(w.ID, "workspace sessions stopped")
+	return err
 }
 
 // fenceWorkspace stops all execution and egress but preserves the filesystem.
@@ -1965,6 +1977,30 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 				return nil, err
 			}
 			return n.controlSnapshot(ctx, p, req)
+		case proto.OpAgentRun:
+			req, err := decode[proto.AgentRunReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return n.agentRunStart(ctx, p, req)
+		case proto.OpAgentDeliver:
+			req, err := decode[proto.AgentDeliverReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return struct{}{}, n.agentRunDeliver(req)
+		case proto.OpAgentRunCancel:
+			req, err := decode[proto.AgentRunCancelReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return struct{}{}, n.agentRunCancel(req)
+		case proto.OpAgentApprovalDecided:
+			req, err := decode[proto.AgentApprovalDecidedReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return struct{}{}, n.agentApprovalDecided(req)
 		}
 		return nil, proto.Err(proto.CodeUnsupported, "unknown control op %q", f.Op)
 	}
@@ -2433,25 +2469,16 @@ func (n *Node) status() proto.NodeStatus {
 // sessions and streaming
 // ---------------------------------------------------------------------------
 
-func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, claims proto.GrantClaims, w *ws, req *proto.SOpenReq) (any, error) {
-	if err := req.Run.Validate(); err != nil {
-		return nil, err
-	}
-	if req.Run != nil && req.Run.Auth == proto.RunAuthWorkspaceResident && w.Spec.Security.Profile != "" && w.Spec.Security.Profile != proto.SecurityLocal {
-		// The node is the authority on the workspace's security profile; a
-		// client cannot talk it into a login it would never see.
-		return nil, proto.Err(proto.CodeDenied, "workspace-resident harness auth is refused under security profile %s", w.Spec.Security.Profile)
-	}
-	unlock, err := n.lockWorkspaceTree(w, false)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
+// sessionEnv builds the environment a process in w starts with: the
+// workspace's env, then extra, with binding references resolved to
+// placeholders and ${REMOUNT_BROKER} expanded, plus the broker's own
+// variables. Real secrets are never in the result; they stay in the broker.
+func (n *Node) sessionEnv(w *ws, extra map[string]string) []string {
 	env := map[string]string{}
 	for k, v := range w.Spec.Env {
 		env[k] = v
 	}
-	for k, v := range req.Env {
+	for k, v := range extra {
 		env[k] = v
 	}
 	base := ""
@@ -2467,7 +2494,24 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 		envList = append(envList, w.broker.EnvFor()...)
 		envList = append(envList, gitConfigEnv(w.broker, w.Spec.Repo, leases)...)
 	}
-	envList = append(envList, workspace.MapEnv(env)...)
+	return append(envList, workspace.MapEnv(env)...)
+}
+
+func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, claims proto.GrantClaims, w *ws, req *proto.SOpenReq) (any, error) {
+	if err := req.Run.Validate(); err != nil {
+		return nil, err
+	}
+	if req.Run != nil && req.Run.Auth == proto.RunAuthWorkspaceResident && w.Spec.Security.Profile != "" && w.Spec.Security.Profile != proto.SecurityLocal {
+		// The node is the authority on the workspace's security profile; a
+		// client cannot talk it into a login it would never see.
+		return nil, proto.Err(proto.CodeDenied, "workspace-resident harness auth is refused under security profile %s", w.Spec.Security.Profile)
+	}
+	unlock, err := n.lockWorkspaceTree(w, false)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	envList := n.sessionEnv(w, req.Env)
 	spec := session.Spec{
 		WS: w.ID, Kind: req.Kind, Program: req.Program, Cwd: req.Cwd, Env: envList,
 		Rows: req.Rows, Cols: req.Cols, Stdin: req.Stdin, IdempotencyKey: req.IdempotencyKey,
