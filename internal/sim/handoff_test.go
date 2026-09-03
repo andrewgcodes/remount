@@ -101,7 +101,13 @@ func TestHandoffThenResumeCarriesHarnessState(t *testing.T) {
 		t.Fatalf("non path-keyed recipe pinned a mount path: %+v", res.Workspace.Spec)
 	}
 	ws := res.Workspace
-	if ws.Spec.Labels[launch.LabelRecipe] != "fake" || ws.Spec.Labels[launch.LabelOrigin] != dir || ws.Spec.RestoreFrom != res.Artifact {
+	// The origin label is the canonical path (symlinks resolved), which is
+	// what a later resume from the same directory computes too.
+	canonical, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.Spec.Labels[launch.LabelRecipe] != "fake" || ws.Spec.Labels[launch.LabelOrigin] != canonical || ws.Spec.RestoreFrom != res.Artifact {
 		t.Fatalf("labels %+v restore %q", ws.Spec.Labels, ws.Spec.RestoreFrom)
 	}
 	out := readOut(t, res.Session)
@@ -213,7 +219,7 @@ func TestHandoffThenResumeCarriesHarnessState(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "namespaced backend") {
 		t.Fatalf("path-keyed handoff onto a process node: %v", err)
 	}
-	if bad == nil || bad.MountPath != dir || bad.Workspace == nil || bad.Workspace.Spec.MountPath != dir {
+	if bad == nil || bad.MountPath != canonical || bad.Workspace == nil || bad.Workspace.Spec.MountPath != canonical {
 		t.Fatalf("path-keyed handoff = %+v", bad)
 	}
 	if got, _ := c.GetWorkspace(ctx, bad.Workspace.ID); got.State != proto.WSPending || got.Node != "" {
