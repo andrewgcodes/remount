@@ -475,6 +475,10 @@ func (r *agentRun) main() {
 		runErr     error
 		stopReason string
 	)
+	if err := r.installHarness(); err != nil {
+		r.finish(-1, err, "", nil)
+		return
+	}
 	cmd, client, err := r.spawn()
 	if err != nil {
 		r.finish(-1, err, "", nil)
@@ -531,6 +535,9 @@ func (r *agentRun) finish(exitCode int, runErr error, stopReason string, client 
 	text := ""
 	if runErr != nil && !cancelled {
 		text = runErr.Error()
+		if exitCode != 0 && !strings.Contains(text, "exited") {
+			text = fmt.Sprintf("%s (harness exited %d)", text, exitCode)
+		}
 	}
 	exit := proto.ExitInfo{Code: exitCode, Error: text}
 	if cancelled {
@@ -612,39 +619,20 @@ func (r *agentRun) spawn() (*exec.Cmd, *acp.Client, error) {
 // explicit ACP command behind a one-line env preamble.
 func (r *agentRun) program() ([]string, map[string]string, error) {
 	spec := r.req.Spec
-	env := map[string]string{}
-	if spec.Recipe == "" && len(spec.ACPCommand) == 0 {
-		return nil, nil, proto.Err(proto.CodeBadRequest, "agent has neither a recipe nor an acp command")
-	}
-	bindings, err := workspaceBindings(r.w.Spec.Labels)
+	env, err := r.bindingEnv()
 	if err != nil {
 		return nil, nil, err
-	}
-	for _, b := range bindings {
-		for k, v := range b.SessionEnv() {
-			env[k] = v
-		}
 	}
 	if spec.Recipe == "" {
 		program := append([]string{"/bin/sh", "-c", acpLauncherEnvScript, "remount-acp"}, spec.ACPCommand...)
 		return program, env, nil
 	}
-	var recipe *launch.Recipe
-	if spec.RecipeYAML != "" {
-		recipe, err = launch.Parse([]byte(spec.RecipeYAML))
-	} else {
-		recipe, err = launch.Load(spec.Recipe)
-	}
+	recipe, data, err := r.recipe()
 	if err != nil {
-		return nil, nil, proto.Err(proto.CodeBadRequest, "recipe: %v", err)
+		return nil, nil, err
 	}
 	if recipe.ACP == nil && len(spec.ACPCommand) == 0 {
 		return nil, nil, proto.Err(proto.CodeUnsupported, "recipe %s has no acp command", recipe.Name)
-	}
-	data := launch.Data{
-		Task: spec.Task, Recipe: recipe.Name, Workspace: r.w.ID, Sandbox: spec.Sandbox,
-		Approve: r.req.Policy.Approve, Model: spec.Model, Providers: spec.Providers, Primary: spec.Primary,
-		Broker: "${REMOUNT_BROKER}",
 	}
 	if len(spec.ACPCommand) > 0 {
 		program := append([]string{"/bin/sh", "-c", acpLauncherEnvScript, "remount-acp"}, spec.ACPCommand...)
@@ -659,6 +647,151 @@ func (r *agentRun) program() ([]string, map[string]string, error) {
 		return nil, nil, err
 	}
 	return []string{"/bin/sh", lp}, env, nil
+}
+
+// bindingEnv is the placeholder environment the workspace's bindings give
+// every session: names and base URLs, never a value the broker holds.
+func (r *agentRun) bindingEnv() (map[string]string, error) {
+	spec := r.req.Spec
+	if spec.Recipe == "" && len(spec.ACPCommand) == 0 {
+		return nil, proto.Err(proto.CodeBadRequest, "agent has neither a recipe nor an acp command")
+	}
+	bindings, err := workspaceBindings(r.w.Spec.Labels)
+	if err != nil {
+		return nil, err
+	}
+	env := map[string]string{}
+	for _, b := range bindings {
+		for k, v := range b.SessionEnv() {
+			env[k] = v
+		}
+	}
+	return env, nil
+}
+
+// recipe loads the Agent's recipe and the template data every rendering of
+// it uses.
+func (r *agentRun) recipe() (*launch.Recipe, launch.Data, error) {
+	spec := r.req.Spec
+	var (
+		recipe *launch.Recipe
+		err    error
+	)
+	if spec.RecipeYAML != "" {
+		recipe, err = launch.Parse([]byte(spec.RecipeYAML))
+	} else {
+		recipe, err = launch.Load(spec.Recipe)
+	}
+	if err != nil {
+		return nil, launch.Data{}, proto.Err(proto.CodeBadRequest, "recipe: %v", err)
+	}
+	data := launch.Data{
+		Task: spec.Task, Recipe: recipe.Name, Workspace: r.w.ID, Sandbox: spec.Sandbox,
+		Approve: r.req.Policy.Approve, Model: spec.Model, Providers: spec.Providers, Primary: spec.Primary,
+		Broker: "${REMOUNT_BROKER}",
+	}
+	return recipe, data, nil
+}
+
+// agentInstallTimeout bounds a recipe's install script. A harness that
+// cannot be installed in this long is a failed run, not a hung one.
+const agentInstallTimeout = 15 * time.Minute
+
+// installHarness runs the recipe's install script once per materialization,
+// the way `remount run` does from the client, so an Agent created over the
+// API alone gets its harness. The marker carries the workspace generation:
+// a move lands on a possibly different image and installs again; a retry on
+// the same node does not. Output is kept in the transcript under the stderr
+// stream so `agent watch` shows an install that fails.
+func (r *agentRun) installHarness() error {
+	if r.req.Spec.Recipe == "" {
+		return nil
+	}
+	recipe, data, err := r.recipe()
+	if err != nil {
+		return err
+	}
+	script, err := recipe.InstallScript(data)
+	if err != nil {
+		return proto.Err(proto.CodeBadRequest, "recipe %s: %v", recipe.Name, err)
+	}
+	if script == "" {
+		return nil
+	}
+	marker := recipe.InstallMarkerPath()
+	want := fmt.Sprintf("gen %d\n", r.req.Gen)
+	extraEnv, err := r.bindingEnv()
+	if err != nil {
+		return err
+	}
+	unlock, err := r.n.lockWorkspaceTree(r.w, false)
+	if err != nil {
+		return err
+	}
+	if res, rerr := r.w.handle.FS().Read(marker, 0, 256); rerr == nil && string(res.Data) == want {
+		unlock()
+		return nil
+	}
+	spec := session.Spec{
+		WS: r.w.ID, Kind: proto.SessionExec, Program: []string{"/bin/sh", "-c", ". ./.remount/env 2>/dev/null; " + script}, Cwd: ".",
+		Env: r.n.sessionEnv(r.w, extraEnv), Principal: r.req.Owner, Tenant: r.req.Tenant,
+		Timeout: agentInstallTimeout,
+		Run:     &proto.RunInfo{Recipe: recipe.Name, TaskHash: launch.TaskHash(r.req.Spec.Task), Sandbox: r.req.Spec.Sandbox, Auth: r.req.Spec.Auth},
+	}
+	if err := r.w.handle.Prepare(&spec); err != nil {
+		unlock()
+		return err
+	}
+	redact := newRedactor(r.secretLiterals(spec.Env))
+	s, err := r.n.sessions.Open(spec)
+	unlock()
+	if err != nil {
+		return proto.Err(proto.CodeInternal, "install %s: %v", recipe.Name, err)
+	}
+	defer r.n.sessions.Remove(s.ID, true)
+	exit, err := s.Wait(r.ctx)
+	if err != nil {
+		s.Kill()
+		if r.isCancelled() {
+			return err
+		}
+		return proto.Err(proto.CodeInternal, "install %s: %v", recipe.Name, err)
+	}
+	r.recordInstallOutput(s, redact)
+	if exit.Code != 0 || exit.Signal != "" {
+		return proto.Err(proto.CodeInternal, "install %s exited %d %s", recipe.Name, exit.Code, exit.Signal)
+	}
+	unlock, err = r.n.lockWorkspaceTree(r.w, false)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return r.w.handle.FS().Write(marker, []byte(want), 0o644, false, true)
+}
+
+// recordInstallOutput copies the tail of an install session's output into
+// the transcript. It is best effort: a redacted, bounded log line, never a
+// reason to fail the run.
+func (r *agentRun) recordInstallOutput(s *session.Session, redact *redactor) {
+	chunks, err := s.Log.Read(0, 0)
+	if err != nil {
+		return
+	}
+	var out []byte
+	for _, c := range chunks {
+		if c.Stream == proto.StreamStdout || c.Stream == proto.StreamStderr {
+			out = append(out, c.Data...)
+		}
+	}
+	if len(out) > agentTerminalOutputLimit {
+		out = out[len(out)-agentTerminalOutputLimit:]
+	}
+	out, _ = redact.apply(out)
+	if len(out) > 0 {
+		if _, err := r.transcript.Record(proto.StreamStderr, out); err != nil {
+			r.n.logger.Warn("acp transcript record", "agent", r.req.Agent, "run", r.req.Run, "err", err)
+		}
+	}
 }
 
 // workspaceBindings reads the bindings `remount run` recorded on the

@@ -162,6 +162,21 @@ func (af *agentFixture) start(t *testing.T, subject Subject, task string) (*prot
 	return a, run
 }
 
+// startNamed is start for a second agent in the same fixture; the fixture's
+// single node runs both.
+func (af *agentFixture) startNamed(t *testing.T, subject Subject, name, task string) (*proto.Agent, proto.AgentRunReq) {
+	t.Helper()
+	a := af.create(t, subject, proto.AgentCreateReq{Name: name, Spec: agentSpec(task)})
+	af.claim(t, a.WS)
+	af.c.agentReconcile(context.Background())
+	run := af.lastRun(t)
+	if run.Agent != a.ID {
+		t.Fatalf("last run belongs to %s, want %s", run.Agent, a.ID)
+	}
+	af.report(t, run, 1, proto.AgentReport{Kind: proto.AgentReportStarted, Transcript: "s_acp_" + name})
+	return a, run
+}
+
 func (af *agentFixture) report(t *testing.T, run proto.AgentRunReq, seq uint64, rep proto.AgentReport) {
 	t.Helper()
 	rep.Agent, rep.Run, rep.WS, rep.Gen, rep.Seq = run.Agent, run.Run, run.WS, run.Gen, seq
@@ -949,5 +964,151 @@ func TestAgentTransitionsRejectResurrection(t *testing.T) {
 	}
 	if err := transitionAgent(proto.AgentIdle, proto.AgentWaitingApproval); err == nil {
 		t.Fatal("idle -> waiting_approval allowed without a run")
+	}
+}
+
+// parkRaw puts an approval row of any kind into the control plane, the way
+// the broker will once it parks egress decisions; the node path refuses the
+// egress kind.
+func (af *agentFixture) parkRaw(t *testing.T, a *proto.Agent, run proto.AgentRunReq, ap proto.Approval) {
+	t.Helper()
+	af.c.mu.Lock()
+	live := af.c.agents[a.ID]
+	r := findRun(live, run.Run)
+	ws := af.c.workspaces[live.WS]
+	kind := ap.Kind
+	ap.Kind = proto.ApprovalToolCall
+	events, err := af.c.parkApprovalLocked(live, r, ws, "n_one", &ap)
+	if err == nil {
+		af.c.approvals[ap.ID].Kind = kind
+		af.c.markApprovalDirty(af.c.approvals[ap.ID])
+		var more []*proto.Event
+		if more, err = af.c.refreshAgentStatusLocked(live, ""); err == nil {
+			err = af.c.persistAgentRows(live, "", "", "", nil, nil, append(events, more...)...)
+		}
+	}
+	af.c.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestApprovalEgressAndElicitationSemantics(t *testing.T) {
+	af := newAgentFixture(t, "", nil)
+	a, run := af.start(t, localSubject(), "ask me")
+	af.report(t, run, 2, proto.AgentReport{Kind: proto.AgentReportTurnStarted, Message: run.Messages[0].ID})
+	// The node may only park the ACP kinds.
+	rep := proto.AgentReport{Agent: run.Agent, Run: run.Run, WS: run.WS, Gen: run.Gen, Seq: 3, Kind: proto.AgentReportPermission,
+		Approval: &proto.Approval{ID: "ap_x", Kind: proto.ApprovalEgress, Title: "api.example.com"}}
+	if err := af.c.agentReport(context.Background(), "n_one", &rep); codeOf(err) != proto.CodeBadRequest {
+		t.Fatalf("node parking egress = %v", err)
+	}
+	af.parkRaw(t, a, run, proto.Approval{ID: "ap_eg1", Kind: proto.ApprovalEgress, Title: "POST api.example.com"})
+	af.parkRaw(t, a, run, proto.Approval{ID: "ap_eg2", Kind: proto.ApprovalEgress, Title: "POST evil.example.com"})
+	af.parkRaw(t, a, run, proto.Approval{ID: "ap_eg3", Kind: proto.ApprovalEgress, Title: "POST other.example.com"})
+	if got := af.agent(t, a.ID); got.Status != proto.AgentWaitingApproval || got.PendingApprovals != 3 {
+		t.Fatalf("agent with egress pending: %+v", got)
+	}
+	ctx := context.Background()
+	if _, err := af.c.approvalDecide(ctx, localSubject(), &proto.ApprovalDecideReq{ID: "ap_eg1", Option: "maybe"}); codeOf(err) != proto.CodeBadRequest {
+		t.Fatalf("egress with a made-up option = %v", err)
+	}
+	if _, err := af.c.approvalDecide(ctx, localSubject(), &proto.ApprovalDecideReq{ID: "ap_eg1", Option: "allow", Denied: true}); codeOf(err) != proto.CodeBadRequest {
+		t.Fatalf("egress allow+denied = %v", err)
+	}
+	d1, err := af.c.approvalDecide(ctx, localSubject(), &proto.ApprovalDecideReq{ID: "ap_eg1"})
+	if err != nil || d1.Decision.Denied || d1.Decision.Option != "allow" {
+		t.Fatalf("egress default = %+v, %v; want allow", d1, err)
+	}
+	d2, err := af.c.approvalDecide(ctx, localSubject(), &proto.ApprovalDecideReq{ID: "ap_eg2", Option: "deny"})
+	if err != nil || !d2.Decision.Denied || d2.Decision.Option != "deny" {
+		t.Fatalf("egress deny = %+v, %v", d2, err)
+	}
+	d3, err := af.c.approvalDecide(ctx, localSubject(), &proto.ApprovalDecideReq{ID: "ap_eg3", Denied: true})
+	if err != nil || !d3.Decision.Denied || d3.Decision.Option != "deny" {
+		t.Fatalf("egress denied = %+v, %v", d3, err)
+	}
+	if got := af.agent(t, a.ID); got.PendingApprovals != 0 || got.Status != proto.AgentRunning {
+		t.Fatalf("agent after all decided: %+v", got)
+	}
+
+	// Elicitation content is a JSON object; anything else is refused before
+	// the row changes.
+	af.report(t, run, 4, proto.AgentReport{Kind: proto.AgentReportElicitation, Approval: &proto.Approval{
+		ID: "ap_el", Kind: proto.ApprovalElicitation, Title: "which db?", Detail: json.RawMessage(`{"schema":{}}`),
+	}})
+	for _, bad := range []proto.ApprovalDecideReq{
+		{ID: "ap_el", Content: json.RawMessage(`"pg"`)},
+		{ID: "ap_el", Content: json.RawMessage(`["pg"]`)},
+		{ID: "ap_el", Content: json.RawMessage(`{"db":`)},
+		{ID: "ap_el", Option: "once"},
+	} {
+		if _, err := af.c.approvalDecide(ctx, localSubject(), &bad); codeOf(err) != proto.CodeBadRequest {
+			t.Fatalf("elicitation %+v = %v", bad, err)
+		}
+	}
+	if ap, _ := af.c.approvalCopy("ap_el"); ap.Status != proto.ApprovalPending {
+		t.Fatalf("a refused decision changed the row: %+v", ap)
+	}
+	// A denied elicitation keeps no content, even if some was sent.
+	den, err := af.c.approvalDecide(ctx, localSubject(), &proto.ApprovalDecideReq{ID: "ap_el", Denied: true, Content: json.RawMessage(`{"db":"pg"}`)})
+	if err != nil || !den.Decision.Denied || len(den.Decision.Content) != 0 {
+		t.Fatalf("denied elicitation = %+v, %v", den, err)
+	}
+	// Events carry the decision, never the elicitation content or egress detail.
+	for _, e := range eventsOfType(t, af.log, proto.EvApprovalDecided) {
+		if s := string(proto.MustMarshal(e)); strings.Contains(s, `"pg"`) || strings.Contains(s, "schema") {
+			t.Fatalf("decided event leaks content: %s", s)
+		}
+	}
+
+	// A list filtered by agent and status sees only that agent's rows.
+	other, orun := af.startNamed(t, localSubject(), "other", "second agent")
+	af.report(t, orun, 2, proto.AgentReport{Kind: proto.AgentReportTurnStarted, Message: orun.Messages[0].ID})
+	af.report(t, orun, 3, proto.AgentReport{Kind: proto.AgentReportPermission, Approval: &proto.Approval{
+		ID: "ap_o", Kind: proto.ApprovalToolCall, Title: "rm", Options: []proto.ApprovalOption{{ID: "ok", Kind: "allow_once"}},
+	}})
+	mine, err := af.c.approvalList(ctx, localSubject(), &proto.ApprovalListReq{Agent: a.ID, Status: proto.ApprovalDecided})
+	if err != nil || len(mine.Approvals) != 4 {
+		t.Fatalf("decided approvals of %s = %+v, %v", a.ID, mine, err)
+	}
+	theirs, err := af.c.approvalList(ctx, localSubject(), &proto.ApprovalListReq{Agent: other.ID})
+	if err != nil || len(theirs.Approvals) != 1 || theirs.Approvals[0].ID != "ap_o" {
+		t.Fatalf("pending approvals of %s = %+v, %v", other.ID, theirs, err)
+	}
+	if _, err := af.c.approvalGet(ctx, Subject{ID: "mallory", Tenant: "tenant-b"}, "ap_o"); codeOf(err) != proto.CodeDenied {
+		t.Fatalf("stranger get = %v", err)
+	}
+}
+
+func TestApprovalUndeliveredDecisionStopsRetryingWhenRunEnds(t *testing.T) {
+	af := newAgentFixture(t, "", nil)
+	_, run := af.start(t, localSubject(), "ask me")
+	af.report(t, run, 2, proto.AgentReport{Kind: proto.AgentReportTurnStarted, Message: run.Messages[0].ID})
+	af.report(t, run, 3, proto.AgentReport{Kind: proto.AgentReportPermission, Approval: &proto.Approval{
+		ID: "ap_u", Kind: proto.ApprovalToolCall, Title: "rm", Options: []proto.ApprovalOption{{ID: "ok", Kind: "allow_once"}},
+	}})
+	af.fail.Store(true)
+	if _, err := af.c.approvalDecide(context.Background(), localSubject(), &proto.ApprovalDecideReq{ID: "ap_u"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for af.opCount(proto.OpAgentApprovalDecided) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	sends := af.opCount(proto.OpAgentApprovalDecided)
+	// The run ends before the node ever acknowledged.
+	af.report(t, run, 4, proto.AgentReport{Kind: proto.AgentReportFinished, Cancelled: true})
+	af.fail.Store(false)
+	af.advance(agentRedeliverAfter + time.Second)
+	af.c.expireStaleApprovals(context.Background())
+	af.advance(agentRedeliverAfter + time.Second)
+	af.c.expireStaleApprovals(context.Background())
+	ap, _ := af.c.approvalCopy("ap_u")
+	if ap.Status != proto.ApprovalDecided || ap.DeliveredAt != -1 {
+		t.Fatalf("undelivered decision after run end = %+v; want delivered_at -1", ap)
+	}
+	if af.opCount(proto.OpAgentApprovalDecided) != sends {
+		t.Fatalf("decision re-sent after the run ended: %d -> %d", sends, af.opCount(proto.OpAgentApprovalDecided))
 	}
 }

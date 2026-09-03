@@ -124,6 +124,10 @@ func run(ctx context.Context, argv []string) error {
 		return cmdResume(ctx, args)
 	case "binding":
 		return cmdBinding(ctx, args)
+	case "approvals":
+		return cmdApprovals(ctx, args)
+	case "approve":
+		return cmdApprove(ctx, args)
 	case "status":
 		return cmdStatus(ctx, args)
 	case "inspect":
@@ -203,6 +207,8 @@ func usage() {
   remount handoff [--recipe R] [--task T] [--dir .]                      move this checkout and the harness's conversation into a workspace and keep it going
   remount resume WS [--task T]        rejoin a running harness, or wake the workspace and continue the conversation
   remount binding preset ls           provider presets a --binding may name
+  remount approvals [--agent ID] [--status pending|decided|expired|all]   what an Agent is waiting on a human for
+  remount approve ID [--option X | --deny | --content JSON]              answer one; no flag picks the first allow option
   remount nodes | events [--follow] [--ws WS] | timers
 
 Inspection, at three depths. All take --json.

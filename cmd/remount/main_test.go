@@ -539,3 +539,27 @@ func TestHandoffAndResumeValidateBeforeDialing(t *testing.T) {
 		})
 	}
 }
+
+func TestApproveValidatesFlagsBeforeDialing(t *testing.T) {
+	ctx := context.Background()
+	err := cmdApprove(ctx, []string{})
+	if err == nil || !strings.Contains(err.Error(), "approve ID") {
+		t.Fatalf("approve arity: %v", err)
+	}
+	err = cmdApprove(ctx, []string{"ap_1", "--deny", "--option", "allow"})
+	if err == nil || !strings.Contains(err.Error(), "exclusive") {
+		t.Fatalf("approve exclusive flags: %v", err)
+	}
+	err = cmdApprove(ctx, []string{"ap_1", "--content", "not json"})
+	if err == nil || !strings.Contains(err.Error(), "JSON object") {
+		t.Fatalf("approve content: %v", err)
+	}
+	err = cmdApprove(ctx, []string{"ap_1", "--content", `["array"]`})
+	if err == nil || !strings.Contains(err.Error(), "JSON object") {
+		t.Fatalf("approve content array: %v", err)
+	}
+	err = cmdApprovals(ctx, []string{"extra"})
+	if err == nil || !strings.Contains(err.Error(), `unexpected argument "extra"`) {
+		t.Fatalf("approvals arity: %v", err)
+	}
+}

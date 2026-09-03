@@ -558,3 +558,102 @@ func TestAgentRunRefusesWrongGenerationAndSecondRun(t *testing.T) {
 	}
 	f.waitDone(t)
 }
+
+// installRecipe is a recipe whose install script records each run in the
+// workspace and whose ACP command is the fake harness the fixture uses.
+func installRecipe(t *testing.T, mode, install string) string {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf(`name: inst
+auth: workspace_resident
+command: ["true"]
+install: |
+  %s
+acp:
+  command: ["/usr/bin/env", "%s=1", "%s=%s", %q]
+`, install, fakeACPEnv, fakeACPModeEnv, mode, exe)
+}
+
+func TestAgentRunInstallsRecipeOncePerGeneration(t *testing.T) {
+	f := newAgentFixture(t)
+	req := f.request(t, "echo", "hello")
+	req.Spec = proto.AgentSpec{Recipe: "inst", RecipeYAML: installRecipe(t, "echo", `echo "installed key=${OPENAI_API_KEY:-none}" >&2; echo run >> installs.txt`)}
+	if _, err := f.n.agentRunStart(context.Background(), nil, &req); err != nil {
+		t.Fatal(err)
+	}
+	started := f.next(t, proto.AgentReportStarted)
+	f.next(t, proto.AgentReportTurnFinished)
+	if err := f.n.agentRunCancel(&proto.AgentRunCancelReq{Agent: req.Agent, Run: req.Run, Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	f.next(t, proto.AgentReportFinished)
+	f.waitDone(t)
+	res, err := f.w.handle.FS().Read("installs.txt", 0, 0)
+	if err != nil || string(res.Data) != "run\n" {
+		t.Fatalf("installs.txt = %+v, %v", res, err)
+	}
+	// Install output reaches the transcript, on the stderr stream.
+	s, _ := f.n.sessions.Get(started.Transcript)
+	chunks, err := s.Log.Read(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr []byte
+	for _, c := range chunks {
+		if c.Stream == proto.StreamStderr {
+			stderr = append(stderr, c.Data...)
+		}
+	}
+	if !bytes.Contains(stderr, []byte("installed key=")) {
+		t.Fatalf("install output missing from transcript: %q", stderr)
+	}
+
+	// Same generation: a second run does not install again.
+	req.Run = "run_second"
+	if _, err := f.n.agentRunStart(context.Background(), nil, &req); err != nil {
+		t.Fatal(err)
+	}
+	f.next(t, proto.AgentReportTurnFinished)
+	_ = f.n.agentRunCancel(&proto.AgentRunCancelReq{Agent: req.Agent, Run: req.Run, Reason: "test"})
+	f.next(t, proto.AgentReportFinished)
+	f.waitDone(t)
+	if res, err := f.w.handle.FS().Read("installs.txt", 0, 0); err != nil || string(res.Data) != "run\n" {
+		t.Fatalf("second run reinstalled: %+v, %v", res, err)
+	}
+
+	// A new generation (the workspace moved) installs again.
+	f.n.mu.Lock()
+	f.w.Generation++
+	f.n.mu.Unlock()
+	req.Run, req.Gen = "run_third", f.w.Generation
+	if _, err := f.n.agentRunStart(context.Background(), nil, &req); err != nil {
+		t.Fatal(err)
+	}
+	f.next(t, proto.AgentReportTurnFinished)
+	_ = f.n.agentRunCancel(&proto.AgentRunCancelReq{Agent: req.Agent, Run: req.Run, Reason: "test"})
+	f.next(t, proto.AgentReportFinished)
+	f.waitDone(t)
+	if res, err := f.w.handle.FS().Read("installs.txt", 0, 0); err != nil || string(res.Data) != "run\nrun\n" {
+		t.Fatalf("new generation did not reinstall: %+v, %v", res, err)
+	}
+}
+
+func TestAgentRunInstallFailureFailsTheRun(t *testing.T) {
+	f := newAgentFixture(t)
+	req := f.request(t, "echo", "hello")
+	req.Spec = proto.AgentSpec{Recipe: "inst", RecipeYAML: installRecipe(t, "echo", `echo "no network" >&2; exit 3`)}
+	if _, err := f.n.agentRunStart(context.Background(), nil, &req); err != nil {
+		t.Fatal(err)
+	}
+	fin := f.next(t, proto.AgentReportFinished)
+	if fin.Cancelled || fin.ExitCode != -1 || !strings.Contains(fin.Error, "install inst exited 3") {
+		t.Fatalf("finished = %+v", fin)
+	}
+	f.waitDone(t)
+	if _, err := f.w.handle.FS().Read(".remount/launch/inst.installed", 0, 0); err == nil {
+		t.Fatal("a failed install left a marker")
+	}
+}
