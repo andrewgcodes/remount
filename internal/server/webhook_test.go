@@ -6,8 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/proto"
@@ -17,6 +20,87 @@ func sign(secret, body string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(body))
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+func slackSign(secret string, timestamp int64, body string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = fmt.Fprintf(mac, "v0:%d:%s", timestamp, body)
+	return "v0=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+// Provider adapters verify their provider's exact raw-body scheme before
+// translating provider-native bodies into stable event names.
+func TestWebhookProviderSignaturesAndMapping(t *testing.T) {
+	// GitHub's published test vector catches verification over decoded or
+	// re-encoded JSON instead of the bytes delivered on the wire.
+	const githubDigest = "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17"
+	if !verifyPrefixedHMAC("It's a Secret to Everybody", []byte("Hello, World!"), githubDigest, "sha256=") {
+		t.Fatal("GitHub published signature fixture did not verify")
+	}
+	const slackFixtureBody = `{"type":"event_callback","event":{"type":"app_mention"}}`
+	const slackDigest = "v0=3228c02cb5d71de76c2d48ba6aab79458570489724b6f414d4f22df4e00f2493"
+	if !verifyPrefixedHMAC("slack-test-secret", []byte("v0:1770000000:"+slackFixtureBody), slackDigest, "v0=") {
+		t.Fatal("recorded Slack v0 signature fixture did not verify")
+	}
+
+	s, hs := newAPIServer(t, func(o *Options) {
+		o.WebhookProviders = WebhookProviderConfig{
+			GitHubSecret:       "github-test-secret",
+			SlackSigningSecret: "slack-test-secret",
+			LinearSecret:       "linear-test-secret",
+			GenericBearer:      "generic-test-token",
+		}
+	})
+	post := func(body string, headers map[string]string, wantStatus int, wantType string) {
+		t.Helper()
+		resp, responseBody := apiCall(t, hs, http.MethodPost, "/v1/events", "", body, headers)
+		if resp.StatusCode != wantStatus {
+			t.Fatalf("POST provider = %d %s", resp.StatusCode, responseBody)
+		}
+		if wantType == "" {
+			return
+		}
+		events, err := s.Log.Read(context.Background(), 1, "", 100)
+		if err != nil || len(events) == 0 || events[len(events)-1].Type != wantType {
+			t.Fatalf("mapped events = %+v, %v; want %s", events, err, wantType)
+		}
+	}
+
+	githubBody := `{"action":"created","repository":{"full_name":"acme/widgets"},"comment":{"body":"wake"}}`
+	post(githubBody, map[string]string{
+		"X-GitHub-Event":      "issue_comment",
+		"X-Hub-Signature-256": sign("github-test-secret", githubBody),
+	}, http.StatusAccepted, "webhook.github.issue_comment")
+	post(githubBody, map[string]string{
+		"X-GitHub-Event":      "issue_comment",
+		"X-Hub-Signature-256": sign("wrong", githubBody),
+	}, http.StatusUnauthorized, "")
+
+	slackBody := `{"type":"event_callback","event":{"type":"app_mention","text":"hi"}}`
+	now := time.Now().Unix()
+	post(slackBody, map[string]string{
+		"X-Slack-Request-Timestamp": fmt.Sprint(now),
+		"X-Slack-Signature":         slackSign("slack-test-secret", now, slackBody),
+	}, http.StatusAccepted, "webhook.slack.app_mention")
+	old := now - int64((defaultSlackReplayWindow+time.Minute)/time.Second)
+	post(slackBody, map[string]string{
+		"X-Slack-Request-Timestamp": fmt.Sprint(old),
+		"X-Slack-Signature":         slackSign("slack-test-secret", old, slackBody),
+	}, http.StatusUnauthorized, "")
+
+	linearBody := `{"action":"create","type":"Issue","webhookTimestamp":1710000000000}`
+	const linearDigest = "5c1a2f0cc7610128ba02aa83ef2fe695e99da28ee66ef5c6031ee6f3021fcea3"
+	post(linearBody, map[string]string{"Linear-Signature": linearDigest}, http.StatusAccepted, "webhook.linear.issue.create")
+
+	genericBody := `{"type":"deploy.completed","payload":{"environment":"staging"}}`
+	post(genericBody, map[string]string{
+		"Authorization":      "Bearer generic-test-token",
+		"X-Remount-Provider": "generic",
+	}, http.StatusAccepted, "webhook.generic.deploy_completed")
+	post(genericBody, map[string]string{
+		"Authorization":      "Bearer wrong",
+		"X-Remount-Provider": "generic",
+	}, http.StatusUnauthorized, "")
 }
 
 // A signed webhook creates an Agent from a templated task, a redelivery

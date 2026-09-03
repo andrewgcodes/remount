@@ -263,6 +263,14 @@ response is `202 {"accepted": true, "agent": "ag_…", "ws": "ws_…", "status":
 "…"}`. Redelivering the same webhook (same rendered `idempotency_key`)
 returns the same agent.
 
+With `remount server --notifications FILE`, provider-native GitHub, Slack and
+Linear bodies are verified using their own signature formats and translated
+to `webhook.<provider>.*` events; `X-Remount-Provider: generic` selects the
+separate configured bearer. The same file configures tenant-scoped Slack or
+allow-listed generic outbound subscriptions for `egress.pending`,
+`run.finished`, `ws.fenced`, and `pool.*`. See `docs/operations.md` for the
+environment-reference-only configuration and durable dead-letter behavior.
+
 ## Scheduling and children
 
 `policy.start_at` (Unix milliseconds) holds the first run until that time:

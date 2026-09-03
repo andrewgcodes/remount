@@ -23,6 +23,7 @@ remount server --listen 0.0.0.0:7443 --data /var/lib/remount --token "$REMOUNT_T
 | `--insecure` | off | allow an empty token, for local experiments only |
 | `--bindings` | none | JSON file of secrets the nodes may lease |
 | `--provisioners` | none | provider registry JSON; credentials are named environment references |
+| `--notifications` | none | provider-webhook and outbound-notification JSON; credentials are named environment references |
 | `--lease` | `30` | claim lease in seconds |
 | `--mode` | `standalone` | `standalone`, `production-single-tenant`, or `production-multi-tenant` |
 | `--max-concurrent-requests` | `128` | active control request handlers; excess work fails with `resource_exhausted` |
@@ -559,3 +560,63 @@ operator record. After a crash, provider inventory is re-read before any new
 mutation. A machine is eligible for idle destruction only when its
 `remount.node` label exactly matches an online control node reporting zero
 workspace assignments.
+
+## Provider webhooks and outbound notifications
+
+`remount server --notifications /etc/remount/notifications.json` enables
+provider-native webhook verification and outbound event subscriptions. Secret
+values do not belong in this file: every provider secret, bearer, and Slack
+incoming-webhook URL names an environment variable, and startup fails when a
+referenced variable is empty or absent.
+
+```json
+{
+  "webhooks": {
+    "github_secret_env": "REMOUNT_GITHUB_WEBHOOK_SECRET",
+    "slack_signing_secret_env": "REMOUNT_SLACK_SIGNING_SECRET",
+    "linear_secret_env": "REMOUNT_LINEAR_WEBHOOK_SECRET",
+    "generic_bearer_env": "REMOUNT_GENERIC_WEBHOOK_BEARER",
+    "slack_replay_window": "5m"
+  },
+  "subscriptions": [
+    {
+      "id": "security-approvals",
+      "tenant": "tenant-a",
+      "events": ["egress.pending", "ws.fenced", "pool.*"],
+      "kind": "slack_webhook",
+      "url_env": "REMOUNT_SLACK_WEBHOOK_URL"
+    },
+    {
+      "id": "run-audit",
+      "tenant": "tenant-a",
+      "events": ["run.finished"],
+      "kind": "generic_webhook",
+      "url": "https://notify.example.com/remount",
+      "bearer_token_env": "REMOUNT_NOTIFY_BEARER",
+      "allowed_hosts": ["notify.example.com"]
+    }
+  ],
+  "limits": {
+    "batch_events": 64,
+    "batch_bytes": 524288,
+    "attempts": 4,
+    "retry_base": "100ms",
+    "retry_max": "5s",
+    "http_timeout": "20s",
+    "max_subscriptions": 128,
+    "max_dead_letters_per_tenant": 10000,
+    "dead_letter_retention": "720h",
+    "dead_letter_gc_interval": "10m"
+  }
+}
+```
+
+Generic destinations require HTTPS on port 443 and an exact hostname
+allow-list. Slack destinations must use `url_env`; putting their secret path in
+the JSON is refused. Redirects and DNS answers for private or local addresses
+are refused. Workers retry within configured count/time bounds, then store
+only sanitized sequence/type metadata in `control.db`. A full or unavailable
+dead-letter store retains the export cursor, so failed delivery cannot become
+an unobserved success. Watch `notifier.unavailable`,
+`notifier.dead_lettered`, `notifier.dead_letters_pruned`, and the
+`remount_notification_*` metrics.

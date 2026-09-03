@@ -377,11 +377,12 @@ type WSMoveReq struct {
 }
 
 type WSSleepReq struct {
-	ID             string `cbor:"id" json:"id"`
-	AfterSec       int64  `cbor:"after_sec,omitempty" json:"after_sec,omitempty"` // wake after N seconds
-	AtMillis       int64  `cbor:"at,omitempty" json:"at,omitempty"`               // or at unix millis
-	OnEvent        string `cbor:"on,omitempty" json:"on,omitempty"`               // or when an event of this type is posted
-	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+	ID             string            `cbor:"id" json:"id"`
+	AfterSec       int64             `cbor:"after_sec,omitempty" json:"after_sec,omitempty"` // wake after N seconds
+	AtMillis       int64             `cbor:"at,omitempty" json:"at,omitempty"`               // or at unix millis
+	OnEvent        string            `cbor:"on,omitempty" json:"on,omitempty"`               // or when an event of this type is posted
+	Match          map[string]string `cbor:"match,omitempty" json:"match,omitempty"`         // payload fields that must all match
+	IdempotencyKey string            `cbor:"idem,omitempty" json:"idem,omitempty"`
 }
 
 // WSACLReq replaces a workspace's ACL. Principals present before and absent
@@ -866,14 +867,15 @@ type GrantClaims struct {
 
 // Timer is a durable wake.
 type Timer struct {
-	ID        string `cbor:"id" json:"id"`
-	WS        string `cbor:"ws" json:"ws"`
-	At        int64  `cbor:"at,omitempty" json:"at,omitempty"` // unix millis
-	OnEvent   string `cbor:"on,omitempty" json:"on,omitempty"` // event type
-	Action    string `cbor:"action" json:"action"`             // resume
-	Fired     bool   `cbor:"fired" json:"fired"`
-	FiredAt   int64  `cbor:"fired_at,omitempty" json:"fired_at,omitempty"`
-	CreatedAt int64  `cbor:"created_at" json:"created_at"`
+	ID        string            `cbor:"id" json:"id"`
+	WS        string            `cbor:"ws" json:"ws"`
+	At        int64             `cbor:"at,omitempty" json:"at,omitempty"` // unix millis
+	OnEvent   string            `cbor:"on,omitempty" json:"on,omitempty"` // event type
+	Match     map[string]string `cbor:"match,omitempty" json:"match,omitempty"`
+	Action    string            `cbor:"action" json:"action"` // resume
+	Fired     bool              `cbor:"fired" json:"fired"`
+	FiredAt   int64             `cbor:"fired_at,omitempty" json:"fired_at,omitempty"`
+	CreatedAt int64             `cbor:"created_at" json:"created_at"`
 }
 
 type TimerListRes struct {
@@ -1454,58 +1456,61 @@ type WSDiag struct {
 // ---------------------------------------------------------------------------
 
 const (
-	EvNodeEnrolled   = "node.enrolled"
-	EvNodeOnline     = "node.online"
-	EvNodeOffline    = "node.offline"
-	EvWSCreated      = "ws.created"
-	EvWSOffered      = "ws.offered"
-	EvWSClaiming     = "ws.claiming"
-	EvWSClaimed      = "ws.claimed"
-	EvWSReleased     = "ws.released"
-	EvWSMoved        = "ws.moved"
-	EvWSPaused       = "ws.paused"
-	EvWSResumed      = "ws.resumed"
-	EvWSSnapshot     = "ws.snapshot"
-	EvWSRestored     = "ws.restored"
-	EvWSDestroyed    = "ws.destroyed"
-	EvWSLeaseExpired = "ws.lease_expired"
-	EvWSFenced       = "ws.fenced"
-	EvWSStateChanged = "ws.state_changed"
-	EvWSACL          = "ws.acl"        // ACL replaced; payload names revoked principals and the new revision
-	EvAuthzRevoked   = "authz.revoked" // node closed a revoked principal's sessions
-	EvSOpened        = "s.opened"
-	EvSExited        = "s.exited"
-	EvSInput         = "s.input"
-	EvFSWrite        = "fs.write"
-	EvFSApplyTar     = "fs.apply_tar" // one overlay applied; payload carries artifact and counts, fs.write follows per path
-	EvFSMkdir        = "fs.mkdir"
-	EvFSEdit         = "fs.edit"
-	EvFSRemove       = "fs.remove"
-	EvFSRename       = "fs.rename"
-	EvCredUsed       = "cred.used"
-	EvEgressPending  = "egress.pending"
-	EvEgressAllowed  = "egress.allowed"
-	EvEgressDenied   = "egress.denied"
-	EvEgressRedacted = "egress.redacted"
-	EvPolicyUpdated  = "policy.updated"
-	EvTimerSet       = "timer.set"
-	EvTimerFired     = "timer.fired"
-	EvPeerGone       = "peer.gone"
-	EvEventGap       = "event.producer_gap"
-	EvFleetRequested = "fleet.quarantine.requested"
-	EvFleetTarget    = "fleet.quarantine.target"
-	EvFleetCompleted = "fleet.quarantine.completed"
-	EvBaseCreated    = "base.created"
-	EvBaseRemoved    = "base.removed"
-	EvQueueCreated   = "queue.created"           // payload {queue, ws, items}
-	EvQueueAdvanced  = "queue.advanced"          // one queued task finished; payload {queue, index, exit, status}
-	EvPoolCreated    = "pool.created"            // a durable pool specification was admitted
-	EvPoolRemoved    = "pool.removed"            // an empty pool specification was removed
-	EvPoolScaled     = "pool.scaled"             // payload {pool, from, to, reason}
-	EvPoolFailed     = "pool.provision_failed"   // payload {pool, reason, retry_at}; no credentials
-	EvExportAdvanced = "export.cursor.advanced"  // a durable destination cursor advanced after accepting a batch
-	EvRunStarted     = "run.started"             // a harness launch opened its session; payload {s, recipe, task_hash, sandbox, auth}
-	EvRunFinished    = "run.finished"            // that session exited; payload {s, recipe, exit, signal}
-	EvAuthWSResident = "auth.workspace_resident" // a launch relies on a login the harness keeps inside the workspace; payload {s, recipe}
-	EvWSOffer        = "ws.offer"                // control -> node (not logged; a hint to claim)
+	EvNodeEnrolled      = "node.enrolled"
+	EvNodeOnline        = "node.online"
+	EvNodeOffline       = "node.offline"
+	EvWSCreated         = "ws.created"
+	EvWSOffered         = "ws.offered"
+	EvWSClaiming        = "ws.claiming"
+	EvWSClaimed         = "ws.claimed"
+	EvWSReleased        = "ws.released"
+	EvWSMoved           = "ws.moved"
+	EvWSPaused          = "ws.paused"
+	EvWSResumed         = "ws.resumed"
+	EvWSSnapshot        = "ws.snapshot"
+	EvWSRestored        = "ws.restored"
+	EvWSDestroyed       = "ws.destroyed"
+	EvWSLeaseExpired    = "ws.lease_expired"
+	EvWSFenced          = "ws.fenced"
+	EvWSStateChanged    = "ws.state_changed"
+	EvWSACL             = "ws.acl"        // ACL replaced; payload names revoked principals and the new revision
+	EvAuthzRevoked      = "authz.revoked" // node closed a revoked principal's sessions
+	EvSOpened           = "s.opened"
+	EvSExited           = "s.exited"
+	EvSInput            = "s.input"
+	EvFSWrite           = "fs.write"
+	EvFSApplyTar        = "fs.apply_tar" // one overlay applied; payload carries artifact and counts, fs.write follows per path
+	EvFSMkdir           = "fs.mkdir"
+	EvFSEdit            = "fs.edit"
+	EvFSRemove          = "fs.remove"
+	EvFSRename          = "fs.rename"
+	EvCredUsed          = "cred.used"
+	EvEgressPending     = "egress.pending"
+	EvEgressAllowed     = "egress.allowed"
+	EvEgressDenied      = "egress.denied"
+	EvEgressRedacted    = "egress.redacted"
+	EvPolicyUpdated     = "policy.updated"
+	EvTimerSet          = "timer.set"
+	EvTimerFired        = "timer.fired"
+	EvPeerGone          = "peer.gone"
+	EvEventGap          = "event.producer_gap"
+	EvFleetRequested    = "fleet.quarantine.requested"
+	EvFleetTarget       = "fleet.quarantine.target"
+	EvFleetCompleted    = "fleet.quarantine.completed"
+	EvBaseCreated       = "base.created"
+	EvBaseRemoved       = "base.removed"
+	EvQueueCreated      = "queue.created"                // payload {queue, ws, items}
+	EvQueueAdvanced     = "queue.advanced"               // one queued task finished; payload {queue, index, exit, status}
+	EvPoolCreated       = "pool.created"                 // a durable pool specification was admitted
+	EvPoolRemoved       = "pool.removed"                 // an empty pool specification was removed
+	EvPoolScaled        = "pool.scaled"                  // payload {pool, from, to, reason}
+	EvPoolFailed        = "pool.provision_failed"        // payload {pool, reason, retry_at}; no credentials
+	EvExportAdvanced    = "export.cursor.advanced"       // a durable destination cursor advanced after accepting a batch
+	EvNotifyUnavailable = "notifier.unavailable"         // delivery or its durable fallback is unavailable; payload is sanitized
+	EvNotifyDeadLetter  = "notifier.dead_lettered"       // failed delivery metadata was durably retained
+	EvNotifyDLQPruned   = "notifier.dead_letters_pruned" // bounded retention removed old dead-letter metadata
+	EvRunStarted        = "run.started"                  // a harness launch opened its session; payload {s, recipe, task_hash, sandbox, auth}
+	EvRunFinished       = "run.finished"                 // that session exited; payload {s, recipe, exit, signal}
+	EvAuthWSResident    = "auth.workspace_resident"      // a launch relies on a login the harness keeps inside the workspace; payload {s, recipe}
+	EvWSOffer           = "ws.offer"                     // control -> node (not logged; a hint to claim)
 )
