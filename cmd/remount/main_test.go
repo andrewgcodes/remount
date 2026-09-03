@@ -83,6 +83,72 @@ func TestAbsFlagPathResolvesRelativeAndNamesFlag(t *testing.T) {
 	}
 }
 
+func TestArityRejectsExtraPositionalsAndSuggestsImage(t *testing.T) {
+	ctx := context.Background()
+	err := cmdWS(ctx, []string{"create", "python:3.12", "--wait=false"})
+	if err == nil || !strings.Contains(err.Error(), "--image python:3.12") {
+		t.Fatalf("image-like positional: %v", err)
+	}
+	err = cmdWS(ctx, []string{"create", "extra"})
+	if err == nil || !strings.Contains(err.Error(), `unexpected argument "extra"`) {
+		t.Fatalf("plain extra positional: %v", err)
+	}
+	err = cmdWS(ctx, []string{"get", "ws_1", "ws_2"})
+	if err == nil || !strings.Contains(err.Error(), `unexpected argument "ws_2"`) || strings.Contains(err.Error(), "--image") {
+		t.Fatalf("ws get arity: %v", err)
+	}
+	err = cmdWS(ctx, []string{"destroy"})
+	if err == nil || !strings.Contains(err.Error(), "missing argument: ws destroy WS") {
+		t.Fatalf("ws destroy arity: %v", err)
+	}
+	err = cmdFS(ctx, []string{"mv", "ws_1", "a"})
+	if err == nil || !strings.Contains(err.Error(), "fs mv WS FROM TO") {
+		t.Fatalf("fs mv arity: %v", err)
+	}
+	err = cmdFS(ctx, []string{"ls", "ws_1", "/", "extra"})
+	if err == nil || !strings.Contains(err.Error(), `unexpected argument "extra"`) {
+		t.Fatalf("fs ls arity: %v", err)
+	}
+	err = cmdAttach(ctx, []string{"ws_1"})
+	if err == nil || !strings.Contains(err.Error(), "attach WS SESSION") {
+		t.Fatalf("attach arity: %v", err)
+	}
+	err = cmdPort(ctx, []string{"ws_1", "70000"})
+	if err == nil || !strings.Contains(err.Error(), "1-65535") {
+		t.Fatalf("port range: %v", err)
+	}
+	err = cmdFleet(ctx, []string{"get"})
+	if err == nil || !strings.Contains(err.Error(), "fleet get OPERATION") {
+		t.Fatalf("fleet get arity: %v", err)
+	}
+	if !looksLikeImage("ghcr.io/org/img") || !looksLikeImage("node:22") || looksLikeImage("ws_abc") || looksLikeImage("plain") {
+		t.Fatal("looksLikeImage heuristics")
+	}
+}
+
+func TestGlobalFlagsAcceptedBeforeCommand(t *testing.T) {
+	globals, rest := splitGlobalFlags([]string{"--json", "--server", "http://x:1", "--token=t", "ws", "get", "ws_1"})
+	if !reflect.DeepEqual(globals, []string{"--json", "--server", "http://x:1", "--token=t"}) ||
+		!reflect.DeepEqual(rest, []string{"ws", "get", "ws_1"}) {
+		t.Fatalf("globals=%v rest=%v", globals, rest)
+	}
+	globals, rest = splitGlobalFlags([]string{"--follow", "events"})
+	if len(globals) != 0 || len(rest) != 2 {
+		t.Fatalf("non-global flag consumed: %v %v", globals, rest)
+	}
+	// Globals ahead of a nested subcommand still reach its FlagSet: arity
+	// runs after parse, so the positional count proves --json was not
+	// mistaken for a positional.
+	err := run(context.Background(), []string{"--json", "ws", "get", "ws_1", "ws_2"})
+	if err == nil || !strings.Contains(err.Error(), `unexpected argument "ws_2"`) {
+		t.Fatalf("run with leading global: %v", err)
+	}
+	err = run(context.Background(), []string{"--json", "server"})
+	if err == nil || !strings.Contains(err.Error(), "does not accept --json") {
+		t.Fatalf("server should refuse client globals: %v", err)
+	}
+}
+
 func TestWorkspaceCreateRejectsClientSelectedPrincipalBeforeDial(t *testing.T) {
 	err := cmdWS(context.Background(), []string{"create", "--principal", "a_attacker", "--wait=false"})
 	if err == nil || !strings.Contains(err.Error(), "caller identity is authoritative") {
