@@ -44,6 +44,8 @@ type Spec struct {
 	// unique inside one tenant, so omitting this would let an actor in one
 	// tenant consume another tenant's per-principal session allowance.
 	Tenant string
+	// Run marks a harness launch; carried in the info chunk and to OnExit.
+	Run *proto.RunInfo
 }
 
 // Session is a running or finished process with its output log.
@@ -473,43 +475,50 @@ func (m *Manager) Close() {
 // Open starts a session. If spec.IdempotencyKey names an existing session it
 // is returned instead of starting a second process.
 func (m *Manager) Open(spec Spec) (*Session, error) {
+	s, _, err := m.OpenOrReplay(spec)
+	return s, err
+}
+
+// OpenOrReplay is Open that also reports whether a new session was started
+// (created=true) or an idempotent replay returned an existing one.
+func (m *Manager) OpenOrReplay(spec Spec) (s *Session, created bool, err error) {
 	fingerprint := sessionFingerprint(spec)
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		return nil, proto.Err(proto.CodeClosed, "manager closed")
+		return nil, false, proto.Err(proto.CodeClosed, "manager closed")
 	}
 	if spec.IdempotencyKey != "" {
 		if existing, ok := m.byIdem[spec.IdempotencyKey]; ok {
 			if existing.fingerprint != fingerprint {
 				m.mu.Unlock()
-				return nil, proto.Err(proto.CodeConflict, "idempotency key was reused with different session arguments")
+				return nil, false, proto.Err(proto.CodeConflict, "idempotency key was reused with different session arguments")
 			}
 			s := m.sessions[existing.id]
 			m.mu.Unlock()
-			return s, nil
+			return s, false, nil
 		}
 	}
 	if len(m.sessions) >= m.opts.MaxSessions {
 		m.mu.Unlock()
 		metrics.SessionQuotaRejected.Inc()
-		return nil, proto.Err(proto.CodeResourceExhausted, "node session limit %d reached", m.opts.MaxSessions)
+		return nil, false, proto.Err(proto.CodeResourceExhausted, "node session limit %d reached", m.opts.MaxSessions)
 	}
 	if m.byWS[spec.WS] >= m.opts.MaxSessionsPerWorkspace {
 		m.mu.Unlock()
 		metrics.SessionQuotaRejected.Inc()
-		return nil, proto.Err(proto.CodeResourceExhausted, "workspace session limit %d reached", m.opts.MaxSessionsPerWorkspace)
+		return nil, false, proto.Err(proto.CodeResourceExhausted, "workspace session limit %d reached", m.opts.MaxSessionsPerWorkspace)
 	}
 	principalKey := sessionPrincipalKey(spec.Tenant, spec.Principal)
 	if m.byPrincipal[principalKey] >= m.opts.MaxSessionsPerPrincipal {
 		m.mu.Unlock()
 		metrics.SessionQuotaRejected.Inc()
-		return nil, proto.Err(proto.CodeResourceExhausted, "principal session limit %d reached", m.opts.MaxSessionsPerPrincipal)
+		return nil, false, proto.Err(proto.CodeResourceExhausted, "principal session limit %d reached", m.opts.MaxSessionsPerPrincipal)
 	}
 	if m.active >= m.opts.MaxActive {
 		m.mu.Unlock()
 		metrics.SessionQuotaRejected.Inc()
-		return nil, proto.Err(proto.CodeResourceExhausted, "node active-session limit %d reached", m.opts.MaxActive)
+		return nil, false, proto.Err(proto.CodeResourceExhausted, "node active-session limit %d reached", m.opts.MaxActive)
 	}
 	id := ids.New("s")
 	var spillPath string
@@ -522,11 +531,11 @@ func (m *Manager) Open(spec Spec) (*Session, error) {
 	})
 	if err != nil {
 		m.mu.Unlock()
-		return nil, err
+		return nil, false, err
 	}
-	s := &Session{
+	s = &Session{
 		ID: id, WS: spec.WS, Kind: spec.Kind, Log: log, exited: make(chan struct{}), startDone: make(chan struct{}), outputReady: make(chan struct{}), Principal: spec.Principal, Tenant: spec.Tenant,
-		Info: proto.SessionInfo{ID: id, WS: spec.WS, Kind: spec.Kind, Program: spec.Program, OpenedAt: time.Now().UnixMilli()},
+		Info: proto.SessionInfo{ID: id, WS: spec.WS, Kind: spec.Kind, Program: spec.Program, OpenedAt: time.Now().UnixMilli(), Run: spec.Run},
 	}
 	s.onFinish = func() { m.markInactive(id, s) }
 	m.sessions[id] = s
@@ -566,7 +575,7 @@ func (m *Manager) Open(spec Spec) (*Session, error) {
 			_ = s.Signal("KILL")
 		}
 		s.finish(proto.ExitInfo{Code: -1, Error: startErr.Error()})
-		return s, nil // the session exists; its log says why it failed
+		return s, true, nil // the session exists; its log says why it failed
 	}
 	if spec.Timeout > 0 {
 		s.mu.Lock()
@@ -576,7 +585,7 @@ func (m *Manager) Open(spec Spec) (*Session, error) {
 		s.mu.Unlock()
 	}
 	close(s.outputReady)
-	return s, nil
+	return s, true, nil
 }
 
 func sessionPrincipalKey(tenant, principal string) string {

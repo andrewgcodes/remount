@@ -409,6 +409,45 @@ leaves the machine. An unlisted host with no credential is refused too.
 Nothing on the workspace's disk or in its environment ever contained the real
 key. The audit for all three requests is in the event log.
 
+### Run a coding agent with one command
+
+`remount run` does the create, the harness install, the provider wiring and
+the launch in one step. `--binding b_openai` picks the `openai` preset by
+name, so the harness gets `OPENAI_API_KEY=ref:b_openai` and an
+`OPENAI_BASE_URL` that resolves to the broker at run time. Allow the hosts the
+recipe installs from when you start standalone:
+
+```sh
+./remount standalone --data ./data --bindings ./bindings.json \
+  --allow api.openai.com --allow registry.npmjs.org --allow models.dev &
+mkdir -p proj && echo hello > proj/README.md
+./remount run opencode --dir proj --binding b_openai --model openai/gpt-4o-mini \
+  -- 'Create a file named GREETING.txt containing exactly the word hello. Do nothing else.'
+```
+
+```
+workspace ws_06g6c49ka10ptnrcpzk8an8298 created
+installing opencode
+> build · gpt-4o-mini
+← Write GREETING.txt
+I have created a file named **GREETING.txt** containing the word "hello."
+```
+
+Ctrl-C detaches and leaves the agent running; `remount attach WS SID` picks the
+output back up from the start. `--detach` skips the attach and prints the two
+ids and the attach line. The run is in the log as `run.started` and
+`run.finished`, with a hash of the task rather than the task:
+
+```
+    37 06:59:58.574 run.started   ws_06g6c49ka10…  local-user  {"auth":"api_key","recipe":"opencode","s":"s_06g6c49k…","sandbox":"workspace-write","task_hash":"56d7ee2b45f68478"}
+    45 07:01:13.157 run.finished  ws_06g6c49ka10…  local-user  {"exit":0,"recipe":"opencode","s":"s_06g6c49k…","signal":""}
+```
+
+`remount run custom --binding b_openai -- python agent.py` runs anything that
+honors `OPENAI_API_KEY` and `OPENAI_BASE_URL`; `remount binding preset ls`
+lists the other providers. [harness-integration.md](harness-integration.md)
+has the full recipe table and the two kinds of auth.
+
 ### Sharing a workspace, and taking it back
 
 A workspace's ACL names who else may use it. Only the owner (or an

@@ -708,6 +708,48 @@ type SessionInfo struct {
 	Program  []string `cbor:"program,omitempty" json:"program,omitempty"`
 	PID      int      `cbor:"pid,omitempty" json:"pid,omitempty"`
 	OpenedAt int64    `cbor:"opened_at" json:"opened_at"`
+	Run      *RunInfo `cbor:"run,omitempty" json:"run,omitempty"`
+}
+
+// RunInfo marks a session as a harness launch (`remount run`). The node
+// records it so run.started and run.finished are emitted by the peer that
+// observes the process, not by a client that may have detached.
+type RunInfo struct {
+	Recipe string `cbor:"recipe" json:"recipe"`
+	// TaskHash is a short digest of the task text; the text itself is never
+	// put in the event log.
+	TaskHash string `cbor:"task_hash,omitempty" json:"task_hash,omitempty"`
+	Sandbox  string `cbor:"sandbox,omitempty" json:"sandbox,omitempty"`
+	// Auth is RunAuthAPIKey or RunAuthWorkspaceResident.
+	Auth string `cbor:"auth,omitempty" json:"auth,omitempty"`
+}
+
+// RunInfo.Auth values.
+const (
+	// RunAuthAPIKey: the harness reads a brokered provider key placeholder
+	// from the environment.
+	RunAuthAPIKey = "api_key"
+	// RunAuthWorkspaceResident: the harness keeps its own login token in the
+	// workspace, outside the broker's view.
+	RunAuthWorkspaceResident = "workspace_resident"
+)
+
+// Validate rejects a RunInfo the node should not record.
+func (r *RunInfo) Validate() error {
+	if r == nil {
+		return nil
+	}
+	if r.Recipe == "" || len(r.Recipe) > 64 {
+		return Err(CodeBadRequest, "run.recipe is required and at most 64 bytes")
+	}
+	if len(r.TaskHash) > 64 || len(r.Sandbox) > 32 {
+		return Err(CodeBadRequest, "run.task_hash or run.sandbox too long")
+	}
+	switch r.Auth {
+	case "", RunAuthAPIKey, RunAuthWorkspaceResident:
+		return nil
+	}
+	return Err(CodeBadRequest, "run.auth must be %s or %s", RunAuthAPIKey, RunAuthWorkspaceResident)
 }
 
 type Gap struct {
@@ -731,6 +773,8 @@ type SOpenReq struct {
 	Grant *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 	// Subscribe: if true (default) chunks are streamed to this client from seq 0.
 	NoSubscribe bool `cbor:"no_sub,omitempty" json:"no_sub,omitempty"`
+	// Run marks a harness launch; see RunInfo.
+	Run *RunInfo `cbor:"run,omitempty" json:"run,omitempty"`
 }
 
 type SOpenRes struct {
@@ -1185,5 +1229,8 @@ const (
 	EvFleetCompleted = "fleet.quarantine.completed"
 	EvBaseCreated    = "base.created"
 	EvBaseRemoved    = "base.removed"
-	EvWSOffer        = "ws.offer" // control -> node (not logged; a hint to claim)
+	EvRunStarted     = "run.started"             // a harness launch opened its session; payload {s, recipe, task_hash, sandbox, auth}
+	EvRunFinished    = "run.finished"            // that session exited; payload {s, recipe, exit, signal}
+	EvAuthWSResident = "auth.workspace_resident" // a launch relies on a login the harness keeps inside the workspace; payload {s, recipe}
+	EvWSOffer        = "ws.offer"                // control -> node (not logged; a hint to claim)
 )

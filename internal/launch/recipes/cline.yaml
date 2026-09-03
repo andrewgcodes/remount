@@ -1,0 +1,15 @@
+# Cline CLI. https://docs.cline.bot  (CLI surface still moving; verified last
+# against cline 1.x `cline -y`.)
+name: cline
+description: Cline CLI
+auth: either
+providers: [anthropic, openai, openrouter, google, xai, deepseek, mistral, groq]
+hosts:
+  - registry.npmjs.org
+install: |
+  command -v cline >/dev/null 2>&1 || npm install -g cline
+env:
+  CLINE_MODEL: "{{.Model}}"
+command: ["cline", "-y", "{{.Task}}"]
+state_dirs: [".cline"]
+path_keyed: true

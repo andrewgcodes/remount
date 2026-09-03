@@ -301,7 +301,11 @@ func (b *Broker) Start() (string, error) {
 	b.advertised = advertised
 	raw := "http://" + advertised
 	b.base = raw + "/c/" + b.token
-	proxyURL := &url.URL{Scheme: "http", Host: advertised, User: url.User(b.token)}
+	// Explicit empty password: Bun (so every Bun-compiled harness such as
+	// OpenCode) parses "http://tok@host:port" as the host "tok@host" and
+	// dials that; "http://tok:@host:port" is read correctly by Bun, Node,
+	// curl, Python and Go.
+	proxyURL := &url.URL{Scheme: "http", Host: advertised, User: url.UserPassword(b.token, "")}
 	b.proxyBase = proxyURL.String()
 	b.srv = &http.Server{
 		Handler: b, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute,

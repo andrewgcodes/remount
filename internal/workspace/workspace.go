@@ -517,11 +517,33 @@ func (h *dockerHandle) Prepare(spec *session.Spec) error {
 	return nil
 }
 
+// reown hands the bind mount back to the node's uid. The container runs as
+// root, so everything a harness writes lands on the host owned by root; a
+// non-root node could then neither snapshot a 0600 file nor delete the tree.
+// Runs inside the container so it works even when the node cannot chown.
+func (h *dockerHandle) reown(ctx context.Context) error {
+	if os.Getuid() == 0 {
+		return nil
+	}
+	owner := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	out, err := exec.CommandContext(ctx, h.bin, "exec", h.name, "chown", "-R", owner, "/work").CombinedOutput()
+	if err != nil {
+		return proto.Err(proto.CodeInternal, "docker exec chown: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func (h *dockerHandle) Snapshot(ctx context.Context, excludes []string, w io.Writer) error {
+	if err := h.reown(ctx); err != nil {
+		return err
+	}
 	return artifact.Snapshot(h.root, excludes, w)
 }
 
 func (h *dockerHandle) Checkpoint(ctx context.Context, excludes []string, w io.Writer) (err error) {
+	if err := h.reown(ctx); err != nil { // a paused container cannot exec
+		return err
+	}
 	out, err := exec.CommandContext(ctx, h.bin, "pause", h.name).CombinedOutput()
 	if err != nil {
 		return proto.Err(proto.CodeInternal, "docker pause: %s", strings.TrimSpace(string(out)))
@@ -540,6 +562,9 @@ func (h *dockerHandle) Checkpoint(ctx context.Context, excludes []string, w io.W
 
 func (h *dockerHandle) Destroy(ctx context.Context) error {
 	_ = h.fs.Close()
+	// Best effort: the container may already be gone or stopped, and a failed
+	// chown surfaces as the RemoveAll error below if it matters.
+	_ = h.reown(ctx)
 	out, err := exec.CommandContext(ctx, h.bin, "rm", "-f", h.name).CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "No such container") {
 		return proto.Err(proto.CodeInternal, "docker rm: %s", strings.TrimSpace(string(out)))

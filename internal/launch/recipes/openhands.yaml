@@ -1,0 +1,18 @@
+# OpenHands headless. https://docs.all-hands.dev
+name: openhands
+description: OpenHands (headless, local runtime)
+auth: api_key
+providers: [anthropic, openai, google, openrouter, groq, together, fireworks, deepseek, xai, mistral]
+hosts:
+  - pypi.org
+  - files.pythonhosted.org
+install: |
+  command -v openhands >/dev/null 2>&1 || uv tool install --python 3.12 openhands-ai
+env:
+  LLM_API_KEY: "{{key .Primary}}"
+  LLM_BASE_URL: "{{baseURL .Primary}}"
+  LLM_MODEL: "{{if .Model}}{{.Model}}{{else}}{{.Primary}}/default{{end}}"
+  RUNTIME: local
+  LOG_ALL_EVENTS: "true"
+command: ["openhands", "-t", "{{.Task}}"]
+state_dirs: [".openhands"]

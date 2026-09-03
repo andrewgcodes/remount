@@ -545,6 +545,18 @@ func TestHostMatchAndEnvResolution(t *testing.T) {
 	if !strings.Contains(strings.Join(b.EnvFor(), " "), "HTTPS_PROXY="+b.ProxyURL()) {
 		t.Fatal(b.EnvFor())
 	}
+	// Bun reads "http://tok@host" as host "tok@host"; the userinfo must carry
+	// an explicit empty password so Bun-compiled harnesses reach the broker.
+	pu, err := url.Parse(b.ProxyURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, set := pu.User.Password(); !set || pu.User.Username() != b.token || !strings.Contains(b.ProxyURL(), b.token+":@") {
+		t.Fatalf("proxy url %q must be http://TOKEN:@host:port", b.ProxyURL())
+	}
+	if !b.validProxyAuthorization("Basic " + base64.StdEncoding.EncodeToString([]byte(b.token+":"))) {
+		t.Fatal("token with empty password must authenticate")
+	}
 	if _, err := net.Dial("tcp", b.ln.Addr().String()); err != nil {
 		t.Fatal(err)
 	}

@@ -1,0 +1,28 @@
+# Goose (Block). https://block.github.io/goose
+name: goose
+description: Goose agent
+auth: api_key
+providers: [openai, anthropic, google, openrouter, groq]
+hosts:
+  - github.com
+  - objects.githubusercontent.com
+  - release-assets.githubusercontent.com
+install: |
+  command -v goose >/dev/null 2>&1 || {
+    mkdir -p "$HOME/.local/bin"
+    curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+  }
+  export PATH="$HOME/.local/bin:$PATH"
+env:
+  PATH: "$HOME/.local/bin:$PATH"
+  GOOSE_PROVIDER: "{{.Primary}}"
+  GOOSE_MODEL: "{{.Model}}"
+  GOOSE_DISABLE_KEYRING: "1"
+  # Goose reads <PROVIDER>_HOST rather than a base URL.
+  OPENAI_HOST: "{{if has \"openai\"}}{{.Broker}}/d/api.openai.com{{end}}"
+  ANTHROPIC_HOST: "{{if has \"anthropic\"}}{{.Broker}}/d/api.anthropic.com{{end}}"
+  OPENROUTER_HOST: "{{if has \"openrouter\"}}{{.Broker}}/d/openrouter.ai{{end}}"
+  GROQ_HOST: "{{if has \"groq\"}}{{.Broker}}/d/api.groq.com{{end}}"
+command: ["goose", "run", "--text", "{{.Task}}"]
+resume_command: ["goose", "run", "--resume", "--text", "{{.Task}}"]
+state_dirs: [".local/share/goose", ".config/goose"]

@@ -379,6 +379,9 @@ func New(opts Options) (*Node, error) {
 		MaxSessionsPerPrincipal: opts.MaxSessionsPerPrincipal,
 		OnExit: func(s *session.Session, info proto.ExitInfo) {
 			n.emitSession(proto.EvSExited, s.WS, s.Principal, s.ID, map[string]any{"s": s.ID, "code": info.Code, "signal": info.Signal})
+			if run := s.Info.Run; run != nil {
+				n.emitSession(proto.EvRunFinished, s.WS, s.Principal, s.ID, map[string]any{"s": s.ID, "recipe": run.Recipe, "exit": info.Code, "signal": info.Signal})
+			}
 		},
 	})
 	return n, nil
@@ -2418,6 +2421,14 @@ func (n *Node) status() proto.NodeStatus {
 // ---------------------------------------------------------------------------
 
 func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, claims proto.GrantClaims, w *ws, req *proto.SOpenReq) (any, error) {
+	if err := req.Run.Validate(); err != nil {
+		return nil, err
+	}
+	if req.Run != nil && req.Run.Auth == proto.RunAuthWorkspaceResident && w.Spec.Security.Profile != "" && w.Spec.Security.Profile != proto.SecurityLocal {
+		// The node is the authority on the workspace's security profile; a
+		// client cannot talk it into a login it would never see.
+		return nil, proto.Err(proto.CodeDenied, "workspace-resident harness auth is refused under security profile %s", w.Spec.Security.Profile)
+	}
 	unlock, err := n.lockWorkspaceTree(w, false)
 	if err != nil {
 		return nil, err
@@ -2446,7 +2457,7 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 	spec := session.Spec{
 		WS: w.ID, Kind: req.Kind, Program: req.Program, Cwd: req.Cwd, Env: envList,
 		Rows: req.Rows, Cols: req.Cols, Stdin: req.Stdin, IdempotencyKey: req.IdempotencyKey,
-		Principal: claims.Principal, Tenant: claims.Tenant,
+		Principal: claims.Principal, Tenant: claims.Tenant, Run: req.Run,
 	}
 	if req.IdempotencyKey != "" {
 		spec.IdempotencyKey = sessionOpenKey(claims, w.ID, proto.SessionExec, req.IdempotencyKey)
@@ -2457,7 +2468,7 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 	if err := w.handle.Prepare(&spec); err != nil {
 		return nil, err
 	}
-	s, err := n.sessions.Open(spec)
+	s, created, err := n.sessions.OpenOrReplay(spec)
 	if err != nil {
 		return nil, err
 	}
@@ -2465,6 +2476,12 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 		return nil, err
 	}
 	n.emitSession(proto.EvSOpened, w.ID, claims.Principal, s.ID, map[string]any{"s": s.ID, "kind": req.Kind, "program": req.Program, "client": client})
+	if run := req.Run; run != nil && created {
+		n.emitSession(proto.EvRunStarted, w.ID, claims.Principal, s.ID, map[string]any{"s": s.ID, "recipe": run.Recipe, "task_hash": run.TaskHash, "sandbox": run.Sandbox, "auth": run.Auth})
+		if run.Auth == proto.RunAuthWorkspaceResident {
+			n.emitSession(proto.EvAuthWSResident, w.ID, claims.Principal, s.ID, map[string]any{"s": s.ID, "recipe": run.Recipe})
+		}
+	}
 	if !req.NoSubscribe {
 		n.subscribe(p, client, s, 0)
 	}

@@ -1,0 +1,24 @@
+# Aider. https://aider.chat/docs
+name: aider
+description: Aider pair programmer
+auth: api_key
+providers: [openai, anthropic, google, openrouter, groq, deepseek, xai, mistral]
+hosts:
+  - pypi.org
+  - files.pythonhosted.org
+install: |
+  command -v aider >/dev/null 2>&1 || uv tool install --python 3.12 aider-chat
+env:
+  AIDER_CHECK_UPDATE: "false"
+  AIDER_ANALYTICS: "false"
+  AIDER_YES_ALWAYS: "true"
+  AIDER_MODEL: "{{.Model}}"
+  OPENAI_API_BASE: "{{if has \"openai\"}}{{baseURL \"openai\"}}{{end}}"
+  ANTHROPIC_API_BASE: "{{if has \"anthropic\"}}{{baseURL \"anthropic\"}}{{end}}"
+  GEMINI_API_BASE: "{{if has \"google\"}}{{baseURL \"google\"}}{{end}}"
+  OPENROUTER_API_BASE: "{{if has \"openrouter\"}}{{baseURL \"openrouter\"}}{{end}}"
+  DEEPSEEK_API_BASE: "{{if has \"deepseek\"}}{{baseURL \"deepseek\"}}{{end}}"
+command: ["aider", "--message", "{{.Task}}", "--no-git"]
+resume_command: ["aider", "--restore-chat-history", "--message", "{{.Task}}", "--no-git"]
+state_dirs: [".aider.chat.history.md", ".aider.input.history", ".aider.tags.cache.v4"]
+path_keyed: true
