@@ -24,7 +24,7 @@ type Options struct {
 	Dir         string // packed and uploaded by the caller into RestoreFrom
 	RestoreFrom string
 	Base        string
-	Repo        string // recorded for P1.5; refused until the git connector lands
+	Repo        proto.RepoSpec // cloned by the node before the workspace is ready (ADR 0054)
 
 	Name     string
 	Image    string
@@ -92,17 +92,21 @@ func (o *Options) Validate() (*Plan, error) {
 	if r == nil {
 		return nil, errors.New("recipe is required")
 	}
-	if o.Repo != "" {
-		return nil, errors.New("--repo needs the git connector (not yet available); clone locally and use --dir, or --base")
+	if o.Repo.URL != "" {
+		repo, err := o.Repo.Normalize()
+		if err != nil {
+			return nil, err
+		}
+		o.Repo = repo
 	}
 	seeds := 0
-	for _, set := range []bool{o.WS != "", o.RestoreFrom != "", o.Base != ""} {
+	for _, set := range []bool{o.WS != "", o.RestoreFrom != "", o.Base != "", o.Repo.URL != ""} {
 		if set {
 			seeds++
 		}
 	}
 	if seeds > 1 {
-		return nil, errors.New("--ws, --dir/--restore-from and --base are mutually exclusive")
+		return nil, errors.New("--ws, --dir/--restore-from, --base and --repo are mutually exclusive")
 	}
 	switch o.Sandbox {
 	case "":
@@ -194,7 +198,7 @@ func (o *Options) Validate() (*Plan, error) {
 		return nil, fmt.Errorf("--backend process cannot mount the tree at %s: it has no mount namespace (ADR 0041); use docker", o.MountPath)
 	}
 	spec := proto.WorkspaceSpec{
-		Name: o.Name, Image: o.Image, RestoreFrom: o.RestoreFrom, Base: o.Base,
+		Name: o.Name, Image: o.Image, RestoreFrom: o.RestoreFrom, Base: o.Base, Repo: o.Repo,
 		Requires:  proto.Requires{Backend: o.Backend},
 		Env:       map[string]string{},
 		Exclude:   append([]string(nil), o.Exclude...),

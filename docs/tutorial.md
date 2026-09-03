@@ -280,6 +280,20 @@ NEW=$(./remount ws create --base golden --json | jq -r .id)
 A base names an artifact, not a workspace: re-snapshotting `$WS` does not move
 `golden`. To update it, `base rm` and snapshot `--as-base` again.
 
+The third way to seed a workspace is a repository. The node clones it through
+the broker before the workspace becomes `claimed`, using a binding's
+placeholder for a private repository (a public one needs no binding), and
+emits `repo.cloned` with the commit it checked out:
+
+```sh
+NEW=$(./remount ws create --repo github.com/acme/app@main --repo-depth 1 --json | jq -r .id)
+./remount exec $NEW -- git log -1 --oneline
+./remount events --ws $NEW | grep repo.cloned
+```
+
+Inside the workspace `git fetch` and `git push` route through
+`$REMOUNT_GIT_CONNECTOR` and reach only that repository.
+
 ## 7. Sleep and wake
 
 A sleeping workspace has no node. Its last snapshot is kept, its timers are

@@ -88,6 +88,8 @@ type Audit struct {
 	Protocol      string
 	SharedState   string
 	Connector     string
+	Op            string // connector operation when the connector names one (git: fetch|push)
+	Repo          string // owner/name for git connector decisions
 	Digest        string
 	Cached        bool
 	Host          string
@@ -131,6 +133,11 @@ type Options struct {
 	// ConnectorStore is the node-owned immutable package cache. Package rules
 	// fail closed when it is unavailable.
 	ConnectorStore *connector.Store
+	// Repo is the workspace's declared repository. Without typed policy it is
+	// the only thing the /git/ surface serves: fetch and push of exactly that
+	// repository, so `--repo` works under the local profile without a rule
+	// while still refusing every other path on the hosting service.
+	Repo proto.RepoSpec
 }
 
 // Broker serves one workspace.
@@ -218,6 +225,7 @@ func New(opts Options) *Broker {
 	for i := range opts.Network.Rules {
 		rule := &opts.Network.Rules[i]
 		rule.Hosts = append([]string(nil), rule.Hosts...)
+		rule.Repos = append([]string(nil), rule.Repos...)
 		rule.Ports = append([]uint16(nil), rule.Ports...)
 		rule.Methods = append([]string(nil), rule.Methods...)
 		rule.PathPrefixes = append([]string(nil), rule.PathPrefixes...)
@@ -249,6 +257,7 @@ func New(opts Options) *Broker {
 			Transport: b.client, Store: opts.ConnectorStore,
 		})
 	}
+	b.connectors[proto.EgressConnectorGit] = connector.NewGit(connector.GitOptions{Transport: b.client})
 	return b
 }
 
@@ -325,6 +334,10 @@ func (b *Broker) ProxyURL() string { return b.proxyBase }
 // PackageURL is the capability-bearing base for managed package retrieval.
 func (b *Broker) PackageURL() string { return strings.TrimSuffix(b.base, "/") + "/package" }
 
+// GitURL returns the git connector root: <GitURL>/<host>/<owner>/<name>.git
+// is what a workspace's insteadOf rewrites https://<host>/ to.
+func (b *Broker) GitURL() string { return strings.TrimSuffix(b.base, "/") + "/git" }
+
 // Close stops the listener.
 func (b *Broker) Close() error {
 	b.mu.Lock()
@@ -397,6 +410,7 @@ func (b *Broker) EnvFor() []string {
 	return []string{
 		"REMOUNT_BROKER=" + b.base,
 		"REMOUNT_PACKAGE_CONNECTOR=" + b.PackageURL(),
+		"REMOUNT_GIT_CONNECTOR=" + b.GitURL(),
 		"HTTP_PROXY=" + b.proxyBase,
 		"HTTPS_PROXY=" + b.proxyBase,
 		"http_proxy=" + b.proxyBase,
@@ -500,11 +514,14 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/package/"):
 		host, rest := splitDest(strings.TrimPrefix(r.URL.Path, "/package/"))
 		b.packageProxy(w, r, host, rest, r.URL.RawQuery)
+	case strings.HasPrefix(r.URL.Path, "/git/"):
+		host, rest := splitDest(strings.TrimPrefix(r.URL.Path, "/git/"))
+		b.gitProxy(w, r, host, rest, r.URL.RawQuery)
 	case r.URL.Path == "/healthz":
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok\n")
 	default:
-		http.Error(w, "remount broker: use /d/<host>/<path>, /http/<host>/<path>, /package/<host>/<path>, or HTTP proxy mode", http.StatusNotFound)
+		http.Error(w, "remount broker: use /d/<host>/<path>, /http/<host>/<path>, /package/<host>/<path>, /git/<host>/<owner>/<repo>.git/<endpoint>, or HTTP proxy mode", http.StatusNotFound)
 	}
 }
 
@@ -538,11 +555,14 @@ func (b *Broker) serveSelfAddressed(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/package/"):
 		host, rest := splitDest(strings.TrimPrefix(r.URL.Path, "/package/"))
 		b.packageProxy(w, r, host, rest, r.URL.RawQuery)
+	case strings.HasPrefix(r.URL.Path, "/git/"):
+		host, rest := splitDest(strings.TrimPrefix(r.URL.Path, "/git/"))
+		b.gitProxy(w, r, host, rest, r.URL.RawQuery)
 	case r.URL.Path == "/healthz":
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok\n")
 	default:
-		http.Error(w, "remount broker: use /d/<host>/<path>, /http/<host>/<path>, /package/<host>/<path>, or HTTP proxy mode", http.StatusNotFound)
+		http.Error(w, "remount broker: use /d/<host>/<path>, /http/<host>/<path>, /package/<host>/<path>, /git/<host>/<owner>/<repo>.git/<endpoint>, or HTTP proxy mode", http.StatusNotFound)
 	}
 }
 
@@ -1035,6 +1055,166 @@ func (b *Broker) packageProxy(w http.ResponseWriter, r *http.Request, host, requ
 	}
 }
 
+// hasTypedGitRule reports whether the workspace's policy speaks to git at
+// all. When it does, it is authoritative for the /git/ surface; when it does
+// not, the declared repository alone decides, whatever else the policy says
+// about model hosts or package registries.
+func (b *Broker) hasTypedGitRule() bool {
+	for _, rule := range b.opts.Network.Rules {
+		if rule.Connector == proto.EgressConnectorGit {
+			return true
+		}
+	}
+	return false
+}
+
+// implicitGitRule is the rule the /git/ surface uses when the workspace has
+// no typed git rule: exactly the declared repository, fetch and push.
+func (b *Broker) implicitGitRule(authority string) (proto.EgressRule, bool) {
+	if b.opts.Repo.URL == "" {
+		return proto.EgressRule{}, false
+	}
+	_, host, ownerRepo, err := proto.ParseRepoURL(b.opts.Repo.URL)
+	if err != nil || !hostMatches(authority, []string{host}) {
+		return proto.EgressRule{}, false
+	}
+	return proto.EgressRule{
+		ID: "repo", Connector: proto.EgressConnectorGit, Protocol: proto.EgressProtocolHTTPS,
+		Hosts: []string{host}, Repos: []string{ownerRepo}, Push: true,
+		Methods: []string{"GET", "POST"}, SharedState: proto.SharedStateNone,
+	}, true
+}
+
+// gitProxy serves the managed git connector: /git/<host>/<owner>/<name>.git/
+// <smart-http endpoint>. The connector decides what a git request is; this
+// method decides which rule (if any) covers the host and releases credentials.
+func (b *Broker) gitProxy(w http.ResponseWriter, r *http.Request, host, requestPath, query string) {
+	audit := b.auditFor(r.Method, proto.EgressProtocolHTTPS, host, requestPath)
+	audit.Connector = proto.EgressConnectorGit
+	fail := func(decision, reason string, status int) {
+		audit.Decision, audit.Reason = decision, reason
+		b.emit(audit)
+		http.Error(w, "remount broker: "+reason, status)
+	}
+	if ambiguousPolicyPath(r.URL.EscapedPath()) {
+		fail(DecisionDenied, "ambiguous encoded path is not a git endpoint", http.StatusBadRequest)
+		return
+	}
+	authority, err := normalizeAuthority(host, proto.EgressProtocolHTTPS)
+	if err != nil {
+		fail(DecisionDenied, err.Error(), http.StatusBadRequest)
+		return
+	}
+	audit.Host = authority
+	var rule proto.EgressRule
+	if b.hasTypedGitRule() {
+		policy := b.authorizePolicy(proto.EgressConnectorGit, proto.EgressProtocolHTTPS, authority, r.Method, requestPath)
+		if policy.rule.ID != "" {
+			audit.Rule, audit.SharedState = policy.rule.ID, policy.rule.SharedState
+		}
+		if !policy.allowed {
+			status := http.StatusForbidden
+			decision := DecisionDenied
+			if policy.reason == "request limit exhausted" {
+				decision, status = DecisionLimitExceeded, http.StatusTooManyRequests
+			}
+			fail(decision, policy.reason, status)
+			return
+		}
+		rule = policy.rule
+	} else {
+		implicit, ok := b.implicitGitRule(authority)
+		if !ok {
+			fail(DecisionDenied, "no repository is declared for this host; create the workspace with --repo or add a git connector rule", http.StatusForbidden)
+			return
+		}
+		rule = implicit
+		audit.Rule, audit.SharedState = rule.ID, rule.SharedState
+	}
+	managed := b.connectors[proto.EgressConnectorGit]
+	if managed == nil {
+		fail(DecisionDenied, "git connector is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	target := &url.URL{Scheme: proto.EgressProtocolHTTPS, Host: authority, Path: requestPath, RawQuery: query}
+	request := connector.ConnectorRequest{
+		Workspace: b.opts.WS, Tenant: b.opts.Tenant, Principal: b.opts.Principal,
+		Generation: b.opts.Generation, Rule: rule, Method: strings.ToUpper(r.Method),
+		URL: target, Header: r.Header, Body: r.Body, ContentLength: r.ContentLength,
+	}
+	// Authorize before releasing a credential: a request for anything but
+	// the covered repository never sees the token, even in an audit.
+	decision, err := managed.Authorize(r.Context(), request)
+	if err != nil {
+		fail(DecisionDenied, "git connector authorization failed", http.StatusInternalServerError)
+		return
+	}
+	audit.Op, audit.Repo = decision.Operation, decision.Resource
+	if !decision.Allowed {
+		fail(DecisionDenied, decision.Reason, http.StatusForbidden)
+		return
+	}
+	used, rejected := b.rewriteCredentials(r.Header, proto.EgressProtocolHTTPS, authority)
+	if rejected != nil {
+		audit.Binding = rejected.binding
+		fail(rejected.decision, rejected.reason, rejected.status)
+		return
+	}
+	credUse := b.credentialUse(audit, used, "credential released to managed git connector")
+	response, err := managed.Execute(r.Context(), request)
+	if err != nil {
+		status := http.StatusBadGateway
+		audit.Decision, audit.Reason = DecisionDenied, "git connector request failed"
+		var connectorErr *connector.Error
+		if errors.As(err, &connectorErr) {
+			if connectorErr.HTTPStatus != 0 {
+				status = connectorErr.HTTPStatus
+			}
+			audit.Reason = connectorErr.Error()
+			if connectorErr.Code == "resource_exhausted" || connectorErr.Code == "response_too_large" {
+				audit.Decision = DecisionLimitExceeded
+			}
+		}
+		credUse(0, ErrorClassConnector)
+		b.emit(audit)
+		http.Error(w, "remount broker: "+audit.Reason, status)
+		return
+	}
+	defer response.Body.Close()
+	audit.Status = response.StatusCode
+	audit.RequestBytes = r.ContentLength
+	credUse(response.StatusCode, "")
+	for name, values := range response.Header {
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+	w.WriteHeader(response.StatusCode)
+	audit.Decision, audit.Reason = DecisionAllowed, "managed git "+decision.Operation
+	b.emit(audit)
+	n, copyErr := io.Copy(&flushWriter{w: w}, response.Body)
+	if copyErr != nil {
+		a := audit
+		a.Decision, a.Reason, a.ResponseBytes = DecisionLimitExceeded, copyErr.Error(), n
+		if !strings.Contains(copyErr.Error(), "exceeds rule limit") {
+			a.Decision, a.Reason = DecisionDenied, "upstream stream failed: "+copyErr.Error()
+		}
+		b.emit(a)
+	}
+}
+
+// flushWriter flushes after every write so a pack negotiation round trip is
+// not held back by buffering.
+type flushWriter struct{ w http.ResponseWriter }
+
+func (f *flushWriter) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	if flusher, ok := f.w.(http.Flusher); ok && err == nil {
+		flusher.Flush()
+	}
+	return n, err
+}
+
 func (b *Broker) rewritePackageRedirect(header http.Header, source *url.URL) error {
 	raw := header.Get("Location")
 	if raw == "" {
@@ -1489,34 +1669,7 @@ func (b *Broker) emit(a Audit) {
 // only), "*" (anything), each optionally with ":port". A pattern with a port
 // matches only that port; a pattern without one matches any port.
 func hostMatches(host string, patterns []string) bool {
-	host = strings.ToLower(host)
-	hport := ""
-	if h, p, err := net.SplitHostPort(host); err == nil {
-		host, hport = h, p
-	}
-	for _, p := range patterns {
-		p = strings.ToLower(p)
-		pport := ""
-		if ph, pp, err := net.SplitHostPort(p); err == nil {
-			p, pport = ph, pp
-		}
-		if pport != "" && pport != hport {
-			continue
-		}
-		if p == "*" {
-			return true
-		}
-		if strings.HasPrefix(p, "*.") {
-			if strings.HasSuffix(host, p[1:]) && host != p[2:] {
-				return true
-			}
-			continue
-		}
-		if host == p {
-			return true
-		}
-	}
-	return false
+	return proto.HostMatchesAny(host, patterns)
 }
 
 type credentialReplacement struct {

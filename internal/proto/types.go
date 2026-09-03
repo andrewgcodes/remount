@@ -150,6 +150,10 @@ type WorkspaceSpec struct {
 	// unchanged. Only backends that advertise RuntimeCaps.MountPath may claim
 	// a workspace that sets it.
 	MountPath string `cbor:"mount_path,omitempty" json:"mount_path,omitempty"`
+	// Repo is cloned into the tree by the node, through its own broker,
+	// before ws.ready. It is exclusive with RestoreFrom and Base: a wake or
+	// move restores the snapshot instead and never clones again.
+	Repo RepoSpec `cbor:"repo,omitempty" json:"repo,omitempty"`
 }
 
 // DefaultMountPath is where a workspace is materialized when the spec does
@@ -235,6 +239,11 @@ type EgressRule struct {
 	MaxRequestBytes  int64    `cbor:"max_request_bytes,omitempty" json:"max_request_bytes,omitempty"`
 	MaxResponseBytes int64    `cbor:"max_response_bytes,omitempty" json:"max_response_bytes,omitempty"`
 	SharedState      string   `cbor:"shared_state,omitempty" json:"shared_state,omitempty"`
+	// Repos names the repositories a git connector rule covers as
+	// "owner/name" or "owner/*"; Push additionally permits git-receive-pack.
+	// Both are refused on every other connector.
+	Repos []string `cbor:"repos,omitempty" json:"repos,omitempty"`
+	Push  bool     `cbor:"push,omitempty" json:"push,omitempty"`
 }
 
 type AuditPolicy struct {
@@ -422,6 +431,10 @@ type WSReleasedReq struct {
 	Gen      uint64 `cbor:"gen" json:"gen"`
 	Snapshot string `cbor:"snapshot,omitempty" json:"snapshot,omitempty"` // artifact id, if one was taken
 	Reason   string `cbor:"reason,omitempty" json:"reason,omitempty"`
+	// Failed marks a release caused by a materialization that could not
+	// complete (restore, clone, policy). Control holds the workspace out of
+	// placement with a growing delay instead of re-offering it immediately.
+	Failed bool `cbor:"failed,omitempty" json:"failed,omitempty"`
 	// Preparing is returned by a duplicate ws.release while the original
 	// checkpoint is still running. It lets control poll without accumulating
 	// blocked request handlers after a response timeout or reconnect.

@@ -34,6 +34,10 @@ type ConnectorRequest struct {
 	URL            *url.URL
 	Header         http.Header
 	ExpectedDigest string
+	// Body and ContentLength carry a request body for connectors that accept
+	// one (git). ContentLength 0 with a non-nil Body means chunked.
+	Body          io.Reader
+	ContentLength int64
 }
 
 // ConnectorDecision records the stable authorization outcome.
@@ -41,6 +45,10 @@ type ConnectorDecision struct {
 	Allowed bool
 	Code    string
 	Reason  string
+	// Operation and Resource name what was authorized in connector terms
+	// (git: fetch|push and owner/name) so audits can say more than a path.
+	Operation string
+	Resource  string
 }
 
 // ConnectorResponse is an upstream response plus node-owned provenance.
@@ -61,6 +69,7 @@ type Provenance struct {
 	SHA256    string
 	Bytes     int64
 	Cached    bool
+	Operation string
 }
 
 // Error is a stable connector failure. Detail is safe to return to the

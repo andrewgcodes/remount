@@ -196,6 +196,7 @@ type Control struct {
 	fleetLocks            map[string]*keyedMutex
 	bases                 map[string]*proto.Base // baseKey(tenant, name) -> pinned snapshot
 	queues                map[string]*proto.Queue
+	retries               map[string]*materializeRetry // ws -> hold-back after a failed materialization
 	fleetWake             chan struct{}
 	timerReservations     int
 	timerReservationsByWS map[string]int
@@ -323,6 +324,7 @@ func New(opts Options) (*Control, error) {
 		fleetOps: map[string]*proto.FleetOperation{}, fleetLocks: map[string]*keyedMutex{}, fleetWake: make(chan struct{}, 1),
 		bases:                 map[string]*proto.Base{},
 		queues:                map[string]*proto.Queue{},
+		retries:               map[string]*materializeRetry{},
 		timerReservationsByWS: map[string]int{},
 		requestSlots:          make(chan struct{}, opts.MaxConcurrentRequests), overloadSlots: make(chan struct{}, overloadLimit),
 		requestCtx: requestCtx, requestCancel: requestCancel, acceptRequests: true,
@@ -1045,6 +1047,7 @@ func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int)
 	}
 	for _, candidate := range workspaceCandidates {
 		delete(c.workspaces, candidate.id)
+		delete(c.retries, candidate.id)
 	}
 	for _, id := range queueCandidates {
 		delete(c.queues, id)
@@ -1869,6 +1872,19 @@ func (c *Control) wsCreate(ctx context.Context, subject Subject, req *proto.WSCr
 	}
 	if req.Spec.MountPath == proto.DefaultMountPath {
 		req.Spec.MountPath = ""
+	}
+	if req.Spec.Repo.URL != "" || req.Spec.Repo.Ref != "" || req.Spec.Repo.Depth != 0 {
+		repo, err := req.Spec.Repo.Normalize()
+		if err != nil {
+			return nil, err
+		}
+		if req.Spec.Base != "" || req.Spec.RestoreFrom != "" {
+			// A clone needs an empty tree; a base or restore already carries
+			// one. Refusing here is better than a clone that silently never
+			// happens because the restore path won the race.
+			return nil, proto.Err(proto.CodeBadRequest, "repo cannot be combined with base or restore_from")
+		}
+		req.Spec.Repo = repo
 	}
 	scope := subject.Tenant + "|" + subject.ID + "|workspace.create"
 	unlockMutation := c.lockMutation(scope, req.IdempotencyKey)
@@ -2948,8 +2964,43 @@ func (c *Control) wsReady(ctx context.Context, node string, req *proto.WSReadyRe
 		return err
 	}
 	*ws = next
+	delete(c.retries, ws.ID)
 	c.mu.Unlock()
 	return nil
+}
+
+// materializeRetry holds a workspace out of placement after a node reported
+// that materializing it failed. Without it a clone or restore that cannot
+// succeed is re-offered the instant it is released and the fleet burns
+// generations in a tight loop; with it the retry cadence doubles from one
+// second to a thirty second ceiling and resets on the first successful claim.
+type materializeRetry struct {
+	failures  int
+	notBefore int64 // unix ms
+}
+
+const (
+	materializeRetryBase = time.Second
+	materializeRetryMax  = 30 * time.Second
+)
+
+// holdBackLocked records one failed materialization and returns the delay
+// before the workspace may be offered again. Caller holds c.mu.
+func (c *Control) holdBackLocked(wsID string) time.Duration {
+	r := c.retries[wsID]
+	if r == nil {
+		r = &materializeRetry{}
+		c.retries[wsID] = r
+	}
+	delay := materializeRetryBase << r.failures
+	if delay > materializeRetryMax || delay <= 0 {
+		delay = materializeRetryMax
+	}
+	if r.failures < 16 {
+		r.failures++
+	}
+	r.notBefore = c.now().Add(delay).UnixMilli()
+	return delay
 }
 
 func (c *Control) wsRenew(ctx context.Context, node string, req *proto.WSRenewReq) (*proto.WSRenewRes, error) {
@@ -3081,7 +3132,11 @@ func (c *Control) wsReleased(ctx context.Context, node string, req *proto.WSRele
 	}
 	next.Node = ""
 	next.LeaseUntil = 0
-	if err := c.persistWS(&next, c.wsEvent(&next, proto.EvWSReleased, "", node, map[string]any{"reason": req.Reason, "snapshot": req.Snapshot})); err != nil {
+	payload := map[string]any{"reason": req.Reason, "snapshot": req.Snapshot}
+	if req.Failed {
+		payload["retry_after_ms"] = c.holdBackLocked(ws.ID).Milliseconds()
+	}
+	if err := c.persistWS(&next, c.wsEvent(&next, proto.EvWSReleased, "", node, payload)); err != nil {
 		c.mu.Unlock()
 		return err
 	}
@@ -3198,9 +3253,13 @@ func (c *Control) offerPending(ctx context.Context) {
 	}
 	type offer struct{ node, ws string }
 	var offers []offer
+	now := c.now().UnixMilli()
 	c.mu.Lock()
 	for _, ws := range c.workspaces {
 		if ws.State != proto.WSPending {
+			continue
+		}
+		if r := c.retries[ws.ID]; r != nil && r.notBefore > now {
 			continue
 		}
 		for id, n := range c.nodes {

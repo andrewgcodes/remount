@@ -947,7 +947,7 @@ func (n *Node) connectOnce(ctx context.Context) error {
 	info := workspace.HostInfoForRegistry(n.opts.Backends)
 	info.Version = n.opts.Version
 	info.Caps = n.opts.Caps
-	info.Connectors = []string{proto.EgressConnectorPackage}
+	info.Connectors = []string{proto.EgressConnectorPackage, proto.EgressConnectorGit}
 	hello.Node = &info
 	hello.IssuedAt = time.Now().UnixMilli()
 	hello.Nonce = make([]byte, 32)
@@ -1307,10 +1307,17 @@ func writeWorkspaceEnv(handle workspace.Handle, w *ws) error {
 	if w.broker != nil {
 		fmt.Fprintf(&b, "REMOUNT_BROKER=%s\n", w.broker.BaseURL())
 		fmt.Fprintf(&b, "REMOUNT_PACKAGE_CONNECTOR=%s\n", w.broker.PackageURL())
+		fmt.Fprintf(&b, "REMOUNT_GIT_CONNECTOR=%s\n", w.broker.GitURL())
 	}
 	for _, l := range w.leases {
 		// The placeholder, never the secret.
 		fmt.Fprintf(&b, "REMOUNT_REF_%s=%s\n", strings.ToUpper(strings.TrimPrefix(l.ID, "b_")), broker.Placeholder(l))
+	}
+	for _, kv := range gitConfigEnv(w.broker, w.Spec.Repo, w.leases) {
+		// GIT_CONFIG_* routes the declared repository through the broker for
+		// any shell that sources this file; values carry spaces, so quote.
+		key, value, _ := strings.Cut(kv, "=")
+		fmt.Fprintf(&b, "%s='%s'\n", key, strings.ReplaceAll(value, "'", `'\''`))
 	}
 	if err := handle.FS().Mkdir(EnvFileDir); err != nil {
 		return err
@@ -2404,7 +2411,7 @@ func (n *Node) status() proto.NodeStatus {
 	info := workspace.HostInfoForRegistry(n.opts.Backends)
 	info.Version = n.opts.Version
 	info.Caps = append([]string(nil), n.opts.Caps...)
-	info.Connectors = []string{proto.EgressConnectorPackage}
+	info.Connectors = []string{proto.EgressConnectorPackage, proto.EgressConnectorGit}
 	st := proto.NodeStatus{ID: n.id, Labels: n.opts.Labels, Info: info, Online: true, LastSeen: time.Now().UnixMilli()}
 	n.mu.Lock()
 	for id := range n.workspaces {
@@ -2452,6 +2459,7 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 	var envList []string
 	if w.broker != nil {
 		envList = append(envList, w.broker.EnvFor()...)
+		envList = append(envList, gitConfigEnv(w.broker, w.Spec.Repo, leases)...)
 	}
 	envList = append(envList, workspace.MapEnv(env)...)
 	spec := session.Spec{
@@ -2648,7 +2656,7 @@ func (n *Node) tryClaim(ctx context.Context, wsID string, adopt bool) {
 	if err := n.materialize(mctx, res.Workspace, adopt); err != nil {
 		n.logger.Error("materialize failed; releasing", "ws", wsID, "err", err)
 		rctx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		_ = p.Call(rctx, proto.PeerControl, proto.OpWSReleased, proto.WSReleasedReq{ID: wsID, Gen: res.Workspace.Generation, Reason: "materialize failed: " + err.Error()}, nil)
+		_ = p.Call(rctx, proto.PeerControl, proto.OpWSReleased, proto.WSReleasedReq{ID: wsID, Gen: res.Workspace.Generation, Reason: "materialize failed: " + err.Error(), Failed: true}, nil)
 		releaseCancel()
 	}
 }
@@ -2688,6 +2696,16 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 	if adopt {
 		handle, err = be.Adopt(ctx, w.ID)
 		if err != nil {
+			adopt = false
+		} else if needsClone(w.Spec) && !cloneCompleted(handle) {
+			// The tree exists but its clone never finished (the node died
+			// mid-fetch or the clone failed). It was never ws.ready, so no
+			// client has written to it: nothing is lost by starting over,
+			// and serving it would hand out an empty checkout.
+			n.logger.Warn("discarding tree whose clone never completed", "ws", w.ID)
+			if err := handle.Destroy(ctx); err != nil {
+				return fmt.Errorf("discard incomplete clone: %w", err)
+			}
 			adopt = false
 		}
 	}
@@ -2753,7 +2771,7 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 	brokerOpts := broker.Options{
 		WS: w.ID, Generation: w.Generation, Principal: w.Spec.Principal, Tenant: w.Tenant, Leases: leases,
 		Network: w.Spec.Security.Network, Allow: n.opts.Allow, AllowPrivate: n.opts.AllowPrivate,
-		RootCAs: n.opts.BrokerRootCAs, ConnectorStore: n.connectors,
+		RootCAs: n.opts.BrokerRootCAs, ConnectorStore: n.connectors, Repo: w.Spec.Repo,
 		Audit: func(a broker.Audit) {
 			typ := proto.EvEgressAllowed
 			switch a.Decision {
@@ -2766,7 +2784,7 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 			n.emit(typ, a.WS, a.Principal, map[string]any{
 				"generation": a.Generation, "decision": a.Decision, "binding": a.Binding,
 				"rule": a.Rule, "protocol": a.Protocol, "shared_state": a.SharedState,
-				"connector": a.Connector, "digest": a.Digest, "cached": a.Cached,
+				"connector": a.Connector, "op": a.Op, "repo": a.Repo, "digest": a.Digest, "cached": a.Cached,
 				"host": a.Host, "method": a.Method, "path": a.Path, "reason": a.Reason,
 				"status": a.Status, "error": a.Error, "request_bytes": a.RequestBytes, "response_bytes": a.ResponseBytes,
 			})
@@ -2798,6 +2816,32 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 			return retainOnError(fmt.Errorf("apply enforced network policy: %w", err))
 		}
 	}
+	// A declared repository is cloned into a fresh tree before the workspace
+	// is ever serviceable. A restore already carries the checkout, and an
+	// adopted tree is whatever the previous claim left; only a first
+	// materialization fetches. A failed clone is not quarantined like a
+	// failed restore: the tree was created moments ago and holds nothing of
+	// anyone's, so it is destroyed and the next offer starts clean instead of
+	// adopting an empty checkout.
+	cloned := ""
+	if needsClone(w.Spec) && !adopt {
+		commit, err := n.cloneRepo(ctx, entry)
+		if err == nil {
+			err = markCloneCompleted(handle, commit)
+		}
+		if err != nil {
+			metrics.RepoCloneFailures.Inc()
+			if revokeErr := n.revokeWorkspaceNetwork(ctx, entry); revokeErr != nil {
+				n.logger.Error("revoke network after clone failure", "ws", w.ID, "err", revokeErr)
+			}
+			entry.broker.Close()
+			if destroyErr := handle.Destroy(context.WithoutCancel(ctx)); destroyErr != nil {
+				n.logger.Error("discard tree after clone failure", "ws", w.ID, "err", destroyErr)
+			}
+			return fmt.Errorf("clone %s: %w", w.Spec.Repo.URL, err)
+		}
+		cloned = commit
+	}
 	// Drop a sourceable env file into the workspace. The broker's address
 	// changes every time a workspace is materialized, so anything that bakes
 	// it into a config file goes stale after a move. Reading this file at
@@ -2822,6 +2866,10 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 	if w.Spec.RestoreFrom != "" && !adopt {
 		metrics.RestoresDone.Inc()
 		n.emit(proto.EvWSRestored, w.ID, w.Spec.Principal, map[string]any{"from": w.Spec.RestoreFrom, "backend": be.Name()})
+	}
+	if cloned != "" {
+		metrics.RepoClones.Inc()
+		n.emit(proto.EvRepoCloned, w.ID, w.Spec.Principal, cloneEventPayload(w.Spec.Repo, cloned, be.Name()))
 	}
 	n.logger.Info("workspace claimed", "ws", w.ID, "gen", w.Generation, "backend", be.Name(), "restore", w.Spec.RestoreFrom, "adopted", adopt)
 	// Only now is the workspace serviceable; tell the control plane so a

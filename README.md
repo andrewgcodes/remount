@@ -182,7 +182,8 @@ append-only event log is the durable audit and observation record.
 | `remount attach WS SESSION --from N` | reattach to a running session |
 | `remount fs read\|write\|ls\|stat\|rm\|mv\|mkdir\|search\|edit` | workspace filesystem |
 | `remount port WS PORT` | forward a port out of the workspace |
-| `remount run RECIPE [--dir .] [--binding b_openai] -- TASK` | seed a workspace, install a coding harness, run it against brokered keys |
+| `remount run RECIPE [--dir . \| --repo URL[@REF]] [--binding b_openai] -- TASK` | seed a workspace, install a coding harness, run it against brokered keys |
+| `remount ws create --repo URL[@REF] [--repo-depth N]` | the node clones through the broker before the workspace is ready; the token never enters the tree |
 | `remount run RECIPE --queue FILE [--sleep-after D]` | run a file of tasks in order in one workspace; progress lives on the control plane |
 | `remount handoff` / `remount resume WS` | move this checkout and the harness's conversation into a workspace; pick it back up from anywhere |
 | `remount nodes` / `events` / `timers` | inspect the fleet |
