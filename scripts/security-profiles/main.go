@@ -17,6 +17,7 @@ import (
 
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/workspace"
+	"remount.dev/remount/internal/workspace/firecracker"
 	"remount.dev/remount/internal/workspace/gvisor"
 )
 
@@ -64,7 +65,7 @@ func generate() ([]byte, error) {
 	// gVisor registration is gated by New's real runsc/netns probes. Caps is
 	// deliberately static, so reading it cannot accidentally turn a failed
 	// probe into an advertised backend.
-	registry := workspace.NewRegistry(process, docker, &gvisor.Backend{})
+	registry := workspace.NewRegistry(process, docker, &gvisor.Backend{}, &firecracker.Backend{})
 	registered, err := registeredBackendNames()
 	if err != nil {
 		return nil, err
@@ -141,11 +142,11 @@ explicitly approved for multi-tenant placement.
   It satisfies `+"`isolated`"+` but not the microVM requirement of
   `+"`multi_tenant`"+`.
 
-The Firecracker package is host-gated but is not registered by
-`+"`cmd/remount/build_node.go`"+` in this candidate, so it is intentionally absent
-from the advertised matrix. Vendor provisioners do not change these rows: caps
-come from the backend inside a machine, and vendor pools remain one tenant per
-VM.
+The Firecracker descriptor shown here is the fail-closed, unverified zero
+value. A live node advertises its microVM capabilities only after construction
+probes its KVM, jailer, guest, volume and network adapters. Vendor provisioners
+do not change these rows: caps come from the backend inside a machine, and
+vendor pools remain one tenant per VM.
 
 ## Operational proof
 

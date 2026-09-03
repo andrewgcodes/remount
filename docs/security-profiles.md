@@ -14,6 +14,7 @@ backend is absent, not healthy.
 | `process` | yes | no | no |
 | `docker` | yes | no | no |
 | `gvisor` | yes | yes | no |
+| `firecracker` | yes | no | no |
 
 `local` defaults to minimum isolation `none`. `isolated` requires
 container isolation, a deny-default network, brokered secrets, required audit,
@@ -28,6 +29,7 @@ explicitly approved for multi-tenant placement.
 | `process` | `none` | `fs` | `cooperative_proxy` | `token` | `root_handle` | no | no | no | no |
 | `docker` | `container` | `fs` | `cooperative_proxy` | `token` | `bind_mount` | yes | yes | no | no |
 | `gvisor` | `container` | `fs` | `enforced_gateway` | `per_session_capability` | `bind_mount` | yes | yes | yes | no |
+| `firecracker` | `none` | `fs` | `open` | `none` | `` | no | no | no | no |
 
 ## What the rows mean
 
@@ -41,11 +43,11 @@ explicitly approved for multi-tenant placement.
   It satisfies `isolated` but not the microVM requirement of
   `multi_tenant`.
 
-The Firecracker package is host-gated but is not registered by
-`cmd/remount/build_node.go` in this candidate, so it is intentionally absent
-from the advertised matrix. Vendor provisioners do not change these rows: caps
-come from the backend inside a machine, and vendor pools remain one tenant per
-VM.
+The Firecracker descriptor shown here is the fail-closed, unverified zero
+value. A live node advertises its microVM capabilities only after construction
+probes its KVM, jailer, guest, volume and network adapters. Vendor provisioners
+do not change these rows: caps come from the backend inside a machine, and
+vendor pools remain one tenant per VM.
 
 ## Operational proof
 

@@ -202,7 +202,7 @@ func TestSharedVolumeSurvivesPublishAndMove(t *testing.T) {
 	if moved.LastSnapshot == "" {
 		t.Fatal("move did not commit a workspace checkpoint")
 	}
-	rc, err := c.DownloadArtifact(ctx, moved.LastSnapshot)
+	rc, err := c.DownloadSnapshot(ctx, moved.LastSnapshot, moved.LastSnapshotFormat)
 	if err != nil {
 		t.Fatal(err)
 	}
