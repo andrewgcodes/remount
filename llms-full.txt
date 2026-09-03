@@ -947,7 +947,40 @@ a YAML pull request, not Go.
 | `gemini` | Gemini CLI | key or login | google | harness default | `.gemini/` |
 | `aider` | aider | key | openai, anthropic, google, openrouter, groq, deepseek, xai, mistral | harness default | `.aider.*` in the workspace |
 | `cline` | Cline CLI | key or login | anthropic, openai, openrouter, google, xai, deepseek, mistral, groq | harness default | `.cline/` |
+| `pi` | pi coding agent | key | anthropic, openai, openrouter, google, groq, xai, mistral | harness default | `.pi/` |
 | `custom` | anything after `--` | key or login | every preset | env only | none |
+
+#### Agents: structured or PTY transcript
+
+An Agent (`remount agent create`, ADR 0043) runs the recipe's harness as an
+[Agent Client Protocol](https://agentclientprotocol.com) server when the recipe
+declares `acp.command`. That gives a **structured** transcript: message chunks,
+tool calls, plans and permission requests as typed frames the API can filter
+and a client can render. A recipe without `acp` still makes an Agent, but a
+degraded one: the harness runs on a pseudo-terminal, the transcript is the
+terminal log, and a follow-up message is typed at the prompt through the
+recipe's `prompt_template`. The table says which you get; the API reports it as
+`mode: acp | pty` so a client never has to guess.
+
+| Recipe | Transcript | `acp.command` | `load_session` | Adapter | `ui` |
+|---|---|---|---|---|---|
+| `opencode` | structured | `opencode acp` | yes | native | `opencode web` on 4096 |
+| `goose` | structured | `goose acp --with-builtin developer` | yes, with history | native | — |
+| `openhands` | structured | `openhands acp` | — (`--resume ID` is the harness-native path) | native | — |
+| `gemini` | structured | `gemini --acp` | — | native | — |
+| `cline` | structured | `cline --acp` | — | native | — |
+| `pi` | structured | `npx -y pi-acp` | — | `pi-acp` bridges to `pi --mode rpc`, which can steer mid-turn | — |
+| `claude` | structured | `npx -y @agentclientprotocol/claude-agent-acp` | yes | official adapter; subscription login stays workspace-resident (ADR 0039) | — |
+| `codex` | structured | `npx -y @agentclientprotocol/codex-acp` | — | official adapter | — |
+| `aider` | **pty** | — | — | none; `prompt_template` types the message | — |
+| `custom` | **pty** unless `--acp-cmd` | yours | — | — | — |
+
+`load_session` is the recipe's claim. The node checks it against what the
+agent advertises in `initialize` and records `agent.capabilities` either way;
+when an agent cannot reopen a session, a woken Agent starts a fresh one and the
+event says so. `session_id_from` (opencode: newest
+`.local/share/opencode/storage/session/*/ses_*.json`, key `id`) lets a handoff
+continue the laptop conversation on the node with `session/load`.
 
 Every backend sets `HOME` to the workspace root, so the state column is where
 the harness's `~/.something` actually lands: inside the workspace, in every

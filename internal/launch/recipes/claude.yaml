@@ -24,3 +24,9 @@ sandbox_flags:
   full: ["--dangerously-skip-permissions"]
 state_dirs: [".claude", ".claude.json"]
 path_keyed: true
+# ACP through the official adapter (npm @agentclientprotocol/claude-agent-acp);
+# subscription auth stays workspace-resident per ADR 0039.
+acp:
+  command: ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
+  adapter: "@agentclientprotocol/claude-agent-acp"
+  load_session: true

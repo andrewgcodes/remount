@@ -21,3 +21,6 @@ env:
 command: ["aider", "--message", "{{.Task}}", "--no-git"]
 resume_command: ["aider", "--restore-chat-history", "--message", "{{.Task}}", "--no-git"]
 state_dirs: [".aider.chat.history.md", ".aider.input.history", ".aider.tags.cache.v4"]
+# aider speaks no ACP: the Agent runs in pty mode and follow-ups are typed
+# at its prompt.
+prompt_template: "{{.Message}}\n"

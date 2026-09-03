@@ -17,3 +17,7 @@ sandbox_flags:
   full: ["--sandbox", "danger-full-access"]
 state_dirs: [".codex"]
 path_keyed: true
+# ACP through the official adapter (npm @agentclientprotocol/codex-acp).
+acp:
+  command: ["npx", "-y", "@agentclientprotocol/codex-acp"]
+  adapter: "@agentclientprotocol/codex-acp"

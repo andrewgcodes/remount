@@ -6,11 +6,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEveryBuiltinRecipeLoadsAndRenders(t *testing.T) {
 	names := Builtin()
-	want := []string{"aider", "claude", "cline", "codex", "custom", "gemini", "goose", "opencode", "openhands"}
+	want := []string{"aider", "claude", "cline", "codex", "custom", "gemini", "goose", "opencode", "openhands", "pi"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("builtin recipes = %v, want %v", names, want)
 	}
@@ -231,6 +232,167 @@ func TestShellQuote(t *testing.T) {
 	} {
 		if got := ShellQuote(in); got != want {
 			t.Errorf("ShellQuote(%q) = %s, want %s", in, got, want)
+		}
+	}
+}
+
+// The ACP commands below were each checked against the harness's own
+// documentation (see the comment in every recipe). A change here is a change
+// to what runs in every Agent built from the recipe, so it is asserted.
+func TestBuiltinACPCommands(t *testing.T) {
+	want := map[string][]string{
+		"opencode":  {"opencode", "acp"},
+		"goose":     {"goose", "acp", "--with-builtin", "developer"},
+		"openhands": {"openhands", "acp"},
+		"gemini":    {"gemini", "--acp"},
+		"cline":     {"cline", "--acp"},
+		"pi":        {"npx", "-y", "pi-acp"},
+		"claude":    {"npx", "-y", "@agentclientprotocol/claude-agent-acp"},
+		"codex":     {"npx", "-y", "@agentclientprotocol/codex-acp"},
+	}
+	for _, name := range Builtin() {
+		r, err := Load(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := Data{Recipe: name, Workspace: "ws_1", Sandbox: SandboxWorkspaceWrite, Approve: ApproveNever}
+		if len(r.Providers) > 0 {
+			d.Providers = []string{r.Providers[0]}
+			d.Primary = r.Providers[0]
+		}
+		argv, ok := want[name]
+		if !ok {
+			if r.Mode() != ModePTY {
+				t.Fatalf("%s: expected pty mode", name)
+			}
+			if _, err := r.ACPArgv(d); err == nil {
+				t.Fatalf("%s: ACPArgv without acp must fail", name)
+			}
+			if _, err := r.ACPLauncher(d); err == nil {
+				t.Fatalf("%s: ACPLauncher without acp must fail", name)
+			}
+			continue
+		}
+		if r.Mode() != ModeACP {
+			t.Fatalf("%s: expected acp mode", name)
+		}
+		got, err := r.ACPArgv(d)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if strings.Join(got, " ") != strings.Join(argv, " ") {
+			t.Fatalf("%s: acp command %q, want %q", name, got, argv)
+		}
+		script, err := r.ACPLauncher(d)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !strings.HasSuffix(strings.TrimSpace(script), "exec "+strings.Join(argv, " ")) {
+			t.Fatalf("%s: launcher tail:\n%s", name, script)
+		}
+		shellCheck(t, script)
+		if r.ACPLauncherPath() == r.LauncherPath() {
+			t.Fatalf("%s: acp launcher must not overwrite the pty launcher", name)
+		}
+	}
+	if got := len(want); got != 8 {
+		t.Fatalf("table has %d rows", got)
+	}
+}
+
+func TestRecipeACPUIAndPromptFields(t *testing.T) {
+	src := `
+name: t
+auth: workspace_resident
+command: ["h"]
+acp:
+  command: ["h", "acp", "--ws", "{{.Workspace}}"]
+  env:
+    H_FLAG: "{{.Sandbox}}"
+  load_session: true
+ui:
+  command: ["h", "web", "--port", "{{.Port}}"]
+  port: 4096
+prompt_template: "/say {{.Message}}\r"
+session_id_from:
+  glob: ".h/sessions/*.json"
+  key: meta.id
+`
+	r, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := Data{Recipe: "t", Workspace: "ws_9", Sandbox: SandboxReadOnly, Approve: ApproveNever}
+	argv, err := r.ACPArgv(d)
+	if err != nil || strings.Join(argv, " ") != "h acp --ws ws_9" {
+		t.Fatalf("acp argv %q %v", argv, err)
+	}
+	script, err := r.ACPLauncher(d)
+	if err != nil || !strings.Contains(script, `export H_FLAG="read-only"`) {
+		t.Fatalf("acp env not exported:\n%s\n%v", script, err)
+	}
+	ui, err := r.UIArgv(d)
+	if err != nil || strings.Join(ui, " ") != "h web --port 4096" {
+		t.Fatalf("ui argv %q %v", ui, err)
+	}
+	ui, err = r.UIArgv(Data{Recipe: "t", Port: 5000})
+	if err != nil || ui[3] != "5000" {
+		t.Fatalf("ui argv with explicit port %q %v", ui, err)
+	}
+	p, err := r.PromptBytes("hello world")
+	if err != nil || p != "/say hello world\r" {
+		t.Fatalf("prompt %q %v", p, err)
+	}
+	plain, _ := Parse([]byte("name: p\nauth: workspace_resident\ncommand: [\"h\"]\n"))
+	if p, _ := plain.PromptBytes("x"); p != "x\n" {
+		t.Fatalf("default prompt template %q", p)
+	}
+
+	dir := t.TempDir()
+	fsys := os.DirFS(dir)
+	if id, err := r.SessionIDFrom.Extract(fsys); err != nil || id != "" {
+		t.Fatalf("no state yet: %q %v", id, err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".h", "sessions"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, body string, age time.Duration) {
+		p := filepath.Join(dir, ".h", "sessions", name)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		when := time.Now().Add(-age)
+		if err := os.Chtimes(p, when, when); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("old.json", `{"meta":{"id":"old"}}`, time.Hour)
+	write("new.json", `{"meta":{"id":"new"}}`, 0)
+	write("ignored.txt", `{"meta":{"id":"txt"}}`, 0)
+	if id, err := r.SessionIDFrom.Extract(fsys); err != nil || id != "new" {
+		t.Fatalf("newest wins: %q %v", id, err)
+	}
+	write("bad.json", `{"meta":{}}`, -time.Hour)
+	if _, err := r.SessionIDFrom.Extract(fsys); err == nil {
+		t.Fatal("missing key must be an error, not an empty id")
+	}
+	byName := &SessionIDFrom{Glob: ".h/sessions/*.json"}
+	if id, err := byName.Extract(fsys); err != nil || id != "bad" {
+		t.Fatalf("basename id %q %v", id, err)
+	}
+
+	for _, bad := range []string{
+		"name: t\nauth: workspace_resident\ncommand: [\"h\"]\nacp:\n  load_session: true\n",
+		"name: t\nauth: workspace_resident\ncommand: [\"h\"]\nui:\n  command: [\"h\"]\n  port: 0\n",
+		"name: t\nauth: workspace_resident\ncommand: [\"h\"]\nui:\n  port: 80\n",
+		"name: t\nauth: workspace_resident\ncommand: [\"h\"]\nsession_id_from:\n  glob: \"/abs/*.json\"\n",
+		"name: t\nauth: workspace_resident\ncommand: [\"h\"]\nsession_id_from:\n  glob: \"../*.json\"\n",
+		"name: t\nauth: workspace_resident\ncommand: [\"h\"]\nsession_id_from:\n  glob: \"[.json\"\n",
+		"name: t\nauth: workspace_resident\ncommand: [\"h\"]\nacp:\n  command: [\"h\"]\n  env:\n    \"BAD-NAME\": x\n",
+		"name: t\nauth: workspace_resident\ncommand: [\"h\"]\nprompt_template: \"{{.Nope}}\"\n",
+	} {
+		if _, err := Parse([]byte(bad)); err == nil {
+			t.Fatalf("expected validation error for:\n%s", bad)
 		}
 	}
 }

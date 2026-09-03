@@ -261,8 +261,10 @@ Named honestly, because a roadmap presented as a feature list is a lie.
   and the protocol has room for it because the relay already ignores bodies.
 - **Credential substitution inside CONNECT.** Would require a CA in the
   workspace, which we declined in v0. Model traffic uses the reverse-proxy path.
-- **Web and phone UI.** The event log and attach are the only two things a UI
-  needs, and both exist.
+- **Web and phone UI.** Remount ships no end-user UI (ADR 0046). It provides
+  the device-neutral Agent API: any client, the developer's own web app, the
+  reference app in `examples/diy-devin`, a vendor mobile app, or the harness's
+  own web UI reached through the preview proxy, is a client of the same Agent.
 - **Direct peer-to-peer.** Every session byte goes through the relay today.
 - **Automated controller high availability.** The supported topology is one
   SQLite writer. Active/passive failover is an operator procedure, not a
