@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 )
@@ -26,6 +27,21 @@ func (c *Control) Diag(ctx context.Context) *proto.ControlDiag {
 		WorkspacesPerSubjectMax: c.opts.MaxWorkspacesPerSubject,
 		EventsMax:               c.opts.MaxEvents,
 		RequestsActiveMax:       c.opts.MaxConcurrentRequests,
+	}
+	role, recovery, reconciling := c.controllerRecoverySnapshot()
+	d.ControllerRole, d.ControllerEpoch, d.ControllerReconciling = role, c.controllerEpoch, reconciling
+	if reporter, ok := c.controllerAuthority.(ControllerAuthorityReporter); ok {
+		d.ControllerLeaseAgeMS = reporter.LeaseAge().Milliseconds()
+	}
+	if recovery != nil {
+		d.LastReplicatedAt = recovery.LastReplicatedAt.UnixMilli()
+		d.RestoredEventSeq = recovery.RestoredEventSeq
+		d.RecoveryLostWindowMS = recovery.LostWindow.Milliseconds()
+	} else if replicated := c.controllerLastReplicatedAt(); !replicated.IsZero() {
+		d.LastReplicatedAt = replicated.UnixMilli()
+	}
+	if reconciling {
+		d.Findings = append(d.Findings, proto.Finding{Severity: "error", Check: "controller.reconciling", Detail: "promoted controller has not completed node-authoritative reconciliation", Hint: "lifecycle writes and readiness remain disabled"})
 	}
 	if seq, err := c.log.Last(ctx); err == nil {
 		d.EventSeq = seq
@@ -168,6 +184,13 @@ func (c *Control) Diag(ctx context.Context) *proto.ControlDiag {
 // the deepest integrity check available: it reads every byte rather than
 // trusting a counter.
 func (c *Control) verifyArtifacts() []proto.Finding {
+	return c.verifyArtifactsForTenant(context.Background(), "")
+}
+
+func (c *Control) verifyArtifactsForTenant(ctx context.Context, tenant string) []proto.Finding {
+	if c.opts.TenantArtifacts != nil {
+		return c.verifyResolvedArtifacts(ctx, tenant)
+	}
 	if c.opts.Artifacts == nil {
 		return []proto.Finding{{
 			Severity: "warn", Check: "artifact.verify_unavailable",
@@ -194,6 +217,69 @@ func (c *Control) verifyArtifacts() []proto.Finding {
 		Severity: "info", Check: "artifact.verified",
 		Detail: fmt.Sprintf("re-hashed %d artifacts, %d damaged", len(ids), bad),
 	})
+	return out
+}
+
+func (c *Control) verifyResolvedArtifacts(ctx context.Context, tenant string) []proto.Finding {
+	tenants := []string{tenant}
+	if tenant == "*" {
+		inventory, ok := c.opts.TenantArtifacts.(artifact.TenantInventory)
+		if !ok {
+			return []proto.Finding{{Severity: "warn", Check: "artifact.verify_unavailable", Detail: "tenant artifact inventory is unavailable"}}
+		}
+		var err error
+		tenants, err = inventory.Tenants(ctx)
+		if err != nil {
+			return []proto.Finding{{Severity: "error", Check: "artifact.tenant_list", Detail: err.Error()}}
+		}
+	}
+	if tenant == "" {
+		return []proto.Finding{{Severity: "warn", Check: "artifact.verify_unavailable", Detail: "authenticated tenant is unavailable"}}
+	}
+	var out []proto.Finding
+	total, bad, retired := 0, 0, 0
+	if deep, ok := c.opts.TenantArtifacts.(artifact.TenantDeepVerifier); ok {
+		for _, tenantID := range tenants {
+			verified, err := deep.VerifyTenant(ctx, tenantID)
+			if err != nil {
+				out = append(out, proto.Finding{Severity: "error", Check: "artifact.tenant_inventory", Subject: tenantID, Detail: err.Error()})
+				continue
+			}
+			for _, item := range verified {
+				total++
+				if item.Retired {
+					retired++
+				}
+				if item.Err != nil {
+					bad++
+					out = append(out, proto.Finding{Severity: "error", Check: "artifact.digest", Subject: item.Tenant + "/" + item.ID,
+						Detail: fmt.Sprintf("key version %s: %v", item.Version, item.Err), Hint: "repair or remove the damaged encrypted representation before restore"})
+				}
+			}
+		}
+	} else {
+		for _, tenantID := range tenants {
+			store, err := c.opts.TenantArtifacts.ResolveTenant(tenantID)
+			if err != nil {
+				out = append(out, proto.Finding{Severity: "error", Check: "artifact.tenant_open", Subject: tenantID, Detail: err.Error()})
+				continue
+			}
+			ids, err := store.List()
+			if err != nil {
+				out = append(out, proto.Finding{Severity: "error", Check: "artifact.list", Subject: tenantID, Detail: err.Error()})
+				continue
+			}
+			for _, id := range ids {
+				total++
+				if err := store.Verify(id); err != nil {
+					bad++
+					out = append(out, proto.Finding{Severity: "error", Check: "artifact.digest", Subject: tenantID + "/" + id, Detail: err.Error()})
+				}
+			}
+		}
+	}
+	out = append(out, proto.Finding{Severity: "info", Check: "artifact.verified",
+		Detail: fmt.Sprintf("re-hashed %d encrypted representations, %d damaged, %d on retired keys", total, bad, retired)})
 	return out
 }
 

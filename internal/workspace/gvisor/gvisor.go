@@ -194,10 +194,10 @@ type handle struct {
 	started    bool
 }
 
-func (h *handle) ID() string        { return h.id }
-func (h *handle) Backend() string   { return "gvisor" }
-func (h *handle) FS() *fsops.FS     { return h.fs }
-func (h *handle) MountPath() string { return h.mount }
+func (h *handle) ID() string               { return h.id }
+func (h *handle) Backend() string          { return "gvisor" }
+func (h *handle) FS() workspace.FileSystem { return h.fs }
+func (h *handle) MountPath() string        { return h.mount }
 
 // BrokerAdvertiseHost is consumed by the node integration hook so the broker
 // binds the host-veth address rather than loopback or all interfaces.

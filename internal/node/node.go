@@ -9,6 +9,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -18,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -25,6 +27,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +42,7 @@ import (
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/session"
 	"remount.dev/remount/internal/transport"
+	"remount.dev/remount/internal/volume"
 	"remount.dev/remount/internal/workspace"
 )
 
@@ -63,6 +67,12 @@ type Options struct {
 	// cache, including concurrent staging. Zero selects 32 GiB / 50,000.
 	MaxArtifactStoreBytes int64
 	MaxArtifactObjects    int
+	// MaxVolumeSourceBytes bounds expanded immutable volume caches separately
+	// from their compressed blobs. Zero selects 32 GiB.
+	MaxVolumeSourceBytes int64
+	// MaxVolumeSourceEntries bounds inode consumption by expanded caches.
+	// Zero selects two million files, directories and symlinks.
+	MaxVolumeSourceEntries int
 	// ArtifactRetention is the minimum age of an unreferenced cache entry;
 	// ArtifactGCInterval controls background reference-aware collection. Zero
 	// selects 24 hours and ten minutes.
@@ -104,6 +114,9 @@ type Options struct {
 	SessionSpillBytes      int64
 	SessionMaxChunkBytes   int
 	SessionMaxMemoryChunks int
+	SessionSegmentBytes    int64
+	SessionMaxLogSegments  int
+	SessionLogRetention    time.Duration
 	// MutationRetention is the replay window for completed node-side
 	// idempotency results. Pending/ambiguous intents are never pruned. Zero
 	// selects 30 days; MaxMutationRecords defaults to 10,000.
@@ -115,6 +128,12 @@ type Options struct {
 	// budget. Zero selects 4 concurrent snapshots and a one-second interval.
 	MaxConcurrentSnapshots int
 	SnapshotMinInterval    time.Duration
+	// Volumes overrides the durable local read-only mount backend. Nil creates
+	// the Linux bind-mount implementation rooted under DataDir.
+	Volumes volume.Backend
+	// VolumeCapability is for injected, already-probed implementations in
+	// tests or platform integrations. The built-in backend probes itself.
+	VolumeCapability bool
 }
 
 // Node is the supervisor.
@@ -124,10 +143,16 @@ type Node struct {
 	priv   ed25519.PrivateKey
 	logger *slog.Logger
 
-	sessions   *session.Manager
-	store      *artifact.Store
-	connectors *connector.Store
-	events     *eventlog.Log
+	sessions        *session.Manager
+	store           *artifact.Store
+	connectors      *connector.Store
+	volumes         volume.Backend
+	volumeRoot      *volume.DirectoryResolver
+	events          *eventlog.Log
+	volumeMu        sync.Mutex
+	epochMu         sync.Mutex
+	epochPath       string
+	controllerEpoch uint64
 
 	mu         sync.Mutex
 	peer       *transport.Peer
@@ -147,14 +172,23 @@ type Node struct {
 	// materializing holds workspaces this node has claimed but not finished
 	// restoring: their leases must be renewed too, or a slow restore loses
 	// the claim it is working on.
-	materializing map[string]*materialization
-	deadlines     map[string]time.Time    // monotonic local self-fence deadline
-	quarantined   map[string]struct{}     // local bytes retained but never served
-	grants        map[string]*proto.Grant // client|ws -> grant
-	subs          map[string]*subscriber  // client|session -> active stream
-	prepared      map[string]*preparedRelease
-	committed     map[string]uint64 // idempotent release commits by workspace
-	eventClaims   map[string]eventClaim
+	materializing       map[string]*materialization
+	deadlines           map[string]time.Time    // monotonic local self-fence deadline
+	quarantined         map[string]struct{}     // local bytes retained but never served
+	grants              map[string]*proto.Grant // client|ws -> grant
+	subs                map[string]*subscriber  // client|session -> active stream
+	sessionCapabilities map[string]*localSessionCapability
+	capabilityWG        sync.WaitGroup
+	prepared            map[string]*preparedRelease
+	committed           map[string]uint64 // idempotent release commits by workspace
+	eventClaims         map[string]eventClaim
+	releaseMu           sync.Mutex
+	releaseReconcileMu  sync.Mutex
+	releases            map[string]durableRelease
+	releasePath         string
+	quarantineMu        sync.Mutex
+	quarantines         map[string]durableQuarantine
+	quarantinePath      string
 
 	mutationMu    sync.Mutex
 	mutations     map[string]*mutationEntry
@@ -226,6 +260,7 @@ type materialization struct {
 
 type mutationEntry struct {
 	Fingerprint  [32]byte
+	Request      []byte
 	State        string
 	Result       []byte
 	CompletedAt  int64
@@ -236,6 +271,7 @@ type mutationEntry struct {
 
 type persistedMutation struct {
 	Fingerprint []byte `cbor:"fingerprint"`
+	Request     []byte `cbor:"request,omitempty"`
 	State       string `cbor:"state,omitempty"`
 	Result      []byte `cbor:"result"`
 	CompletedAt int64  `cbor:"completed_at"`
@@ -257,12 +293,12 @@ func New(opts Options) (*Node, error) {
 	if opts.HTTPClient == nil {
 		opts.HTTPClient = &http.Client{Timeout: 10 * time.Minute}
 	}
-	if opts.MaxArtifactBytes < 0 || opts.MaxArtifactStoreBytes < 0 || opts.MaxArtifactObjects < 0 ||
+	if opts.MaxArtifactBytes < 0 || opts.MaxArtifactStoreBytes < 0 || opts.MaxArtifactObjects < 0 || opts.MaxVolumeSourceBytes < 0 || opts.MaxVolumeSourceEntries < 0 ||
 		opts.MaxConnectorCacheBytes < 0 || opts.MaxConnectorWorkspaceBytes < 0 || opts.MaxConnectorObjectBytes < 0 ||
 		opts.MaxConnectorObjects < 0 || opts.MaxConnectorWorkspaceObjects < 0 ||
 		opts.MaxSessions < 0 || opts.MaxActiveSessions < 0 || opts.MaxSessionsPerWorkspace < 0 ||
 		opts.MaxSessionsPerPrincipal < 0 || opts.SessionMemoryBytes < 0 || opts.SessionSpillBytes < 0 ||
-		opts.SessionMaxChunkBytes < 0 || opts.SessionMaxMemoryChunks < 0 || opts.MaxConcurrentRequests < 0 ||
+		opts.SessionMaxChunkBytes < 0 || opts.SessionMaxMemoryChunks < 0 || opts.SessionSegmentBytes < 0 || opts.SessionMaxLogSegments < 0 || opts.SessionLogRetention < 0 || opts.MaxConcurrentRequests < 0 ||
 		opts.MutationRetention < 0 || opts.MaxMutationRecords < 0 || opts.MaxConcurrentSnapshots < 0 ||
 		opts.SnapshotMinInterval < 0 || opts.ArtifactRetention < 0 || opts.ArtifactGCInterval < 0 {
 		return nil, errors.New("node: resource limits must not be negative")
@@ -275,6 +311,12 @@ func New(opts Options) (*Node, error) {
 	}
 	if opts.MaxArtifactObjects == 0 {
 		opts.MaxArtifactObjects = 50_000
+	}
+	if opts.MaxVolumeSourceBytes == 0 {
+		opts.MaxVolumeSourceBytes = 32 << 30
+	}
+	if opts.MaxVolumeSourceEntries == 0 {
+		opts.MaxVolumeSourceEntries = 2_000_000
 	}
 	if opts.ArtifactRetention == 0 {
 		opts.ArtifactRetention = 24 * time.Hour
@@ -312,6 +354,15 @@ func New(opts Options) (*Node, error) {
 	if opts.SessionMaxMemoryChunks == 0 {
 		opts.SessionMaxMemoryChunks = 16_384
 	}
+	if opts.SessionSegmentBytes == 0 {
+		opts.SessionSegmentBytes = session.DefaultSegmentBytes
+	}
+	if opts.SessionMaxLogSegments == 0 {
+		opts.SessionMaxLogSegments = session.DefaultMaxSegments
+	}
+	if opts.SessionLogRetention == 0 {
+		opts.SessionLogRetention = 24 * time.Hour
+	}
 	if opts.MutationRetention == 0 {
 		opts.MutationRetention = 30 * 24 * time.Hour
 	}
@@ -324,7 +375,7 @@ func New(opts Options) (*Node, error) {
 	if opts.SnapshotMinInterval == 0 {
 		opts.SnapshotMinInterval = time.Second
 	}
-	for _, d := range []string{"", "ws", "spill", "artifacts"} {
+	for _, d := range []string{"", "ws", "spill", "artifacts", "volumes", "volumes/sources"} {
 		if err := os.MkdirAll(filepath.Join(opts.DataDir, d), 0o700); err != nil {
 			return nil, err
 		}
@@ -333,6 +384,11 @@ func New(opts Options) (*Node, error) {
 		return nil, err
 	}
 	id, priv, err := loadIdentity(filepath.Join(opts.DataDir, "identity.json"), opts.ID)
+	if err != nil {
+		return nil, err
+	}
+	epochPath := filepath.Join(opts.DataDir, "controller-epoch.cbor")
+	controllerEpoch, err := loadControllerEpoch(epochPath)
 	if err != nil {
 		return nil, err
 	}
@@ -349,16 +405,53 @@ func New(opts Options) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	opts.Caps = slices.DeleteFunc(opts.Caps, func(capability string) bool { return capability == proto.CapabilityReadOnlyVolumes })
+	_, processBackendErr := opts.Backends.Get("process")
+	var volumeRoot *volume.DirectoryResolver
+	volumeCapable := opts.Volumes != nil && opts.VolumeCapability && processBackendErr == nil
+	if opts.Volumes == nil {
+		volumeRoot, err = volume.OpenDirectoryResolver(filepath.Join(opts.DataDir, "volumes", "sources"))
+		if err != nil {
+			return nil, err
+		}
+		opts.Volumes, err = volume.OpenLocalBackend(context.Background(), filepath.Join(opts.DataDir, "volumes", "state.json"), volumeRoot, volume.BindMountEngine{}, volume.Options{})
+		if err != nil {
+			_ = volumeRoot.Close()
+			return nil, err
+		}
+		if probeErr := volume.ProbeBindMount(context.Background(), filepath.Join(opts.DataDir, "volumes")); probeErr == nil && processBackendErr == nil {
+			volumeCapable = true
+		} else {
+			opts.Logger.Info("read-only volumes unavailable", "mount_probe", probeErr, "process_backend", processBackendErr)
+		}
+	}
+	if volumeCapable && !slices.Contains(opts.Caps, proto.CapabilityReadOnlyVolumes) {
+		opts.Caps = append(opts.Caps, proto.CapabilityReadOnlyVolumes)
+	}
 	connectorStore, err := connector.NewStore(filepath.Join(opts.DataDir, "connectors"), connector.StoreOptions{
 		MaxBytes: opts.MaxConnectorCacheBytes, MaxBytesPerScope: opts.MaxConnectorWorkspaceBytes,
 		MaxObjectBytes: opts.MaxConnectorObjectBytes, MaxObjects: opts.MaxConnectorObjects,
 		MaxObjectsPerScope: opts.MaxConnectorWorkspaceObjects,
 	})
 	if err != nil {
+		if volumeRoot != nil {
+			_ = opts.Volumes.Close()
+			_ = volumeRoot.Close()
+		}
 		return nil, err
 	}
 	mutationPath := filepath.Join(opts.DataDir, "mutations.cbor")
 	mutations, err := loadMutations(mutationPath)
+	if err != nil {
+		return nil, err
+	}
+	releasePath := filepath.Join(opts.DataDir, "releases.cbor")
+	releases, err := loadReleases(releasePath)
+	if err != nil {
+		return nil, err
+	}
+	quarantinePath := filepath.Join(opts.DataDir, "quarantines.cbor")
+	quarantines, err := loadQuarantines(quarantinePath)
 	if err != nil {
 		return nil, err
 	}
@@ -372,25 +465,55 @@ func New(opts Options) (*Node, error) {
 	}
 	n := &Node{
 		opts: opts, id: id, priv: priv, logger: opts.Logger.With("node", id),
-		store: store, connectors: connectorStore, events: eventlog.New(eventlog.NewMemory(10000)),
+		store: store, connectors: connectorStore, volumes: opts.Volumes, volumeRoot: volumeRoot, events: eventlog.New(eventlog.NewMemory(10000)),
 		workspaces: map[string]*ws{}, materializing: map[string]*materialization{},
 		agentRuns: map[string]*agentRun{}, agentRunsDone: map[string]time.Time{},
 		deadlines: map[string]time.Time{}, quarantined: map[string]struct{}{},
-		grants: map[string]*proto.Grant{}, subs: map[string]*subscriber{},
+		grants: map[string]*proto.Grant{}, subs: map[string]*subscriber{}, sessionCapabilities: map[string]*localSessionCapability{},
 		prepared: map[string]*preparedRelease{}, committed: map[string]uint64{},
 		eventClaims: map[string]eventClaim{},
-		mutations:   mutations, mutationPath: mutationPath,
+		releases:    releases, releasePath: releasePath,
+		quarantines: quarantines, quarantinePath: quarantinePath,
+		mutations: mutations, mutationPath: mutationPath,
 		snapshotSlots: make(chan struct{}, opts.MaxConcurrentSnapshots),
 		requestSlots:  make(chan struct{}, opts.MaxConcurrentRequests), overloadSlots: make(chan struct{}, overloadLimit),
 		requestCtx: requestCtx, requestCancel: requestCancel, acceptRequests: true,
 		started: time.Now(), stop: make(chan struct{}), online: make(chan struct{}),
+		epochPath: epochPath, controllerEpoch: controllerEpoch,
+	}
+	for id, record := range releases {
+		if record.State != releaseCommitted {
+			n.quarantined[id] = struct{}{}
+		}
+	}
+	for _, record := range quarantines {
+		if record.State != quarantineCommitted && record.State != quarantineSuperseded {
+			n.quarantined[record.Request.WS] = struct{}{}
+		}
+	}
+	for key, entry := range mutations {
+		if !strings.HasPrefix(key, "fleet:") || strings.Contains(key, ":destroy:") || len(entry.Request) == 0 {
+			continue
+		}
+		var request proto.WSQuarantineReq
+		if proto.Unmarshal(entry.Request, &request) == nil && request.WS != "" {
+			n.quarantined[request.WS] = struct{}{}
+		}
 	}
 	n.sessions = session.NewManager(session.ManagerOptions{
 		SpillDir: filepath.Join(opts.DataDir, "spill"), MemBytes: opts.SessionMemoryBytes, SpillBytes: opts.SessionSpillBytes,
 		MaxChunk: opts.SessionMaxChunkBytes, MaxChunks: opts.SessionMaxMemoryChunks,
 		MaxSessions: opts.MaxSessions, MaxActive: opts.MaxActiveSessions, MaxSessionsPerWorkspace: opts.MaxSessionsPerWorkspace,
 		MaxSessionsPerPrincipal: opts.MaxSessionsPerPrincipal,
+		Retention:               opts.SessionLogRetention, SegmentBytes: opts.SessionSegmentBytes, MaxLogSegments: opts.SessionMaxLogSegments,
+		BlobStoreForSession:      n.sessionLogBlobStore,
+		CommitSessionLogRecord:   n.commitSessionLogRecord,
+		CompleteSessionLogRecord: n.completeSessionLogRecord,
+		OnRecordError: func(id string, err error) {
+			n.emit(proto.EvSessionLogUnavailable, "", "", map[string]any{"session": id, "tier": session.TierBlob, "error": err.Error()})
+		},
 		OnExit: func(s *session.Session, info proto.ExitInfo) {
+			n.dropSessionCapabilities(s.ID)
 			n.emitSession(proto.EvSExited, s.WS, s.Principal, s.ID, map[string]any{"s": s.ID, "code": info.Code, "signal": info.Signal})
 			if run := s.Info.Run; run != nil {
 				n.emitSession(proto.EvRunFinished, s.WS, s.Principal, s.ID, map[string]any{"s": s.ID, "recipe": run.Recipe, "exit": info.Code, "signal": info.Signal})
@@ -465,7 +588,7 @@ func loadMutations(path string) (map[string]*mutationEntry, error) {
 			record.CompletedAt = legacyCompletedAt
 		}
 		entry := &mutationEntry{
-			State: state, Result: append([]byte(nil), record.Result...),
+			Request: append([]byte(nil), record.Request...), State: state, Result: append([]byte(nil), record.Result...),
 			CompletedAt: record.CompletedAt, done: make(chan struct{}),
 		}
 		copy(entry.Fingerprint[:], record.Fingerprint)
@@ -515,7 +638,8 @@ func (n *Node) persistMutationsLocked() error {
 		}
 		stored[key] = persistedMutation{
 			Fingerprint: append([]byte(nil), entry.Fingerprint[:]...), State: entry.State,
-			Result: append([]byte(nil), entry.Result...), CompletedAt: entry.CompletedAt,
+			Request: append([]byte(nil), entry.Request...),
+			Result:  append([]byte(nil), entry.Result...), CompletedAt: entry.CompletedAt,
 		}
 	}
 	b, err := proto.Marshal(stored)
@@ -564,7 +688,8 @@ func (n *Node) runMutation(ctx context.Context, key string, request any, apply f
 	if key == "" {
 		return apply()
 	}
-	fingerprint := sha256.Sum256(proto.MustMarshal(request))
+	requestBytes := proto.MustMarshal(request)
+	fingerprint := sha256.Sum256(requestBytes)
 	n.mutationMu.Lock()
 	pruned := n.pruneExpiredMutationsLocked(time.Now())
 	if existing := n.mutations[key]; existing != nil {
@@ -628,7 +753,7 @@ func (n *Node) runMutation(ctx context.Context, key string, request any, apply f
 			"node mutation journal contains %d records", maxRecords)
 	}
 	entry := &mutationEntry{
-		Fingerprint: fingerprint, State: mutationPending, CompletedAt: time.Now().UnixMilli(),
+		Fingerprint: fingerprint, Request: append([]byte(nil), requestBytes...), State: mutationPending, CompletedAt: time.Now().UnixMilli(),
 		done: make(chan struct{}), needsPersist: true,
 	}
 	n.mutations[key] = entry
@@ -676,6 +801,59 @@ func (n *Node) runMutation(ctx context.Context, key string, request any, apply f
 		return nil, err
 	}
 	return result, err
+}
+
+// refuseAmbiguousMutation prevents lifecycle code from treating a generic
+// restart-loaded intent as proof that its precondition completed. In
+// particular, quarantine may not snapshot or detach a retained process tree
+// unless the previous node durably proved that every producer was joined.
+func (n *Node) refuseAmbiguousMutation(key string, request any, operation string) error {
+	requestBytes := proto.MustMarshal(request)
+	fingerprint := sha256.Sum256(requestBytes)
+	n.mutationMu.Lock()
+	defer n.mutationMu.Unlock()
+	entry := n.mutations[key]
+	if entry == nil || entry.State != mutationPending || entry.err == nil {
+		return nil
+	}
+	if entry.Fingerprint != fingerprint || !bytes.Equal(entry.Request, requestBytes) {
+		return proto.Err(proto.CodeConflict, "pending %s request cannot be reconciled", operation)
+	}
+	return proto.Err(proto.CodeConflict,
+		"%s was interrupted before durable quiescence proof; automatic destructive recovery is refused", operation)
+}
+
+func (n *Node) completedMutation(ctx context.Context, key string, request any) ([]byte, bool, error) {
+	if key == "" {
+		return nil, false, nil
+	}
+	fingerprint := sha256.Sum256(proto.MustMarshal(request))
+	n.mutationMu.Lock()
+	entry := n.mutations[key]
+	if entry == nil {
+		n.mutationMu.Unlock()
+		return nil, false, nil
+	}
+	if entry.Fingerprint != fingerprint {
+		n.mutationMu.Unlock()
+		return nil, true, proto.Err(proto.CodeConflict, "idempotency key was reused with different arguments")
+	}
+	done := entry.done
+	n.mutationMu.Unlock()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return nil, true, ctx.Err()
+	}
+	n.mutationMu.Lock()
+	defer n.mutationMu.Unlock()
+	if entry.State != mutationCompleted || entry.err != nil {
+		if entry.err != nil {
+			return nil, true, entry.err
+		}
+		return nil, true, proto.Err(proto.CodeConflict, "mutation outcome is not complete")
+	}
+	return append([]byte(nil), entry.Result...), true, nil
 }
 
 // ID returns the node id.
@@ -900,13 +1078,45 @@ func (n *Node) CollectArtifacts(now time.Time) (artifact.GCResult, error) {
 		if workspace.Spec.RestoreFrom != "" {
 			references[workspace.Spec.RestoreFrom] = struct{}{}
 		}
+		for _, mount := range workspace.Spec.Volumes {
+			if mount.Artifact != "" {
+				references[mount.Artifact] = struct{}{}
+			}
+		}
 	}
 	for _, prepared := range n.prepared {
 		if prepared.response.Snapshot != "" {
 			references[prepared.response.Snapshot] = struct{}{}
 		}
+		for _, mount := range prepared.workspace.Spec.Volumes {
+			if mount.Artifact != "" {
+				references[mount.Artifact] = struct{}{}
+			}
+		}
 	}
 	n.mu.Unlock()
+	n.quarantineMu.Lock()
+	for _, quarantine := range n.quarantines {
+		if quarantine.State == quarantineCommitted || quarantine.State == quarantineSuperseded {
+			continue
+		}
+		if quarantine.Response.Snapshot != "" {
+			references[quarantine.Response.Snapshot] = struct{}{}
+		}
+		for _, mount := range quarantine.Request.Volumes {
+			if mount.Artifact != "" {
+				references[mount.Artifact] = struct{}{}
+			}
+		}
+	}
+	n.quarantineMu.Unlock()
+	n.volumeMu.Lock()
+	defer n.volumeMu.Unlock()
+	if reporter, ok := n.volumes.(volume.ArtifactReferenceReporter); ok {
+		for _, id := range reporter.ArtifactReferences() {
+			references[id] = struct{}{}
+		}
+	}
 	ids := make([]string, 0, len(references))
 	for id := range references {
 		ids = append(ids, id)
@@ -915,10 +1125,72 @@ func (n *Node) CollectArtifacts(now time.Time) (artifact.GCResult, error) {
 	if err != nil {
 		return result, err
 	}
+	if err := n.collectVolumeSourcesLocked(); err != nil {
+		return result, err
+	}
 	metrics.ArtifactGCRuns.Inc()
 	metrics.ArtifactGCObjects.Add(uint64(result.Removed))
 	metrics.ArtifactGCBytes.Add(uint64(result.RemovedBytes))
 	return result, nil
+}
+
+// collectVolumeSources gives expanded read-only volume caches the same
+// lifetime as their verified artifact blobs. The blob store owns admission
+// and retention; a source without its blob can always be reconstructed after
+// a verified refetch and must not become an unaccounted second cache.
+func (n *Node) collectVolumeSourcesLocked() error {
+	root := filepath.Join(n.opts.DataDir, "volumes", "sources")
+	tenants, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	for _, tenant := range tenants {
+		if !tenant.IsDir() || volume.ValidateTenant(tenant.Name()) != nil {
+			continue
+		}
+		tenantPath := filepath.Join(root, tenant.Name())
+		entries, err := os.ReadDir(tenantPath)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			id := entry.Name()
+			if strings.HasPrefix(id, ".staging-") {
+				if err := os.RemoveAll(filepath.Join(tenantPath, id)); err != nil {
+					return err
+				}
+				continue
+			}
+			if strings.HasPrefix(id, ".complete-") {
+				artifactID := strings.TrimPrefix(id, ".complete-")
+				if _, err := artifact.Digest(artifactID); err != nil || !n.store.Has(artifactID) {
+					if err := os.Remove(filepath.Join(tenantPath, id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+						return err
+					}
+				}
+				continue
+			}
+			if _, err := artifact.Digest(id); err != nil || n.store.Has(id) {
+				continue
+			}
+			if err := os.RemoveAll(filepath.Join(tenantPath, id)); err != nil {
+				return err
+			}
+			if err := os.Remove(filepath.Join(tenantPath, ".complete-"+id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+		remaining, err := os.ReadDir(tenantPath)
+		if err != nil {
+			return err
+		}
+		if len(remaining) == 0 {
+			if err := os.Remove(tenantPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (n *Node) shutdown() {
@@ -947,12 +1219,23 @@ func (n *Node) shutdown() {
 			n.logger.Error("revoke workspace network during shutdown", "ws", w.ID, "err", err)
 		}
 	}
-	n.sessions.Close()
+	n.sessions.Shutdown()
+	n.capabilityWG.Wait()
 	for w := range held {
 		if w.broker != nil {
 			_ = w.broker.Close()
 		}
+		if err := n.detachWorkspaceVolumes(context.Background(), w, w.Spec.Volumes); err != nil {
+			n.logger.Error("retain workspace tree after shutdown volume detach failure", "ws", w.ID, "err", err)
+			continue
+		}
 		_ = w.handle.FS().Close()
+	}
+	if n.volumes != nil {
+		_ = n.volumes.Close()
+	}
+	if n.volumeRoot != nil {
+		_ = n.volumeRoot.Close()
 	}
 }
 
@@ -991,6 +1274,13 @@ func (n *Node) helloAndServe(ctx context.Context, peer *transport.Peer, hello pr
 	if !proto.HasCapability(ok.Caps, proto.CapabilityV1) {
 		peer.Close()
 		return proto.Err(proto.CodeUnsupported, "server did not negotiate required capability %q", proto.CapabilityV1)
+	}
+	if proto.HasCapability(ok.Caps, proto.CapabilityControllerEpoch) {
+		if err := n.acceptControllerEpoch(ok.ControllerEpoch); err != nil {
+			peer.Close()
+			return err
+		}
+		peer.SetControllerEpoch(ok.ControllerEpoch)
 	}
 	n.mu.Lock()
 	n.peer = peer
@@ -1079,6 +1369,9 @@ func (n *Node) renew(ctx context.Context) {
 	n.mu.Lock()
 	p := n.peer
 	req := proto.WSRenewReq{Gen: map[string]uint64{}, Authz: map[string]uint64{}}
+	if proto.HasCapability(n.protocol, proto.CapabilityControllerEpoch) {
+		req.ControllerEpoch = n.currentControllerEpoch()
+	}
 	for id, w := range n.workspaces {
 		req.IDs = append(req.IDs, id)
 		req.Gen[id] = w.Generation
@@ -1109,6 +1402,8 @@ func (n *Node) renew(ctx context.Context) {
 		rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		if err := p.Call(rctx, proto.PeerControl, proto.OpWSRenew, req, &res); err != nil {
 			n.logger.Warn("renew failed", "err", err)
+		} else if req.ControllerEpoch != 0 && res.ControllerEpoch != req.ControllerEpoch {
+			n.logger.Warn("renew response refused", "epoch", res.ControllerEpoch, "expected_epoch", req.ControllerEpoch)
 		} else {
 			n.applyRenewResults(req, &res)
 		}
@@ -1122,6 +1417,9 @@ func (n *Node) renew(ctx context.Context) {
 func (n *Node) applyRenewResults(req proto.WSRenewReq, res *proto.WSRenewRes) {
 	results := make(map[string]proto.WSRenewResult, len(res.Results))
 	for _, result := range res.Results {
+		if req.ControllerEpoch != 0 && result.ControllerEpoch != req.ControllerEpoch {
+			continue
+		}
 		results[result.ID] = result
 	}
 	for _, id := range req.IDs {
@@ -1388,7 +1686,7 @@ func appendWarning(existing, warning string) string {
 // first so queued starters fail their post-lock serviceability check.
 func (n *Node) stopWorkspaceSessions(w *ws) error {
 	w.treeMu.Lock()
-	err := n.sessions.KillWorkspace(w.ID)
+	err := n.sessions.TerminateWorkspace(w.ID, "workspace released")
 	w.treeMu.Unlock()
 	// Agent runs join after the tree boundary is released: a run still
 	// waiting to spawn needs the boundary to observe the workspace is gone.
@@ -1435,7 +1733,7 @@ func (n *Node) fenceWorkspace(ctx context.Context, id, reason string) {
 	if w != nil {
 		sessionErr = n.stopWorkspaceSessions(w)
 	} else {
-		sessionErr = n.sessions.KillWorkspace(id)
+		sessionErr = n.sessions.TerminateWorkspace(id, "workspace fenced")
 	}
 	if sessionErr != nil {
 		n.logger.Error("stop workspace sessions while fencing", "ws", id, "err", sessionErr)
@@ -1444,12 +1742,18 @@ func (n *Node) fenceWorkspace(ctx context.Context, id, reason string) {
 		if w.broker != nil {
 			_ = w.broker.Close()
 		}
+		detachErr := n.detachWorkspaceVolumes(context.WithoutCancel(ctx), w, w.Spec.Volumes)
+		if detachErr != nil {
+			n.logger.Error("retain fenced workspace tree after volume detach failure", "ws", id, "err", detachErr)
+		}
 		// Wait for an operation already inside the tree critical section and
 		// prevent a pre-authorized waiter from racing the close. Such a waiter
 		// revalidates after it acquires treeMu and observes removal above.
-		w.treeMu.Lock()
-		_ = w.handle.FS().Close()
-		w.treeMu.Unlock()
+		if detachErr == nil {
+			w.treeMu.Lock()
+			_ = w.handle.FS().Close()
+			w.treeMu.Unlock()
+		}
 	}
 	n.logger.Warn("workspace execution fenced; local filesystem retained", "ws", id, "reason", reason,
 		"network_revoked", networkErr == nil, "network_error", errorString(networkErr),
@@ -1474,88 +1778,69 @@ func (n *Node) quarantine(ctx context.Context, req *proto.WSQuarantineReq) (*pro
 	default:
 		return nil, proto.Err(proto.CodeBadRequest, "unknown quarantine action %q", req.Action)
 	}
-	key := "fleet:" + req.OperationID + ":" + req.WS
-	raw, err := n.runMutation(ctx, key, *req, func() ([]byte, error) {
-		n.mu.Lock()
-		w := n.workspaces[req.WS]
-		materializing := n.materializing[req.WS]
-		if w == nil {
-			_, retained := n.quarantined[req.WS]
-			if materializing == nil && !retained {
-				n.mu.Unlock()
-				return nil, proto.Err(proto.CodeNotFound, "workspace %s not here", req.WS)
-			}
-			if materializing != nil && materializing.generation != 0 && materializing.generation != req.Gen {
-				n.mu.Unlock()
-				return nil, proto.Err(proto.CodeConflict, "generation mismatch")
-			}
-			if materializing != nil && materializing.cancel != nil {
-				materializing.cancel()
-			}
-			n.quarantined[req.WS] = struct{}{}
-			delete(n.deadlines, req.WS)
+	if err := lockMutexContext(ctx, &n.releaseReconcileMu); err != nil {
+		return nil, proto.Err(proto.CodeTimeout, "wait for lifecycle reconciliation: %v", err)
+	}
+	defer n.releaseReconcileMu.Unlock()
+	legacyKey := "fleet:" + req.OperationID + ":" + req.WS
+	if err := n.refuseAmbiguousMutation(legacyKey, *req, "quarantine"); err != nil {
+		return nil, err
+	}
+	n.mu.Lock()
+	live := n.workspaces[req.WS]
+	materializing := n.materializing[req.WS]
+	_, retained := n.quarantined[req.WS]
+	if live != nil {
+		if req.Tenant != "" && req.Tenant != live.Tenant {
 			n.mu.Unlock()
-
-			res := proto.WSQuarantineRes{
-				Fenced: true, Generation: req.Gen, Action: req.Action, Backend: req.Backend,
-			}
-			if materializing != nil {
-				if materializing.done == nil {
-					res.Fenced = false
-					res.Warning = "materialization cancellation cannot be confirmed"
-				} else {
-					select {
-					case <-materializing.done:
-					case <-ctx.Done():
-						return nil, ctx.Err()
-					}
-				}
-			}
-
-			if req.Backend == "" {
-				res.Fenced = false
-				res.Warning = appendWarning(res.Warning, "retained workspace has no backend identity for network revocation")
-			} else if backend, backendErr := n.opts.Backends.Get(req.Backend); backendErr != nil {
-				res.Fenced = false
-				res.Warning = appendWarning(res.Warning, backendErr.Error())
-			} else if handle, adoptErr := backend.Adopt(ctx, req.WS); adoptErr != nil {
-				res.Fenced = false
-				res.Warning = appendWarning(res.Warning, adoptErr.Error())
-			} else {
-				retainedWorkspace := &ws{
-					Workspace: proto.Workspace{
-						ID: req.WS, Generation: req.Gen,
-						Spec: proto.WorkspaceSpec{
-							Exclude: append([]string(nil), req.Exclude...), Security: req.Security,
-						},
-					},
-					handle: handle,
-				}
-				if revokeErr := n.revokeWorkspaceNetwork(ctx, retainedWorkspace); revokeErr != nil {
-					res.Fenced = false
-					res.Warning = appendWarning(res.Warning, "network revocation failed: "+revokeErr.Error())
-				}
-				if req.Action == proto.FleetActionCheckpoint || req.Action == proto.FleetActionDestroy {
-					id, _, snapshotErr := n.snapshot(ctx, retainedWorkspace, true)
-					if snapshotErr != nil {
-						res.Warning = appendWarning(res.Warning, snapshotErr.Error())
-					} else {
-						res.Snapshot = id
-					}
-				}
-				_ = handle.FS().Close()
-			}
-			n.emit(proto.EvWSFenced, req.WS, "", map[string]any{
-				"operation": req.OperationID, "action": req.Action, "materializing": materializing != nil,
-				"snapshot": res.Snapshot, "warning": res.Warning, "network_revoked": res.Fenced,
-			})
-			return proto.Marshal(res)
+			return nil, proto.Err(proto.CodeConflict, "quarantine tenant mismatch")
 		}
-		if w.Generation != req.Gen {
+		if len(req.Volumes) > 0 && !bytes.Equal(proto.MustMarshal(req.Volumes), proto.MustMarshal(live.Spec.Volumes)) {
 			n.mu.Unlock()
+			return nil, proto.Err(proto.CodeConflict, "quarantine volume declaration mismatch")
+		}
+		req.Tenant = live.Tenant
+		req.Volumes = append([]proto.VolumeMount(nil), live.Spec.Volumes...)
+		if req.Backend != "" && req.Backend != live.handle.Backend() {
+			n.mu.Unlock()
+			return nil, proto.Err(proto.CodeConflict, "quarantine backend mismatch")
+		}
+		req.Backend = live.handle.Backend()
+	}
+	n.mu.Unlock()
+	_, hadPrior := n.quarantineRecord(req.OperationID, req.WS)
+	if !hadPrior && live == nil && materializing == nil && req.Backend == "" {
+		if retained {
+			return nil, proto.Err(proto.CodeConflict, "retained workspace has no typed quarantine authority")
+		}
+		return nil, proto.Err(proto.CodeNotFound, "workspace %s not here", req.WS)
+	}
+	record, existed, err := n.beginQuarantine(*req)
+	if err != nil {
+		return nil, err
+	}
+	if existed && record.State == quarantinePreparing {
+		return nil, proto.Err(proto.CodeConflict, "quarantine interrupted before durable quiescence proof")
+	}
+	if record.State == quarantineSuperseded {
+		return nil, proto.Err(proto.CodeConflict, "quarantine operation was superseded")
+	}
+	if record.State == quarantinePrepared || record.State == quarantineDestroyAuthorized || record.State == quarantineCommitted {
+		res := record.Response
+		return &res, nil
+	}
+	var retainedWorkspace *ws
+	if record.State == quarantinePreparing {
+		if live != nil && live.Generation != req.Gen {
 			return nil, proto.Err(proto.CodeConflict, "generation mismatch")
 		}
-		delete(n.workspaces, req.WS)
+		if materializing != nil && materializing.generation != 0 && materializing.generation != req.Gen {
+			return nil, proto.Err(proto.CodeConflict, "generation mismatch")
+		}
+		n.mu.Lock()
+		if n.workspaces[req.WS] == live {
+			delete(n.workspaces, req.WS)
+		}
 		delete(n.deadlines, req.WS)
 		n.quarantined[req.WS] = struct{}{}
 		for key, grant := range n.grants {
@@ -1569,52 +1854,126 @@ func (n *Node) quarantine(ctx context.Context, req *proto.WSQuarantineReq) (*pro
 				delete(n.subs, key)
 			}
 		}
+		if materializing != nil && materializing.cancel != nil {
+			materializing.cancel()
+		}
 		n.mu.Unlock()
-
-		if w.broker != nil {
-			w.broker.Suspend()
+		if materializing != nil {
+			if materializing.done == nil {
+				return nil, proto.Err(proto.CodeConflict, "materialization cancellation cannot be confirmed")
+			}
+			select {
+			case <-materializing.done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
-		networkErr := n.revokeWorkspaceNetwork(ctx, w)
-		if w.broker != nil {
-			_ = w.broker.Close()
+		retainedWorkspace = live
+		if retainedWorkspace == nil {
+			retainedWorkspace, err = n.adoptQuarantineWorkspace(ctx, record.Request)
+			if err != nil {
+				return nil, err
+			}
 		}
-		sessionErr := n.stopWorkspaceSessions(w)
-		res := proto.WSQuarantineRes{
-			Fenced: true, Generation: req.Gen, Action: req.Action, Backend: w.handle.Backend(),
+		if retainedWorkspace.broker != nil {
+			retainedWorkspace.broker.Suspend()
 		}
-		if sessionErr != nil {
-			res.Fenced = false
-			res.Warning = appendWarning(res.Warning, "session fencing failed: "+sessionErr.Error())
+		networkErr := n.revokeWorkspaceNetwork(ctx, retainedWorkspace)
+		if retainedWorkspace.broker != nil {
+			_ = retainedWorkspace.broker.Close()
 		}
-		if networkErr != nil {
-			res.Fenced = false
-			res.Warning = appendWarning(res.Warning, "network revocation failed: "+networkErr.Error())
+		sessionErr := n.stopWorkspaceSessions(retainedWorkspace)
+		if networkErr != nil || sessionErr != nil {
+			res := proto.WSQuarantineRes{Generation: req.Gen, Action: req.Action, Backend: retainedWorkspace.handle.Backend()}
+			if networkErr != nil {
+				res.Warning = appendWarning(res.Warning, "network revocation failed: "+networkErr.Error())
+			}
+			if sessionErr != nil {
+				res.Warning = appendWarning(res.Warning, "session fencing failed: "+sessionErr.Error())
+			}
+			if err := n.advanceQuarantine(req.OperationID, req.WS, quarantinePreparing, quarantinePrepared, res); err != nil {
+				return nil, err
+			}
+			return &res, nil
 		}
-		if sessionErr == nil && (req.Action == proto.FleetActionCheckpoint || req.Action == proto.FleetActionDestroy) {
-			id, _, snapshotErr := n.snapshot(ctx, w, true)
+		res := proto.WSQuarantineRes{Fenced: true, Generation: req.Gen, Action: req.Action, Backend: retainedWorkspace.handle.Backend()}
+		if err := n.advanceQuarantine(req.OperationID, req.WS, quarantinePreparing, quarantineQuiesced, res); err != nil {
+			return nil, err
+		}
+		record.State, record.Response = quarantineQuiesced, res
+	}
+	if record.State == quarantineQuiesced {
+		if retainedWorkspace == nil {
+			retainedWorkspace, err = n.adoptQuarantineWorkspace(ctx, record.Request)
+			if err != nil {
+				return nil, err
+			}
+		}
+		res := record.Response
+		if req.Action == proto.FleetActionCheckpoint || req.Action == proto.FleetActionDestroy {
+			result, snapshotErr := n.snapshotResultFenced(ctx, retainedWorkspace, true)
 			if snapshotErr != nil {
 				res.Warning = appendWarning(res.Warning, snapshotErr.Error())
 			} else {
-				res.Snapshot = id
+				res.Snapshot = result.Artifact
+				res.SnapshotFormat = result.Format
 			}
 		}
-		w.treeMu.Lock()
-		_ = w.handle.FS().Close()
-		w.treeMu.Unlock()
-		n.emit(proto.EvWSFenced, req.WS, w.Spec.Principal, map[string]any{
-			"operation": req.OperationID, "action": req.Action, "snapshot": res.Snapshot,
-			"warning": res.Warning, "network_revoked": res.Fenced,
-		})
-		return proto.Marshal(res)
+		if err := n.advanceQuarantine(req.OperationID, req.WS, quarantineQuiesced, quarantineCheckpointed, res); err != nil {
+			return nil, err
+		}
+		record.State, record.Response = quarantineCheckpointed, res
+	}
+	if record.State == quarantineCheckpointed {
+		if retainedWorkspace == nil {
+			retainedWorkspace, err = n.adoptQuarantineWorkspace(ctx, record.Request)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if err := n.detachWorkspaceVolumesScoped(context.WithoutCancel(ctx), retainedWorkspace,
+			retainedWorkspace.Spec.Volumes, req.OperationID+":quarantine"); err != nil {
+			return nil, fmt.Errorf("detach quarantine volumes: %w", err)
+		}
+		retainedWorkspace.treeMu.Lock()
+		_ = retainedWorkspace.handle.FS().Close()
+		retainedWorkspace.treeMu.Unlock()
+		if err := n.advanceQuarantine(req.OperationID, req.WS, quarantineCheckpointed, quarantineDetached, record.Response); err != nil {
+			return nil, err
+		}
+		record.State = quarantineDetached
+	}
+	if record.State == quarantineDetached {
+		if err := n.advanceQuarantine(req.OperationID, req.WS, quarantineDetached, quarantinePrepared, record.Response); err != nil {
+			return nil, err
+		}
+		record.State = quarantinePrepared
+	}
+	n.emit(proto.EvWSFenced, req.WS, "", map[string]any{
+		"operation": req.OperationID, "action": req.Action, "snapshot": record.Response.Snapshot,
+		"warning": record.Response.Warning, "network_revoked": record.Response.Fenced,
 	})
+	res := record.Response
+	return &res, nil
+}
+
+func (n *Node) adoptQuarantineWorkspace(ctx context.Context, req proto.WSQuarantineReq) (*ws, error) {
+	if req.Backend == "" {
+		return nil, proto.Err(proto.CodeConflict, "quarantine has no durable backend identity")
+	}
+	backend, err := n.opts.Backends.Get(req.Backend)
 	if err != nil {
 		return nil, err
 	}
-	var res proto.WSQuarantineRes
-	if err := proto.Unmarshal(raw, &res); err != nil {
-		return nil, err
+	handle, err := backend.Adopt(ctx, req.WS)
+	if err != nil {
+		return nil, fmt.Errorf("adopt retained quarantine workspace: %w", err)
 	}
-	return &res, nil
+	return &ws{Workspace: proto.Workspace{
+		ID: req.WS, Tenant: req.Tenant, Generation: req.Gen,
+		Spec: proto.WorkspaceSpec{Exclude: append([]string(nil), req.Exclude...), Security: req.Security,
+			Volumes: append([]proto.VolumeMount(nil), req.Volumes...)},
+	}, handle: handle}, nil
 }
 
 // quarantineCommit performs the destructive second phase only after control
@@ -1626,85 +1985,84 @@ func (n *Node) quarantineCommit(ctx context.Context, req *proto.WSQuarantineComm
 		return proto.Err(proto.CodeBadRequest,
 			"quarantine commit requires operation, workspace, generation, backend and snapshot")
 	}
-	if err := n.verifyQuarantineProof(ctx, req); err != nil {
+	if err := lockMutexContext(ctx, &n.releaseReconcileMu); err != nil {
+		return proto.Err(proto.CodeTimeout, "wait for lifecycle reconciliation: %v", err)
+	}
+	defer n.releaseReconcileMu.Unlock()
+	proofRequest, err := n.verifyQuarantineProof(ctx, req)
+	if err != nil {
 		return err
 	}
-	key := "fleet:" + req.OperationID + ":destroy:" + req.WS
-	_, err := n.runMutation(ctx, key, *req, func() ([]byte, error) {
-		n.mu.Lock()
-		if current := n.workspaces[req.WS]; current != nil {
-			n.mu.Unlock()
-			return nil, proto.Err(proto.CodeConflict, "workspace %s is still serviceable", req.WS)
+	record, _ := n.quarantineRecord(req.OperationID, req.WS)
+	if record.State == quarantineCommitted {
+		return nil
+	}
+	if record.State == quarantinePrepared {
+		if err := n.advanceQuarantine(req.OperationID, req.WS, quarantinePrepared, quarantineDestroyAuthorized, record.Response); err != nil {
+			return err
 		}
+	}
+	n.mu.Lock()
+	if current := n.workspaces[req.WS]; current != nil || n.materializing[req.WS] != nil {
 		n.mu.Unlock()
-		backend, err := n.opts.Backends.Get(req.Backend)
-		if err != nil {
-			return nil, err
-		}
-		handle, err := backend.Adopt(ctx, req.WS)
-		var protocolErr *proto.Error
-		if errors.As(err, &protocolErr) && protocolErr.Code == proto.CodeNotFound {
-			n.mu.Lock()
-			delete(n.quarantined, req.WS)
-			n.mu.Unlock()
-			return proto.Marshal(struct{}{})
-		}
-		if err != nil {
-			return nil, err
+		return proto.Err(proto.CodeConflict, "workspace %s is still serviceable or materializing", req.WS)
+	}
+	n.mu.Unlock()
+	backend, err := n.opts.Backends.Get(req.Backend)
+	if err != nil {
+		return err
+	}
+	handle, err := backend.Adopt(ctx, req.WS)
+	var protocolErr *proto.Error
+	if err != nil && (!errors.As(err, &protocolErr) || protocolErr.Code != proto.CodeNotFound) {
+		return err
+	}
+	if err == nil {
+		retainedWorkspace := &ws{Workspace: proto.Workspace{
+			ID: req.WS, Tenant: proofRequest.Tenant, Generation: req.Gen,
+			Spec: proto.WorkspaceSpec{Volumes: append([]proto.VolumeMount(nil), proofRequest.Volumes...)},
+		}, handle: handle}
+		if err := n.detachWorkspaceVolumesScoped(context.WithoutCancel(ctx), retainedWorkspace,
+			retainedWorkspace.Spec.Volumes, req.OperationID+":quarantine"); err != nil {
+			_ = handle.FS().Close()
+			return err
 		}
 		if err := handle.Destroy(ctx); err != nil {
-			return nil, err
+			return err
 		}
-		n.mu.Lock()
-		delete(n.quarantined, req.WS)
-		n.mu.Unlock()
-		return proto.Marshal(struct{}{})
-	})
-	return err
+	}
+	if err := n.advanceQuarantine(req.OperationID, req.WS, quarantineDestroyAuthorized, quarantineCommitted, record.Response); err != nil {
+		return err
+	}
+	n.mu.Lock()
+	delete(n.quarantined, req.WS)
+	n.mu.Unlock()
+	return nil
 }
 
 // verifyQuarantineProof prevents a destructive phase-two request from becoming
 // authority by itself. The exact snapshot and backend must have been returned
 // by a successfully completed, durable phase-one quarantine on this node.
-func (n *Node) verifyQuarantineProof(ctx context.Context, req *proto.WSQuarantineCommitReq) error {
-	key := "fleet:" + req.OperationID + ":" + req.WS
-	n.mutationMu.Lock()
-	entry := n.mutations[key]
-	if entry == nil {
-		n.mutationMu.Unlock()
-		return proto.Err(proto.CodeConflict, "destroy commit has no quarantine proof")
+func (n *Node) verifyQuarantineProof(ctx context.Context, req *proto.WSQuarantineCommitReq) (proto.WSQuarantineReq, error) {
+	_ = ctx
+	record, ok := n.quarantineRecord(req.OperationID, req.WS)
+	if !ok {
+		return proto.WSQuarantineReq{}, proto.Err(proto.CodeConflict, "destroy commit has no quarantine proof")
 	}
-	done := entry.done
-	n.mutationMu.Unlock()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		return ctx.Err()
+	if record.State != quarantinePrepared && record.State != quarantineDestroyAuthorized && record.State != quarantineCommitted {
+		return proto.WSQuarantineReq{}, proto.Err(proto.CodeConflict, "destroy commit quarantine proof is not durably complete")
 	}
-
-	n.mutationMu.Lock()
-	if entry.State == mutationCompleted && entry.needsPersist {
-		if err := n.persistMutationsLocked(); err != nil {
-			entry.err = proto.Err(proto.CodeInternal,
-				"quarantine proof completed but is not durable: %v", err)
-		}
-	}
-	state := entry.State
-	result := append([]byte(nil), entry.Result...)
-	entryErr := entry.err
-	n.mutationMu.Unlock()
-	if state != mutationCompleted || entryErr != nil {
-		return proto.Err(proto.CodeConflict, "destroy commit quarantine proof is not durably complete")
-	}
-	var proof proto.WSQuarantineRes
-	if err := proto.Unmarshal(result, &proof); err != nil {
-		return proto.Err(proto.CodeConflict, "destroy commit quarantine proof is invalid: %v", err)
-	}
+	proof := record.Response
 	if !proof.Fenced || proof.Generation != req.Gen || proof.Action != proto.FleetActionDestroy ||
-		proof.Backend != req.Backend || proof.Snapshot != req.Snapshot {
-		return proto.Err(proto.CodeConflict, "destroy commit does not match quarantine proof")
+		proof.Backend != req.Backend || proof.Snapshot != req.Snapshot ||
+		!sameArtifactFormat(proof.SnapshotFormat, req.SnapshotFormat) {
+		return proto.WSQuarantineReq{}, proto.Err(proto.CodeConflict, "destroy commit does not match quarantine proof")
 	}
-	return nil
+	proofRequest := record.Request
+	if proofRequest.WS != req.WS || proofRequest.Gen != req.Gen || proofRequest.OperationID != req.OperationID {
+		return proto.WSQuarantineReq{}, proto.Err(proto.CodeConflict, "destroy commit quarantine request proof is invalid")
+	}
+	return proofRequest, nil
 }
 
 // quarantineMaterialization makes a partially prepared filesystem inert while
@@ -1748,6 +2106,23 @@ func (n *Node) reclaimLocal(ctx context.Context) {
 // ---------------------------------------------------------------------------
 
 func (n *Node) handle(ctx context.Context, p *transport.Peer, f *proto.Frame) {
+	n.mu.Lock()
+	requireEpoch := proto.HasCapability(n.protocol, proto.CapabilityControllerEpoch)
+	n.mu.Unlock()
+	if requireEpoch {
+		if err := n.acceptControllerEpoch(f.ControllerEpoch); err != nil {
+			if f.T == proto.KindReq {
+				var wireErr *proto.Error
+				if !errors.As(err, &wireErr) {
+					wireErr = proto.Err(proto.CodeInternal, "%v", err)
+				}
+				_ = p.RespondErr(ctx, f, wireErr)
+			}
+			n.logger.Warn("controller frame refused", "epoch", f.ControllerEpoch, "err", err)
+			return
+		}
+		p.SetControllerEpoch(f.ControllerEpoch)
+	}
 	switch f.T {
 	case proto.KindEvent:
 		n.handleEvent(ctx, f)
@@ -1884,6 +2259,9 @@ func (n *Node) authorizeClaims(client, wsID string, g *proto.Grant) (*ws, proto.
 	if g.Claims.Tenant != w.Tenant || g.Claims.AuthzRevision != w.AuthzRevision {
 		return nil, proto.GrantClaims{}, proto.Err(proto.CodeUnauthorized, "grant authorization revision or tenant is stale")
 	}
+	if proto.HasCapability(n.protocol, proto.CapabilityControllerEpoch) && g.Claims.ControllerEpoch != n.currentControllerEpoch() {
+		return nil, proto.GrantClaims{}, proto.Err(proto.CodeUnauthorized, "grant controller epoch is stale")
+	}
 	n.grants[key] = g
 	return w, g.Claims, nil
 }
@@ -1891,6 +2269,15 @@ func (n *Node) authorizeClaims(client, wsID string, g *proto.Grant) (*ws, proto.
 func (n *Node) authorize(client, wsID string, g *proto.Grant) (*ws, error) {
 	w, _, err := n.authorizeClaims(client, wsID, g)
 	return w, err
+}
+
+func cloneGrant(g *proto.Grant) *proto.Grant {
+	if g == nil {
+		return nil
+	}
+	cp := *g
+	cp.Signature = append([]byte(nil), g.Signature...)
+	return &cp
 }
 
 // lockWorkspaceTree closes the authorization-to-operation race. A lifecycle
@@ -1956,6 +2343,8 @@ func sessionOpenKey(claims proto.GrantClaims, wsID, kind, key string) string {
 func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) (any, error) {
 	if f.From == proto.PeerControl {
 		switch f.Op {
+		case proto.OpControllerState:
+			return n.controllerState()
 		case proto.OpWSQuarantine:
 			req, err := decode[proto.WSQuarantineReq](f)
 			if err != nil {
@@ -1985,7 +2374,13 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			if err != nil {
 				return nil, err
 			}
-			return struct{}{}, n.releaseAbort(req)
+			return struct{}{}, n.releaseAbort(ctx, req)
+		case proto.OpWSReleaseAbortCommit:
+			req, err := decode[proto.WSReleaseCommitReq](f)
+			if err != nil {
+				return nil, err
+			}
+			return struct{}{}, n.releaseAbortCommit(ctx, req)
 		case proto.OpWSSnapshot:
 			req, err := decode[proto.WSSnapshotReq](f)
 			if err != nil {
@@ -2072,7 +2467,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		s, err := n.sessionFor(f.From, req.S, req.Grant)
+		s, err := n.sessionFor(ctx, f.From, req.S, req.Grant)
 		if err != nil {
 			return nil, err
 		}
@@ -2083,7 +2478,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		s, err := n.sessionFor(f.From, req.S, req.Grant)
+		s, err := n.sessionFor(ctx, f.From, req.S, req.Grant)
 		if err != nil {
 			return nil, err
 		}
@@ -2093,7 +2488,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		s, err := n.sessionFor(f.From, req.S, req.Grant)
+		s, err := n.sessionFor(ctx, f.From, req.S, req.Grant)
 		if err != nil {
 			return nil, err
 		}
@@ -2103,7 +2498,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		s, err := n.sessionFor(f.From, req.S, req.Grant)
+		s, err := n.sessionFor(ctx, f.From, req.S, req.Grant)
 		if err != nil {
 			return nil, err
 		}
@@ -2113,7 +2508,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		if _, err := n.sessionFor(f.From, req.S, req.Grant); err != nil {
+		if _, err := n.sessionFor(ctx, f.From, req.S, req.Grant); err != nil {
 			return nil, err
 		}
 		return struct{}{}, nil // liveness only in v0; cursors are per-subscriber
@@ -2122,7 +2517,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		s, err := n.sessionFor(f.From, req.S, req.Grant)
+		s, err := n.sessionFor(ctx, f.From, req.S, req.Grant)
 		if err != nil {
 			return nil, err
 		}
@@ -2136,7 +2531,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		s, err := n.sessionFor(f.From, req.S, req.Grant)
+		s, err := n.sessionFor(ctx, f.From, req.S, req.Grant)
 		if err != nil {
 			return nil, err
 		}
@@ -2168,7 +2563,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 					continue
 				}
 			}
-			res.Sessions = append(res.Sessions, proto.SessionStatus{Info: s.Info, Exited: s.Exited(), Exit: s.ExitInfo(), Next: s.Log.Next(), Oldest: s.Log.Oldest()})
+			res.Sessions = append(res.Sessions, nodeSessionStatus(s))
 		}
 		return res, nil
 	case proto.OpFSRead:
@@ -2412,11 +2807,11 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		clean.Grant = nil
 		key := n.mutationKey(f.From, w.ID, proto.OpWSSnapshot, req.IdempotencyKey)
 		raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
-			result, err := n.snapshotExplicit(ctx, w, req.Upload, req.Authoritative, func(id string) error {
+			result, err := n.snapshotExplicitWithFormat(ctx, w, req.Upload, req.Authoritative, func(id, format string) error {
 				cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 				defer cancel()
 				return p.Call(cctx, proto.PeerControl, proto.OpWSSnapshotCommit,
-					proto.WSSnapshotCommitReq{ID: w.ID, Gen: w.Generation, Snapshot: id}, nil)
+					proto.WSSnapshotCommitReq{ID: w.ID, Gen: w.Generation, Snapshot: id, Format: format}, nil)
 			})
 			if err != nil {
 				return nil, err
@@ -2431,6 +2826,133 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		return result, nil
+	case proto.OpVolumeArchive:
+		req, err := decode[proto.VolumeArchiveReq](f)
+		if err != nil {
+			return nil, err
+		}
+		if req.IdempotencyKey == "" {
+			return nil, proto.Err(proto.CodeBadRequest, "volume archive requires an idempotency key")
+		}
+		w, err := n.authorize(f.From, req.WS, req.Grant)
+		if err != nil {
+			return nil, err
+		}
+		clean := *req
+		clean.Grant = nil
+		key := n.mutationKey(f.From, w.ID, proto.OpVolumeArchive, req.IdempotencyKey)
+		raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
+			result, err := n.archiveVolume(ctx, w, req.Path, req.Upload)
+			if err != nil {
+				return nil, err
+			}
+			return proto.Marshal(result)
+		})
+		if err != nil {
+			return nil, err
+		}
+		var result proto.WSSnapshotRes
+		if err := proto.Unmarshal(raw, &result); err != nil {
+			return nil, err
+		}
+		return result, nil
+	case proto.OpVolumePublish:
+		req, err := decode[proto.VolumePublishPathReq](f)
+		if err != nil {
+			return nil, err
+		}
+		if req.IdempotencyKey == "" {
+			return nil, proto.Err(proto.CodeBadRequest, "volume publish requires an idempotency key")
+		}
+		w, _, err := n.authorizeClaims(f.From, req.WS, req.Grant)
+		if err != nil {
+			return nil, err
+		}
+		n.mu.Lock()
+		forwardedGrant := cloneGrant(n.grants[f.From+"|"+w.ID])
+		n.mu.Unlock()
+		if forwardedGrant == nil {
+			return nil, proto.Err(proto.CodeUnauthorized, "volume.publish grant is unavailable")
+		}
+		clean := *req
+		clean.Grant = nil
+		if err := proto.ValidateVolumeMount(proto.VolumeMount{ID: req.Volume, Path: req.Path}); err != nil || req.ExpectedVersion == 0 {
+			if err == nil {
+				err = proto.Err(proto.CodeBadRequest, "expected_version is required")
+			}
+			return nil, err
+		}
+		key := n.mutationKey(f.From, w.ID, proto.OpVolumePublish, req.IdempotencyKey)
+		archiveKey := key
+		if archiveKey != "" {
+			archiveKey += "|archive"
+		}
+		archiveRaw, replayed, err := n.completedMutation(ctx, archiveKey, clean)
+		if err != nil {
+			return nil, err
+		}
+		var unlockPublish func()
+		if !replayed {
+			release, err := n.acquireSnapshot(ctx, w, true)
+			if err != nil {
+				return nil, err
+			}
+			defer release()
+			n.mu.Lock()
+			if n.workspaces[w.ID] != w || w.checkpointing {
+				n.mu.Unlock()
+				return nil, proto.Err(proto.CodeConflict, "workspace %s is not available for volume publish", w.ID)
+			}
+			w.checkpointing = true
+			n.mu.Unlock()
+			unlockPublish = func() {
+				w.treeMu.Unlock()
+				n.mu.Lock()
+				w.checkpointing = false
+				n.mu.Unlock()
+			}
+			w.treeMu.Lock()
+			defer unlockPublish()
+			n.mu.Lock()
+			stillAuthorized := n.workspaces[w.ID] == w && w.checkpointing
+			n.mu.Unlock()
+			if !stillAuthorized {
+				return nil, proto.Err(proto.CodeConflict, "workspace %s changed while waiting for volume publish boundary", w.ID)
+			}
+			// Recheck after admission and the tree boundary: a concurrent exact
+			// retry may have completed while this caller waited.
+			archiveRaw, replayed, err = n.completedMutation(ctx, archiveKey, clean)
+			if err != nil {
+				return nil, err
+			}
+			if !replayed {
+				if err := n.sessions.TerminateWorkspace(w.ID, "volume publish checkpoint"); err != nil {
+					return nil, proto.Err(proto.CodeTimeout, "quiesce workspace sessions for volume publish: %v", err)
+				}
+				archiveRaw, err = n.runMutation(ctx, archiveKey, clean, func() ([]byte, error) {
+					archive, err := n.archiveVolumeLocked(ctx, w, req.Path, true, proto.SnapshotConsistencyQuiesced)
+					if err != nil {
+						return nil, err
+					}
+					return proto.Marshal(archive)
+				})
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		var archive proto.WSSnapshotRes
+		if err := proto.Unmarshal(archiveRaw, &archive); err != nil {
+			return nil, err
+		}
+		var published proto.Volume
+		if err := p.Call(ctx, proto.PeerControl, proto.OpVolumePublishCommit, proto.VolumePublishReq{
+			ID: req.Volume, Workspace: w.ID, Generation: w.Generation, Artifact: archive.Artifact,
+			ExpectedVersion: req.ExpectedVersion, IdempotencyKey: req.IdempotencyKey, Grant: forwardedGrant,
+		}, &published); err != nil {
+			return nil, err
+		}
+		return published, nil
 	case proto.OpWSInfo:
 		req, err := decode[proto.WSGetReq](f)
 		if err != nil {
@@ -2440,7 +2962,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		info := proto.WSInfoRes{WS: w.ID, Backend: w.handle.Backend(), Root: w.handle.FS().Root()}
+		info := proto.WSInfoRes{WS: w.ID, Backend: w.handle.Backend(), Root: workspace.MountPathOf(w.handle)}
 		if w.broker != nil {
 			info.Broker = w.broker.BaseURL()
 		}
@@ -2453,10 +2975,28 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 }
 
 // sessionFor looks up a session and checks the client is authorized for its workspace.
-func (n *Node) sessionFor(client, sid string, g *proto.Grant) (*session.Session, error) {
+func nodeSessionStatus(s *session.Session) proto.SessionStatus {
+	stats := s.Log.Stats()
+	return proto.SessionStatus{
+		Info: s.Info, Exited: s.Exited(), Exit: s.ExitInfo(), Next: stats.Next, Oldest: stats.Oldest,
+		BlobBytes: stats.BlobBytes, BlobSegments: stats.BlobSegments, UnavailableTier: stats.UnavailableTier,
+	}
+}
+
+func (n *Node) sessionFor(ctx context.Context, client, sid string, g *proto.Grant) (*session.Session, error) {
 	s, ok := n.sessions.Get(sid)
 	if !ok {
-		return nil, proto.Err(proto.CodeNotFound, "session %s", sid)
+		if g == nil || g.Claims.WS == "" {
+			return nil, proto.Err(proto.CodeNotFound, "session %s", sid)
+		}
+		w, _, err := n.authorizeClaims(client, g.Claims.WS, g)
+		if err != nil {
+			return nil, err
+		}
+		s, err = n.restoreSessionLog(ctx, w, sid)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if _, err := n.authorize(client, s.WS, g); err != nil {
 		return nil, err
@@ -2489,6 +3029,10 @@ func (n *Node) status() proto.NodeStatus {
 // placeholders and ${REMOUNT_BROKER} expanded, plus the broker's own
 // variables. Real secrets are never in the result; they stay in the broker.
 func (n *Node) sessionEnv(w *ws, extra map[string]string) []string {
+	return n.sessionEnvWithCapability(w, extra, "")
+}
+
+func (n *Node) sessionEnvWithCapability(w *ws, extra map[string]string, capability string) []string {
 	env := map[string]string{}
 	for k, v := range w.Spec.Env {
 		env[k] = v
@@ -2499,6 +3043,9 @@ func (n *Node) sessionEnv(w *ws, extra map[string]string) []string {
 	base := ""
 	if w.broker != nil {
 		base = w.broker.BaseURL()
+		if capability != "" {
+			base = w.broker.BaseURLForCapability(capability)
+		}
 	}
 	n.mu.Lock()
 	leases := slices.Clone(w.leases)
@@ -2506,10 +3053,36 @@ func (n *Node) sessionEnv(w *ws, extra map[string]string) []string {
 	env = broker.ResolveEnv(env, base, leases)
 	var envList []string
 	if w.broker != nil {
-		envList = append(envList, w.broker.EnvFor()...)
+		if capability == "" {
+			envList = append(envList, w.broker.EnvFor()...)
+		} else {
+			envList = append(envList, w.broker.EnvForCapability(capability)...)
+		}
 		envList = append(envList, gitConfigEnv(w.broker, w.Spec.Repo, leases)...)
 	}
 	return append(envList, workspace.MapEnv(env)...)
+}
+
+func (n *Node) issueSessionCapability(ctx context.Context, claims proto.GrantClaims, w *ws) (string, time.Time, error) {
+	n.mu.Lock()
+	p := n.peer
+	n.mu.Unlock()
+	if p == nil {
+		return "", time.Time{}, proto.Err(proto.CodeUnreachable, "control connection lost before session capability issue")
+	}
+	request := proto.SessionCapabilityIssueReq{
+		Client: claims.Client, Workspace: w.ID, Generation: w.Generation, AuthzRevision: claims.AuthzRevision,
+		Principal: claims.Principal, Tenant: claims.Tenant, Roles: append([]string(nil), claims.Roles...),
+	}
+	var response proto.SessionCapabilityIssueRes
+	if err := p.Call(ctx, proto.PeerControl, proto.OpSessionCapabilityIssue, request, &response); err != nil {
+		return "", time.Time{}, err
+	}
+	expiresAt := time.UnixMilli(response.ExpiresAt)
+	if response.Capability == "" || !expiresAt.After(time.Now()) {
+		return "", time.Time{}, proto.Err(proto.CodeUnauthorized, "control returned an invalid session capability")
+	}
+	return response.Capability, expiresAt, nil
 }
 
 func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, claims proto.GrantClaims, w *ws, req *proto.SOpenReq) (any, error) {
@@ -2526,27 +3099,69 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 		return nil, err
 	}
 	defer unlock()
-	envList := n.sessionEnv(w, req.Env)
+	sessionIdempotencyKey := req.IdempotencyKey
+	if sessionIdempotencyKey != "" {
+		sessionIdempotencyKey = sessionOpenKey(claims, w.ID, proto.SessionExec, sessionIdempotencyKey)
+	}
+	capability := ""
+	installedCapability := false
+	handle, err := n.sessionCapabilityHandle(claims, sessionIdempotencyKey)
+	if err != nil {
+		return nil, err
+	}
+	if n.matchingSessionCapability(handle, claims, w) {
+		capability = handle
+	} else {
+		proof, expiresAt, issueErr := n.issueSessionCapability(ctx, claims, w)
+		if issueErr != nil {
+			var protocol *proto.Error
+			localProfile := w.Spec.Security.Profile == "" || w.Spec.Security.Profile == proto.SecurityLocal
+			if !errors.As(issueErr, &protocol) || protocol.Code != proto.CodeUnsupported || !localProfile {
+				return nil, issueErr
+			}
+			// Local/legacy deployments retain the workspace capability. A
+			// security profile that requires session-cap can never downgrade.
+		} else {
+			if err := n.installSessionCapability(handle, proof, expiresAt, claims, w); err != nil {
+				return nil, err
+			}
+			installedCapability = true
+			capability = handle
+		}
+	}
+	envList := n.sessionEnvWithCapability(w, req.Env, capability)
 	spec := session.Spec{
-		WS: w.ID, Kind: req.Kind, Program: req.Program, Cwd: req.Cwd, Env: envList,
+		WS: w.ID, Generation: w.Generation, Kind: req.Kind, Program: req.Program, Cwd: req.Cwd, Env: envList,
 		Rows: req.Rows, Cols: req.Cols, Stdin: req.Stdin, IdempotencyKey: req.IdempotencyKey,
 		Principal: claims.Principal, Tenant: claims.Tenant, Run: req.Run,
 	}
-	if req.IdempotencyKey != "" {
-		spec.IdempotencyKey = sessionOpenKey(claims, w.ID, proto.SessionExec, req.IdempotencyKey)
-	}
+	spec.IdempotencyKey = sessionIdempotencyKey
 	if req.TimeoutSec > 0 {
 		spec.Timeout = time.Duration(req.TimeoutSec) * time.Second
 	}
 	if err := w.handle.Prepare(&spec); err != nil {
+		if installedCapability {
+			n.dropSessionCapability(handle)
+		}
 		return nil, err
 	}
 	s, created, err := n.sessions.OpenOrReplay(spec)
 	if err != nil {
+		if installedCapability {
+			n.dropSessionCapability(handle)
+		}
 		return nil, err
 	}
 	if err := n.confirmOpenAuthz(w, claims, s); err != nil {
+		if installedCapability {
+			n.dropSessionCapability(handle)
+		}
 		return nil, err
+	}
+	if capability != "" && created {
+		n.bindSessionCapability(handle, s)
+	} else if installedCapability {
+		n.dropSessionCapability(handle)
 	}
 	n.emitSession(proto.EvSOpened, w.ID, claims.Principal, s.ID, map[string]any{"s": s.ID, "kind": req.Kind, "program": req.Program, "client": client})
 	if run := req.Run; run != nil && created {
@@ -2573,7 +3188,7 @@ func (n *Node) portOpen(ctx context.Context, p *transport.Peer, client string, c
 	if req.Port < 1 || req.Port > 65535 {
 		return nil, proto.Err(proto.CodeBadRequest, "port must be between 1 and 65535")
 	}
-	spec := session.Spec{WS: w.ID, Kind: proto.SessionPort, Host: req.Host, Port: req.Port, Principal: claims.Principal, Tenant: claims.Tenant}
+	spec := session.Spec{WS: w.ID, Generation: w.Generation, Kind: proto.SessionPort, Host: req.Host, Port: req.Port, Principal: claims.Principal, Tenant: claims.Tenant}
 	if req.IdempotencyKey != "" {
 		spec.IdempotencyKey = sessionOpenKey(claims, w.ID, proto.SessionPort, req.IdempotencyKey)
 	}
@@ -2628,11 +3243,16 @@ func (n *Node) subscribe(p *transport.Peer, client string, s *session.Session, f
 		for {
 			chunks, err := cur.Next(ctx, 64)
 			if err != nil {
+				var unavailable *session.ErrTierUnavailable
 				var ev *session.ErrEvicted
 				if errors.As(err, &ev) {
 					// Truthful gap, then continue from what exists.
 					metrics.GapsReported.Inc()
-					gap := proto.MustMarshal(proto.Gap{From: ev.Requested, To: ev.Oldest - 1})
+					tier := ""
+					if errors.As(err, &unavailable) {
+						tier = unavailable.Tier
+					}
+					gap := proto.MustMarshal(proto.Gap{From: ev.Requested, To: ev.Oldest - 1, Tier: tier})
 					f := &proto.Frame{V: proto.Version, T: proto.KindChunk, To: client, S: s.ID, WS: s.WS, Seq: ev.Requested, Body: proto.MustMarshal(proto.ChunkBody{Stream: proto.StreamGap, Data: gap})}
 					if p.Send(ctx, f) != nil {
 						return
@@ -2743,8 +3363,23 @@ func (n *Node) requireUplinkCapabilities(profile string) error {
 }
 
 func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) error {
+	return n.materializeWithReady(ctx, w, adopt, true)
+}
+
+func (n *Node) materializeWithReady(ctx context.Context, w proto.Workspace, adopt, notifyReady bool) error {
+	return n.materializeWithReadyHook(ctx, w, adopt, notifyReady, nil)
+}
+
+func (n *Node) materializeWithReadyHook(ctx context.Context, w proto.Workspace, adopt, notifyReady bool, beforePublish func(*ws) (bool, error)) error {
 	if err := n.requireUplinkCapabilities(w.Spec.Security.Profile); err != nil {
 		return err
+	}
+	restoreFormat, err := proto.NormalizeArtifactFormat(w.Spec.RestoreFormat)
+	if err != nil {
+		return err
+	}
+	if w.Spec.RestoreFrom == "" && w.Spec.RestoreFormat != "" {
+		return proto.Err(proto.CodeBadRequest, "restore format requires restore_from")
 	}
 	be, err := n.opts.Backends.Get(w.Spec.Requires.Backend)
 	if err != nil {
@@ -2778,16 +3413,26 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 		create := func() (workspace.Handle, error) {
 			var restore io.Reader
 			var closer io.Closer
-			if w.Spec.RestoreFrom != "" {
-				r, ferr := n.fetchArtifact(ctx, w.Spec.RestoreFrom)
+			var chunkedDone <-chan error
+			if w.Spec.RestoreFrom != "" && (restoreFormat == proto.ArtifactFormatTar || restoreFormat == proto.ArtifactFormatFirecrackerFullV1) {
+				r, ferr := n.fetchWorkspaceArtifact(ctx, &w, w.Spec.RestoreFrom)
 				if ferr != nil {
 					return nil, fmt.Errorf("fetch %s: %w", w.Spec.RestoreFrom, ferr)
 				}
 				restore, closer = r, r
+			} else if w.Spec.RestoreFrom != "" && restoreFormat == proto.ArtifactFormatChunkedV1 {
+				r, done := n.chunkedTarReader(ctx, &w)
+				restore, closer, chunkedDone = r, r, done
 			}
 			h, cerr := be.Create(ctx, w.ID, w.Spec, restore)
 			if closer != nil {
-				closer.Close()
+				_ = closer.Close()
+			}
+			if chunkedDone != nil {
+				producerErr := <-chunkedDone
+				if cerr == nil {
+					cerr = producerErr
+				}
 			}
 			return h, cerr
 		}
@@ -2798,6 +3443,7 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 			// snapshot. Adopt it; never destroy it merely because a restore was
 			// also named.
 			handle, err = be.Adopt(ctx, w.ID)
+			adopt = err == nil
 		}
 		if err != nil {
 			return err
@@ -2805,11 +3451,12 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 	}
 	entry := &ws{Workspace: w, handle: handle}
 	retainOnError := func(err error) error {
+		detachErr := n.detachWorkspaceVolumes(context.WithoutCancel(ctx), entry, entry.Spec.Volumes)
 		if revokeErr := n.revokeWorkspaceNetwork(ctx, entry); revokeErr != nil {
 			n.logger.Error("revoke network after materialization failure", "ws", w.ID, "err", revokeErr)
 		}
 		n.quarantineMaterialization(w.ID, handle, entry.broker, err.Error())
-		return err
+		return errors.Join(err, detachErr)
 	}
 	if err := ctx.Err(); err != nil {
 		return retainOnError(err)
@@ -2837,6 +3484,9 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 		WS: w.ID, Generation: w.Generation, Principal: w.Spec.Principal, Tenant: w.Tenant, Leases: leases,
 		Network: w.Spec.Security.Network, Allow: n.opts.Allow, AllowPrivate: n.opts.AllowPrivate,
 		RootCAs: n.opts.BrokerRootCAs, ConnectorStore: n.connectors, Repo: w.Spec.Repo,
+		CapabilityVerifier: func(ctx context.Context, capability string) (string, error) {
+			return n.verifyLocalSessionCapability(ctx, entry, capability)
+		},
 		Approval: func(ctx context.Context, req proto.EgressApprovalReq) (*proto.EgressApprovalRes, error) {
 			n.mu.Lock()
 			p := n.peer
@@ -2949,12 +3599,25 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 		}
 		cloned = commit
 	}
+	if err := n.attachWorkspaceVolumes(ctx, entry); err != nil {
+		return retainOnError(fmt.Errorf("materialize shared volumes: %w", err))
+	}
 	// Drop a sourceable env file into the workspace. The broker's address
 	// changes every time a workspace is materialized, so anything that bakes
 	// it into a config file goes stale after a move. Reading this file at
 	// start-up is the portable way to find it.
 	if err := writeWorkspaceEnv(handle, entry); err != nil {
 		return retainOnError(fmt.Errorf("write workspace environment: %w", err))
+	}
+	if beforePublish != nil {
+		publish, err := beforePublish(entry)
+		if err != nil {
+			return retainOnError(err)
+		}
+		if !publish {
+			entry.broker.Suspend()
+			return nil
+		}
 	}
 	n.mu.Lock()
 	materializing := n.materializing[w.ID]
@@ -2979,6 +3642,9 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 		n.emit(proto.EvRepoCloned, w.ID, w.Spec.Principal, cloneEventPayload(w.Spec.Repo, cloned, be.Name()))
 	}
 	n.logger.Info("workspace claimed", "ws", w.ID, "gen", w.Generation, "backend", be.Name(), "restore", w.Spec.RestoreFrom, "adopted", adopt)
+	if !notifyReady {
+		return nil
+	}
 	// Only now is the workspace serviceable; tell the control plane so a
 	// client waiting on it is not handed a node that is still restoring.
 	n.mu.Lock()
@@ -3013,17 +3679,30 @@ func (n *Node) brokerAdvertiseHost(handle workspace.Handle) string {
 	return ""
 }
 
-func (n *Node) artifactToken() string {
+func (n *Node) artifactCredential() (token string, dynamic bool, peer *transport.Peer) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.httpToken != "" {
-		return n.httpToken
+		return n.httpToken, true, n.peer
 	}
-	return n.opts.Token
+	return n.opts.Token, false, n.peer
 }
 
 func (n *Node) fetchArtifact(ctx context.Context, id string) (io.ReadCloser, error) {
+	return n.fetchWorkspaceArtifact(ctx, nil, id)
+}
+
+func (n *Node) fetchWorkspaceArtifact(ctx context.Context, w *proto.Workspace, id string) (io.ReadCloser, error) {
 	if n.store.Has(id) {
+		_, dynamic, _ := n.artifactCredential()
+		if dynamic {
+			if err := n.authorizeCachedArtifact(ctx, w, id); err != nil {
+				return nil, err
+			}
+		}
+		if err := n.store.Verify(id); err != nil {
+			return nil, fmt.Errorf("verify cached artifact %s: %w", id, err)
+		}
 		r, _, err := n.store.Open(id)
 		return r, err
 	}
@@ -3034,7 +3713,9 @@ func (n *Node) fetchArtifact(ctx context.Context, id string) (io.ReadCloser, err
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+n.artifactToken())
+	if err := n.authorizeArtifactRequest(ctx, w, req, id); err != nil {
+		return nil, err
+	}
 	resp, err := n.opts.HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -3057,12 +3738,55 @@ func (n *Node) fetchArtifact(ctx context.Context, id string) (io.ReadCloser, err
 	return r, err
 }
 
+func (n *Node) authorizeCachedArtifact(ctx context.Context, w *proto.Workspace, id string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, strings.TrimSuffix(n.opts.ArtifactURL, "/")+"/"+id, nil)
+	if err != nil {
+		return err
+	}
+	if err := n.authorizeArtifactRequest(ctx, w, req, id); err != nil {
+		return err
+	}
+	resp, err := n.opts.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("artifact %s: HTTP %d", id, resp.StatusCode)
+	}
+	return nil
+}
+
+func (n *Node) authorizeArtifactRequest(ctx context.Context, w *proto.Workspace, req *http.Request, id string) error {
+	token, dynamic, peer := n.artifactCredential()
+	req.Header.Set("Authorization", "Bearer "+token)
+	if !dynamic {
+		return nil
+	}
+	if w == nil || w.ID == "" || w.Generation == 0 || peer == nil {
+		return errors.New("artifact authorization unavailable")
+	}
+	var proof proto.ArtifactProofRes
+	if err := peer.Call(ctx, proto.PeerControl, proto.OpArtifactProof, proto.ArtifactProofReq{
+		Workspace: w.ID, Generation: w.Generation, Method: req.Method, Artifact: id,
+	}, &proof); err != nil {
+		return fmt.Errorf("authorize artifact request: %w", err)
+	}
+	if proof.Proof == "" {
+		return errors.New("artifact authorization unavailable")
+	}
+	req.Header.Set(proto.ArtifactWorkspaceHeader, w.ID)
+	req.Header.Set(proto.ArtifactGenerationHeader, strconv.FormatUint(w.Generation, 10))
+	req.Header.Set(proto.ArtifactProofHeader, proof.Proof)
+	return nil
+}
+
 // applyTar overlays an uploaded artifact onto a workspace tree. The fetch
 // happens before the tree lock so a slow download never blocks other file
 // operations; the overlay itself holds the lock because every rename must be
 // ordered against concurrent fs.* mutations.
 func (n *Node) applyTar(ctx context.Context, w *ws, id, client string) ([]byte, error) {
-	rc, err := n.fetchArtifact(ctx, id)
+	rc, err := n.fetchWorkspaceArtifact(ctx, &w.Workspace, id)
 	if err != nil {
 		return nil, proto.Err(proto.CodeNotFound, "fs.apply_tar: %v", err)
 	}
@@ -3073,7 +3797,11 @@ func (n *Node) applyTar(ctx context.Context, w *ws, id, client string) ([]byte, 
 	}
 	defer unlock()
 	limits := artifact.RestoreLimits{MaxCompressedBytes: n.opts.MaxArtifactBytes}
-	res, err := artifact.ApplyOverlay(w.handle.FS().Root(), rc, limits)
+	host, ok := workspace.HostFileSystemOf(w.handle)
+	if !ok {
+		return nil, proto.Err(proto.CodeUnsupported, "backend %s has no host filesystem for archive apply", w.handle.Backend())
+	}
+	res, err := artifact.ApplyOverlay(host.Root(), rc, limits)
 	// Whatever landed before a mid-archive refusal is real state; record it
 	// before reporting the failure.
 	if len(res.Paths) > 0 || res.Dirs > 0 {
@@ -3091,16 +3819,16 @@ func (n *Node) applyTar(ctx context.Context, w *ws, id, client string) ([]byte, 
 	return proto.Marshal(proto.FSApplyTarRes{Files: len(res.Paths), Dirs: res.Dirs, Bytes: res.Bytes})
 }
 
-func (n *Node) snapshot(ctx context.Context, w *ws, upload bool) (string, int64, error) {
+func (n *Node) snapshotResultFenced(ctx context.Context, w *ws, upload bool) (proto.WSSnapshotRes, error) {
 	release, err := n.acquireSnapshot(ctx, w, false)
 	if err != nil {
-		return "", 0, err
+		return proto.WSSnapshotRes{}, err
 	}
 	defer release()
 	w.treeMu.Lock()
 	defer w.treeMu.Unlock()
-	result, err := n.snapshotRaw(ctx, w, upload, proto.SnapshotConsistencyQuiesced)
-	return result.Artifact, result.Bytes, err
+	result, err := n.snapshotRaw(ctx, w, upload, proto.SnapshotConsistencyQuiesced, true)
+	return result, err
 }
 
 // controlSnapshot serves a snapshot the control plane asks for on its own
@@ -3126,11 +3854,11 @@ func (n *Node) controlSnapshot(ctx context.Context, p *transport.Peer, req *prot
 	clean := *req
 	key := n.mutationKey(proto.PeerControl, w.ID, proto.OpWSSnapshot, req.IdempotencyKey)
 	raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
-		result, err := n.snapshotExplicit(ctx, w, req.Upload, req.Authoritative, func(id string) error {
+		result, err := n.snapshotExplicitWithFormat(ctx, w, req.Upload, req.Authoritative, func(id, format string) error {
 			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
 			return p.Call(cctx, proto.PeerControl, proto.OpWSSnapshotCommit,
-				proto.WSSnapshotCommitReq{ID: w.ID, Gen: w.Generation, Snapshot: id}, nil)
+				proto.WSSnapshotCommitReq{ID: w.ID, Gen: w.Generation, Snapshot: id, Format: format}, nil)
 		})
 		if err != nil {
 			return nil, err
@@ -3148,6 +3876,14 @@ func (n *Node) controlSnapshot(ctx context.Context, p *transport.Peer, req *prot
 }
 
 func (n *Node) snapshotExplicit(ctx context.Context, w *ws, upload, authoritative bool, commit func(string) error) (proto.WSSnapshotRes, error) {
+	var withFormat func(string, string) error
+	if commit != nil {
+		withFormat = func(id, _ string) error { return commit(id) }
+	}
+	return n.snapshotExplicitWithFormat(ctx, w, upload, authoritative, withFormat)
+}
+
+func (n *Node) snapshotExplicitWithFormat(ctx context.Context, w *ws, upload, authoritative bool, commit func(string, string) error) (proto.WSSnapshotRes, error) {
 	if authoritative && !upload {
 		return proto.WSSnapshotRes{}, proto.Err(proto.CodeBadRequest, "an authoritative checkpoint must be uploaded")
 	}
@@ -3198,13 +3934,14 @@ func (n *Node) snapshotExplicit(ctx context.Context, w *ws, upload, authoritativ
 	if authoritative {
 		// Process backends cannot suspend arbitrary escaped host processes, so
 		// their documented local-mode contract is limited to Remount-managed
-		// writers. KillWorkspace joins every such session before archiving.
-		if err := n.sessions.KillWorkspace(w.ID); err != nil {
+		// writers. TerminateWorkspace joins every such session before archiving
+		// while retaining its replay record for a later node.
+		if err := n.sessions.TerminateWorkspace(w.ID, "authoritative checkpoint"); err != nil {
 			return proto.WSSnapshotRes{}, proto.Err(proto.CodeTimeout, "quiesce workspace sessions: %v", err)
 		}
 		consistency = proto.SnapshotConsistencyQuiesced
 	}
-	result, err := n.snapshotRaw(ctx, w, upload, consistency)
+	result, err := n.snapshotRaw(ctx, w, upload, consistency, false)
 	if err != nil {
 		return result, err
 	}
@@ -3214,7 +3951,7 @@ func (n *Node) snapshotExplicit(ctx context.Context, w *ws, upload, authoritativ
 	// it mutate between archive completion and commit would acknowledge data not
 	// represented by the new authoritative checkpoint.
 	if authoritative {
-		if err := commit(result.Artifact); err != nil {
+		if err := commit(result.Artifact, result.Format); err != nil {
 			return result, fmt.Errorf("commit snapshot: %w", err)
 		}
 	}
@@ -3253,18 +3990,371 @@ func (n *Node) acquireSnapshot(ctx context.Context, w *ws, explicit bool) (func(
 	return func() { <-n.snapshotSlots }, nil
 }
 
+func (n *Node) archiveVolume(ctx context.Context, w *ws, requestedPath string, upload bool) (proto.WSSnapshotRes, error) {
+	if err := proto.ValidateVolumeMount(proto.VolumeMount{ID: "archive", Path: requestedPath}); err != nil {
+		return proto.WSSnapshotRes{}, err
+	}
+	release, err := n.acquireSnapshot(ctx, w, true)
+	if err != nil {
+		return proto.WSSnapshotRes{}, err
+	}
+	defer release()
+	unlock, err := n.lockWorkspaceTree(w, false)
+	if err != nil {
+		return proto.WSSnapshotRes{}, err
+	}
+	defer unlock()
+	return n.archiveVolumeLocked(ctx, w, requestedPath, upload, proto.SnapshotConsistencyLive)
+}
+
+func (n *Node) archiveVolumeLocked(ctx context.Context, w *ws, requestedPath string, upload bool, consistency string) (proto.WSSnapshotRes, error) {
+	host, ok := workspace.HostFileSystemOf(w.handle)
+	if !ok {
+		return proto.WSSnapshotRes{}, proto.Err(proto.CodeUnsupported, "backend %s cannot expose a host path for archive", w.handle.Backend())
+	}
+	root, err := host.Resolve(requestedPath)
+	if err != nil {
+		return proto.WSSnapshotRes{}, err
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return proto.WSSnapshotRes{}, err
+	}
+	if !info.IsDir() {
+		return proto.WSSnapshotRes{}, proto.Err(proto.CodeBadRequest, "volume publish path must be a directory")
+	}
+	pr, pw := io.Pipe()
+	producerDone := make(chan error, 1)
+	go func() {
+		err := artifact.Snapshot(root, nil, pw)
+		_ = pw.CloseWithError(err)
+		producerDone <- err
+	}()
+	id, size, err := n.store.PutLimit(pr, n.opts.MaxArtifactBytes)
+	if err != nil {
+		_ = pr.CloseWithError(err)
+		<-producerDone
+		return proto.WSSnapshotRes{}, err
+	}
+	if producerErr := <-producerDone; producerErr != nil {
+		return proto.WSSnapshotRes{}, producerErr
+	}
+	if upload && n.opts.ArtifactURL != "" {
+		if err := n.upload(ctx, &w.Workspace, id); err != nil {
+			return proto.WSSnapshotRes{Artifact: id, Bytes: size, Consistency: consistency}, err
+		}
+	}
+	n.emit(proto.EvWSSnapshot, w.ID, w.Spec.Principal, map[string]any{
+		"artifact": id, "bytes": size, "uploaded": upload, "volume_path": requestedPath,
+		"consistency": consistency, "authoritative": false,
+	})
+	return proto.WSSnapshotRes{Artifact: id, Bytes: size, Consistency: consistency}, nil
+}
+
+func (n *Node) prepareVolumeArtifact(ctx context.Context, tenant, artifactID string) error {
+	return n.prepareVolumeArtifactForWorkspace(ctx, nil, tenant, artifactID)
+}
+
+func (n *Node) prepareVolumeArtifactForWorkspace(ctx context.Context, w *proto.Workspace, tenant, artifactID string) error {
+	if err := volume.ValidateTenant(tenant); err != nil {
+		return err
+	}
+	if _, err := artifact.Digest(artifactID); err != nil {
+		return err
+	}
+	destination := filepath.Join(n.opts.DataDir, "volumes", "sources", tenant, artifactID)
+	tenantPath := filepath.Dir(destination)
+	completeMarker := filepath.Join(tenantPath, ".complete-"+artifactID)
+	if err := os.MkdirAll(tenantPath, 0o700); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(tenantPath)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".staging-") {
+			if err := os.RemoveAll(filepath.Join(tenantPath, entry.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	if info, err := os.Lstat(destination); err == nil {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("volume source %s is not a real directory", artifactID)
+		}
+		marker, markerErr := os.ReadFile(completeMarker)
+		markerFields := strings.Split(strings.TrimSuffix(string(marker), "\n"), "\n")
+		if markerErr == nil && len(markerFields) == 2 && markerFields[0] == artifactID {
+			if digest, digestErr := expandedVolumeDigest(destination); digestErr == nil && digest == markerFields[1] {
+				return nil
+			}
+		}
+		if err := os.RemoveAll(destination); err != nil {
+			return err
+		}
+		_ = os.Remove(completeMarker)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	used, usedEntries, err := volumeSourceUsage(filepath.Join(n.opts.DataDir, "volumes", "sources"))
+	if err != nil {
+		return err
+	}
+	remaining := n.opts.MaxVolumeSourceBytes - used
+	remainingEntries := n.opts.MaxVolumeSourceEntries - usedEntries
+	markerBytes := int64(2*len(artifactID) + 2)
+	// The final cache adds the artifact directory and completion marker in
+	// addition to the restored archive entries. Reserve them before extraction
+	// so a successful atomic publish cannot cross the advertised totals.
+	if remaining <= markerBytes || remainingEntries <= 2 {
+		metrics.VolumeQuotaRejected.Inc()
+		return proto.Err(proto.CodeResourceExhausted, "expanded volume cache limit reached (bytes=%d entries=%d)", n.opts.MaxVolumeSourceBytes, n.opts.MaxVolumeSourceEntries)
+	}
+	remaining -= markerBytes
+	remainingEntries -= 2
+	stage, err := os.MkdirTemp(tenantPath, ".staging-"+artifactID+"-")
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.RemoveAll(stage)
+		}
+	}()
+	r, err := n.fetchWorkspaceArtifact(ctx, w, artifactID)
+	if err != nil {
+		return err
+	}
+	maxExpanded := min(n.opts.MaxArtifactBytes, remaining)
+	restoreErr := artifact.RestoreWithLimits(stage, r, artifact.RestoreLimits{
+		MaxCompressedBytes: n.opts.MaxArtifactBytes,
+		MaxExpandedBytes:   maxExpanded,
+		MaxFileBytes:       maxExpanded,
+		MaxEntries:         min(artifact.DefaultRestoreLimits.MaxEntries, remainingEntries),
+	})
+	closeErr := r.Close()
+	if restoreErr != nil || closeErr != nil {
+		if restoreErr != nil {
+			metrics.VolumeQuotaRejected.Inc()
+		}
+		return errors.Join(restoreErr, closeErr)
+	}
+	expandedDigest, err := expandedVolumeDigest(stage)
+	if err != nil {
+		return fmt.Errorf("hash expanded volume source %s: %w", artifactID, err)
+	}
+	if err := os.Rename(stage, destination); err != nil {
+		return err
+	}
+	if err := writeVolumeCompleteMarker(completeMarker, artifactID, expandedDigest); err != nil {
+		return err
+	}
+	if err := syncParentDir(tenantPath); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func expandedVolumeDigest(root string) (string, error) {
+	h := sha256.New()
+	if err := artifact.Snapshot(root, nil, h); err != nil {
+		return "", err
+	}
+	return artifact.ID(h.Sum(nil)), nil
+}
+
+func writeVolumeCompleteMarker(path, artifactID, expandedDigest string) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".complete-staging-")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		if err != nil {
+			_ = os.Remove(name)
+		}
+	}()
+	if err = tmp.Chmod(0o600); err == nil {
+		_, err = io.WriteString(tmp, artifactID+"\n"+expandedDigest+"\n")
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(name, path)
+	}
+	return err
+}
+
+func volumeSourceUsage(root string) (bytes int64, entries int, err error) {
+	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == root {
+			return nil
+		}
+		entries++
+		if !entry.IsDir() {
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			bytes += info.Size()
+		}
+		return nil
+	})
+	return bytes, entries, err
+}
+
+func volumeOperationIDScoped(kind string, w *ws, mount proto.VolumeMount, scope string) string {
+	if scope == "" {
+		sum := sha256.Sum256(proto.MustMarshal(struct {
+			Kind, Workspace, Path string
+			Generation, Version   uint64
+		}{kind, w.ID, mount.Path, w.Generation, mount.Version}))
+		return fmt.Sprintf("%s-%x", kind, sum[:12])
+	}
+	sum := sha256.Sum256(proto.MustMarshal(struct {
+		Kind, Workspace, Path, Scope string
+		Generation, Version          uint64
+	}{kind, w.ID, mount.Path, scope, w.Generation, mount.Version}))
+	return fmt.Sprintf("%s-%x", kind, sum[:12])
+}
+
+func (n *Node) attachWorkspaceVolumes(ctx context.Context, w *ws) error {
+	return n.attachWorkspaceVolumesScoped(ctx, w, "")
+}
+
+func (n *Node) attachWorkspaceVolumesScoped(ctx context.Context, w *ws, scope string) error {
+	if n.volumes == nil {
+		if len(w.Spec.Volumes) == 0 {
+			return nil
+		}
+		return proto.Err(proto.CodeUnsupported, "node has no read-only volume backend")
+	}
+	n.volumeMu.Lock()
+	defer n.volumeMu.Unlock()
+	if err := n.volumes.SetWorkspaceGeneration(ctx, w.Tenant, w.ID, w.Generation); err != nil {
+		return fmt.Errorf("set volume generation fence: %w", err)
+	}
+	if len(w.Spec.Volumes) == 0 {
+		return nil
+	}
+	host, ok := workspace.HostFileSystemOf(w.handle)
+	if !ok {
+		return proto.Err(proto.CodeUnsupported, "backend %s cannot expose a host path for volume attachment", w.handle.Backend())
+	}
+	attached := make([]proto.VolumeMount, 0, len(w.Spec.Volumes))
+	for _, mount := range w.Spec.Volumes {
+		if err := proto.ValidateVolumeMount(mount); err != nil || mount.Version == 0 || mount.Artifact == "" {
+			if err == nil {
+				err = errors.New("control did not resolve volume version and artifact")
+			}
+			return errors.Join(err, n.detachWorkspaceVolumesLocked(context.WithoutCancel(ctx), w, attached, scope+":cleanup"))
+		}
+		if err := n.volumes.EnsureVersion(ctx, w.Tenant, mount.ID, mount.Version, mount.Artifact); err != nil {
+			cleanupErr := n.detachWorkspaceVolumesLocked(context.WithoutCancel(ctx), w, attached, scope+":cleanup")
+			return errors.Join(fmt.Errorf("reconcile volume %s: %w", mount.ID, err), cleanupErr)
+		}
+		// EnsureVersion validates the control-derived tenant, id and digest
+		// before any of them are used to construct a cache path.
+		if err := n.prepareVolumeArtifactForWorkspace(ctx, &w.Workspace, w.Tenant, mount.Artifact); err != nil {
+			cleanupErr := n.detachWorkspaceVolumesLocked(context.WithoutCancel(ctx), w, attached, scope+":cleanup")
+			return errors.Join(fmt.Errorf("prepare volume %s: %w", mount.ID, err), cleanupErr)
+		}
+		_, err := n.volumes.Attach(ctx, volume.AttachRequest{
+			OperationID: volumeOperationIDScoped("attach", w, mount, scope), Tenant: w.Tenant, ID: mount.ID,
+			Workspace: w.ID, Generation: w.Generation, Path: mount.Path,
+			WorkspaceRoot: host.Root(), ReadOnly: true, Version: mount.Version, Artifact: mount.Artifact,
+		})
+		if err != nil {
+			cleanupErr := n.detachWorkspaceVolumesLocked(context.WithoutCancel(ctx), w, attached, scope+":cleanup")
+			return errors.Join(fmt.Errorf("attach volume %s at %s: %w", mount.ID, mount.Path, err), cleanupErr)
+		}
+		attached = append(attached, mount)
+	}
+	return nil
+}
+
+func (n *Node) detachWorkspaceVolumes(ctx context.Context, w *ws, mounts []proto.VolumeMount) error {
+	return n.detachWorkspaceVolumesScoped(ctx, w, mounts, "")
+}
+
+func (n *Node) detachWorkspaceVolumesScoped(ctx context.Context, w *ws, mounts []proto.VolumeMount, scope string) error {
+	if n.volumes == nil {
+		return nil
+	}
+	n.volumeMu.Lock()
+	defer n.volumeMu.Unlock()
+	return n.detachWorkspaceVolumesLocked(ctx, w, mounts, scope)
+}
+
+func (n *Node) detachWorkspaceVolumesLocked(ctx context.Context, w *ws, mounts []proto.VolumeMount, scope string) error {
+	var errs []error
+	for i := len(mounts) - 1; i >= 0; i-- {
+		mount := mounts[i]
+		err := n.volumes.Detach(ctx, volume.DetachRequest{
+			OperationID: volumeOperationIDScoped("detach", w, mount, scope), Tenant: w.Tenant,
+			Workspace: w.ID, Generation: w.Generation, Path: mount.Path,
+		})
+		if err != nil && !errors.Is(err, volume.ErrNotFound) {
+			n.logger.Error("detach workspace volume", "ws", w.ID, "volume", mount.ID, "path", mount.Path, "err", err)
+			errs = append(errs, fmt.Errorf("detach volume %s at %s: %w", mount.ID, mount.Path, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // snapshotRaw requires w.treeMu to be held exclusively. Quiesced snapshots
 // call the backend's Checkpoint contract; live snapshots are explicitly
 // labeled and are never eligible to update control-plane failover state.
-func (n *Node) snapshotRaw(ctx context.Context, w *ws, upload bool, consistency string) (proto.WSSnapshotRes, error) {
+func (n *Node) snapshotRaw(ctx context.Context, w *ws, upload bool, consistency string, retainFence bool) (proto.WSSnapshotRes, error) {
 	// .remount is node-local truth and must never travel with the workspace.
 	excludes := append([]string{EnvFileDir}, w.Spec.Exclude...)
+	for _, mount := range w.Spec.Volumes {
+		excludes = append(excludes, mount.Path)
+	}
+	if n.chunkedSnapshotEnabled(w) {
+		result, err := n.snapshotChunked(ctx, w, upload, excludes)
+		if err != nil {
+			return proto.WSSnapshotRes{}, err
+		}
+		metrics.SnapshotsTaken.Inc()
+		metrics.SnapshotBytes.Add(uint64(result.PlaintextBytes))
+		metrics.SnapshotBytesUploaded.Add(uint64(result.BytesUploaded))
+		metrics.SnapshotLogicalBytes.Add(uint64(result.PlaintextBytes))
+		authoritative := consistency == proto.SnapshotConsistencyQuiesced && upload
+		n.emit(proto.EvWSSnapshot, w.ID, w.Spec.Principal, map[string]any{
+			"artifact": result.ManifestID, "format": proto.ArtifactFormatChunkedV1,
+			"bytes": result.PlaintextBytes, "manifest_bytes": result.ManifestBytes,
+			"uploaded_bytes": result.BytesUploaded, "chunks": result.Chunks,
+			"uploaded_chunks": result.ChunksUploaded, "uploaded": upload,
+			"consistency": consistency, "authoritative": authoritative,
+		})
+		return proto.WSSnapshotRes{
+			Artifact: result.ManifestID, Bytes: result.PlaintextBytes, Consistency: consistency,
+			Authoritative: authoritative, Format: proto.ArtifactFormatChunkedV1,
+			UploadedBytes: result.BytesUploaded, Chunks: result.Chunks, UploadedChunks: result.ChunksUploaded,
+		}, nil
+	}
 	pr, pw := io.Pipe()
 	producerDone := make(chan error, 1)
 	go func() {
 		var err error
 		if consistency == proto.SnapshotConsistencyQuiesced {
-			err = w.handle.Checkpoint(ctx, excludes, pw)
+			if fenced, ok := w.handle.(workspace.FencedCheckpointer); ok && retainFence {
+				err = fenced.CheckpointFenced(ctx, excludes, pw)
+			} else {
+				err = w.handle.Checkpoint(ctx, excludes, pw)
+			}
 		} else {
 			err = w.handle.Snapshot(ctx, excludes, pw)
 		}
@@ -3284,23 +4374,27 @@ func (n *Node) snapshotRaw(ctx context.Context, w *ws, upload bool, consistency 
 		return proto.WSSnapshotRes{}, producerErr
 	}
 	if upload && n.opts.ArtifactURL != "" {
-		if err := n.upload(ctx, id); err != nil {
+		if err := n.upload(ctx, &w.Workspace, id); err != nil {
 			return proto.WSSnapshotRes{Artifact: id, Bytes: size, Consistency: consistency}, fmt.Errorf("upload artifact %s: %w", id, err)
 		}
 	}
 	metrics.SnapshotsTaken.Inc()
 	metrics.SnapshotBytes.Add(uint64(size))
 	authoritative := consistency == proto.SnapshotConsistencyQuiesced && upload
+	format := proto.ArtifactFormatTar
+	if workspace.KindOf(w.handle) == workspace.CheckpointFSMem {
+		format = proto.ArtifactFormatFirecrackerFullV1
+	}
 	n.emit(proto.EvWSSnapshot, w.ID, w.Spec.Principal, map[string]any{
 		"artifact": id, "bytes": size, "uploaded": upload,
-		"consistency": consistency, "authoritative": authoritative,
+		"format": format, "consistency": consistency, "authoritative": authoritative,
 	})
 	return proto.WSSnapshotRes{
-		Artifact: id, Bytes: size, Consistency: consistency, Authoritative: authoritative,
+		Artifact: id, Bytes: size, Consistency: consistency, Authoritative: authoritative, Format: format,
 	}, nil
 }
 
-func (n *Node) upload(ctx context.Context, id string) error {
+func (n *Node) upload(ctx context.Context, w *proto.Workspace, id string) error {
 	r, size, err := n.store.Open(id)
 	if err != nil {
 		return err
@@ -3311,7 +4405,9 @@ func (n *Node) upload(ctx context.Context, id string) error {
 		return err
 	}
 	req.ContentLength = size
-	req.Header.Set("Authorization", "Bearer "+n.artifactToken())
+	if err := n.authorizeArtifactRequest(ctx, w, req, id); err != nil {
+		return err
+	}
 	resp, err := n.opts.HTTPClient.Do(req)
 	if err != nil {
 		return err
@@ -3324,11 +4420,83 @@ func (n *Node) upload(ctx context.Context, id string) error {
 	return nil
 }
 
+// rollbackRelease makes restoration, rather than further destruction, the
+// only interpretation of the durable journal. It restores exact pins but keeps
+// the runtime fenced until control durably enters claiming and explicitly
+// authorizes publication through releaseAbortCommit.
+func (n *Node) rollbackRelease(ctx context.Context, w *ws, prepared *preparedRelease, cause error) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if cause != nil {
+		prepared.err = cause
+	}
+	if _, err := n.beginReleaseAbort(w.ID, w.Generation, prepared.request.OperationID); err != nil {
+		n.mu.Lock()
+		n.quarantined[w.ID] = struct{}{}
+		select {
+		case <-prepared.done:
+		default:
+			close(prepared.done)
+		}
+		n.mu.Unlock()
+		return errors.Join(cause, err)
+	}
+	record, _ := n.releaseRecord(w.ID)
+	if err := n.detachWorkspaceVolumesScoped(cleanupCtx, w, w.Spec.Volumes, releaseOperationScope(record)+":abort-reset"); err != nil {
+		n.mu.Lock()
+		n.quarantined[w.ID] = struct{}{}
+		n.mu.Unlock()
+		return errors.Join(cause, fmt.Errorf("reset release volume pins before abort: %w", err))
+	}
+	if err := n.attachWorkspaceVolumesScoped(cleanupCtx, w, releaseOperationScope(record)+":abort"); err != nil {
+		n.mu.Lock()
+		n.quarantined[w.ID] = struct{}{}
+		select {
+		case <-prepared.done:
+		default:
+			close(prepared.done)
+		}
+		n.mu.Unlock()
+		return errors.Join(cause, fmt.Errorf("reattach exact release volume pins before abort: %w", err))
+	}
+	if err := n.markReleaseRestored(w.ID, w.Generation); err != nil {
+		n.mu.Lock()
+		n.quarantined[w.ID] = struct{}{}
+		select {
+		case <-prepared.done:
+		default:
+			close(prepared.done)
+		}
+		n.mu.Unlock()
+		return errors.Join(cause, err)
+	}
+	n.mu.Lock()
+	n.quarantined[w.ID] = struct{}{}
+	select {
+	case <-prepared.done:
+	default:
+		close(prepared.done)
+	}
+	n.mu.Unlock()
+	return cause
+}
+
 // release gives a workspace back to the control plane.
 func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error) {
+	if req.OperationID == "" {
+		req.OperationID = fmt.Sprintf("legacy-%x", sha256.Sum256(proto.MustMarshal(struct {
+			WS, Reason string
+			Gen        uint64
+			Snapshot   bool
+		}{req.WS, req.Reason, req.Gen, req.Snapshot})))
+	}
+	if err := lockMutexContext(ctx, &n.releaseReconcileMu); err != nil {
+		return nil, proto.Err(proto.CodeTimeout, "wait for lifecycle reconciliation: %v", err)
+	}
+	defer n.releaseReconcileMu.Unlock()
 	n.mu.Lock()
 	if existing := n.prepared[req.WS]; existing != nil {
-		if existing.request.Gen != req.Gen || existing.request.Snapshot != req.Snapshot || existing.request.Reason != req.Reason {
+		if existing.request.Gen != req.Gen || existing.request.OperationID != req.OperationID || existing.request.Snapshot != req.Snapshot || existing.request.Reason != req.Reason {
 			n.mu.Unlock()
 			return nil, proto.Err(proto.CodeConflict, "release retry does not match prepared operation")
 		}
@@ -3340,9 +4508,21 @@ func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error
 			}
 			return existing.response, nil
 		default:
-			return proto.WSReleasedReq{ID: req.WS, Gen: req.Gen, Reason: req.Reason, Preparing: true}, nil
+			return proto.WSReleasedReq{ID: req.WS, Gen: req.Gen, OperationID: req.OperationID, Reason: req.Reason, Preparing: true}, nil
 		}
 	}
+	n.mu.Unlock()
+	if record, ok := n.releaseRecord(req.WS); ok {
+		if record.State == releaseCommitted && req.Gen > record.Request.Gen {
+			// A higher control generation is authority to start the next release;
+			// beginRelease atomically replaces the older commit tombstone.
+		} else if !sameReleaseRequest(record.Request, *req) {
+			return nil, proto.Err(proto.CodeConflict, "release retry does not match durable operation")
+		} else {
+			return n.reconcileReleaseLocked(ctx, record)
+		}
+	}
+	n.mu.Lock()
 	w := n.workspaces[req.WS]
 	if w == nil {
 		n.mu.Unlock()
@@ -3355,6 +4535,26 @@ func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error
 	if w.checkpointing {
 		n.mu.Unlock()
 		return nil, proto.Err(proto.CodeConflict, "workspace %s is checkpointing", req.WS)
+	}
+	if req.Tenant != "" && req.Tenant != w.Tenant {
+		n.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "release tenant mismatch")
+	}
+	if req.Backend != "" && req.Backend != w.handle.Backend() {
+		n.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "release backend mismatch")
+	}
+	req.Tenant = w.Tenant
+	req.Backend = w.handle.Backend()
+	req.Spec = w.Spec
+	releaseRecord, existed, err := n.beginRelease(*req)
+	if err != nil {
+		n.mu.Unlock()
+		return nil, err
+	} else if existed {
+		n.mu.Unlock()
+		record, _ := n.releaseRecord(req.WS)
+		return n.reconcileReleaseLocked(ctx, record)
 	}
 	prepared := &preparedRelease{workspace: w, request: *req, done: make(chan struct{})}
 	n.prepared[req.WS] = prepared
@@ -3370,29 +4570,28 @@ func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error
 	// Drain any session startup already inside the tree boundary, then stop all
 	// resulting processes so the snapshot (or destroy) is quiescent.
 	if err := n.stopWorkspaceSessions(w); err != nil {
-		prepared.err = fmt.Errorf("quiesce workspace sessions: %w", err)
-		n.mu.Lock()
-		n.workspaces[req.WS] = w
-		n.deadlines[req.WS] = time.Now().Add(n.localLeaseWindowLocked())
-		delete(n.prepared, req.WS)
-		close(prepared.done)
-		n.mu.Unlock()
-		return nil, prepared.err
+		return nil, n.rollbackRelease(ctx, w, prepared, fmt.Errorf("quiesce workspace sessions: %w", err))
 	}
-	out := proto.WSReleasedReq{ID: req.WS, Gen: req.Gen, Reason: req.Reason}
+	if err := n.updateRelease(req.WS, releasePreparing, releaseQuiesced, proto.WSReleasedReq{}); err != nil {
+		return nil, n.rollbackRelease(ctx, w, prepared, err)
+	}
+	out := proto.WSReleasedReq{ID: req.WS, Gen: req.Gen, OperationID: req.OperationID, Reason: req.Reason}
 	if req.Snapshot {
-		id, _, err := n.snapshot(ctx, w, true)
+		result, err := n.snapshotResultFenced(ctx, w, true)
 		if err != nil {
-			prepared.err = fmt.Errorf("checkpoint %s: %w", id, err)
-			n.mu.Lock()
-			n.workspaces[req.WS] = w
-			n.deadlines[req.WS] = time.Now().Add(n.localLeaseWindowLocked())
-			delete(n.prepared, req.WS)
-			close(prepared.done)
-			n.mu.Unlock()
-			return nil, prepared.err
+			return nil, n.rollbackRelease(ctx, w, prepared, fmt.Errorf("checkpoint %s: %w", result.Artifact, err))
 		}
-		out.Snapshot = id
+		out.Snapshot = result.Artifact
+		out.SnapshotFormat = result.Format
+	}
+	if err := n.updateRelease(req.WS, releaseQuiesced, releaseCheckpoint, out); err != nil {
+		return nil, n.rollbackRelease(ctx, w, prepared, err)
+	}
+	if err := n.detachWorkspaceVolumesScoped(context.WithoutCancel(ctx), w, w.Spec.Volumes, releaseOperationScope(releaseRecord)+":prepare"); err != nil {
+		return nil, n.rollbackRelease(ctx, w, prepared, fmt.Errorf("detach release volumes: %w", err))
+	}
+	if err := n.updateRelease(req.WS, releaseCheckpoint, releasePrepared, out); err != nil {
+		return nil, n.rollbackRelease(ctx, w, prepared, err)
 	}
 	if w.broker != nil {
 		w.broker.Suspend()
@@ -3405,34 +4604,80 @@ func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error
 }
 
 func (n *Node) releaseCommit(ctx context.Context, req *proto.WSReleaseCommitReq) error {
-	n.mu.Lock()
-	if n.committed[req.ID] == req.Gen {
-		n.mu.Unlock()
+	if err := lockMutexContext(ctx, &n.releaseReconcileMu); err != nil {
+		return proto.Err(proto.CodeTimeout, "wait for release reconciliation: %v", err)
+	}
+	defer n.releaseReconcileMu.Unlock()
+	record, ok := n.releaseRecord(req.ID)
+	if !ok {
+		return proto.Err(proto.CodeConflict, "workspace %s has no durable prepared release", req.ID)
+	}
+	if !releaseMatchesCommit(record, req) || record.Response.Gen != req.Gen || record.Response.Snapshot != req.Snapshot ||
+		!sameArtifactFormat(record.Response.SnapshotFormat, req.SnapshotFormat) {
+		return proto.Err(proto.CodeConflict, "release commit does not match durable prepared checkpoint")
+	}
+	if record.State == releaseCommitted {
 		return nil
 	}
+	if record.State != releasePrepared {
+		return proto.Err(proto.CodeConflict, "workspace %s release is not prepared", req.ID)
+	}
+	n.mu.Lock()
+	if current := n.workspaces[req.ID]; current != nil || n.materializing[req.ID] != nil {
+		n.mu.Unlock()
+		return proto.Err(proto.CodeConflict, "workspace %s is still serviceable or materializing", req.ID)
+	}
 	prepared := n.prepared[req.ID]
-	if prepared == nil {
-		n.mu.Unlock()
-		return proto.Err(proto.CodeConflict, "workspace %s has no prepared release", req.ID)
-	}
-	if prepared.response.Gen != req.Gen || prepared.response.Snapshot != req.Snapshot {
-		n.mu.Unlock()
-		return proto.Err(proto.CodeConflict, "release commit does not match prepared checkpoint")
-	}
-	done := prepared.done
 	n.mu.Unlock()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		return ctx.Err()
+	var releaseWorkspace *ws
+	if prepared != nil {
+		select {
+		case <-prepared.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if prepared.err != nil {
+			return prepared.err
+		}
+		releaseWorkspace = prepared.workspace
+	} else {
+		backend, err := n.opts.Backends.Get(record.Request.Backend)
+		if err != nil {
+			return err
+		}
+		handle, err := backend.Adopt(ctx, req.ID)
+		var protocolErr *proto.Error
+		if errors.As(err, &protocolErr) && protocolErr.Code == proto.CodeNotFound {
+			if err := n.updateRelease(req.ID, releasePrepared, releaseCommitted, record.Response); err != nil {
+				return err
+			}
+			n.mu.Lock()
+			delete(n.prepared, req.ID)
+			n.committed[req.ID] = req.Gen
+			delete(n.quarantined, req.ID)
+			n.mu.Unlock()
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		releaseWorkspace = &ws{Workspace: proto.Workspace{
+			ID: req.ID, Tenant: record.Request.Tenant, Generation: req.Gen,
+			State: proto.WSClaimed, Spec: record.Request.Spec,
+		}, handle: handle}
 	}
-	if prepared.err != nil {
-		return prepared.err
+	if releaseWorkspace.broker != nil {
+		_ = releaseWorkspace.broker.Close()
 	}
-	if prepared.workspace.broker != nil {
-		_ = prepared.workspace.broker.Close()
+	if err := n.detachWorkspaceVolumesScoped(context.WithoutCancel(ctx), releaseWorkspace, releaseWorkspace.Spec.Volumes, releaseOperationScope(record)+":prepare"); err != nil {
+		return err
 	}
-	if err := prepared.workspace.handle.Destroy(ctx); err != nil {
+	if err := releaseWorkspace.handle.Destroy(ctx); err != nil {
+		return err
+	}
+	if err := n.updateRelease(req.ID, releasePrepared, releaseCommitted, record.Response); err != nil {
+		// Destruction is idempotently observable through backend.Adopt. A retry
+		// will see NotFound and durably finish the same tombstone.
 		return err
 	}
 	n.mu.Lock()
@@ -3440,21 +4685,95 @@ func (n *Node) releaseCommit(ctx context.Context, req *proto.WSReleaseCommitReq)
 		delete(n.prepared, req.ID)
 		n.committed[req.ID] = req.Gen
 	}
+	delete(n.quarantined, req.ID)
 	n.mu.Unlock()
 	return nil
 }
 
-func (n *Node) releaseAbort(req *proto.WSReleaseCommitReq) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	prepared := n.prepared[req.ID]
-	if prepared == nil {
-		if current := n.workspaces[req.ID]; current != nil && current.Generation == req.Gen {
-			return nil // duplicate abort after successful restoration
-		}
-		return proto.Err(proto.CodeConflict, "workspace %s has no prepared release", req.ID)
+func (n *Node) releaseAbort(ctx context.Context, req *proto.WSReleaseCommitReq) error {
+	if err := lockMutexContext(ctx, &n.releaseReconcileMu); err != nil {
+		return proto.Err(proto.CodeTimeout, "wait for release reconciliation: %v", err)
 	}
-	if prepared.response.Gen != req.Gen {
+	defer n.releaseReconcileMu.Unlock()
+	n.mu.Lock()
+	prepared := n.prepared[req.ID]
+	current := n.workspaces[req.ID]
+	if current != nil && current.Generation == req.Gen {
+		n.mu.Unlock()
+		if record, ok := n.releaseRecord(req.ID); ok {
+			if !releaseMatchesCommit(record, req) || (record.State != releaseAuthorized && record.State != releasePublished) {
+				return proto.Err(proto.CodeConflict, "workspace %s has an incompatible durable release", req.ID)
+			}
+		}
+		return nil
+	}
+	n.mu.Unlock()
+	record, ok := n.releaseRecord(req.ID)
+	if !ok || !releaseMatchesCommit(record, req) {
+		return proto.Err(proto.CodeConflict, "workspace %s has no matching prepared release", req.ID)
+	}
+	if (record.State == releaseRestored || record.State == releaseAuthorized || record.State == releasePublished) && prepared != nil {
+		return nil
+	}
+	if record.State != releaseRestored && record.State != releaseAuthorized && record.State != releasePublished {
+		if _, err := n.beginReleaseAbort(req.ID, req.Gen, req.OperationID); err != nil {
+			return err
+		}
+		record, _ = n.releaseRecord(req.ID)
+	}
+	if prepared == nil {
+		recovered := proto.Workspace{
+			ID: req.ID, Tenant: record.Request.Tenant, Generation: req.Gen,
+			State: proto.WSClaimed, Spec: record.Request.Spec,
+		}
+		recovered.Spec.Requires.Backend = record.Request.Backend
+		mctx, cancel := context.WithCancel(ctx)
+		materializing := &materialization{
+			generation: req.Gen, deadline: time.Now().Add(n.localLeaseWindow()),
+			cancel: cancel, done: make(chan struct{}),
+		}
+		n.mu.Lock()
+		if n.materializing[req.ID] != nil || n.workspaces[req.ID] != nil {
+			n.mu.Unlock()
+			cancel()
+			return proto.Err(proto.CodeConflict, "workspace %s recovery is already active", req.ID)
+		}
+		n.materializing[req.ID] = materializing
+		n.quarantined[req.ID] = struct{}{}
+		n.mu.Unlock()
+		var restored *ws
+		err := n.materializeWithReadyHook(mctx, recovered, true, false, func(entry *ws) (bool, error) {
+			restored = entry
+			latest, ok := n.releaseRecord(req.ID)
+			if !ok || !releaseMatchesCommit(latest, req) {
+				return false, proto.Err(proto.CodeConflict, "release abort authority changed during restoration")
+			}
+			if latest.State == releaseAborting {
+				return false, n.markReleaseRestored(req.ID, req.Gen)
+			}
+			if latest.State != releaseRestored && latest.State != releaseAuthorized && latest.State != releasePublished {
+				return false, proto.Err(proto.CodeConflict, "release abort cannot restore from %s", latest.State)
+			}
+			return false, nil
+		})
+		cancel()
+		n.mu.Lock()
+		if n.materializing[req.ID] == materializing {
+			delete(n.materializing, req.ID)
+		}
+		n.mu.Unlock()
+		close(materializing.done)
+		if err != nil {
+			return fmt.Errorf("restore retained release source before abort: %w", err)
+		}
+		prepared = &preparedRelease{workspace: restored, request: record.Request, response: record.Response, done: make(chan struct{})}
+		close(prepared.done)
+		n.mu.Lock()
+		n.prepared[req.ID] = prepared
+		n.mu.Unlock()
+		return nil
+	}
+	if prepared.request.Gen != req.Gen || (req.OperationID != "" && prepared.request.OperationID != req.OperationID) {
 		return proto.Err(proto.CodeConflict, "release abort generation mismatch")
 	}
 	select {
@@ -3462,11 +4781,107 @@ func (n *Node) releaseAbort(req *proto.WSReleaseCommitReq) error {
 	default:
 		return proto.Err(proto.CodeTimeout, "release prepare is still running")
 	}
-	if prepared.workspace.broker != nil {
-		prepared.workspace.broker.Resume()
+	return n.rollbackRelease(ctx, prepared.workspace, prepared, nil)
+}
+
+// releaseAbortCommit publishes an already restored runtime only after control
+// has durably entered WSClaiming. The durable authorized state makes a crash
+// between authorization and publication replayable without granting a stale
+// same-generation release operation authority over a later cycle.
+func (n *Node) releaseAbortCommit(ctx context.Context, req *proto.WSReleaseCommitReq) error {
+	if err := lockMutexContext(ctx, &n.releaseReconcileMu); err != nil {
+		return proto.Err(proto.CodeTimeout, "wait for release reconciliation: %v", err)
 	}
-	n.workspaces[req.ID] = prepared.workspace
+	defer n.releaseReconcileMu.Unlock()
+	record, ok := n.releaseRecord(req.ID)
+	if !ok {
+		n.mu.Lock()
+		current := n.workspaces[req.ID]
+		n.mu.Unlock()
+		if current != nil && current.Generation == req.Gen {
+			return nil
+		}
+		return proto.Err(proto.CodeConflict, "workspace %s has no restored release", req.ID)
+	}
+	if !releaseMatchesCommit(record, req) {
+		return proto.Err(proto.CodeConflict, "release abort commit does not match durable operation")
+	}
+	alreadyPublished := record.State == releasePublished
+	if record.State == releaseRestored {
+		if err := n.advanceReleaseAbort(req.ID, req.Gen, req.OperationID, releaseRestored, releaseAuthorized); err != nil {
+			return err
+		}
+	} else if record.State != releaseAuthorized && !alreadyPublished {
+		return proto.Err(proto.CodeConflict, "workspace %s release abort is not restored", req.ID)
+	}
+	n.mu.Lock()
+	prepared := n.prepared[req.ID]
+	current := n.workspaces[req.ID]
+	n.mu.Unlock()
+	if current != nil {
+		if current.Generation != req.Gen {
+			return proto.Err(proto.CodeConflict, "release abort publication generation mismatch")
+		}
+		if alreadyPublished {
+			return nil
+		}
+		return n.advanceReleaseAbort(req.ID, req.Gen, req.OperationID, releaseAuthorized, releasePublished)
+	}
+	if prepared == nil || prepared.workspace == nil {
+		return proto.Err(proto.CodeConflict, "workspace %s restored runtime is unavailable; repeat abort preparation", req.ID)
+	}
+	w := prepared.workspace
+	if w.Generation != req.Gen {
+		return proto.Err(proto.CodeConflict, "release abort publication generation mismatch")
+	}
+	if fenced, ok := w.handle.(workspace.FencedCheckpointer); ok {
+		resumeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if err := fenced.ResumeFenced(resumeCtx); err != nil {
+			return fmt.Errorf("resume release-aborted workspace: %w", err)
+		}
+	}
+	if w.broker != nil {
+		w.broker.Resume()
+	}
+	n.mu.Lock()
+	if n.workspaces[req.ID] != nil || n.materializing[req.ID] != nil {
+		n.mu.Unlock()
+		if w.broker != nil {
+			w.broker.Suspend()
+		}
+		return proto.Err(proto.CodeConflict, "workspace %s publication boundary is busy", req.ID)
+	}
+	n.workspaces[req.ID] = w
 	n.deadlines[req.ID] = time.Now().Add(n.localLeaseWindowLocked())
 	delete(n.prepared, req.ID)
+	delete(n.quarantined, req.ID)
+	n.mu.Unlock()
+	if !alreadyPublished {
+		if err := n.advanceReleaseAbort(req.ID, req.Gen, req.OperationID, releaseAuthorized, releasePublished); err != nil {
+			// Control is durably WSClaiming, so the runtime is not grant-visible. Keep
+			// it locally fenced until the durable replay tombstone can be written.
+			n.fenceWorkspace(context.WithoutCancel(ctx), req.ID, "persist release abort publication")
+			return err
+		}
+	}
+	metrics.ReleaseAbortsPublished.Inc()
 	return nil
+}
+
+func lockMutexContext(ctx context.Context, mu *sync.Mutex) error {
+	for {
+		if mu.TryLock() {
+			return nil
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }

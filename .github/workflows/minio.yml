@@ -44,6 +44,8 @@ jobs:
           exit 1
       - name: S3 REST and multipart compatibility
         run: go test -race -count=1 -run '^TestMinIOIntegration$' -v -timeout 180s ./internal/artifact/s3
+      - name: warm-standby failover core (E10)
+        run: go test -race -count=1 -run '^TestMinIOControlFailoverE10Core$' -v -timeout 180s ./integration/failover
       - name: remove MinIO
         if: always()
         run: docker rm -f remount-minio

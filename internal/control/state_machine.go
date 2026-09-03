@@ -35,23 +35,24 @@ const (
 	actorNode     lifecycleActor = "node"
 	actorRecovery lifecycleActor = "recovery"
 
-	transitionRecover            = "recover"
-	transitionReconnect          = "node.disconnect"
-	transitionReleaseAbort       = "release.abort"
-	transitionDestroyBegin       = "destroy.begin"
-	transitionDestroyCommit      = "destroy.commit"
-	transitionReleaseBegin       = "release.begin"
-	transitionReleaseCommit      = "release.commit"
-	transitionMove               = "move.commit"
-	transitionSleep              = "sleep.commit"
-	transitionWake               = "wake"
-	transitionClaim              = "claim"
-	transitionReady              = "ready"
-	transitionNodeReleased       = "node.released"
-	transitionFleetBegin         = "fleet.begin"
-	transitionFleetComplete      = "fleet.complete"
-	transitionLeaseExpired       = "lease.expired"
-	transitionAuthorityExhausted = "authority.exhausted"
+	transitionRecover             = "recover"
+	transitionReconnect           = "node.disconnect"
+	transitionReleaseAbort        = "release.abort"
+	transitionDestroyBegin        = "destroy.begin"
+	transitionDestroyCommit       = "destroy.commit"
+	transitionReleaseBegin        = "release.begin"
+	transitionReleaseCommit       = "release.commit"
+	transitionMove                = "move.commit"
+	transitionSleep               = "sleep.commit"
+	transitionWake                = "wake"
+	transitionClaim               = "claim"
+	transitionReady               = "ready"
+	transitionNodeReleased        = "node.released"
+	transitionFleetBegin          = "fleet.begin"
+	transitionFleetComplete       = "fleet.complete"
+	transitionLeaseExpired        = "lease.expired"
+	transitionAuthorityExhausted  = "authority.exhausted"
+	transitionControllerReconcile = "controller.reconcile"
 )
 
 type statePair struct {
@@ -73,6 +74,7 @@ func pairs(values ...statePair) map[statePair]struct{} {
 }
 
 var lifecycleRules = map[string]lifecycleRule{
+	transitionControllerReconcile: {actor: actorRecovery, pairs: controllerReconcilePairs()},
 	transitionRecover: {actor: actorRecovery, pairs: pairs(
 		statePair{proto.WSClaimed, proto.WSClaiming},
 		statePair{proto.WSClaiming, proto.WSClaiming},
@@ -85,9 +87,9 @@ var lifecycleRules = map[string]lifecycleRule{
 		statePair{proto.WSClaimed, proto.WSClaiming},
 	)},
 	transitionReleaseAbort: {actor: actorControl, pairs: pairs(
-		statePair{proto.WSQuiescing, proto.WSClaimed},
+		statePair{proto.WSQuiescing, proto.WSClaiming},
 		statePair{proto.WSQuiescing, proto.WSFailed},
-		statePair{proto.WSDestroying, proto.WSClaimed},
+		statePair{proto.WSDestroying, proto.WSClaiming},
 		statePair{proto.WSDestroying, proto.WSFailed},
 	)},
 	transitionDestroyBegin: {actor: actorControl, pairs: pairs(
@@ -146,6 +148,19 @@ var lifecycleRules = map[string]lifecycleRule{
 		statePair{proto.WSClaimed, proto.WSFailed},
 		statePair{proto.WSClaiming, proto.WSFailed},
 	)},
+}
+
+func controllerReconcilePairs() map[statePair]struct{} {
+	states := []string{
+		proto.WSPending, proto.WSClaiming, proto.WSClaimed, proto.WSQuiescing,
+		proto.WSCheckpointing, proto.WSReleased, proto.WSDestroying, proto.WSFailed,
+	}
+	out := make(map[statePair]struct{}, len(states))
+	for _, from := range states {
+		out[statePair{from, proto.WSClaiming}] = struct{}{}
+		out[statePair{from, proto.WSClaimed}] = struct{}{}
+	}
+	return out
 }
 
 func fleetCompletionPairs() map[statePair]struct{} {

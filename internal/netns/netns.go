@@ -28,6 +28,13 @@ type Kernel interface {
 	CloseNamespace(string) error
 }
 
+// TapKernel is the optional microVM TAP extension implemented by the Linux
+// kernel adapter and injectable in tests.
+type TapKernel interface {
+	CreateTap(context.Context, string, string, int, int, netip.Prefix) error
+	DeleteTap(context.Context, string, string) error
+}
+
 // Link is the generation-specific point-to-point network assigned to a
 // workspace. Host and Guest are the two usable addresses of its /30.
 type Link struct {
@@ -43,6 +50,7 @@ type State struct {
 	Slot      uint16 `json:"slot"`
 	Namespace string `json:"namespace"`
 	Link      Link   `json:"link"`
+	Tap       string `json:"tap,omitempty"`
 }
 
 // Manager allocates non-overlapping link-local /30s and creates namespaces.
@@ -135,7 +143,7 @@ func (m *Manager) Adopt(ctx context.Context, state State) (*Network, error) {
 		m.release(state.Slot)
 		return nil, fmt.Errorf("validate retained network: %w", err)
 	}
-	return &Network{manager: m, kernel: m.kernel, slot: state.Slot, namespace: state.Namespace, link: state.Link, active: true}, nil
+	return &Network{manager: m, kernel: m.kernel, slot: state.Slot, namespace: state.Namespace, link: state.Link, tap: state.Tap, active: true}, nil
 }
 
 // Network is one live workspace network namespace.
@@ -150,6 +158,7 @@ type Network struct {
 	broker  netip.AddrPort
 	active  bool
 	revoked bool
+	tap     string
 }
 
 // NamespacePath is a kernel namespace path suitable for an OCI network
@@ -162,9 +171,48 @@ func (n *Network) HostAddress() netip.Addr { return n.link.Host.Addr() }
 // GuestAddress returns the sandbox side of the veth.
 func (n *Network) GuestAddress() netip.Addr { return n.link.Guest.Addr() }
 
+// PrepareTap creates a persistent TAP inside the deny-first namespace. The
+// returned address is configured inside the microVM; the TAP owns the other
+// address as its gateway. No forwarded packet is permitted until Apply.
+func (n *Network) PrepareTap(ctx context.Context, name string, uid, gid int) (netip.Addr, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.revoked {
+		return netip.Addr{}, errors.New("netns: network is revoked")
+	}
+	if n.tap != "" {
+		if n.tap == name {
+			return tapLinkForSlot(n.slot).Guest, nil
+		}
+		return netip.Addr{}, errors.New("netns: TAP identity changed")
+	}
+	kernel, ok := n.kernel.(TapKernel)
+	if !ok {
+		return netip.Addr{}, errors.New("netns: kernel TAP support unavailable")
+	}
+	tap := tapLinkForSlot(n.slot)
+	if err := kernel.CreateTap(ctx, n.namespace, name, uid, gid, tap.Gateway); err != nil {
+		return netip.Addr{}, err
+	}
+	n.tap = name
+	return tap.Guest, nil
+}
+
+type tapLink struct {
+	Gateway netip.Prefix
+	Guest   netip.Addr
+}
+
+func tapLinkForSlot(slot uint16) tapLink {
+	third := byte(slot >> 6)
+	fourth := byte((slot & 0x3f) << 2)
+	gateway := netip.AddrFrom4([4]byte{172, 31, third, fourth + 1})
+	return tapLink{Gateway: netip.PrefixFrom(gateway, 30), Guest: netip.AddrFrom4([4]byte{172, 31, third, fourth + 2})}
+}
+
 // State returns the non-secret locator needed for restart adoption.
 func (n *Network) State() State {
-	return State{Slot: n.slot, Namespace: n.namespace, Link: n.link}
+	return State{Slot: n.slot, Namespace: n.namespace, Link: n.link, Tap: n.tap}
 }
 
 // Apply permits exactly one TCP destination and then activates the link.
@@ -215,6 +263,14 @@ func (n *Network) failClosed(ctx context.Context, cause error) error {
 func (n *Network) revokeLocked(ctx context.Context) error {
 	if n.revoked {
 		return nil
+	}
+	if n.tap != "" {
+		if kernel, ok := n.kernel.(TapKernel); ok {
+			if err := kernel.DeleteTap(ctx, n.namespace, n.tap); err != nil {
+				return fmt.Errorf("delete TAP: %w", err)
+			}
+		}
+		n.tap = ""
 	}
 	if err := n.kernel.DeleteVeth(ctx, n.link.HostName); err != nil {
 		return fmt.Errorf("delete veth: %w", err)

@@ -3,9 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -293,6 +297,76 @@ func TestWorkspaceCreateRejectsClientSelectedPrincipalBeforeDial(t *testing.T) {
 	err := cmdWS(context.Background(), []string{"create", "--principal", "a_attacker", "--wait=false"})
 	if err == nil || !strings.Contains(err.Error(), "caller identity is authoritative") {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestCredentialFileIsMode0600AndServerScoped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	value := credentialFile{Server: "https://one.example", Tenant: "tenant-a", AccessToken: "access-secret", RefreshToken: "refresh-secret"}
+	if err := writeCredentialFile(path, value); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("credential mode=%o", info.Mode().Perm())
+	}
+	t.Setenv("REMOUNT_CREDENTIAL_FILE", path)
+	if got := storedAccessToken("https://one.example"); got != "access-secret" {
+		t.Fatalf("stored token=%q", got)
+	}
+	if got := storedAccessToken("https://two.example"); got != "" {
+		t.Fatal("credential crossed server boundary")
+	}
+}
+
+func TestStoredCredentialRotatesExpiringAccessForCommonClient(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var request map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		if request["refresh_token"] != "refresh-one" {
+			t.Errorf("refresh=%q", request["refresh_token"])
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "access-two", "refresh_token": "refresh-two"})
+	}))
+	defer server.Close()
+	payload, _ := json.Marshal(map[string]int64{"exp": time.Now().Add(time.Minute).Unix()})
+	expiring := "header." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	if err := writeCredentialFile(path, credentialFile{Server: server.URL, AccessToken: expiring, RefreshToken: "refresh-one"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REMOUNT_CREDENTIAL_FILE", path)
+	if got := storedAccessToken(server.URL); got != "access-two" {
+		t.Fatalf("access=%q", got)
+	}
+	if calls != 1 {
+		t.Fatalf("refresh calls=%d", calls)
+	}
+	if got := storedAccessToken(server.URL); got != "access-two" {
+		t.Fatalf("stored rotated access=%q", got)
+	}
+	if calls != 1 {
+		t.Fatalf("rotated opaque token refreshed again: calls=%d", calls)
+	}
+}
+
+type loginTimeoutError struct{}
+
+func (loginTimeoutError) Error() string   { return "timeout" }
+func (loginTimeoutError) Timeout() bool   { return true }
+func (loginTimeoutError) Temporary() bool { return true }
+
+func TestDevicePollBacksOffOnConnectionTimeout(t *testing.T) {
+	if !devicePollBackoff(loginTimeoutError{}) {
+		t.Fatal("connection timeout did not request polling backoff")
+	}
+	if devicePollBackoff(errors.New("permanent")) {
+		t.Fatal("permanent error requested polling retry")
 	}
 }
 

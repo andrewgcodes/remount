@@ -99,13 +99,49 @@ func MountPathOf(h Handle) string {
 	if m, ok := h.(Mounter); ok {
 		return m.MountPath()
 	}
-	return h.FS().Root()
+	if host, ok := h.FS().(HostFileSystem); ok {
+		return host.Root()
+	}
+	return ""
 }
 
-// Filesystem exposes the backend's jailed host-side filesystem adapter.
+// FileSystem is the path-jailed filesystem surface used by the node. A
+// backend may implement it over a descriptor-rooted host directory or over a
+// generation-bound guest transport. Host paths are deliberately a separate
+// capability: callers must never treat an in-guest tree as a local directory.
+type FileSystem interface {
+	Close() error
+	Read(string, int64, int64) (*proto.FSReadRes, error)
+	Write(string, []byte, uint32, bool, bool) error
+	List(string) ([]proto.FSEntry, error)
+	Stat(string) (*proto.FSEntry, error)
+	Mkdir(string) error
+	Remove(string, bool) error
+	Rename(string, string) error
+	Search(string, string, string, int) (*proto.FSSearchRes, error)
+	Edit(string, []proto.FSEdit) (int, error)
+}
+
+// HostFileSystem is implemented only when the filesystem is safely available
+// as a local host directory. Block devices attached to a running guest must
+// not implement this interface.
+type HostFileSystem interface {
+	FileSystem
+	Root() string
+	Resolve(string) (string, error)
+}
+
+// HostFileSystemOf returns h's local-path capability, when one exists.
+func HostFileSystemOf(h Handle) (HostFileSystem, bool) {
+	host, ok := h.FS().(HostFileSystem)
+	return host, ok
+}
+
+// Filesystem exposes the backend's path-jailed filesystem adapter.
 type Filesystem interface {
-	// FS returns the jailed filesystem view.
-	FS() *fsops.FS
+	// FS returns the filesystem view. Callers needing a local path must also
+	// require HostFileSystem rather than guessing from Root or MountPath.
+	FS() FileSystem
 }
 
 // SessionPreparer turns a portable session request into a backend-specific
@@ -147,6 +183,15 @@ type MemoryCheckpointer interface {
 	Checkpointer
 	// CheckpointKind reports what Checkpoint will produce for this handle.
 	CheckpointKind() CheckpointKind
+}
+
+// FencedCheckpointer is an optional destructive-lifecycle contract. A
+// successful CheckpointFenced leaves all backend-managed execution stopped;
+// the caller either destroys the retained source after its durable commit or
+// calls ResumeFenced after durable abort authorization.
+type FencedCheckpointer interface {
+	CheckpointFenced(context.Context, []string, io.Writer) error
+	ResumeFenced(context.Context) error
 }
 
 // KindOf reports the checkpoint kind a handle produces. Only a kind the
@@ -331,7 +376,7 @@ func newProcessHandle(id, root string) (*processHandle, error) {
 
 func (h *processHandle) ID() string      { return h.id }
 func (h *processHandle) Backend() string { return "process" }
-func (h *processHandle) FS() *fsops.FS   { return h.fs }
+func (h *processHandle) FS() FileSystem  { return h.fs }
 
 func (h *processHandle) Prepare(spec *session.Spec) error {
 	cwd, err := h.fs.Resolve(spec.Cwd)
@@ -550,7 +595,7 @@ type dockerHandle struct {
 
 func (h *dockerHandle) ID() string        { return h.id }
 func (h *dockerHandle) Backend() string   { return "docker" }
-func (h *dockerHandle) FS() *fsops.FS     { return h.fs }
+func (h *dockerHandle) FS() FileSystem    { return h.fs }
 func (h *dockerHandle) MountPath() string { return h.mount }
 
 func (h *dockerHandle) Prepare(spec *session.Spec) error {

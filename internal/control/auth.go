@@ -13,6 +13,9 @@ import (
 
 // Authenticate checks the token and assigns/validates the peer id.
 func (c *Control) Authenticate(ctx context.Context, h *proto.Hello) (string, *proto.HelloOK, error) {
+	if _, err := c.decisionEpoch(); err != nil {
+		return "", nil, err
+	}
 	caps, err := proto.NegotiateCapabilities(h.Caps)
 	if err != nil {
 		return "", nil, err
@@ -20,7 +23,7 @@ func (c *Control) Authenticate(ctx context.Context, h *proto.Hello) (string, *pr
 	if err := c.requireDeploymentCapabilities(h.Role, caps); err != nil {
 		return "", nil, err
 	}
-	ok := &proto.HelloOK{Caps: caps, Server: "remount", Now: c.now().UnixMilli(), PubKey: c.PublicKey(), LeaseSec: c.opts.LeaseSec}
+	ok := &proto.HelloOK{Caps: caps, Server: "remount", Now: c.now().UnixMilli(), PubKey: c.PublicKey(), LeaseSec: c.opts.LeaseSec, ControllerEpoch: c.controllerEpoch}
 	switch h.Role {
 	case proto.RoleNode:
 		if h.Peer == "" || !strings.HasPrefix(h.Peer, "n_") || len(h.PubKey) != ed25519.PublicKeySize {

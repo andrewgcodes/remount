@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"remount.dev/remount/internal/artifact"
+	"remount.dev/remount/internal/artifact/encrypted"
 )
 
 func TestBlobStoreCRUDAndDigestVerification(t *testing.T) {
@@ -219,6 +220,37 @@ func TestNamedObjectsConditionsInventoryAndCleanup(t *testing.T) {
 	}
 	if inventory.StagingObjects != 0 || inventory.MultipartUploads != 0 {
 		t.Fatalf("Inventory after cleanup = %+v", inventory)
+	}
+}
+
+func TestKeyedStoreConditionalCreateAndReadiness(t *testing.T) {
+	_, store := newFakeStore(t, Config{})
+	keyed, err := NewKeyedStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	key := "tenants/tenant-a/v1/art_sha256:" + strings.Repeat("a", 64)
+	if err := keyed.Create(ctx, key, strings.NewReader("ciphertext"), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := keyed.Create(ctx, key, strings.NewReader("replacement"), 11); !errors.Is(err, encrypted.ErrObjectExists) {
+		t.Fatalf("replacement Create = %v, want ErrObjectExists", err)
+	}
+	reader, size, err := keyed.Open(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if err != nil || closeErr != nil || size != 10 || string(body) != "ciphertext" {
+		t.Fatalf("Open = %d %q, read=%v close=%v", size, body, err, closeErr)
+	}
+	if keys, err := keyed.List(ctx, "tenants/tenant-a/"); err != nil || len(keys) != 1 || keys[0] != key {
+		t.Fatalf("List = %v, %v", keys, err)
+	}
+	if err := keyed.Ready(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 

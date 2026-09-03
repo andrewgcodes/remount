@@ -1188,13 +1188,14 @@ func (c *Control) agentFork(ctx context.Context, subject Subject, req *proto.Age
 	if err != nil {
 		return nil, err
 	}
-	snapshot, err := c.forkSnapshot(ctx, subject, ws, derivedIdem(req.IdempotencyKey, "snapshot"))
+	snapshot, snapshotFormat, err := c.forkSnapshot(ctx, subject, ws, derivedIdem(req.IdempotencyKey, "snapshot"))
 	if err != nil {
 		return nil, err
 	}
 	spec := ws.Spec
 	spec.Name = req.Name
 	spec.RestoreFrom = snapshot
+	spec.RestoreFormat = snapshotFormat
 	spec.Base = ""
 	spec.Repo = proto.RepoSpec{}
 	spec.Run = ""
@@ -1207,7 +1208,7 @@ func (c *Control) agentFork(ctx context.Context, subject Subject, req *proto.Age
 	id := ids.New("ag")
 	spec.Labels["remount.agent"] = id
 	spec.Labels["remount.forked_from"] = src.ID
-	copyWS, err := c.wsCreate(ctx, subject, &proto.WSCreateReq{Spec: spec, IdempotencyKey: derivedIdem(req.IdempotencyKey, "ws")})
+	copyWS, err := c.wsCreateResolved(ctx, subject, &proto.WSCreateReq{Spec: spec, IdempotencyKey: derivedIdem(req.IdempotencyKey, "ws")}, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1265,33 +1266,38 @@ func (c *Control) agentFork(ctx context.Context, subject Subject, req *proto.Age
 
 // forkSnapshot gets a durable artifact of the workspace as it is now: the
 // node uploads one for a claimed tree; a paused tree already has one.
-func (c *Control) forkSnapshot(ctx context.Context, subject Subject, ws *proto.Workspace, idem string) (string, error) {
+func (c *Control) forkSnapshot(ctx context.Context, subject Subject, ws *proto.Workspace, idem string) (string, string, error) {
 	switch ws.State {
 	case proto.WSClaimed:
 		if c.send == nil || !c.send.Online(ws.Node) {
-			return "", proto.Err(proto.CodeUnreachable, "node %s holding workspace %s is offline", ws.Node, ws.ID)
+			return "", "", proto.Err(proto.CodeUnreachable, "node %s holding workspace %s is offline", ws.Node, ws.ID)
 		}
 		if err := c.check(ctx, subject, ActionExecute, workspaceResource(ws)); err != nil {
-			return "", err
+			return "", "", err
 		}
 		var res proto.WSSnapshotRes
 		sctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
 		err := c.send.Request(sctx, ws.Node, proto.OpWSSnapshot, proto.WSSnapshotReq{WS: ws.ID, Gen: ws.Generation, Upload: true, IdempotencyKey: idem}, &res)
 		if err != nil {
-			return "", proto.Err(proto.CodeUnreachable, "snapshot for fork: %v", err)
+			return "", "", proto.Err(proto.CodeUnreachable, "snapshot for fork: %v", err)
 		}
 		if res.Artifact == "" {
-			return "", proto.Err(proto.CodeInternal, "node returned an empty snapshot for fork")
+			return "", "", proto.Err(proto.CodeInternal, "node returned an empty snapshot for fork")
 		}
-		return res.Artifact, nil
+		format, err := proto.NormalizeArtifactFormat(res.Format)
+		if err != nil {
+			return "", "", err
+		}
+		return res.Artifact, format, nil
 	case proto.WSPaused, proto.WSPending, proto.WSReleased:
 		if ws.LastSnapshot == "" {
-			return "", proto.Err(proto.CodeConflict, "workspace %s has no snapshot to fork from", ws.ID)
+			return "", "", proto.Err(proto.CodeConflict, "workspace %s has no snapshot to fork from", ws.ID)
 		}
-		return ws.LastSnapshot, nil
+		format, err := proto.NormalizeArtifactFormat(ws.LastSnapshotFormat)
+		return ws.LastSnapshot, format, err
 	default:
-		return "", proto.Err(proto.CodeConflict, "workspace %s is %s; fork needs claimed or paused", ws.ID, ws.State)
+		return "", "", proto.Err(proto.CodeConflict, "workspace %s is %s; fork needs claimed or paused", ws.ID, ws.State)
 	}
 }
 

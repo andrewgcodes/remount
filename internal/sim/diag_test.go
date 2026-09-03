@@ -217,7 +217,7 @@ func TestDeepVerifyDetectsCorruptedArtifact(t *testing.T) {
 	if !ok {
 		t.Fatalf("corruption not detected: %+v", d.Findings)
 	}
-	if dig.Severity != "error" || dig.Subject != snap.Artifact {
+	if dig.Severity != "error" || dig.Subject != "local/"+snap.Artifact {
 		t.Fatalf("wrong finding: %+v", dig)
 	}
 	if !strings.Contains(by["artifact.verified"].Detail, "1 damaged") {

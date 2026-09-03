@@ -26,9 +26,10 @@ func (h HandlerFunc) HandleFrame(ctx context.Context, p *Peer, f *proto.Frame) {
 // Conn. It owns the read loop. When the Conn fails every pending request is
 // failed with ErrClosed; the owner decides whether to redial.
 type Peer struct {
-	conn    Conn
-	handler Handler
-	nextID  atomic.Uint64
+	conn            Conn
+	handler         Handler
+	nextID          atomic.Uint64
+	controllerEpoch atomic.Uint64
 
 	mu      sync.Mutex
 	pending map[uint64]pendingRequest
@@ -43,6 +44,14 @@ type Peer struct {
 
 	writeTimeout time.Duration
 }
+
+// SetControllerEpoch makes every later frame sent by this peer carry epoch
+// and rejects responses from a superseded controller before a caller can act
+// on them. It is called only after a controller-epoch hello is accepted.
+func (p *Peer) SetControllerEpoch(epoch uint64) { p.controllerEpoch.Store(epoch) }
+
+// ControllerEpoch returns the epoch currently attached to outbound frames.
+func (p *Peer) ControllerEpoch() uint64 { return p.controllerEpoch.Load() }
 
 type pendingRequest struct {
 	from string
@@ -83,6 +92,13 @@ func (p *Peer) readLoop() {
 		f, err = p.conn.Recv(ctx)
 		if err != nil {
 			break
+		}
+		if expected := p.controllerEpoch.Load(); expected > 0 && f.ControllerEpoch < expected {
+			if f.T == proto.KindRes {
+				f = &proto.Frame{V: proto.Version, T: proto.KindRes, ID: f.ID, From: f.From, To: f.To, Op: f.Op,
+					ControllerEpoch: f.ControllerEpoch,
+					Err:             proto.Err(proto.CodeConflict, "stale controller epoch %d; node requires at least %d", f.ControllerEpoch, expected)}
+			}
 		}
 		switch f.T {
 		case proto.KindRes, proto.KindPong:
@@ -150,6 +166,11 @@ func (p *Peer) Send(ctx context.Context, f *proto.Frame) error {
 	p.mu.Unlock()
 	if closed {
 		return ErrClosed
+	}
+	if epoch := p.controllerEpoch.Load(); epoch > 0 && f.ControllerEpoch == 0 {
+		copyFrame := *f
+		copyFrame.ControllerEpoch = epoch
+		f = &copyFrame
 	}
 	if p.writeTimeout > 0 {
 		var cancel context.CancelFunc

@@ -137,7 +137,7 @@ func TestLocalDirectoryRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rc, err := c.DownloadArtifact(ctx, snap.Artifact)
+	rc, err := c.DownloadSnapshot(ctx, snap.Artifact, snap.Format)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestLocalDirectoryRoundTrip(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dst, "main.go")); err != nil {
 		t.Fatal(err)
 	}
-	rc, err = c.DownloadArtifact(ctx, snap.Artifact)
+	rc, err = c.DownloadSnapshot(ctx, snap.Artifact, snap.Format)
 	if err != nil {
 		t.Fatal(err)
 	}

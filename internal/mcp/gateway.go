@@ -376,6 +376,51 @@ func (g *ClientGateway) invokeProtocol(ctx context.Context, op string, raw json.
 			return nil, err
 		}
 		return emptyResult(g.Client.RemoveBase(ctx, req.Name, operationOption(req.IdempotencyKey)...))
+	case proto.OpVolumeCreate:
+		req, err := decode[proto.VolumeCreateReq](raw)
+		if err != nil {
+			return nil, err
+		}
+		return g.Client.CreateVolume(ctx, req, operationOption(req.IdempotencyKey)...)
+	case proto.OpVolumeGet:
+		req, err := decode[proto.VolumeGetReq](raw)
+		if err != nil {
+			return nil, err
+		}
+		return g.Client.GetVolume(ctx, req.ID)
+	case proto.OpVolumeList:
+		items, err := g.Client.ListVolumes(ctx)
+		return proto.VolumeListRes{Volumes: items}, err
+	case proto.OpVolumeRemove:
+		req, err := decode[proto.VolumeRemoveReq](raw)
+		if err != nil {
+			return nil, err
+		}
+		return emptyResult(g.Client.RemoveVolume(ctx, req.ID, operationOption(req.IdempotencyKey)...))
+	case proto.OpVolumePublish:
+		req, err := decode[proto.VolumePublishPathReq](raw)
+		if err != nil {
+			return nil, err
+		}
+		return g.Client.PublishVolumePath(ctx, req.WS, req.Path, req.Volume, req.ExpectedVersion, operationOption(req.IdempotencyKey)...)
+	case proto.OpVolumeAttach:
+		req, err := decode[proto.VolumeAttachReq](raw)
+		if err != nil {
+			return nil, err
+		}
+		return g.Client.AttachVolume(ctx, req, operationOption(req.IdempotencyKey)...)
+	case proto.OpVolumeDetach:
+		req, err := decode[proto.VolumeDetachReq](raw)
+		if err != nil {
+			return nil, err
+		}
+		return g.Client.DetachVolume(ctx, req, operationOption(req.IdempotencyKey)...)
+	case proto.OpVolumeArchive:
+		req, err := decode[proto.VolumeArchiveReq](raw)
+		if err != nil {
+			return nil, err
+		}
+		return g.Client.ArchiveVolumeWithUpload(ctx, req.WS, req.Path, req.Upload, operationOption(req.IdempotencyKey)...)
 	case proto.OpPoolCreate:
 		req, err := decode[proto.PoolCreateReq](raw)
 		if err != nil {

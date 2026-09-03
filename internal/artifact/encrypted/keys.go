@@ -517,6 +517,11 @@ func (p *DirectoryKeyProvider) listTenants() ([]string, error) {
 	return tenants, nil
 }
 
+// Tenants returns every tenant with durable wrapped-key metadata.
+func (p *DirectoryKeyProvider) Tenants(_ context.Context) ([]string, error) {
+	return p.listTenants()
+}
+
 func (p *DirectoryKeyProvider) readCurrent(tenant string) (string, error) {
 	body, err := readBoundedFile(filepath.Join(p.tenantDir(tenant), "current"), 256)
 	if err != nil {

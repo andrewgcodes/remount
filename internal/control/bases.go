@@ -28,7 +28,7 @@ type mutationBaseResult struct {
 // workspace; the base's originating workspace, if any, is only payload.
 func (c *Control) baseEvent(typ string, base *proto.Base, principal string) *proto.Event {
 	e := c.newEvent(typ, base.Name, principal, "", map[string]any{
-		"name": base.Name, "artifact": base.Artifact, "workspace": base.Workspace, "bytes": base.Bytes,
+		"name": base.Name, "artifact": base.Artifact, "format": base.Format, "workspace": base.Workspace, "bytes": base.Bytes,
 	})
 	e.Tenant = base.Tenant
 	return e
@@ -56,15 +56,17 @@ func (c *Control) baseCreate(ctx context.Context, subject Subject, req *proto.Ba
 	} else if hit {
 		return c.baseGet(subject.Tenant, prior.Name)
 	}
-	if c.opts.Artifacts == nil {
+	store, err := c.artifactStoreForTenant(subject.Tenant)
+	if err != nil {
 		return nil, proto.Err(proto.CodeUnsupported, "artifact store is unavailable")
 	}
 	// Verify before taking c.mu: this re-hashes the blob and must not stall
 	// every other control operation.
-	if err := c.opts.Artifacts.Verify(req.Artifact); err != nil {
+	format, objects, err := c.resolveSnapshotArtifact(ctx, subject.Tenant, req.Artifact, req.Format)
+	if err != nil {
 		return nil, proto.Err(proto.CodeNotFound, "base artifact %q is unavailable: %v", req.Artifact, err)
 	}
-	r, size, err := c.opts.Artifacts.Open(req.Artifact)
+	r, size, err := store.Open(req.Artifact)
 	if err != nil {
 		return nil, proto.Err(proto.CodeNotFound, "base artifact %q is unavailable: %v", req.Artifact, err)
 	}
@@ -90,7 +92,7 @@ func (c *Control) baseCreate(ctx context.Context, subject Subject, req *proto.Ba
 		return nil, proto.Err(proto.CodeResourceExhausted, "tenant base limit %d reached", limit)
 	}
 	base := &proto.Base{
-		Name: req.Name, Tenant: subject.Tenant, Owner: subject.ID, Artifact: req.Artifact,
+		Name: req.Name, Tenant: subject.Tenant, Owner: subject.ID, Artifact: req.Artifact, Format: format, Objects: objects,
 		Workspace: req.Workspace, Bytes: size, CreatedAt: c.now().UnixMilli(),
 	}
 	err = c.transact(func(tx *eventlog.Tx) error {

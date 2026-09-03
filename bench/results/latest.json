@@ -1,0 +1,108 @@
+{
+  "commit": "0bb21377a1ae242ac482d7efe51a3ee95a8edc69",
+  "count": 3,
+  "dirty": true,
+  "host": "Darwin arm64 / arm / Python 3.14.5",
+  "iterations": 2,
+  "measured_at": "2026-09-03T19:31:01.260083+00:00",
+  "microbenchmarks": {
+    "BenchmarkBrokerAllowedRoundTrip": {
+      "B_per_op": 56788.0,
+      "allocs_per_op": 196.0,
+      "ns_per_op": 256375.0,
+      "samples": 3
+    },
+    "BenchmarkChunkedSnapshotDelta4KiBOf8MiB": {
+      "dedupe_ratio": 99.26,
+      "ns_per_op": 33175626.0,
+      "samples": 3,
+      "upload_B_per_op": 84515.0
+    },
+    "BenchmarkChunkedSnapshotFull8MiB": {
+      "ns_per_op": 979136354.0,
+      "samples": 3,
+      "upload_B_per_op": 8399182.0
+    },
+    "BenchmarkDirectTLSRoundTrip": {
+      "B_per_op": 16888.0,
+      "allocs_per_op": 91.0,
+      "ns_per_op": 189208.0,
+      "samples": 3
+    }
+  },
+  "move_matrix": {
+    "backend": "process",
+    "commit": "0bb21377a1ae242ac482d7efe51a3ee95a8edc69",
+    "dirty": true,
+    "host": "Darwin arm64 / Python 3.14.5",
+    "measured_at": "2026-09-03T19:29:51Z",
+    "node_a": "n_bench_a",
+    "node_b": "n_bench_b",
+    "results": [
+      {
+        "bytes": 1048576,
+        "p50_seconds": 0.18768783297855407,
+        "p99_seconds": 0.2512834588997066,
+        "samples_seconds": [
+          0.2512834588997066,
+          0.1861184169538319,
+          0.18768783297855407
+        ]
+      },
+      {
+        "bytes": 104857600,
+        "p50_seconds": 0.6633943330962211,
+        "p99_seconds": 0.7059179591014981,
+        "samples_seconds": [
+          0.7059179591014981,
+          0.5399658330716193,
+          0.6633943330962211
+        ]
+      },
+      {
+        "bytes": 524288000,
+        "p50_seconds": 2.733284208108671,
+        "p99_seconds": 3.3078799169743434,
+        "samples_seconds": [
+          3.3078799169743434,
+          2.733284208108671,
+          2.693406124948524
+        ]
+      }
+    ],
+    "schema": 1
+  },
+  "scenarios": {
+    "move_then_node_loss_recovery": {
+      "p50_seconds": 3.21,
+      "p99_seconds": 3.23,
+      "samples": 3
+    },
+    "reconnect_mid_stream": {
+      "p50_seconds": 0.52,
+      "p99_seconds": 0.54,
+      "samples": 3
+    }
+  },
+  "scale": {
+    "backend": "process",
+    "clients": 200,
+    "commit": "8d5304ec173b376f0abd4f37a3e5b3ceceb2ecc1",
+    "control_restart_seconds": 0.23354575,
+    "dirty": true,
+    "host": "Darwin arm64 / Go 1.27.1",
+    "latency_seconds": {
+      "claim": {"p50": 0.515984167, "p99": 6.93777275, "samples": 2000},
+      "exec_round_trip": {"p50": 3.245126, "p99": 3.287465333, "samples": 200},
+      "move": {"p50": 6.694579458, "p99": 8.196249042, "samples": 200},
+      "reattach_after_control_restart": {"p50": 5.686196333, "p99": 5.704838333, "samples": 200}
+    },
+    "measured_at": "2026-09-03T21:50:00-07:00",
+    "nodes": 200,
+    "reconnect_peers": 400,
+    "schema": 1,
+    "test": "go test ./internal/sim -run ^TestHandoffScaleAndControlFailover$ -count=1 -v -timeout=15m",
+    "workspaces": 2000
+  },
+  "schema": 1
+}
