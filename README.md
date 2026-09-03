@@ -186,6 +186,14 @@ append-only event log is the durable audit and observation record.
 | `remount fleet quarantine ...` | durably fence, checkpoint, stop or destroy an incident scope |
 | `remount status` / `inspect` / `doctor` / `metrics` | inspect health and capacity |
 
+Sessions belong to the node, not to the terminal that started them. Ctrl-C in
+`exec`, `sh` or `attach` detaches and prints the `remount attach WS SID`
+command that picks the process back up; pass `--kill-on-interrupt` to send
+SIGINT to the remote process instead (a second Ctrl-C still detaches).
+`exec --timeout D` is enforced server-side by the node and has no client-side
+ceiling; `0` (the default) means no timeout. Long-running work is
+`exec ... ` + Ctrl-C (or a closed laptop) + `attach --from N`.
+
 ## Go SDK
 
 Applications import the supported public packages, not `internal/`:

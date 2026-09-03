@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"flag"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/proto"
 )
 
@@ -146,6 +152,136 @@ func TestGlobalFlagsAcceptedBeforeCommand(t *testing.T) {
 	err = run(context.Background(), []string{"--json", "server"})
 	if err == nil || !strings.Contains(err.Error(), "does not accept --json") {
 		t.Fatalf("server should refuse client globals: %v", err)
+	}
+}
+
+// fakeSession stands in for client.Session so drive's interrupt handling can
+// be exercised without a node.
+type fakeSession struct {
+	chunks  chan client.Chunk
+	mu      sync.Mutex
+	signals []string
+	closed  *bool // kill flag of the Close call, nil if never closed
+	exit    *proto.ExitInfo
+}
+
+func newFakeSession() *fakeSession { return &fakeSession{chunks: make(chan client.Chunk, 16)} }
+
+func (f *fakeSession) Chunks() <-chan client.Chunk { return f.chunks }
+func (f *fakeSession) Exit() *proto.ExitInfo {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.exit
+}
+func (f *fakeSession) Input(context.Context, []byte, bool) error { return nil }
+func (f *fakeSession) Resize(context.Context, uint16, uint16) error {
+	return nil
+}
+func (f *fakeSession) Signal(_ context.Context, sig string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.signals = append(f.signals, sig)
+	return nil
+}
+func (f *fakeSession) Close(_ context.Context, kill bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = &kill
+	return nil
+}
+func (f *fakeSession) finish(code int) {
+	f.mu.Lock()
+	f.exit = &proto.ExitInfo{Code: code}
+	f.mu.Unlock()
+	close(f.chunks)
+}
+
+func TestDriveInterruptDetachesByDefault(t *testing.T) {
+	s := newFakeSession()
+	s.chunks <- client.Chunk{Stream: proto.StreamStdout, Data: []byte("building...\n")}
+	interrupts := make(chan os.Signal, 1)
+	var stdout, stderr bytes.Buffer
+	interrupts <- os.Interrupt
+	err := drive(context.Background(), s, driveOptions{
+		WS: "ws_1", Session: "s_1", stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, interrupts: interrupts,
+	})
+	if err != nil {
+		t.Fatalf("detach should not be an error: %v", err)
+	}
+	if s.closed == nil || *s.closed {
+		t.Fatalf("expected Close(kill=false), got %v", s.closed)
+	}
+	if len(s.signals) != 0 {
+		t.Fatalf("no signal should reach the remote process: %v", s.signals)
+	}
+	if !strings.Contains(stderr.String(), "reattach with: remount attach ws_1 s_1") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "building...") {
+		t.Fatalf("output before interrupt lost: %q", stdout.String())
+	}
+}
+
+func TestDriveKillOnInterruptForwardsSIGINTThenDetaches(t *testing.T) {
+	s := newFakeSession()
+	interrupts := make(chan os.Signal, 2)
+	var stderr bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- drive(context.Background(), s, driveOptions{
+			WS: "ws_1", Session: "s_1", KillOnInterrupt: true,
+			stdin: strings.NewReader(""), stdout: io.Discard, stderr: &stderr, interrupts: interrupts,
+		})
+	}()
+	interrupts <- os.Interrupt
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.mu.Lock()
+		n := len(s.signals)
+		s.mu.Unlock()
+		if n == 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if s.signals[0] != "INT" {
+		t.Fatalf("signals=%v", s.signals)
+	}
+	// The process honours SIGINT; the CLI reports its exit code.
+	s.finish(130)
+	err := <-done
+	var ee exitError
+	if !errors.As(err, &ee) || int(ee) != 130 {
+		t.Fatalf("expected exit 130, got %v", err)
+	}
+	if s.closed != nil {
+		t.Fatal("a process that exits must not also be detached")
+	}
+
+	// A process that ignores SIGINT must not trap the operator: the second
+	// Ctrl-C detaches.
+	s2 := newFakeSession()
+	interrupts2 := make(chan os.Signal, 2)
+	interrupts2 <- os.Interrupt
+	interrupts2 <- os.Interrupt
+	err = drive(context.Background(), s2, driveOptions{
+		WS: "ws_1", Session: "s_2", KillOnInterrupt: true,
+		stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard, interrupts: interrupts2,
+	})
+	if err != nil || len(s2.signals) != 1 || s2.closed == nil || *s2.closed {
+		t.Fatalf("err=%v signals=%v closed=%v", err, s2.signals, s2.closed)
+	}
+}
+
+func TestExecTimeoutIsNotClamped(t *testing.T) {
+	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
+	timeout := fs.Duration("timeout", 0, "")
+	parse(fs, []string{"ws_1", "--timeout", "6h", "--", "sleep", "1"})
+	if int64(timeout.Seconds()) != 6*3600 {
+		t.Fatalf("timeout=%v", *timeout)
+	}
+	if fs.NArg() != 4 || fs.Arg(1) != "--" {
+		t.Fatalf("args=%v", fs.Args())
 	}
 }
 
