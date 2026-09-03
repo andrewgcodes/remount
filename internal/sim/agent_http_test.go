@@ -308,6 +308,13 @@ func TestAgentHTTPAuthAndLifecycle(t *testing.T) {
 	if res := api.do(ctx, "GET", fmt.Sprintf("/v1/agents/%s/transcript?from=%d&limit=5", a.ID, idle.TranscriptNext-2), nil, nil); res.status != 200 || !bytes.Contains(res.body, []byte(`"index":`+fmt.Sprint(idle.TranscriptNext-2))) {
 		t.Fatalf("partial page: %d %s", res.status, res.body)
 	}
+	// A reconnecting EventSource resends its original ?from together with
+	// Last-Event-ID; the header is the newer cursor and wins, or every
+	// reconnect replays from the start.
+	if res := api.do(ctx, "GET", "/v1/agents/"+a.ID+"/transcript?from=0&limit=1", nil, map[string]string{"Last-Event-ID": fmt.Sprint(idle.TranscriptNext - 1)}); res.status != 200 ||
+		!bytes.Contains(res.body, []byte(`"index":`+fmt.Sprint(idle.TranscriptNext-1))) || bytes.Contains(res.body, []byte(`"index":0,`)) {
+		t.Fatalf("Last-Event-ID did not win over ?from: %d %s", res.status, res.body)
+	}
 
 	// SSE resumes from Last-Event-ID and pushes new records as a follow-up
 	// turn happens; the second turn is sent while the stream is open.
@@ -407,8 +414,10 @@ func TestAgentHTTPAuthAndLifecycle(t *testing.T) {
 	_ = term.Close(websocket.StatusNormalClosure, "")
 	termCancel()
 
-	// A browser session cookie authenticates reads and the preview proxy,
-	// never a mutation.
+	// A browser session cookie authenticates the preview proxy and the
+	// stable link only: preview content is same-origin and untrusted, so a
+	// cookie honoured on any route that reads or executes in a workspace
+	// would let one workspace's page act on every agent.
 	sess := api.json(ctx, "POST", "/v1/session", nil, nil, 204, nil)
 	var cookie string
 	for _, c := range (&http.Response{Header: sess.header}).Cookies() {
@@ -424,30 +433,51 @@ func TestAgentHTTPAuthAndLifecycle(t *testing.T) {
 	}
 	viaCookie := w.api("")
 	cookieHdr := map[string]string{"Cookie": "remount_session=" + cookie}
-	if res := viaCookie.do(ctx, "GET", "/v1/agents/"+a.ID, nil, cookieHdr); res.status != 200 {
-		t.Fatalf("cookie read = %d %s", res.status, res.body)
+	if res := viaCookie.do(ctx, "GET", "/a/"+a.ID, nil, cookieHdr); res.status != 200 || !bytes.Contains(res.body, []byte(a.ID)) {
+		t.Fatalf("cookie stable link = %d %s", res.status, res.body)
 	}
-	if res := viaCookie.do(ctx, "POST", "/v1/agents/"+a.ID+"/messages", map[string]any{"text": "x"}, cookieHdr); res.status != 401 {
-		t.Fatalf("cookie mutation = %d %s", res.status, res.body)
+	for _, c := range []struct{ method, path string }{
+		{"GET", "/v1/agents"},
+		{"GET", "/v1/agents/" + a.ID},
+		{"GET", "/v1/agents/" + a.ID + "/transcript"},
+		{"GET", "/v1/agents/" + a.ID + "/approvals"},
+		{"GET", "/v1/agents/" + a.ID + "/diff?wake=true"},
+		{"GET", "/v1/agents/" + a.ID + "/fs/notes/hello.txt"},
+		{"GET", "/v1/agents/" + a.ID + "/fs/"},
+		{"POST", "/v1/agents/" + a.ID + "/messages"},
+		{"PUT", "/v1/agents/" + a.ID + "/fs/x"},
+	} {
+		var body any
+		if c.method != "GET" {
+			body = map[string]any{"text": "x"}
+		}
+		if res := viaCookie.do(ctx, c.method, c.path, body, cookieHdr); res.status != 401 || errorCode(t, res) != proto.CodeUnauthorized {
+			t.Fatalf("cookie-only %s %s = %d %s", c.method, c.path, res.status, res.body)
+		}
 	}
-	if res := viaCookie.do(ctx, "PUT", "/v1/agents/"+a.ID+"/fs/x", "x", cookieHdr); res.status != 401 {
-		t.Fatalf("cookie fs write = %d %s", res.status, res.body)
+	// The terminal upgrade is the code-execution route; a cookie handshake
+	// is refused before any program starts.
+	if _, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(w.http.URL, "http")+"/v1/agents/"+a.ID+"/terminal", &websocket.DialOptions{HTTPHeader: http.Header{"Cookie": {"remount_session=" + cookie}}}); err == nil || resp == nil || resp.StatusCode != 401 {
+		t.Fatalf("cookie terminal accepted: err=%v", err)
+	}
+	if _, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(w.http.URL, "http")+"/v1/agents/"+a.ID+"/transcript", &websocket.DialOptions{HTTPHeader: http.Header{"Cookie": {"remount_session=" + cookie}}}); err == nil || resp == nil || resp.StatusCode != 401 {
+		t.Fatalf("cookie transcript ws accepted: err=%v", err)
 	}
 	crossSite := map[string]string{"Cookie": "remount_session=" + cookie, "Origin": "https://evil.example"}
-	if res := viaCookie.do(ctx, "GET", "/v1/agents/"+a.ID, nil, crossSite); res.status != 403 {
+	if res := viaCookie.do(ctx, "GET", "/a/"+a.ID, nil, crossSite); res.status != 403 {
 		t.Fatalf("cross-site cookie read = %d %s", res.status, res.body)
 	}
 	sameSite := map[string]string{"Cookie": "remount_session=" + cookie, "Origin": "https://ui.example"}
-	if res := viaCookie.do(ctx, "GET", "/v1/agents/"+a.ID, nil, sameSite); res.status != 200 {
+	if res := viaCookie.do(ctx, "GET", "/a/"+a.ID, nil, sameSite); res.status != 200 {
 		t.Fatalf("listed-origin cookie read = %d %s", res.status, res.body)
 	}
 
 	// Preview proxy: a program listening inside the workspace answers under
 	// /v1/agents/{id}/ports/{port}/ with the prefix it is mounted at and
 	// without ever seeing the API credential.
-	var gotAuth, gotCookie, gotPrefix, gotPath string
+	var gotAuth, gotCookie, gotPrefix, gotPath, gotProto string
 	up := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		gotAuth, gotCookie, gotPrefix, gotPath = r.Header.Get("Authorization"), r.Header.Get("Cookie"), r.Header.Get("X-Forwarded-Prefix"), r.URL.RequestURI()
+		gotAuth, gotCookie, gotPrefix, gotPath, gotProto = r.Header.Get("Authorization"), r.Header.Get("Cookie"), r.Header.Get("X-Forwarded-Prefix"), r.URL.RequestURI(), r.Header.Get("Sec-WebSocket-Protocol")
 		rw.Header().Set("X-Upstream", "yes")
 		fmt.Fprint(rw, "preview body")
 	}))
@@ -466,6 +496,14 @@ func TestAgentHTTPAuthAndLifecycle(t *testing.T) {
 	}
 	if res := w.api("").do(ctx, "GET", prefix+"/", nil, nil); res.status != 401 {
 		t.Fatalf("unauthenticated preview = %d", res.status)
+	}
+	// A browser WebSocket through the proxy carries the credential as a
+	// subprotocol; that token is stripped like the header and the program's
+	// own subprotocols pass.
+	bearerProto := "remount.bearer." + base64.RawURLEncoding.EncodeToString([]byte("tok"))
+	pv = w.api("").do(ctx, "GET", prefix+"/ws", nil, map[string]string{"Sec-WebSocket-Protocol": bearerProto + ", chat, " + bearerProto})
+	if pv.status != 200 || gotProto != "chat" || gotAuth != "" {
+		t.Fatalf("subprotocol preview = %d upstream proto=%q auth=%q", pv.status, gotProto, gotAuth)
 	}
 	if res := api.do(ctx, "GET", "/v1/agents/"+a.ID+"/ports/1/", nil, nil); res.status != 503 || errorCode(t, res) != proto.CodeUnreachable {
 		t.Fatalf("closed port = %d %s", res.status, res.body)

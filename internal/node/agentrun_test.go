@@ -121,6 +121,17 @@ func fakeACPConfig(mode string) acptest.Config {
 			os.Exit(7)
 			return "", nil
 		}
+	case "trailer":
+		// Ends the turn, then writes one more frame and exits at once: the
+		// frame is in the pipe when the process is gone.
+		cfg.Turn = func(ctx context.Context, s *acptest.Session, req acp.PromptRequest) (acp.StopReason, error) {
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				_ = s.Text("trailing-frame-after-the-turn")
+				os.Exit(0)
+			}()
+			return acp.StopReasonEndTurn, nil
+		}
 	case "load":
 		cfg.Capabilities = acp.AgentCapabilities{LoadSession: true}
 		cfg.Rewind = func(ctx context.Context, s *acptest.Session, req acp.LoadSessionRequest) error {
@@ -128,6 +139,18 @@ func fakeACPConfig(mode string) acptest.Config {
 		}
 	case "resume":
 		cfg.Capabilities = acp.AgentCapabilities{SessionCapabilities: &acp.SessionCapabilities{Resume: &acp.SessionResumeCapabilities{}}}
+	case "leakvalues":
+		cfg.Turn = func(ctx context.Context, s *acptest.Session, req acp.PromptRequest) (acp.StopReason, error) {
+			// Values alone, no names: nothing for the shape patterns to key
+			// on, so only a literal the redactor was told about is caught.
+			var values []string
+			for _, kv := range os.Environ() {
+				if _, v, ok := strings.Cut(kv, "="); ok {
+					values = append(values, v)
+				}
+			}
+			return acp.StopReasonEndTurn, s.Text("values:" + strings.Join(values, " "))
+		}
 	case "leak":
 		cfg.Turn = func(ctx context.Context, s *acptest.Session, req acp.PromptRequest) (acp.StopReason, error) {
 			// A careless harness: echoes its whole environment and the env
@@ -522,11 +545,31 @@ func TestAgentRunHarnessCrashKeepsMessage(t *testing.T) {
 	}
 	f.waitDone(t)
 	f.n.mu.Lock()
-	done := f.n.agentRunsDone[agentRunKey("ag_1", "run_crash")]
+	_, done := f.n.agentRunsDone[agentRunKey("ag_1", "run_crash")]
 	f.n.mu.Unlock()
 	if !done {
 		t.Fatal("crashed run not remembered as finished")
 	}
+}
+
+func TestAgentRunTrailingFrameReachesTranscript(t *testing.T) {
+	f := newAgentFixture(t)
+	f.start(t, "trailer", "go")
+	started := f.next(t, proto.AgentReportStarted)
+	f.next(t, proto.AgentReportTurnFinished)
+	fin := f.next(t, proto.AgentReportFinished)
+	if fin.Cancelled || fin.ExitCode != 0 {
+		t.Fatalf("finished = %+v", fin)
+	}
+	f.waitDone(t)
+	if tr := f.transcript(t, started.Transcript); !bytes.Contains(tr, []byte("trailing-frame-after-the-turn")) {
+		t.Fatalf("frame written just before exit is missing from the transcript: %s", tr)
+	}
+	s, ok := f.n.sessions.Get(started.Transcript)
+	if !ok {
+		t.Fatal("transcript gone")
+	}
+	f.assertMirrored(t, s)
 }
 
 func TestAgentRunTranscriptRedactsSecrets(t *testing.T) {
@@ -726,5 +769,211 @@ func TestAgentRunInstallFailureFailsTheRun(t *testing.T) {
 	f.waitDone(t)
 	if _, err := f.w.handle.FS().Read(".remount/launch/inst.installed", 0, 0); err == nil {
 		t.Fatal("a failed install left a marker")
+	}
+}
+
+// envRewritingHandle behaves like the docker backend's Prepare: the
+// workspace's variables move out of spec.Env into the command line, and
+// spec.Env becomes the host environment the container CLI itself needs.
+type envRewritingHandle struct {
+	workspace.Handle
+}
+
+func (h envRewritingHandle) Prepare(spec *session.Spec) error {
+	if err := h.Handle.Prepare(spec); err != nil {
+		return err
+	}
+	spec.Program = append(append([]string{"/usr/bin/env"}, spec.Env...), spec.Program...)
+	spec.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
+	return nil
+}
+
+// The redactor learns the workspace's secrets from the environment the
+// workspace declared, not from whatever the backend hands the host after it
+// rewrote the spec. With the docker shape of Prepare the old order saw only
+// the host environment and let a workspace token through.
+func TestAgentRunRedactsWorkspaceEnvWhenBackendRewritesSpec(t *testing.T) {
+	f := newAgentFixture(t)
+	f.n.mu.Lock()
+	f.w.handle = envRewritingHandle{f.w.handle}
+	f.n.mu.Unlock()
+	req := f.start(t, "leakvalues", "echo the environment")
+	started := f.next(t, proto.AgentReportStarted)
+	f.next(t, proto.AgentReportTurnFinished)
+	tr := f.transcript(t, started.Transcript)
+	if !bytes.Contains(tr, []byte("values:")) || !bytes.Contains(tr, []byte(redactedMark)) {
+		t.Fatalf("the harness did not echo its environment, or nothing was redacted: %s", tr)
+	}
+	if bytes.Contains(tr, []byte("tok-canary-from-workspace-env-9f8e7d")) {
+		t.Fatalf("transcript leaks the workspace token after a backend env rewrite: %s", tr)
+	}
+	_ = f.n.agentRunCancel(&proto.AgentRunCancelReq{Agent: req.Agent, Run: req.Run})
+	f.next(t, proto.AgentReportFinished)
+	f.waitDone(t)
+}
+
+// A report the control plane refuses as not authoritative (the run row is
+// closed, the agent is gone, the workspace moved) stops the harness: it
+// would otherwise keep working, with brokered credentials, on a run nobody
+// accounts for. A finished report refused the same way is simply dropped.
+func TestAgentRunStopsWhenControlPlaneDisownsIt(t *testing.T) {
+	f := newAgentFixture(t)
+	inner := f.n.agentReportSink
+	f.n.agentReportSink = func(ctx context.Context, rep *proto.AgentReport) error {
+		if rep.Kind == proto.AgentReportTurnStarted {
+			return proto.Err(proto.CodeConflict, "run is finished; report is not authoritative")
+		}
+		return inner(ctx, rep)
+	}
+	req := f.start(t, "hang", "work forever")
+	fin := f.next(t, proto.AgentReportFinished)
+	if !fin.Cancelled {
+		t.Fatalf("finished after disown = %+v", fin)
+	}
+	f.waitDone(t)
+	f.n.mu.Lock()
+	_, done := f.n.agentRunsDone[agentRunKey(req.Agent, req.Run)]
+	f.n.mu.Unlock()
+	if !done {
+		t.Fatal("disowned run not remembered as finished")
+	}
+}
+
+// A newer run for an agent whose older run is still live here is refused,
+// and the older run is cancelled: the control plane closed it without the
+// node hearing, so the retry of the launch finds the harness gone.
+func TestAgentRunSupersedesOlderLiveRun(t *testing.T) {
+	f := newAgentFixture(t)
+	req := f.start(t, "hang", "work forever")
+	f.next(t, proto.AgentReportTurnStarted)
+	newer := req
+	newer.Run = "run_newer"
+	newer.Attempt = 2
+	_, err := f.n.agentRunStart(context.Background(), nil, &newer)
+	var pe *proto.Error
+	if !errorsAs(err, &pe) || pe.Code != proto.CodeConflict {
+		t.Fatalf("newer run while older is live: err = %v, want conflict", err)
+	}
+	fin := f.next(t, proto.AgentReportFinished)
+	if fin.Run != req.Run || !fin.Cancelled {
+		t.Fatalf("older run after supersede = %+v", fin)
+	}
+	f.waitDone(t)
+	if _, err := f.n.agentRunStart(context.Background(), nil, &newer); err != nil {
+		t.Fatalf("retry of the newer run after the older stopped: %v", err)
+	}
+	if got := f.next(t, proto.AgentReportStarted); got.Run != newer.Run {
+		t.Fatalf("started %s, want %s", got.Run, newer.Run)
+	}
+	_ = f.n.agentRunCancel(&proto.AgentRunCancelReq{Agent: newer.Agent, Run: newer.Run})
+	f.next(t, proto.AgentReportFinished)
+	f.waitDone(t)
+}
+
+func errorsAs(err error, target **proto.Error) bool {
+	for err != nil {
+		if pe, ok := err.(*proto.Error); ok {
+			*target = pe
+			return true
+		}
+		u, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		err = u.Unwrap()
+	}
+	return false
+}
+
+// The per-run report queue is bounded. Past the bound the oldest transcript
+// report behind the in-flight head is dropped; lifecycle reports and the
+// head never are. The loss is reported as a gap chunk placed where the
+// dropped records were, so the mirror stays in seq order and shows the hole.
+func TestAgentReporterBoundsQueueAndPlacesGapInOrder(t *testing.T) {
+	r := &agentReporter{run: &agentRun{req: proto.AgentRunReq{Agent: "ag", Run: "run", WS: "ws", Gen: 1}}, kick: make(chan struct{}, 1)}
+	transcript := func(seq uint64) *proto.AgentReport {
+		return &proto.AgentReport{Kind: proto.AgentReportTranscript, Chunks: []proto.TranscriptChunk{{Seq: seq, Stream: proto.StreamACPOut, Data: []byte("x")}}}
+	}
+	r.mu.Lock()
+	r.enqueueLocked(&proto.AgentReport{Kind: proto.AgentReportStarted}) // head, in flight
+	for seq := uint64(1); seq <= uint64(agentReportQueueMax)+9; seq++ {
+		if seq == 5 {
+			r.enqueueLocked(&proto.AgentReport{Kind: proto.AgentReportTurnStarted})
+		}
+		r.enqueueLocked(transcript(seq))
+	}
+	q := append([]*proto.AgentReport(nil), r.q...)
+	pending := r.gap
+	r.mu.Unlock()
+	if len(q) != agentReportQueueMax {
+		t.Fatalf("queue length = %d, want %d", len(q), agentReportQueueMax)
+	}
+	if q[0].Kind != proto.AgentReportStarted || q[1].Kind != proto.AgentReportTurnStarted {
+		t.Fatalf("head or lifecycle report dropped: %s, %s", q[0].Kind, q[1].Kind)
+	}
+	if pending != nil {
+		t.Fatalf("gap pending for later flush = %+v, want it placed in the queue", pending)
+	}
+	// Two lifecycle reports plus max+9 transcript reports overflow by 11:
+	// seqs 1..11 were dropped and the first surviving transcript report
+	// opens with one gap covering exactly them.
+	first := q[2]
+	if first.Kind != proto.AgentReportTranscript || len(first.Chunks) != 2 || first.Chunks[0].Stream != proto.StreamGap {
+		t.Fatalf("first surviving transcript report = %+v", first)
+	}
+	var g proto.Gap
+	if err := proto.Unmarshal(first.Chunks[0].Data, &g); err != nil {
+		t.Fatal(err)
+	}
+	if g.From != 1 || g.To != 11 || first.Chunks[1].Seq != 12 {
+		t.Fatalf("gap = %+v before seq %d, want 1..11 before 12", g, first.Chunks[1].Seq)
+	}
+	for i := 3; i < len(q); i++ {
+		for _, ch := range q[i].Chunks {
+			if ch.Stream == proto.StreamGap {
+				t.Fatalf("stray gap chunk in report %d", i)
+			}
+		}
+	}
+	// Bytes: a big transcript report tips the byte bound and the victim is
+	// the newest transcript report, so the gap waits for the next flush.
+	r2 := &agentReporter{run: r.run, kick: make(chan struct{}, 1)}
+	r2.mu.Lock()
+	r2.enqueueLocked(&proto.AgentReport{Kind: proto.AgentReportStarted})
+	big := &proto.AgentReport{Kind: proto.AgentReportTranscript, Chunks: []proto.TranscriptChunk{{Seq: 7, Stream: proto.StreamACPOut, Data: make([]byte, agentReportQueueBytes)}}}
+	r2.enqueueLocked(big)
+	if len(r2.q) != 1 || r2.gap == nil || r2.gap.From != 7 || r2.gap.To != 7 {
+		r2.mu.Unlock()
+		t.Fatalf("after oversize report: len=%d gap=%+v", len(r2.q), r2.gap)
+	}
+	r2.chunks = append(r2.chunks, proto.TranscriptChunk{Seq: 8, Stream: proto.StreamACPOut, Data: []byte("y")})
+	r2.flushChunksLocked()
+	next := r2.q[len(r2.q)-1]
+	r2.mu.Unlock()
+	if len(next.Chunks) != 2 || next.Chunks[0].Stream != proto.StreamGap || next.Chunks[0].Seq != 7 || next.Chunks[1].Seq != 8 {
+		t.Fatalf("flushed report after a pending gap = %+v", next.Chunks)
+	}
+	// A pending gap with no further transcript records still ships, ahead of
+	// the finished report, so a run that ends right after the trim does not
+	// take the hole to its grave.
+	r3 := &agentReporter{run: r.run, kick: make(chan struct{}, 1)}
+	r3.mu.Lock()
+	r3.enqueueLocked(&proto.AgentReport{Kind: proto.AgentReportStarted})
+	r3.enqueueLocked(&proto.AgentReport{Kind: proto.AgentReportTranscript, Chunks: []proto.TranscriptChunk{{Seq: 3, Stream: proto.StreamACPOut, Data: make([]byte, agentReportQueueBytes)}}})
+	r3.mu.Unlock()
+	r3.report(proto.AgentReportFinished, nil)
+	r3.mu.Lock()
+	q3 := append([]*proto.AgentReport(nil), r3.q...)
+	pending3 := r3.gap
+	r3.mu.Unlock()
+	if pending3 != nil || len(q3) != 3 || q3[1].Kind != proto.AgentReportTranscript || q3[2].Kind != proto.AgentReportFinished {
+		kinds := make([]string, len(q3))
+		for i, rep := range q3 {
+			kinds[i] = rep.Kind
+		}
+		t.Fatalf("queue at finish = %v, pending gap = %+v; want started, transcript(gap), finished", kinds, pending3)
+	}
+	if len(q3[1].Chunks) != 1 || q3[1].Chunks[0].Stream != proto.StreamGap || q3[1].Chunks[0].Seq != 3 {
+		t.Fatalf("gap-only transcript report = %+v", q3[1].Chunks)
 	}
 }

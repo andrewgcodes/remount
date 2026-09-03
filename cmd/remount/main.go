@@ -687,6 +687,8 @@ func cmdStandalone(ctx context.Context, args []string) error {
 	backends := fs.String("backend", "process", "backends")
 	var allow listFlag
 	fs.Var(&allow, "allow", "host pattern reachable without a credential")
+	agentUI := fs.String("agent-ui", envOr("REMOUNT_AGENT_UI", ""), "operator UI URL that /a/{id} redirects to; {id} is replaced, else appended")
+	cors := fs.String("cors", envOr("REMOUNT_CORS", ""), "comma-separated browser origins allowed to call the HTTP API; the standalone has no token, so any listed page may act on it")
 	parse(fs, args)
 	b, err := loadBindings(*bindings)
 	if err != nil {
@@ -700,7 +702,10 @@ func cmdStandalone(ctx context.Context, args []string) error {
 	if err := os.MkdirAll(*data, 0o700); err != nil {
 		return fmt.Errorf("--data %s: %w", *data, err)
 	}
-	srv, err := server.New(server.Options{DataDir: filepath.Join(*data, "server"), Bindings: b, Logger: slog.Default(), Mode: server.ModeStandalone})
+	srv, err := server.New(server.Options{
+		DataDir: filepath.Join(*data, "server"), Bindings: b, Logger: slog.Default(), Mode: server.ModeStandalone,
+		AgentURLBase: *agentUI, CORSOrigins: splitList(*cors),
+	})
 	if err != nil {
 		return err
 	}

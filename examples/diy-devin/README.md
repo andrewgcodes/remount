@@ -12,6 +12,9 @@ watch it, answer it, look at its diff, come back tomorrow.
 | `github/remount-issue-agent.yml` | a GitHub Actions workflow: labeling an issue `agent` starts one, every comment is a follow-up, signed with the webhook secret |
 
 ```sh
+# The standalone has no token; --cors names the one page origin allowed to
+# call it from a browser. Use `remount server --token … --cors …` for anything
+# that is not your own laptop.
 go run ./cmd/remount standalone --data ./data --cors http://localhost:8000
 export REMOUNT_SERVER=http://127.0.0.1:7443
 ./examples/diy-devin/remount_agent.py run --recipe codex --repo https://github.com/you/app -- "add a health endpoint"
@@ -26,5 +29,6 @@ continues from a phone.
 
 None of these hold a credential the workspace could see. The token is the
 API bearer; provider keys stay behind the node's broker and the page's cookie
-is `HttpOnly`, minted by `POST /v1/session`, and only ever accepted on safe
-methods and the preview proxy.
+is `HttpOnly`, minted by `POST /v1/session`, and only ever accepted on the
+preview proxy and the `/a/{id}` link, never on a route that reads a file,
+opens a terminal or wakes an agent.

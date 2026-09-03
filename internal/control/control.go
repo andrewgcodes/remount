@@ -213,6 +213,7 @@ type Control struct {
 	transcriptWaiters     map[string]chan struct{}   // agent -> closed when its mirror grows or it ends
 	agentRetry            map[string]time.Time       // agent -> no launch before
 	agentDelivered        map[string]time.Time       // inbox message -> last deliver attempt
+	agentBusy             map[string]struct{}        // agents with reconcile work in flight on a node
 	agentKick             chan struct{}
 	retries               map[string]*materializeRetry // ws -> hold-back after a failed materialization
 	fleetWake             chan struct{}
@@ -357,6 +358,7 @@ func New(opts Options) (*Control, error) {
 		transcriptWaiters:     map[string]chan struct{}{},
 		agentRetry:            map[string]time.Time{},
 		agentDelivered:        map[string]time.Time{},
+		agentBusy:             map[string]struct{}{},
 		agentKick:             make(chan struct{}, 1),
 		retries:               map[string]*materializeRetry{},
 		timerReservationsByWS: map[string]int{},
@@ -1128,8 +1130,12 @@ func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int)
 		delete(c.queues, id)
 	}
 	for _, id := range agentCandidates {
+		if a := c.agents[id]; a != nil {
+			c.dropInboxLocked(a)
+		}
 		delete(c.agents, id)
 		delete(c.agentRetry, id)
+		delete(c.agentBusy, id)
 	}
 	for _, id := range approvalCandidates {
 		delete(c.approvals, id)
@@ -4691,7 +4697,7 @@ func (c *Control) loop() {
 		case <-tick.C:
 			c.Tick(context.Background())
 		case <-c.agentKick:
-			c.agentReconcile(context.Background())
+			c.agentReconcileAsync(c.requestCtx)
 		}
 	}
 }
@@ -4765,7 +4771,7 @@ func (c *Control) Tick(ctx context.Context) {
 		c.fireTimer(ctx, t)
 	}
 	c.offerPending(ctx)
-	c.agentReconcile(ctx)
+	c.agentReconcileAsync(c.requestCtx)
 	c.expireStaleApprovals(ctx)
 }
 

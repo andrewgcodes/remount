@@ -8,6 +8,9 @@
 // Everything here is one route from docs/api.md; the client adds only
 // idempotency keys and cursor-resumable streaming.
 
+/** Why an agent is being woken; the server accepts exactly these. */
+export type WakeBy = "request" | "preview" | "diff";
+
 export type AgentStatus =
   | "creating" | "scheduled" | "running" | "waiting_input" | "idle"
   | "waiting_approval" | "sleeping" | "failed" | "finished" | "destroyed";
@@ -70,7 +73,7 @@ export class Remount {
   }
   cancel(id: string) { return this.call<Agent>("POST", `/v1/agents/${id}/cancel`, undefined, crypto.randomUUID()); }
   sleep(id: string) { return this.call<Agent>("POST", `/v1/agents/${id}/sleep`, undefined, crypto.randomUUID()); }
-  wake(id: string, by = "api") { return this.call<Agent>("POST", `/v1/agents/${id}/wake`, { by }, crypto.randomUUID()); }
+  wake(id: string, by: WakeBy = "request") { return this.call<Agent>("POST", `/v1/agents/${id}/wake`, { by }, crypto.randomUUID()); }
   fork(id: string, req: { name?: string; task?: string; policy?: AgentPolicy } = {}) { return this.call<Agent>("POST", `/v1/agents/${id}/fork`, req, crypto.randomUUID()); }
   destroy(id: string) { return this.call<void>("POST", `/v1/agents/${id}/destroy`, undefined, crypto.randomUUID()); }
   approvals(id: string) { return this.call<{ approvals: Approval[] }>("GET", `/v1/agents/${id}/approvals`); }

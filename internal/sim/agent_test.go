@@ -659,10 +659,12 @@ func TestAgentChildReportsToParent(t *testing.T) {
 	c := w.client("c1")
 	ctx := ctxT(t, 120*time.Second)
 	parent, err := c.CreateAgent(ctx, proto.AgentCreateReq{
-		Name:      "parent",
-		Workspace: &proto.WorkspaceSpec{Name: "parent-ws"},
-		Spec:      proto.AgentSpec{Recipe: "custom", Task: "coordinate", ACPCommand: fakeACPCommand(t, "echo"), Sandbox: "read-only"},
-		Policy:    proto.AgentPolicy{Approve: proto.ApproveNever, MaxTurns: 4},
+		Name: "parent",
+		Workspace: &proto.WorkspaceSpec{Name: "parent-ws", Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
+			ID: "docs", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{"docs.example.com"}, Methods: []string{"GET"},
+		}}}}},
+		Spec:   proto.AgentSpec{Recipe: "custom", Task: "coordinate", ACPCommand: fakeACPCommand(t, "echo"), Sandbox: "read-only"},
+		Policy: proto.AgentPolicy{Approve: proto.ApproveNever, MaxTurns: 4},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -670,12 +672,14 @@ func TestAgentChildReportsToParent(t *testing.T) {
 	waitAgent(t, ctx, c, parent.ID, "parent waiting", func(a *proto.Agent) bool { return a.Status == proto.AgentWaitingInput })
 
 	// A child may not hold what the parent does not: providers, workspace
-	// bindings, a looser policy.
+	// bindings, a looser policy, an egress rule the parent lacks.
 	for name, req := range map[string]proto.AgentCreateReq{
 		"providers": {Parent: parent.ID, Workspace: &proto.WorkspaceSpec{}, Spec: proto.AgentSpec{Recipe: "custom", Task: "x", ACPCommand: fakeACPCommand(t, "echo"), Providers: []string{"openai"}}},
 		"bindings":  {Parent: parent.ID, Workspace: &proto.WorkspaceSpec{Bindings: []string{"b_secret"}}, Spec: proto.AgentSpec{Recipe: "custom", Task: "x", ACPCommand: fakeACPCommand(t, "echo")}},
 		"turns":     {Parent: parent.ID, Workspace: &proto.WorkspaceSpec{}, Spec: proto.AgentSpec{Recipe: "custom", Task: "x", ACPCommand: fakeACPCommand(t, "echo")}, Policy: proto.AgentPolicy{MaxTurns: 10}},
 		"approve":   {Parent: parent.ID, Workspace: &proto.WorkspaceSpec{}, Spec: proto.AgentSpec{Recipe: "custom", Task: "x", ACPCommand: fakeACPCommand(t, "echo")}, Policy: proto.AgentPolicy{Approve: proto.ApproveOnRequest, MaxTurns: 1}},
+		"egress":    {Parent: parent.ID, Workspace: &proto.WorkspaceSpec{Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{ID: "docs", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{"docs.example.com"}}}}}}, Spec: proto.AgentSpec{Recipe: "custom", Task: "x", ACPCommand: fakeACPCommand(t, "echo")}},
+		"allow":     {Parent: parent.ID, Workspace: &proto.WorkspaceSpec{Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Default: proto.NetworkDefaultAllow}}}, Spec: proto.AgentSpec{Recipe: "custom", Task: "x", ACPCommand: fakeACPCommand(t, "echo")}},
 	} {
 		if _, err := c.CreateAgent(ctx, req); !errors.Is(err, &proto.Error{Code: proto.CodeDenied}) {
 			t.Fatalf("%s: child create error = %v, want denied", name, err)
@@ -694,6 +698,11 @@ func TestAgentChildReportsToParent(t *testing.T) {
 	}
 	if child.Parent != parent.ID || child.Spec.Sandbox != "read-only" || child.WS == parent.WS {
 		t.Fatalf("child = %+v", child)
+	}
+	if cws, err := c.GetWorkspace(ctx, child.WS); err != nil {
+		t.Fatal(err)
+	} else if cws.Spec.Security.Network.Default != proto.NetworkDefaultDeny || len(cws.Spec.Security.Network.Rules) != 1 || cws.Spec.Security.Network.Rules[0].ID != "docs" {
+		t.Fatalf("child security = %+v, want the parent's egress contract", cws.Spec.Security)
 	}
 	waitAgent(t, ctx, c, child.ID, "child finished", func(a *proto.Agent) bool { return a.Status == proto.AgentFinished })
 

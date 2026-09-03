@@ -97,9 +97,30 @@ func TestWebhookMapsEventsOntoAgents(t *testing.T) {
 		"no-type":   `{"payload":{}}`,
 		"bad-templ": `{"type":"x","agent":{"wake":"a","message":"{{.x"}}`,
 	} {
-		if resp, body := apiCall(t, hs, "POST", "/v1/events", "hook-tok", bad, nil); resp.StatusCode != 400 {
+		resp, body := apiCall(t, hs, "POST", "/v1/events", "hook-tok", bad, nil)
+		var e apiErrorBody
+		if resp.StatusCode != 400 || json.Unmarshal(body, &e) != nil || e.Error.Code != proto.CodeBadRequest {
 			t.Fatalf("%s = %d %s", name, resp.StatusCode, body)
 		}
+	}
+	// Every refusal is the documented JSON error shape, not a text/plain line.
+	if resp, body := apiCall(t, hs, "GET", "/v1/events", "hook-tok", "", nil); resp.StatusCode != 405 || !strings.Contains(string(body), `"code":"unsupported"`) {
+		t.Fatalf("GET = %d %s", resp.StatusCode, body)
+	}
+	if resp, body := apiCall(t, hs, "POST", "/v1/events", "", `{"type":"x"}`, nil); resp.StatusCode != 401 || !strings.Contains(string(body), `"code":"unauthorized"`) || resp.Header.Get("WWW-Authenticate") == "" {
+		t.Fatalf("unauthenticated = %d %s", resp.StatusCode, body)
+	}
+	if resp, body := apiCall(t, hs, "POST", "/v1/events", "hook-tok", `{"type":"x","payload":"`+strings.Repeat("x", webhookBodyLimit)+`"}`, nil); resp.StatusCode != 413 || !strings.Contains(string(body), `"code":"bad_request"`) {
+		t.Fatalf("oversized = %d %.80s", resp.StatusCode, body)
+	}
+	// Numbers render as their literals; GitHub ids are past float precision.
+	bigID := `{"type":"github.issue_comment","payload":{"comment":{"id":3000000001234567,"body":"n"}},"agent":{"wake":"` + out.Agent + `","message":"comment {{.comment.id}}"}}`
+	if resp, body := apiCall(t, hs, "POST", "/v1/events", "hook-tok", bigID, nil); resp.StatusCode != 202 {
+		t.Fatalf("big id = %d %s", resp.StatusCode, body)
+	}
+	resp, body = apiCall(t, hs, "GET", "/v1/agents/"+out.Agent, "hook-tok", "", nil)
+	if resp.StatusCode != 200 || json.Unmarshal(body, &a) != nil || a.Inbox[len(a.Inbox)-1].Text != "comment 3000000001234567" {
+		t.Fatalf("big id rendered = %d %s", resp.StatusCode, body)
 	}
 	// Events without a mapping still append as before.
 	if resp, _ := apiCall(t, hs, "POST", "/v1/events", "hook-tok", `{"type":"ping"}`, nil); resp.StatusCode != 202 {
