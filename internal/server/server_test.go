@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
 	"io"
@@ -25,6 +24,12 @@ type allowAuthorizer struct{}
 
 func (allowAuthorizer) Check(context.Context, control.Subject, string, control.Resource) error {
 	return nil
+}
+
+type allowNodeAuthenticator struct{}
+
+func (allowNodeAuthenticator) AuthenticateNode(context.Context, string, string, []byte) (control.NodeIdentity, error) {
+	return control.NodeIdentity{Tenant: "tenant"}, nil
 }
 
 func testDigest(body string) string {
@@ -280,31 +285,51 @@ func TestConcurrentHealthAddrAndClose(t *testing.T) {
 	}
 }
 
-func TestProductionModeRejectsCooperativeEgressBackend(t *testing.T) {
+func TestProductionModeRequiresIdentityAndRefusesSharedTokens(t *testing.T) {
 	base := Options{
-		Mode: ModeProductionSingleTenant, Token: "node-token",
+		Mode:          ModeProductionSingleTenant,
 		Authenticator: control.StaticAuthenticator{"client-token": {ID: "user", Tenant: "tenant"}},
-		Authorizer:    allowAuthorizer{},
-	}
-	weak := proto.BackendDescriptor{
-		Name: "docker", Security: proto.BackendSecurityCaps{
-			Isolation: "container", EgressMode: "cooperative_proxy", BrokerIdentity: "token",
-		},
-	}
-	base.ApprovedNodes = map[string]control.NodeApproval{"n_one": {
-		PubKey: make([]byte, ed25519.PublicKeySize), Info: proto.NodeInfo{BackendDescriptors: []proto.BackendDescriptor{weak}},
-	}}
-	if _, err := validateSecurityMode(base); err == nil || !strings.Contains(err.Error(), "enforced egress") {
-		t.Fatalf("cooperative production backend error=%v", err)
-	}
-	strong := weak
-	strong.Name = "sandbox"
-	strong.Security.EgressMode = "enforced_gateway"
-	base.ApprovedNodes["n_one"] = control.NodeApproval{
-		PubKey: make([]byte, ed25519.PublicKeySize), Info: proto.NodeInfo{BackendDescriptors: []proto.BackendDescriptor{strong}},
+		Authorizer:    allowAuthorizer{}, NodeAuthenticator: allowNodeAuthenticator{},
 	}
 	if profile, err := validateSecurityMode(base); err != nil || profile != proto.SecurityIsolated {
-		t.Fatalf("enforced production backend profile=%q err=%v", profile, err)
+		t.Fatalf("production identity profile=%q err=%v", profile, err)
+	}
+	base.Token = "shared"
+	if _, err := validateSecurityMode(base); err == nil || !strings.Contains(err.Error(), "refuses shared tokens") {
+		t.Fatalf("shared production token error=%v", err)
+	}
+	base.Token, base.NodeAuthenticator = "", nil
+	if _, err := validateSecurityMode(base); err == nil || !strings.Contains(err.Error(), "principal and node identity") {
+		t.Fatalf("incomplete production identity error=%v", err)
+	}
+}
+
+func TestProductionModeBuildsDurableIdentityByDefault(t *testing.T) {
+	s, err := New(Options{DataDir: t.TempDir(), Mode: ModeProductionMultiTenant})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if s.Identity == nil || s.opts.Authenticator == nil || s.opts.Authorizer == nil || s.opts.NodeAuthenticator == nil {
+		t.Fatal("production server did not construct its durable identity authority")
+	}
+	body := "tenant artifact"
+	unauthenticated := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/v1/artifacts/"+testDigest(body), strings.NewReader(body))
+	s.Handler().ServeHTTP(unauthenticated, req)
+	if unauthenticated.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated production artifact status = %d", unauthenticated.Code)
+	}
+	access, _, err := s.Identity.IssueTokens(context.Background(), "operator", "tenant-a", []string{"operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticated := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPut, "/v1/artifacts/"+testDigest(body), strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+access)
+	s.Handler().ServeHTTP(authenticated, req)
+	if authenticated.Code != http.StatusOK {
+		t.Fatalf("authenticated production artifact status = %d body=%s", authenticated.Code, authenticated.Body.String())
 	}
 }
 
@@ -314,17 +339,9 @@ func TestProductionModeRejectsLiteralBindingSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := Options{
-		Mode: ModeProductionSingleTenant, Token: "node-token",
+		Mode:          ModeProductionSingleTenant,
 		Authenticator: control.StaticAuthenticator{"client-token": {ID: "user", Tenant: "tenant"}},
-		Authorizer:    allowAuthorizer{}, SecretResolver: resolver,
-		ApprovedNodes: map[string]control.NodeApproval{"n_one": {
-			PubKey: make([]byte, ed25519.PublicKeySize),
-			Info: proto.NodeInfo{BackendDescriptors: []proto.BackendDescriptor{{
-				Name: "sandbox", Security: proto.BackendSecurityCaps{
-					Isolation: "container", EgressMode: "enforced_gateway", BrokerIdentity: "token",
-				},
-			}}},
-		}},
+		Authorizer:    allowAuthorizer{}, NodeAuthenticator: allowNodeAuthenticator{}, SecretResolver: resolver,
 	}
 	base.Bindings = []control.Binding{{ID: "b_one", Secret: "must-not-persist", Destinations: []string{"api.example"}}}
 	if _, err := validateSecurityMode(base); err == nil {

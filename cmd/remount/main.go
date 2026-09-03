@@ -503,8 +503,11 @@ func cmdServer(ctx context.Context, args []string) error {
 			return fmt.Errorf("--public-url %q must be an http(s) URL", *publicURL)
 		}
 	}
-	if *token == "" && !*insecure {
-		return errors.New("--token is required (or --insecure for local experiments)")
+	if *mode == server.ModeStandalone && *token == "" && !*insecure {
+		return errors.New("--token is required in standalone server mode (or --insecure for local experiments)")
+	}
+	if *mode != server.ModeStandalone && *token != "" {
+		return errors.New("production modes refuse --token; use principal identity and one-time node enrollment")
 	}
 	dataDir, err := absFlagPath("data", *data)
 	if err != nil {

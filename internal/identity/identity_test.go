@@ -108,8 +108,12 @@ func TestEnrolledNodeReconnectRequiresBoundKey(t *testing.T) {
 	_, key, _ := ed25519.GenerateKey(rand.Reader)
 	pub := key.Public().(ed25519.PublicKey)
 	first, err := manager.AuthenticateNode(context.Background(), "n_one", token, pub)
-	if err != nil || !first.Fresh {
+	if err != nil || !first.Fresh || first.Token == "" {
 		t.Fatalf("first enrollment = %+v, %v", first, err)
+	}
+	subject, err := manager.Authenticate(context.Background(), control.Credential{Token: first.Token})
+	if err != nil || subject.ID != "n_one" || subject.Tenant != "tenant-a" || len(subject.Roles) != 1 || subject.Roles[0] != RoleNode {
+		t.Fatalf("node access token = %+v, %v", subject, err)
 	}
 	reconnected, err := manager.AuthenticateNode(context.Background(), "n_one", "", pub)
 	if err != nil || reconnected.Fresh || reconnected.Tenant != "tenant-a" {

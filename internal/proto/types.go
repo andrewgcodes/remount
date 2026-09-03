@@ -46,6 +46,9 @@ type HelloOK struct {
 	LeaseSec int64    `cbor:"lease_sec,omitempty" json:"lease_sec,omitempty"` // how often nodes must renew claims
 	Subject  string   `cbor:"subject,omitempty" json:"subject,omitempty"`
 	Tenant   string   `cbor:"tenant,omitempty" json:"tenant,omitempty"`
+	// NodeToken is a short-lived node-principal credential for authenticated
+	// HTTP operations. It is returned only to a successfully enrolled node.
+	NodeToken string `cbor:"node_token,omitempty" json:"node_token,omitempty"`
 }
 
 // NodeInfo describes a node's capabilities for placement.

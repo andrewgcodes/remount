@@ -27,7 +27,7 @@ func (a *fakeNodeAuthenticator) AuthenticateNode(_ context.Context, node, token 
 
 func TestDynamicNodeEnrollmentOverridesHelloAuthorityAndEmitsOnce(t *testing.T) {
 	auth := &fakeNodeAuthenticator{wantNode: "n_dynamic", wantToken: "enroll_secret", identity: NodeIdentity{
-		Tenant: "tenant-a", Pool: "fly-iad", Labels: map[string]string{"region": "iad"}, Fresh: true,
+		Tenant: "tenant-a", Pool: "fly-iad", Labels: map[string]string{"region": "iad"}, Fresh: true, Token: "node-access",
 	}}
 	f := newControlFixture(t, "", func(opts *Options) {
 		opts.NodeAuthenticator = auth
@@ -36,12 +36,15 @@ func TestDynamicNodeEnrollmentOverridesHelloAuthorityAndEmitsOnce(t *testing.T) 
 	h, key := signedNodeHello(t, "n_dynamic", "enroll_secret", processNodeInfo(1024))
 	h.Labels = map[string]string{"tenant": "attacker", "pool": "attacker", "region": "evil"}
 	h.Proof = ed25519.Sign(key, proto.HelloProofBytes(h))
-	id, _, err := f.c.Authenticate(context.Background(), &h)
+	id, ok, err := f.c.Authenticate(context.Background(), &h)
 	if err != nil || id != "n_dynamic" || auth.called != 1 {
 		t.Fatalf("authenticate = %q, calls=%d, err=%v", id, auth.called, err)
 	}
 	if h.Labels["tenant"] != "tenant-a" || h.Labels["pool"] != "fly-iad" || h.Labels["region"] != "iad" {
 		t.Fatalf("authoritative labels = %#v", h.Labels)
+	}
+	if ok.NodeToken != "node-access" {
+		t.Fatalf("node token = %q", ok.NodeToken)
 	}
 	f.c.PeerConnected(context.Background(), id, &h)
 	events, err := f.log.Read(context.Background(), 0, "", 10)

@@ -45,6 +45,7 @@ func (c *Control) Authenticate(ctx context.Context, h *proto.Hello) (string, *pr
 			if err := c.validateDynamicNode(h); err != nil {
 				return "", nil, err
 			}
+			ok.NodeToken = identity.Token
 		} else if c.opts.Token != "" && subtle.ConstantTimeCompare([]byte(h.Token), []byte(c.opts.Token)) != 1 {
 			return "", nil, proto.Err(proto.CodeUnauthorized, "bad node token")
 		}

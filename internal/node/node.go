@@ -130,6 +130,7 @@ type Node struct {
 	peer       *transport.Peer
 	protocol   []string // capabilities negotiated with the current uplink
 	ctrlPub    ed25519.PublicKey
+	httpToken  string // short-lived node credential refreshed by hello
 	leaseSec   int64
 	workspaces map[string]*ws
 	// agentRuns are the live Agent run attempts keyed by agent|run;
@@ -983,6 +984,7 @@ func (n *Node) helloAndServe(ctx context.Context, peer *transport.Peer, hello pr
 	n.peer = peer
 	n.protocol = ok.Caps
 	n.ctrlPub = ed25519.PublicKey(ok.PubKey)
+	n.httpToken = ok.NodeToken
 	n.leaseSec = ok.LeaseSec
 	n.grants = map[string]*proto.Grant{}
 	n.mu.Unlock()
@@ -2960,6 +2962,15 @@ func (n *Node) brokerAdvertiseHost(handle workspace.Handle) string {
 	return ""
 }
 
+func (n *Node) artifactToken() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.httpToken != "" {
+		return n.httpToken
+	}
+	return n.opts.Token
+}
+
 func (n *Node) fetchArtifact(ctx context.Context, id string) (io.ReadCloser, error) {
 	if n.store.Has(id) {
 		r, _, err := n.store.Open(id)
@@ -2972,7 +2983,7 @@ func (n *Node) fetchArtifact(ctx context.Context, id string) (io.ReadCloser, err
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+n.opts.Token)
+	req.Header.Set("Authorization", "Bearer "+n.artifactToken())
 	resp, err := n.opts.HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -3249,7 +3260,7 @@ func (n *Node) upload(ctx context.Context, id string) error {
 		return err
 	}
 	req.ContentLength = size
-	req.Header.Set("Authorization", "Bearer "+n.opts.Token)
+	req.Header.Set("Authorization", "Bearer "+n.artifactToken())
 	resp, err := n.opts.HTTPClient.Do(req)
 	if err != nil {
 		return err

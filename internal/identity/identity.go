@@ -234,7 +234,13 @@ func (m *Manager) AuthenticateNode(ctx context.Context, nodeID, token string, pu
 	if !ok || subtle.ConstantTimeCompare(binding.PubKey, pubKey) != 1 {
 		return control.NodeIdentity{}, proto.Err(proto.CodeUnauthorized, "invalid or expired node enrollment")
 	}
-	return control.NodeIdentity{Tenant: binding.Tenant, Pool: binding.Pool, Labels: cloneLabels(binding.Labels), Fresh: fresh}, nil
+	now := m.now()
+	accessToken, err := m.sign(Claims{ID: ids.New("tok"), Subject: nodeID, Tenant: binding.Tenant, Roles: []string{RoleNode},
+		Kind: kindAccess, IssuedAt: now.Unix(), Expires: now.Add(m.accessTTL).Unix()})
+	if err != nil {
+		return control.NodeIdentity{}, err
+	}
+	return control.NodeIdentity{Tenant: binding.Tenant, Pool: binding.Pool, Labels: cloneLabels(binding.Labels), Fresh: fresh, Token: accessToken}, nil
 }
 
 // Check implements control.Authorizer with tenant isolation as the first
