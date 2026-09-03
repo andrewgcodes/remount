@@ -66,6 +66,45 @@ even when read-only), and `full` adds `CONNECT` to those hosts. Those two profil
 a node whose backend enforces egress; the `process` and `docker` backends only
 cooperate through `HTTPS_PROXY`, so they serve `local`.
 
+### Hand-off, resume and queues
+
+The recipe's `resume_command`, `state_dirs` and `path_keyed` fields drive the
+unattended workflow (ADR 0041).
+
+```sh
+cd ~/proj                       # a checkout with a Claude Code conversation open
+remount handoff --task "finish the refactor and open a PR"
+```
+
+`handoff` finds the harness whose state directory exists under your home
+(`--recipe` when several do), packs the checkout and that state into one
+artifact, and starts the `resume_command` in a new workspace. For a
+`path_keyed` recipe — Claude Code, Codex, OpenCode, Gemini and Cline key their
+per-project state on the absolute path of the working tree — the tree is
+mounted at the same absolute path inside the workspace, which needs a node
+with a mount namespace (`docker`). A `process`-only deployment leaves the
+workspace `pending` and `handoff` says so; it never creates a symlink on the
+node to fake the path. Goose, OpenHands and aider keep path-independent state
+and run on either backend at `/work`.
+
+`remount resume WS` picks the conversation back up: it attaches if a harness
+session is still running, otherwise wakes the workspace if it sleeps and runs
+the `resume_command` with `--task` (default "Continue where you left off.").
+The recipe, bindings and model come from the workspace's labels, so the
+command needs nothing but the id.
+
+`remount run RECIPE --queue tasks.txt` runs one task per line in one
+workspace, in order, and records progress as a control-plane `Queue`
+resource rather than in the tree. Between tasks it checkpoints, or with
+`--sleep-after 30m` / `--sleep-until 02:00` puts the workspace to sleep on a
+durable timer and waits for it to come back — on whichever node claims it. A
+non-zero exit stops the queue with the cursor on that task;
+`remount run RECIPE --queue-continue QUEUE` retries it and carries on, from a
+different machine if need be. Events record `queue.advanced{index, exit}`,
+never the task text. `remount ws sleep WS --on EVENT` is the same mechanism
+for waking on an external event (a merged PR, a Slack reply) and is the
+intended hook for event-driven queues.
+
 ### Provider bindings are presets
 
 A binding is a secret the node holds; a preset says how a harness consumes

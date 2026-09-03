@@ -5,11 +5,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"time"
 
 	"golang.org/x/term"
 
+	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/launch"
 	"remount.dev/remount/internal/localfs"
 )
@@ -18,7 +21,7 @@ import (
 // run: seed a workspace, install a harness, launch it against brokered keys
 // ---------------------------------------------------------------------------
 
-const runUsage = "run RECIPE [--dir PATH | --base NAME | --ws WS] [--binding ID[:PRESET]]... [--security P] [--sandbox M] [--approve M] [--detach] -- TASK…"
+const runUsage = "run RECIPE [--dir PATH | --base NAME | --ws WS] [--binding ID[:PRESET]]... [--security P] [--sandbox M] [--approve M] [--mount-path /abs] [--detach] -- TASK…\n    run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM] | --queue-continue QUEUE"
 
 func cmdRun(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
@@ -43,6 +46,11 @@ func cmdRun(ctx context.Context, args []string) error {
 	recipeFile := fs.String("recipe-file", "", "load the recipe from this YAML file instead of a built-in")
 	timeout := fs.Duration("timeout", 0, "server-side session timeout (0 = none)")
 	killOnInterrupt := fs.Bool("kill-on-interrupt", false, "Ctrl-C kills the harness instead of detaching")
+	mountPath := fs.String("mount-path", "", "absolute path the tree appears at inside the workspace (default /work; needs docker)")
+	queueFile := fs.String("queue", "", "run the tasks listed in this file one after another (ADR 0041); - reads stdin")
+	queueContinue := fs.String("queue-continue", "", "continue an existing queue where it stopped")
+	sleepAfter := fs.Duration("sleep-after", 0, "with --queue, sleep the workspace this long between tasks")
+	sleepUntil := fs.String("sleep-until", "", "with --queue, sleep the workspace until this local HH:MM between tasks")
 	var bindings, exclude listFlag
 	fs.Var(&bindings, "binding", "provider binding ID[:PRESET][?host=…] (repeatable)")
 	fs.Var(&exclude, "exclude", "snapshot exclude glob (repeatable)")
@@ -56,6 +64,30 @@ func cmdRun(ctx context.Context, args []string) error {
 	rest := fs.Args()[1:]
 	if len(rest) > 0 && rest[0] == "--" {
 		rest = rest[1:]
+	}
+	queued := *queueFile != "" || *queueContinue != ""
+	if !queued && (*sleepAfter != 0 || *sleepUntil != "") {
+		return errors.New("--sleep-after and --sleep-until need --queue")
+	}
+	if *queueFile != "" && *queueContinue != "" {
+		return errors.New("--queue and --queue-continue are mutually exclusive")
+	}
+	if *sleepAfter != 0 && *sleepUntil != "" {
+		return errors.New("--sleep-after and --sleep-until are mutually exclusive")
+	}
+	if *sleepAfter < 0 {
+		return errors.New("--sleep-after must not be negative")
+	}
+	if *sleepUntil != "" {
+		if _, err := launch.NextWallClock(time.Now(), *sleepUntil); err != nil {
+			return err
+		}
+	}
+	if queued && (*detach || *resume) {
+		return errors.New("--queue runs in the foreground; --detach and --resume do not apply")
+	}
+	if queued && len(rest) > 0 {
+		return errors.New("--queue takes its tasks from the file; nothing may follow --")
 	}
 
 	var recipe *launch.Recipe
@@ -82,9 +114,13 @@ func cmdRun(ctx context.Context, args []string) error {
 	o := launch.Options{
 		Recipe: recipe, WS: *wsID, Base: *base, Repo: *repo, Name: *name, Image: *image, Backend: *backend,
 		Security: *security, Sandbox: *sandbox, Approve: *approve, Model: *model, Exclude: exclude, Resume: *resume,
-		Timeout: *timeout, Stderr: os.Stderr,
+		Timeout: *timeout, Stderr: os.Stderr, MountPath: *mountPath,
 	}
-	if recipe.CommandFromArgs {
+	if queued {
+		if recipe.CommandFromArgs {
+			return fmt.Errorf("recipe %s takes its command from the arguments and cannot run a queue", recipe.Name)
+		}
+	} else if recipe.CommandFromArgs {
 		o.Args = rest
 	} else {
 		o.Task = strings.Join(rest, " ")
@@ -113,8 +149,22 @@ func cmdRun(ctx context.Context, args []string) error {
 			o.Cols, o.Rows = uint16(w), uint16(h)
 		}
 	}
+	var tasks []string
+	if *queueFile != "" {
+		tasks, err = readQueueFile(*queueFile)
+		if err != nil {
+			return err
+		}
+	}
 	// Fail on flag errors before uploading anything.
-	if _, err := o.Validate(); err != nil {
+	probe := o
+	if queued {
+		probe.Task = "probe"
+		if len(tasks) > 0 {
+			probe.Task = tasks[0]
+		}
+	}
+	if _, err := probe.Validate(); err != nil {
 		return err
 	}
 	cl := c.client()
@@ -125,6 +175,9 @@ func cmdRun(ctx context.Context, args []string) error {
 			return err
 		}
 		o.RestoreFrom = id
+	}
+	if queued {
+		return runQueue(ctx, cl, c, o, tasks, *queueContinue, *sleepAfter, *sleepUntil)
 	}
 	res, err := launch.Start(ctx, cl, o)
 	if err != nil {
@@ -181,4 +234,39 @@ func cmdBinding(ctx context.Context, args []string) error {
 	}
 	tw.Flush()
 	return nil
+}
+
+// readQueueFile parses the task list at path, or stdin for "-".
+func readQueueFile(path string) ([]string, error) {
+	var r io.Reader = os.Stdin
+	if path != "-" {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		r = f
+	}
+	tasks, err := launch.ParseQueueFile(r)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return tasks, nil
+}
+
+// runQueue drives `remount run --queue`: the tasks come from a file, the
+// cursor lives on the control plane, and the exit status is the first
+// failing task's.
+func runQueue(ctx context.Context, cl *client.Client, c common, o launch.Options, tasks []string, cont string, sleepAfter time.Duration, sleepUntil string) error {
+	o.PTY, o.Stdin = false, false
+	qo := launch.QueueOptions{Tasks: tasks, Continue: cont, SleepAfter: sleepAfter, SleepUntil: sleepUntil, Run: o, Output: os.Stdout}
+	res, err := launch.RunQueue(ctx, cl, qo)
+	if res != nil && res.Queue != nil {
+		if c.json {
+			printJSON(res.Queue)
+		} else if res.Workspace != nil {
+			fmt.Fprintf(os.Stderr, "queue %s: %s (%d/%d) in %s\n", res.Queue.ID, res.Queue.Status, res.Queue.Cursor, len(res.Queue.Items), res.Workspace.ID)
+		}
+	}
+	return err
 }

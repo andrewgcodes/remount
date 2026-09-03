@@ -42,6 +42,16 @@ type PackOptions struct {
 	NoDefaultExcludes bool
 	// NoIgnoreFiles disables .gitignore and .remountignore processing.
 	NoIgnoreFiles bool
+	// Extra places files or directories from outside dir into the archive,
+	// unfiltered (a harness's ~/.dotdir carried alongside the checkout for a
+	// handoff). A missing Local is skipped and reported in Manifest.Missing.
+	Extra []ExtraTree
+}
+
+// ExtraTree is one path outside the packed directory and where it lands.
+type ExtraTree struct {
+	Local   string // absolute local path, file or directory
+	Archive string // slash-separated path relative to the archive root
 }
 
 // Manifest describes what Pack wrote.
@@ -52,6 +62,8 @@ type Manifest struct {
 	Bytes    int64    `json:"bytes"`
 	Excluded int      `json:"excluded"`
 	Warnings []string `json:"warnings,omitempty"`
+	// Missing lists Extra archive paths whose local source did not exist.
+	Missing []string `json:"missing,omitempty"`
 }
 
 // Pack writes a deterministic tar.gz of dir to w. The root directory itself
@@ -109,12 +121,65 @@ func Pack(dir string, opts PackOptions, w io.Writer) (Manifest, error) {
 		}
 		return ig != nil && ig.ignored(rel, isDir)
 	}
-	stats, err := artifact.SnapshotFiltered(dir, skip, w)
+	trees := []artifact.Tree{{Root: dir, Skip: skip}}
+	for _, extra := range opts.Extra {
+		tree, ok, err := extraTree(extra)
+		if err != nil {
+			return m, err
+		}
+		if !ok {
+			m.Missing = append(m.Missing, extra.Archive)
+			continue
+		}
+		trees = append(trees, tree)
+	}
+	stats, err := artifact.SnapshotTrees(trees, w)
 	if err != nil {
 		return m, err
 	}
 	m.Files, m.Dirs, m.Symlinks, m.Bytes, m.Excluded = stats.Files, stats.Dirs, stats.Symlinks, stats.Bytes, stats.Skipped
 	return m, nil
+}
+
+// extraTree maps one ExtraTree onto a snapshot tree. A directory is walked
+// whole under its archive path; a file is carried by walking its parent with
+// every sibling skipped. ok is false when Local does not exist.
+func extraTree(extra ExtraTree) (artifact.Tree, bool, error) {
+	archive := strings.Trim(filepath.ToSlash(extra.Archive), "/")
+	if archive == "" || archive == "." || archive == ".." || strings.HasPrefix(archive, "../") || strings.Contains(archive, "/../") {
+		return artifact.Tree{}, false, fmt.Errorf("localfs: extra path %q must be relative and inside the archive", extra.Archive)
+	}
+	if archive == artifact.OverlayStageDir || strings.HasPrefix(archive, artifact.OverlayStageDir+"/") {
+		return artifact.Tree{}, false, fmt.Errorf("localfs: extra path %q is reserved for the node", extra.Archive)
+	}
+	local, err := filepath.Abs(extra.Local)
+	if err != nil {
+		return artifact.Tree{}, false, err
+	}
+	st, err := os.Lstat(local)
+	if errors.Is(err, fs.ErrNotExist) {
+		return artifact.Tree{}, false, nil
+	}
+	if err != nil {
+		return artifact.Tree{}, false, err
+	}
+	if st.IsDir() {
+		return artifact.Tree{Root: local, Prefix: archive}, true, nil
+	}
+	if !st.Mode().IsRegular() {
+		return artifact.Tree{}, false, fmt.Errorf("localfs: extra path %s is neither a file nor a directory", extra.Local)
+	}
+	base := filepath.Base(local)
+	prefix := ""
+	if i := strings.LastIndex(archive, "/"); i >= 0 {
+		prefix = archive[:i]
+	}
+	want := archive[strings.LastIndex(archive, "/")+1:]
+	if want != base {
+		// A file lands under its own name; renaming would need a copy.
+		return artifact.Tree{}, false, fmt.Errorf("localfs: extra file %s must keep its name in the archive (%q)", extra.Local, extra.Archive)
+	}
+	return artifact.Tree{Root: filepath.Dir(local), Prefix: prefix, Skip: func(rel string, _ bool) bool { return rel != base }}, true, nil
 }
 
 func dirSize(root *os.Root, rel string) (int64, error) {

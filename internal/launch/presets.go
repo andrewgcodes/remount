@@ -187,6 +187,15 @@ func ParseBinding(spec string) (Binding, error) {
 	return b, nil
 }
 
+// String renders the binding in the form ParseBinding accepts.
+func (b Binding) String() string {
+	out := b.ID + ":" + b.Preset.Name
+	if b.Host != "" {
+		out += "?host=" + b.Host
+	}
+	return out
+}
+
 // BaseURLPath returns the broker path for this binding with any host
 // parameter substituted.
 func (b Binding) BaseURLPath() string {

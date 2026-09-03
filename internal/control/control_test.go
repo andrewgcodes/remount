@@ -1180,3 +1180,46 @@ func TestFleetEmptySelectionIsDurablyAndObservablyComplete(t *testing.T) {
 		t.Fatalf("fleet events requested=%d completed=%d", requested, completed)
 	}
 }
+
+func TestMountPathNeedsANamespacedBackend(t *testing.T) {
+	f := newControlFixture(t, "", nil)
+	info := processNodeInfo(0)
+	info.Backends = append(info.Backends, "docker")
+	info.BackendDescriptors = append(info.BackendDescriptors, proto.BackendDescriptor{
+		Name: "docker", Security: proto.BackendSecurityCaps{
+			Isolation: "container", EgressMode: "cooperative_proxy", BrokerIdentity: "token",
+			FilesystemBoundary: "bind_mount", NetworkNamespace: true, DeviceIsolation: true,
+		}, Runtime: proto.RuntimeCaps{Snapshots: "fs", MountPath: true},
+	})
+	connectNode(t, f.c, "n_mixed", info)
+	connectNode(t, f.c, "n_process", processNodeInfo(0))
+
+	for _, bad := range []string{"relative/path", "/", "/etc/x", "/work/../x", "/proc/self", "/a//b"} {
+		if _, err := f.c.wsCreate(context.Background(), localSubject(), &proto.WSCreateReq{Spec: proto.WorkspaceSpec{MountPath: bad}}); err == nil {
+			t.Fatalf("mount_path %q accepted", bad)
+		}
+	}
+	ws := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{MountPath: "/home/me/proj"})
+	if _, err := f.c.wsClaim(context.Background(), "n_process", ws.ID); err == nil {
+		t.Fatal("process-only node claimed a workspace with a mount path it cannot honor")
+	}
+	claim, err := f.c.wsClaim(context.Background(), "n_mixed", ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Workspace.Spec.Requires.Backend != "docker" || claim.Workspace.Spec.MountPath != "/home/me/proj" {
+		t.Fatalf("claim = backend %q mount %q", claim.Workspace.Spec.Requires.Backend, claim.Workspace.Spec.MountPath)
+	}
+	forced := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{MountPath: "/home/me/proj", Requires: proto.Requires{Backend: "process"}})
+	if _, err := f.c.wsClaim(context.Background(), "n_mixed", forced.ID); err == nil {
+		t.Fatal("forced process backend accepted a mount path")
+	}
+	// The default is normalized away so an explicit /work behaves like "".
+	plain := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{MountPath: proto.DefaultMountPath})
+	if plain.Spec.MountPath != "" {
+		t.Fatalf("default mount path stored as %q", plain.Spec.MountPath)
+	}
+	if _, err := f.c.wsClaim(context.Background(), "n_process", plain.ID); err != nil {
+		t.Fatal(err)
+	}
+}

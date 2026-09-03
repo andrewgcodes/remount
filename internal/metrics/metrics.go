@@ -176,6 +176,7 @@ var (
 	WSCreated                = Count("remount_workspaces_created_total", "workspaces created")
 	WorkspaceQuotaRejected   = Count("remount_workspace_quota_rejections_total", "workspace creates rejected by tenant or subject capacity limits")
 	BaseQuotaRejected        = Count("remount_base_quota_rejections_total", "base creates rejected by the per-tenant pinned-base limit")
+	QueueQuotaRejected       = Count("remount_queue_quota_rejections_total", "queue creates rejected by the per-tenant queue limit")
 	WSClaims                 = Count("remount_workspace_claims_total", "successful claims, including re-adoptions")
 	WSClaimDenied            = Count("remount_workspace_claims_denied_total", "claims refused as ineligible or already held")
 	WSLeaseExpired           = Count("remount_workspace_lease_expired_total", "leases that expired, returning a workspace to pending")

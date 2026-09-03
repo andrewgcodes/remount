@@ -481,6 +481,46 @@ func (c *Client) RemoveBase(ctx context.Context, name string, options ...Operati
 	return c.call(ctx, proto.PeerControl, proto.OpBaseRemove, proto.BaseRemoveReq{Name: name, IdempotencyKey: idem}, nil)
 }
 
+// CreateQueue records a durable task list for a workspace (ADR 0041). A
+// missing idempotency key is generated so a retry cannot create two queues.
+func (c *Client) CreateQueue(ctx context.Context, req proto.QueueCreateReq, options ...OperationOption) (*proto.Queue, error) {
+	if key, set := operationKey(options); set {
+		req.IdempotencyKey = key
+	} else if req.IdempotencyKey == "" {
+		req.IdempotencyKey = ids.New("idem")
+	}
+	var q proto.Queue
+	err := c.call(ctx, proto.PeerControl, proto.OpQueueCreate, req, &q)
+	return &q, err
+}
+
+// GetQueue returns one queue.
+func (c *Client) GetQueue(ctx context.Context, id string) (*proto.Queue, error) {
+	var q proto.Queue
+	err := c.call(ctx, proto.PeerControl, proto.OpQueueGet, proto.QueueGetReq{ID: id}, &q)
+	return &q, err
+}
+
+// ListQueues returns the caller's queues, optionally only those of one
+// workspace, oldest first.
+func (c *Client) ListQueues(ctx context.Context, wsID string) ([]proto.Queue, error) {
+	var res proto.QueueListRes
+	err := c.call(ctx, proto.PeerControl, proto.OpQueueList, proto.QueueListReq{WS: wsID}, &res)
+	return res.Queues, err
+}
+
+// AdvanceQueue records the outcome of the task at the queue's cursor.
+func (c *Client) AdvanceQueue(ctx context.Context, req proto.QueueAdvanceReq, options ...OperationOption) (*proto.Queue, error) {
+	if key, set := operationKey(options); set {
+		req.IdempotencyKey = key
+	} else if req.IdempotencyKey == "" {
+		req.IdempotencyKey = ids.New("idem")
+	}
+	var q proto.Queue
+	err := c.call(ctx, proto.PeerControl, proto.OpQueueAdvance, req, &q)
+	return &q, err
+}
+
 // GetFleetOperation returns one durable containment operation.
 func (c *Client) GetFleetOperation(ctx context.Context, id string) (*proto.FleetOperation, error) {
 	var operation proto.FleetOperation

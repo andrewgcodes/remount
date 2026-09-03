@@ -448,6 +448,52 @@ honors `OPENAI_API_KEY` and `OPENAI_BASE_URL`; `remount binding preset ls`
 lists the other providers. [harness-integration.md](harness-integration.md)
 has the full recipe table and the two kinds of auth.
 
+### Hand off a conversation, and a night's worth of tasks
+
+`remount handoff` moves the checkout you are in *and* the harness's
+conversation into a workspace and keeps it going. The recipe is detected from
+the state under your home directory; the tree lands at the same absolute path
+inside the workspace when the harness keys its history on it, which is why
+this one wants a `docker` node:
+
+```sh
+cd ~/proj
+remount handoff --binding b_anthropic --task "carry on with the failing test"
+```
+
+```
+uploaded 212 files (1840233 bytes) as art_sha256:…
+handed off /home/me/proj (212 files) with claude state .claude,.claude.json to ws_06g6cq… at /home/me/proj
+attach: remount attach ws_06g6cq… s_06g6cq…
+resume later: remount resume ws_06g6cq…
+bring it back: remount pull ws_06g6cq…
+```
+
+Later, from any machine, `remount resume ws_06g6cq…` attaches if the agent is
+still going, wakes the workspace if it went to sleep, and otherwise starts the
+harness's own resume command in the same conversation.
+
+A list of tasks runs the same way, one after another in one workspace, with
+the progress kept on the server so the run survives the workspace sleeping
+and moving:
+
+```sh
+cat > tonight.txt <<'TASKS'
+# one task per line; \ continues a line
+Fix the flaky TestReconnect and make the suite green.
+Update CHANGELOG.md for the 0.4 release.
+Open a PR titled "0.4" with a summary of the changes.
+TASKS
+remount run codex --dir proj --binding b_openai --queue tonight.txt --sleep-after 20m
+```
+
+Each task is a `run` session; between tasks the workspace checkpoints (or here
+sleeps for twenty minutes on a durable timer). A task that exits non-zero stops
+the queue with the cursor on it, and `remount run codex --queue-continue
+q_06g6cr…` retries from there. `remount events --ws WS` shows
+`queue.advanced{index, exit}` per task; the tasks themselves are never in the
+log.
+
 ### Sharing a workspace, and taking it back
 
 A workspace's ACL names who else may use it. Only the owner (or an

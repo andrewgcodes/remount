@@ -283,6 +283,32 @@ operator-actionable `failed` or terminal `destroyed` state.
 claim, ready, move, sleep, wake, and destroy calls cannot silently revive it.
 Duplicate mutating operations are answered from the durable idempotency record.
 
+### 5.2 Stable paths and task queues
+
+`WorkspaceSpec.mount_path` is where the tree appears inside the workspace
+(default `/work`). It must be absolute, clean, at most 1024 bytes and outside
+the system directories (`/`, `/proc`, `/sys`, `/dev`, `/etc`, `/bin`, `/sbin`,
+`/lib`, `/usr`, `/var`, `/run`, `/boot`); `ws.create` rejects anything else
+with `bad_request` and stores the default as empty. A non-default path is a
+placement requirement: only a node whose backend descriptor advertises
+`runtime.mount_path` may claim the workspace, because the path is realised
+inside the workspace's own mount namespace and never as a host symlink. The
+path is part of the spec and survives snapshot, sleep, wake and move.
+
+A **queue** is a durable list of tasks for one workspace:
+`Queue{id, ws, tenant, owner, recipe?, items[{task, session?, exit, signal?,
+attempts, finished_at}], cursor, status, sleep_after_sec?, sleep_until?,
+created_at, updated_at}`. `status` is `running`, `done` or `failed`.
+`queue.create` refuses an empty list, more than 256 tasks or a task over
+16 KiB, and a workspace that already has an unfinished queue (`conflict`).
+`queue.advance{index, exit, signal}` records one task's outcome and requires
+`index == cursor`: a zero exit without a signal moves the cursor and marks the
+queue `done` when it passes the last item; anything else leaves the cursor on
+the task, increments its `attempts`, and marks the queue `failed` so a later
+driver retries the same task. Queue state is never stored in the workspace
+tree; a queue is deleted with its workspace. Both mutations carry `idem` and
+commit the resource, the mutation record and their events in one transaction.
+
 ## 6. Control-plane operations
 
 Sent to `control`. Client operations are marked C, node operations N.
@@ -300,6 +326,10 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `base.create` | C | `BaseCreateReq{name, artifact, workspace?, idem}` → `Base`; pins an uploaded artifact under a tenant-unique name (§10.1) |
 | `base.list` | C | → `BaseListRes{bases}`; the caller's tenant only, unless admin |
 | `base.remove` | C | `BaseRemoveReq{name, idem}` → `{}`; owner or admin only |
+| `queue.create` | C | `QueueCreateReq{ws, recipe?, tasks, sleep_after_sec?\|sleep_until?, idem}` → `Queue`; one unfinished queue per workspace (§5.2) |
+| `queue.get` | C | `QueueGetReq{id}` → `Queue`; owner, workspace principals or admin |
+| `queue.list` | C | `QueueListReq{ws?}` → `QueueListRes{queues}`; the caller's tenant only, unless admin |
+| `queue.advance` | C | `QueueAdvanceReq{id, index, session?, exit, signal?, idem}` → `Queue`; `index` must equal `cursor` or the call fails with `conflict` |
 | `grant` | C | `GrantReq{ws}` → `Grant` |
 | `node.list` | C | → `NodeListRes{nodes}` |
 | `timer.list` | C | → `TimerListRes{timers}` |
@@ -681,12 +711,17 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `peer.gone`, `ws.fenced`, `ws.state_changed`, `event.producer_gap`,
 `fleet.quarantine.requested`, `fleet.quarantine.target`,
 `fleet.quarantine.completed`, `base.created`, `base.removed`, `run.started`,
-`run.finished`, and `auth.workspace_resident`.
+`run.finished`, `auth.workspace_resident`, `queue.created` and
+`queue.advanced`.
 
 `run.started` carries `s`, `recipe`, `task_hash`, `sandbox` and `auth`;
 `run.finished` carries `s`, `recipe`, `exit` and `signal`;
 `auth.workspace_resident` carries `s` and `recipe`. All three set `session`.
 None carries the task text, the harness argv or a provider key.
+
+`queue.created` carries `queue`, `ws` and `items` (a count); `queue.advanced`
+carries `queue`, `index`, `exit`, `signal`, `status` and `cursor`. Both are on
+the workspace stream and neither carries a task's text.
 
 `base.created` and `base.removed` are tenant-scoped rather than
 workspace-scoped: `stream` is the base name, `tenant` is set, `workspace` is

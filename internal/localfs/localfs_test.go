@@ -290,3 +290,52 @@ func TestUnpackUsesGitStatusForCheckouts(t *testing.T) {
 		t.Fatalf("want ErrDirty, got %v", err)
 	}
 }
+
+func TestPackExtraCarriesHomeStateAlongsideCheckout(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.go", "package main\n")
+	writeFile(t, dir, ".claude/settings.json", "{}")
+	home := t.TempDir()
+	writeFile(t, home, ".claude/projects/p1/session.jsonl", "{}\n")
+	writeFile(t, home, ".claude.json", "{\"a\":1}")
+	writeFile(t, home, ".local/share/opencode/db.sqlite", "sqlite")
+	writeFile(t, home, "unrelated.txt", "never packed")
+
+	var buf bytes.Buffer
+	m, err := Pack(dir, PackOptions{Extra: []ExtraTree{
+		{Local: filepath.Join(home, ".claude"), Archive: ".claude"},
+		{Local: filepath.Join(home, ".claude.json"), Archive: ".claude.json"},
+		{Local: filepath.Join(home, ".local/share/opencode"), Archive: ".local/share/opencode"},
+		{Local: filepath.Join(home, ".codex"), Archive: ".codex"},
+	}}, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(m.Missing, []string{".codex"}) {
+		t.Fatalf("missing = %v", m.Missing)
+	}
+	got := entries(t, buf.Bytes())
+	want := []string{
+		".claude", ".claude.json", ".claude/projects", ".claude/projects/p1", ".claude/projects/p1/session.jsonl", ".claude/settings.json",
+		".local", ".local/share", ".local/share/opencode", ".local/share/opencode/db.sqlite", "main.go",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("entries:\n got %v\nwant %v", got, want)
+	}
+
+	// A file at the same archive path from two trees is a conflict.
+	writeFile(t, home, ".claude/settings.json", "home copy")
+	if _, err := Pack(dir, PackOptions{Extra: []ExtraTree{{Local: filepath.Join(home, ".claude"), Archive: ".claude"}}}, &bytes.Buffer{}); err == nil {
+		t.Fatal("conflicting file must fail the pack")
+	}
+	for _, bad := range []ExtraTree{
+		{Local: home, Archive: ".remount/env"},
+		{Local: home, Archive: "../x"},
+		{Local: home, Archive: ""},
+		{Local: filepath.Join(home, ".claude.json"), Archive: "renamed.json"},
+	} {
+		if _, err := Pack(dir, PackOptions{Extra: []ExtraTree{bad}}, &bytes.Buffer{}); err == nil {
+			t.Fatalf("extra %+v must be refused", bad)
+		}
+	}
+}
