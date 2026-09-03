@@ -291,6 +291,12 @@ func normalizeEgressRule(rule *EgressRule, seen map[string]struct{}) error {
 	}
 	seen[rule.ID] = struct{}{}
 	rule.Protocol = strings.ToLower(strings.TrimSpace(rule.Protocol))
+	rule.Connector = strings.ToLower(strings.TrimSpace(rule.Connector))
+	switch rule.Connector {
+	case "", EgressConnectorPackage:
+	default:
+		return Err(CodeBadRequest, "egress rule %q has unsupported connector %q", rule.ID, rule.Connector)
+	}
 	switch rule.Protocol {
 	case EgressProtocolHTTP, EgressProtocolHTTPS, EgressProtocolConnect:
 	default:
@@ -332,7 +338,11 @@ func normalizeEgressRule(rule *EgressRule, seen map[string]struct{}) error {
 		return Err(CodeBadRequest, "egress rule %q has a negative limit", rule.ID)
 	}
 	if rule.SharedState == "" {
-		rule.SharedState = SharedStateNone
+		if rule.Connector == EgressConnectorPackage {
+			rule.SharedState = SharedStateImmutableRead
+		} else {
+			rule.SharedState = SharedStateNone
+		}
 	}
 	switch rule.SharedState {
 	case SharedStateNone, SharedStateImmutableRead, SharedStateScopedWrite, SharedStateGlobalWrite:
@@ -340,6 +350,9 @@ func normalizeEgressRule(rule *EgressRule, seen map[string]struct{}) error {
 		return Err(CodeBadRequest, "egress rule %q has unknown shared state %q", rule.ID, rule.SharedState)
 	}
 	if rule.Protocol == EgressProtocolConnect {
+		if rule.Connector != "" {
+			return Err(CodeBadRequest, "CONNECT rule %q cannot invoke a managed connector", rule.ID)
+		}
 		if len(rule.PathPrefixes) != 0 || rule.MaxRequestBytes != 0 || rule.MaxResponseBytes != 0 {
 			return Err(CodeBadRequest, "CONNECT rule %q cannot claim unenforceable path or byte limits", rule.ID)
 		}
@@ -363,6 +376,17 @@ func normalizeEgressRule(rule *EgressRule, seen map[string]struct{}) error {
 			if method != "GET" && method != "HEAD" {
 				return Err(CodeBadRequest, "immutable-read rule %q permits mutating method %s", rule.ID, method)
 			}
+		}
+	}
+	if rule.Connector == EgressConnectorPackage {
+		if rule.Protocol != EgressProtocolHTTPS {
+			return Err(CodeBadRequest, "package connector rule %q requires HTTPS", rule.ID)
+		}
+		if rule.SharedState != SharedStateImmutableRead {
+			return Err(CodeBadRequest, "package connector rule %q must use immutable_read shared state", rule.ID)
+		}
+		if rule.MaxRequestBytes != 0 {
+			return Err(CodeBadRequest, "package connector rule %q cannot permit a request body", rule.ID)
 		}
 	}
 	sort.Slice(rule.Ports, func(i, j int) bool { return rule.Ports[i] < rule.Ports[j] })

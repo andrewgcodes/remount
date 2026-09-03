@@ -152,6 +152,10 @@ func TestNormalizeSecurityRejectsUnenforceableEgressRules(t *testing.T) {
 		{"connect byte claim", EgressRule{ID: "x", Protocol: "connect", Hosts: []string{"example.com"}, MaxResponseBytes: 1}},
 		{"connect shared state", EgressRule{ID: "x", Protocol: "connect", Hosts: []string{"example.com"}, SharedState: SharedStateGlobalWrite}},
 		{"immutable write", EgressRule{ID: "x", Protocol: "https", Hosts: []string{"example.com"}, Methods: []string{"POST"}, SharedState: SharedStateImmutableRead}},
+		{"unknown connector", EgressRule{ID: "x", Connector: "shell", Protocol: "https", Hosts: []string{"example.com"}}},
+		{"package over plaintext", EgressRule{ID: "x", Connector: EgressConnectorPackage, Protocol: "http", Hosts: []string{"example.com"}}},
+		{"package mutable state", EgressRule{ID: "x", Connector: EgressConnectorPackage, Protocol: "https", Hosts: []string{"example.com"}, SharedState: SharedStateScopedWrite}},
+		{"package request body", EgressRule{ID: "x", Connector: EgressConnectorPackage, Protocol: "https", Hosts: []string{"example.com"}, MaxRequestBytes: 1}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -171,5 +175,19 @@ func TestNormalizeSecurityRejectsUnenforceableEgressRules(t *testing.T) {
 	}}})
 	if err == nil {
 		t.Fatal("duplicate rule id accepted")
+	}
+}
+
+func TestNormalizePackageConnectorDefaultsToImmutableReads(t *testing.T) {
+	security, err := NormalizeSecurity(SecuritySpec{Network: NetworkPolicy{Rules: []EgressRule{{
+		ID: "packages", Connector: " PACKAGE ", Protocol: "HTTPS", Hosts: []string{"registry.example"},
+	}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := security.Network.Rules[0]
+	if rule.Connector != EgressConnectorPackage || rule.SharedState != SharedStateImmutableRead ||
+		!reflect.DeepEqual(rule.Methods, []string{"GET", "HEAD"}) {
+		t.Fatalf("package connector normalized unsafely: %+v", rule)
 	}
 }

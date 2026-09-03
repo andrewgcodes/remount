@@ -205,6 +205,7 @@ not substitute for backend-specific hostile-workspace conformance tests.
 | Claim queue, leases, generations, re-adoption | built, tested |
 | Durable timers, sleep and wake, webhook wake | built, tested |
 | Typed egress broker with substitution, leak blocking, redirect reauthorization, budgets and audit | built, unit/race/simulation tested; live-provider evidence is point-in-time |
+| Managed HTTPS package connector with read-only policy, digest provenance and scope-private immutable cache references | built, direct/race/hostile-workspace simulation tested |
 | Event log, SQLite and in-memory, subscriptions with backfill | built, tested |
 | Grants: ed25519, expiry, generation binding | built, tested |
 | Backends: process and docker | built, tested |

@@ -143,6 +143,11 @@ Every counter is exported at `/metrics` in Prometheus text format, and through
 | `remount_workspace_lease_expired_total` | a node stopped renewing and its work was re-queued |
 | `remount_session_inputs_deduped_total` | a duplicate input arrived after a reconnect |
 | `remount_frames_dropped_total` | a frame was addressed to a peer that had gone |
+| `remount_connector_package_upstream_requests_total` | managed package reads that reached an approved registry |
+| `remount_connector_package_cache_hits_total` | reads served from that workspace's own immutable reference |
+| `remount_connector_package_response_bytes_total` | registry bytes staged and hashed before release |
+| `remount_connector_package_failures_total` | connector execution, integrity, or policy failures |
+| `remount_connector_package_quota_rejections_total` | package staging rejected before disk limits could be exceeded |
 
 The first three mean something was lost or attacked. The last three are normal
 in small numbers and mean something is wrong when they climb.

@@ -70,6 +70,9 @@ Hello  { peer, role: "node"|"client", token, caps: [string],
 
 HelloOK { peer, caps, server, now: int64, pubkey: bytes, lease_sec: int64,
           subject: string, tenant: string }
+
+NodeInfo { backends, backend_descriptors, connectors, os, arch, cpu, mem_mib,
+           caps, snapshots, version }
 ```
 
 A node MUST present a stable `n_` id and its ed25519 public key. `proof` is an
@@ -152,7 +155,7 @@ Each `WorkspaceSpec` carries an enforceable security contract:
 SecuritySpec { profile, min_isolation, require_sibling_isolation,
                require_enforced_egress, secret_mode, network, audit }
 NetworkPolicy { default: "deny"|"allow", rules: [EgressRule] }
-EgressRule { id, protocol, hosts, ports, methods, path_prefixes,
+EgressRule { id, connector?, protocol, hosts, ports, methods, path_prefixes,
              max_requests, max_request_bytes, max_response_bytes,
              shared_state }
 ```
@@ -404,6 +407,27 @@ are rejected. `shared_state` is one of `none`, `immutable_read`,
 write, and admin respectively. `immutable_read` permits only `GET` and `HEAD`.
 CONNECT cannot claim path, body-size, or shared-state enforcement because its
 contents are opaque.
+
+`connector: "package"` is a separate read-only capability. It requires HTTPS,
+`immutable_read`, and `GET`/`HEAD`, and is reachable only as
+`$REMOUNT_PACKAGE_CONNECTOR/<host>/<path>`. A package rule never authorizes the
+generic reverse proxy, forward proxy, or CONNECT. Bodies, range requests,
+WebDAV/mutating methods, and non-HTTPS redirects are denied. Redirects are
+rewritten through the connector so each hop consumes and rechecks policy.
+
+Package responses are staged, bounded, SHA-256 verified, and stored as
+read-only content-addressed blobs. Mutable metadata and references are scoped
+to an opaque tenant/workspace directory. `X-Remount-Expected-Digest` enables a
+cache hit only after that same workspace has independently fetched the digest;
+the header is stripped upstream. `X-Remount-Content-Digest` reports provenance
+without exposing a cache path or hit state. Audits additionally carry the
+connector and digest.
+
+The scheduler MUST require `package` in `NodeInfo.connectors` before assigning
+a workspace containing such a rule. Absence fails closed, including for older
+nodes that do not send the additive field. Production enrollment binds this
+list to operator-approved node information rather than trusting a node's
+self-report.
 
 Every broker listener has a random 256-bit capability unique to one workspace
 materialization, and audit records carry workspace, generation, rule, protocol,

@@ -204,6 +204,13 @@ path and request/response budgets. Both built-in backends provide cooperative
 proxying rather than non-bypassable egress, so production security profiles
 reject them.
 
+Package retrieval can be granted separately with a
+`connector:"package"` egress rule. The managed HTTPS endpoint is read-only,
+reports SHA-256 provenance, stores immutable content by digest, and keeps cache
+references and metadata private to each workspace. See the
+[operations guide](docs/operations.md#network-policy) for the request format
+and its deliberate limitations.
+
 Not built yet, and honestly named as such: a production backend with enforced
 egress, microVM backends (Firecracker, Apple Virtualization), the display and
 browser session kinds, and the web UI.

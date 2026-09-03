@@ -462,7 +462,7 @@ func cmdWS(ctx context.Context, args []string) error {
 		labels, workspaceLabels, env := kvFlag{}, kvFlag{}, kvFlag{}
 		fs.Var(labels, "label", "placement label k=v (repeatable)")
 		fs.Var(workspaceLabels, "workspace-label", "workspace label k=v (repeatable)")
-		fs.Var(env, "env", "env K=V; values may be ref:<binding> or ${REMOUNT_BROKER} (repeatable)")
+		fs.Var(env, "env", "env K=V; values may use ref:<binding>, ${REMOUNT_BROKER}, or ${REMOUNT_PACKAGE_CONNECTOR} (repeatable)")
 		var bindings, exclude listFlag
 		var egressRules egressRuleFlag
 		fs.Var(&bindings, "binding", "binding id (repeatable)")

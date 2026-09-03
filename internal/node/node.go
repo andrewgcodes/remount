@@ -29,6 +29,7 @@ import (
 
 	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/broker"
+	"remount.dev/remount/internal/connector"
 	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/eventlog"
 	"remount.dev/remount/internal/ids"
@@ -53,7 +54,12 @@ type Options struct {
 	// MaxArtifactBytes bounds compressed snapshots and remote downloads.
 	// Zero selects 8 GiB.
 	MaxArtifactBytes int64
-	Logger           *slog.Logger
+	// Package connector cache limits. Zero values select conservative node,
+	// workspace, and object defaults in connector.NewStore.
+	MaxConnectorCacheBytes     int64
+	MaxConnectorWorkspaceBytes int64
+	MaxConnectorObjectBytes    int64
+	Logger                     *slog.Logger
 	// Allow lists hosts every workspace on this node may reach without a credential.
 	Allow []string
 	// AllowPrivate lists hosts that may resolve to private addresses (local models).
@@ -76,9 +82,10 @@ type Node struct {
 	priv   ed25519.PrivateKey
 	logger *slog.Logger
 
-	sessions *session.Manager
-	store    *artifact.Store
-	events   *eventlog.Log
+	sessions   *session.Manager
+	store      *artifact.Store
+	connectors *connector.Store
+	events     *eventlog.Log
 
 	mu         sync.Mutex
 	peer       *transport.Peer
@@ -217,6 +224,13 @@ func New(opts Options) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	connectorStore, err := connector.NewStore(filepath.Join(opts.DataDir, "connectors"), connector.StoreOptions{
+		MaxBytes: opts.MaxConnectorCacheBytes, MaxBytesPerScope: opts.MaxConnectorWorkspaceBytes,
+		MaxObjectBytes: opts.MaxConnectorObjectBytes,
+	})
+	if err != nil {
+		return nil, err
+	}
 	mutationPath := filepath.Join(opts.DataDir, "mutations.cbor")
 	mutations, err := loadMutations(mutationPath)
 	if err != nil {
@@ -232,7 +246,7 @@ func New(opts Options) (*Node, error) {
 	}
 	n := &Node{
 		opts: opts, id: id, priv: priv, logger: opts.Logger.With("node", id),
-		store: store, events: eventlog.New(eventlog.NewMemory(10000)),
+		store: store, connectors: connectorStore, events: eventlog.New(eventlog.NewMemory(10000)),
 		workspaces: map[string]*ws{}, materializing: map[string]*materialization{},
 		deadlines: map[string]time.Time{}, quarantined: map[string]struct{}{},
 		grants: map[string]*proto.Grant{}, subs: map[string]*subscriber{},
@@ -638,6 +652,7 @@ func (n *Node) connectOnce(ctx context.Context) error {
 	info := workspace.HostInfoForRegistry(n.opts.Backends)
 	info.Version = n.opts.Version
 	info.Caps = n.opts.Caps
+	info.Connectors = []string{proto.EgressConnectorPackage}
 	hello.Node = &info
 	hello.IssuedAt = time.Now().UnixMilli()
 	hello.Nonce = make([]byte, 32)
@@ -924,6 +939,7 @@ func writeWorkspaceEnv(handle workspace.Handle, w *ws) error {
 	fmt.Fprintf(&b, "REMOUNT_NODE_BACKEND=%s\n", handle.Backend())
 	if w.broker != nil {
 		fmt.Fprintf(&b, "REMOUNT_BROKER=%s\n", w.broker.BaseURL())
+		fmt.Fprintf(&b, "REMOUNT_PACKAGE_CONNECTOR=%s\n", w.broker.PackageURL())
 	}
 	for _, l := range w.leases {
 		// The placeholder, never the secret.
@@ -1874,6 +1890,7 @@ func (n *Node) status() proto.NodeStatus {
 	info := workspace.HostInfoForRegistry(n.opts.Backends)
 	info.Version = n.opts.Version
 	info.Caps = append([]string(nil), n.opts.Caps...)
+	info.Connectors = []string{proto.EgressConnectorPackage}
 	st := proto.NodeStatus{ID: n.id, Labels: n.opts.Labels, Info: info, Online: true, LastSeen: time.Now().UnixMilli()}
 	n.mu.Lock()
 	for id := range n.workspaces {
@@ -2168,9 +2185,9 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 	}
 	entry.leases = leases
 	brokerOpts := broker.Options{
-		WS: w.ID, Generation: w.Generation, Principal: w.Spec.Principal, Leases: leases,
+		WS: w.ID, Generation: w.Generation, Principal: w.Spec.Principal, Tenant: w.Tenant, Leases: leases,
 		Network: w.Spec.Security.Network, Allow: n.opts.Allow, AllowPrivate: n.opts.AllowPrivate,
-		RootCAs: n.opts.BrokerRootCAs,
+		RootCAs: n.opts.BrokerRootCAs, ConnectorStore: n.connectors,
 		Audit: func(a broker.Audit) {
 			typ := proto.EvEgressAllowed
 			switch a.Decision {
@@ -2183,6 +2200,7 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 			n.emit(typ, a.WS, a.Principal, map[string]any{
 				"generation": a.Generation, "decision": a.Decision, "binding": a.Binding,
 				"rule": a.Rule, "protocol": a.Protocol, "shared_state": a.SharedState,
+				"connector": a.Connector, "digest": a.Digest, "cached": a.Cached,
 				"host": a.Host, "method": a.Method, "path": a.Path, "reason": a.Reason,
 				"status": a.Status, "request_bytes": a.RequestBytes, "response_bytes": a.ResponseBytes,
 			})

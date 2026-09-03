@@ -191,7 +191,7 @@ func TestHelloReturnsDeepCopy(t *testing.T) {
 	r.hellos["node"] = &proto.Hello{
 		Peer: "node", Caps: []string{"v1"}, PubKey: []byte{1}, Nonce: []byte{2}, Proof: []byte{3},
 		Labels: map[string]string{"zone": "a"},
-		Node: &proto.NodeInfo{Backends: []string{"process"}, Caps: []string{"gpu"},
+		Node: &proto.NodeInfo{Backends: []string{"process"}, Caps: []string{"gpu"}, Connectors: []string{"package"},
 			BackendDescriptors: []proto.BackendDescriptor{{Name: "process"}}},
 	}
 
@@ -201,11 +201,13 @@ func TestHelloReturnsDeepCopy(t *testing.T) {
 	got.Labels["zone"] = "changed"
 	got.Node.Backends[0] = "changed"
 	got.Node.Caps[0] = "changed"
+	got.Node.Connectors[0] = "changed"
 	got.Node.BackendDescriptors[0].Name = "changed"
 
 	want := r.Hello("node")
 	if want.Caps[0] != "v1" || want.PubKey[0] != 1 || want.Nonce[0] != 2 || want.Proof[0] != 3 ||
 		want.Labels["zone"] != "a" || want.Node.Backends[0] != "process" || want.Node.Caps[0] != "gpu" ||
+		want.Node.Connectors[0] != "package" ||
 		want.Node.BackendDescriptors[0].Name != "process" {
 		t.Fatalf("stored hello was mutated through returned value: %+v", want)
 	}
