@@ -16,3 +16,7 @@ env:
   LOG_ALL_EVENTS: "true"
 command: ["openhands", "-t", "{{.Task}}"]
 state_dirs: [".openhands"]
+# ACP (verified: openhands CLI command reference); `--resume ID` is the
+# harness-native alternative to session/load.
+acp:
+  command: ["openhands", "acp"]

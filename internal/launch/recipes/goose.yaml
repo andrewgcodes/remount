@@ -26,3 +26,8 @@ env:
 command: ["goose", "run", "--text", "{{.Task}}"]
 resume_command: ["goose", "run", "--resume", "--text", "{{.Task}}"]
 state_dirs: [".local/share/goose", ".config/goose"]
+# ACP (verified: goose docs "Agent Client Protocol"); session/load replays
+# the full history.
+acp:
+  command: ["goose", "acp", "--with-builtin", "developer"]
+  load_session: true

@@ -106,6 +106,75 @@ type Recipe struct {
 	SandboxFlags map[string][]string `json:"sandbox_flags,omitempty"`
 	// ApproveFlags maps an --approve policy to harness-native arguments.
 	ApproveFlags map[string][]string `json:"approve_flags,omitempty"`
+	// ACP runs the harness as an Agent Client Protocol server over stdio
+	// (ADR 0042). Recipes with it have a structured transcript; recipes
+	// without run in PTY mode and prompts are typed via PromptTemplate.
+	ACP *ACPSpec `json:"acp,omitempty"`
+	// UI is the harness's own web interface, reachable only through the
+	// preview proxy; Remount ships no end-user UI of its own (ADR 0046).
+	UI *UISpec `json:"ui,omitempty"`
+	// PromptTemplate renders a follow-up message into the bytes typed into a
+	// PTY-mode harness; the template sees Data.Message. Empty means the
+	// message followed by a newline.
+	PromptTemplate string `json:"prompt_template,omitempty"`
+	// SessionIDFrom locates the harness's own conversation id in its state
+	// directory so a handoff can continue that conversation with
+	// session/load on the node.
+	SessionIDFrom *SessionIDFrom `json:"session_id_from,omitempty"`
+}
+
+// ACPSpec is how a recipe starts its harness as an ACP agent.
+type ACPSpec struct {
+	// Command is the argv of the stdio ACP server; its cwd is the workspace
+	// root (MountPath). Each element is a template.
+	Command []string `json:"command"`
+	// Env is extra environment for the ACP process, exported after the
+	// recipe's Env. Never a credential: keys arrive as broker placeholders.
+	Env map[string]string `json:"env,omitempty"`
+	// LoadSession is the recipe's claim that the agent advertises
+	// session/load. The runner verifies it against Initialize and records a
+	// mismatch rather than trusting either side blindly.
+	LoadSession bool `json:"load_session,omitempty"`
+	// Adapter names a bridge (an npm package, say) when the harness does not
+	// speak ACP natively. Documentation only.
+	Adapter string `json:"adapter,omitempty"`
+}
+
+// UISpec is a harness-native web UI the node can start next to the agent.
+type UISpec struct {
+	// Command is the argv; templates see Data.Port for the port to bind.
+	Command []string `json:"command"`
+	// Port is the port the UI listens on inside the workspace.
+	Port int `json:"port"`
+}
+
+// SessionIDFrom describes where a harness records its conversation id.
+type SessionIDFrom struct {
+	// Glob is a workspace-relative pattern over the harness's state files;
+	// the most recently modified match wins.
+	Glob string `json:"glob"`
+	// Key is a dotted path into the matched JSON file ("id",
+	// "session.id"). Empty means the file's base name without extension is
+	// the id.
+	Key string `json:"key,omitempty"`
+}
+
+// Mode names how an Agent built from this recipe runs.
+const (
+	// ModeACP: structured transcript over the Agent Client Protocol.
+	ModeACP = "acp"
+	// ModePTY: the harness runs on a pseudo-terminal; the transcript is the
+	// terminal log and messages are typed via PromptTemplate.
+	ModePTY = "pty"
+)
+
+// Mode returns ModeACP when the recipe declares an ACP command, else
+// ModePTY.
+func (r *Recipe) Mode() string {
+	if r.ACP != nil {
+		return ModeACP
+	}
+	return ModePTY
 }
 
 // ConfigFile is one file the launcher writes before exec.
@@ -131,6 +200,10 @@ type Data struct {
 	// Broker is the shell expression for the broker base URL. The launcher
 	// sources .remount/env first, so it is always the hosting node's.
 	Broker string
+	// Message is the follow-up text a PromptTemplate renders.
+	Message string
+	// Port is the port a UI command binds.
+	Port int
 }
 
 var recipeNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
@@ -241,9 +314,35 @@ func (r *Recipe) Validate() error {
 			return fmt.Errorf("recipe %s: approve_flags key %q is not an approval policy", r.Name, policy)
 		}
 	}
+	if r.ACP != nil {
+		if len(r.ACP.Command) == 0 {
+			return fmt.Errorf("recipe %s: acp.command is required", r.Name)
+		}
+		for k := range r.ACP.Env {
+			if !envNamePattern.MatchString(k) {
+				return fmt.Errorf("recipe %s: acp.env name %q is not a valid identifier", r.Name, k)
+			}
+		}
+	}
+	if r.UI != nil {
+		if len(r.UI.Command) == 0 {
+			return fmt.Errorf("recipe %s: ui.command is required", r.Name)
+		}
+		if r.UI.Port < 1 || r.UI.Port > 65535 {
+			return fmt.Errorf("recipe %s: ui.port %d out of range", r.Name, r.UI.Port)
+		}
+	}
+	if r.SessionIDFrom != nil {
+		if err := validateRelativePath(r.SessionIDFrom.Glob); err != nil {
+			return fmt.Errorf("recipe %s: session_id_from.glob: %w", r.Name, err)
+		}
+		if _, err := path.Match(r.SessionIDFrom.Glob, ""); err != nil {
+			return fmt.Errorf("recipe %s: session_id_from.glob: %w", r.Name, err)
+		}
+	}
 	// Compile every template once with a representative Data so a syntax
 	// error or unknown field is a load-time error.
-	probe := Data{Task: "t", Recipe: r.Name, Workspace: "ws_probe", Sandbox: SandboxWorkspaceWrite, Approve: ApproveNever, Broker: "$REMOUNT_BROKER"}
+	probe := Data{Task: "t", Recipe: r.Name, Workspace: "ws_probe", Sandbox: SandboxWorkspaceWrite, Approve: ApproveNever, Broker: "$REMOUNT_BROKER", Message: "m", Port: 1}
 	if len(r.Providers) > 0 {
 		probe.Providers = []string{r.Providers[0]}
 		probe.Primary = r.Providers[0]
@@ -284,6 +383,10 @@ type rendered struct {
 	Configure []ConfigFile
 	Command   []string
 	Resume    []string
+	ACP       []string
+	ACPEnv    map[string]string
+	UI        []string
+	Prompt    string
 }
 
 func funcs(d Data) template.FuncMap {
@@ -402,7 +505,73 @@ func (r *Recipe) render(d Data) (*rendered, error) {
 	if out.Resume, err = list("resume_command", r.ResumeCommand); err != nil {
 		return nil, err
 	}
+	if r.ACP != nil {
+		if out.ACP, err = list("acp.command", r.ACP.Command); err != nil {
+			return nil, err
+		}
+		out.ACPEnv = map[string]string{}
+		akeys := make([]string, 0, len(r.ACP.Env))
+		for k := range r.ACP.Env {
+			akeys = append(akeys, k)
+		}
+		sort.Strings(akeys)
+		for _, k := range akeys {
+			if out.ACPEnv[k], err = one("acp.env."+k, r.ACP.Env[k]); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if r.UI != nil {
+		if out.UI, err = list("ui.command", r.UI.Command); err != nil {
+			return nil, err
+		}
+	}
+	tmpl := r.PromptTemplate
+	if tmpl == "" {
+		tmpl = "{{.Message}}\n"
+	}
+	if out.Prompt, err = one("prompt_template", tmpl); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// ACPArgv renders the argv of the recipe's ACP server, or an error when the
+// recipe has none.
+func (r *Recipe) ACPArgv(d Data) ([]string, error) {
+	if r.ACP == nil {
+		return nil, fmt.Errorf("recipe %s has no acp command; it runs in %s mode", r.Name, ModePTY)
+	}
+	out, err := r.render(d)
+	if err != nil {
+		return nil, err
+	}
+	return out.ACP, nil
+}
+
+// UIArgv renders the argv of the recipe's web UI bound to d.Port.
+func (r *Recipe) UIArgv(d Data) ([]string, error) {
+	if r.UI == nil {
+		return nil, fmt.Errorf("recipe %s has no ui", r.Name)
+	}
+	if d.Port == 0 {
+		d.Port = r.UI.Port
+	}
+	out, err := r.render(d)
+	if err != nil {
+		return nil, err
+	}
+	return out.UI, nil
+}
+
+// PromptBytes renders message into what a PTY-mode agent types at the
+// harness.
+func (r *Recipe) PromptBytes(message string) (string, error) {
+	out, err := r.render(Data{Recipe: r.Name, Message: message})
+	if err != nil {
+		return "", err
+	}
+	return out.Prompt, nil
 }
 
 var envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -472,6 +641,28 @@ func (r *Recipe) Launcher(d Data, resume bool) (string, error) {
 		}
 		argv = out.Resume
 	}
+	return r.launcher(d, out, argv, nil)
+}
+
+// ACPLauncherPath is where the ACP launcher for this recipe lives.
+func (r *Recipe) ACPLauncherPath() string {
+	return LauncherDir + "/" + r.Name + ".acp.sh"
+}
+
+// ACPLauncher renders the sh script that execs the recipe's ACP server with
+// the same preamble as Launcher, plus the ACP-specific env.
+func (r *Recipe) ACPLauncher(d Data) (string, error) {
+	if r.ACP == nil {
+		return "", fmt.Errorf("recipe %s has no acp command", r.Name)
+	}
+	out, err := r.render(d)
+	if err != nil {
+		return "", err
+	}
+	return r.launcher(d, out, out.ACP, out.ACPEnv)
+}
+
+func (r *Recipe) launcher(d Data, out *rendered, argv []string, extraEnv map[string]string) (string, error) {
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\n")
 	b.WriteString("# Generated by `remount run`; regenerated on every launch. Do not edit.\n")
@@ -507,6 +698,17 @@ func (r *Recipe) Launcher(d Data, resume bool) (string, error) {
 			continue
 		}
 		fmt.Fprintf(&b, "export %s=\"%s\"\n", k, escapeDQ(out.Env[k]))
+	}
+	ekeys := make([]string, 0, len(extraEnv))
+	for k := range extraEnv {
+		ekeys = append(ekeys, k)
+	}
+	sort.Strings(ekeys)
+	for _, k := range ekeys {
+		if extraEnv[k] == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "export %s=\"%s\"\n", k, escapeDQ(extraEnv[k]))
 	}
 	for i, f := range out.Configure {
 		eof := fmt.Sprintf("REMOUNT_EOF_%d", i)
@@ -555,3 +757,62 @@ func TaskHash(task string) string {
 	sum := sha256.Sum256([]byte(task))
 	return hex.EncodeToString(sum[:8])
 }
+
+// Extract returns the harness's conversation id from the state files under
+// fsys (rooted at the workspace), or "" when no state file matches yet. The
+// newest match wins because a harness that keeps one file per conversation
+// has the current one last.
+func (s *SessionIDFrom) Extract(fsys fs.FS) (string, error) {
+	matches, err := fs.Glob(fsys, s.Glob)
+	if err != nil {
+		return "", fmt.Errorf("session_id_from: %w", err)
+	}
+	var best string
+	var bestMod int64
+	for _, m := range matches {
+		info, err := fs.Stat(fsys, m)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if mod := info.ModTime().UnixNano(); best == "" || mod > bestMod || (mod == bestMod && m > best) {
+			best, bestMod = m, mod
+		}
+	}
+	if best == "" {
+		return "", nil
+	}
+	if s.Key == "" {
+		base := path.Base(best)
+		return strings.TrimSuffix(base, path.Ext(base)), nil
+	}
+	b, err := fs.ReadFile(fsys, best)
+	if err != nil {
+		return "", fmt.Errorf("session_id_from: %w", err)
+	}
+	if len(b) > maxSessionStateFile {
+		return "", fmt.Errorf("session_id_from: %s is larger than %d bytes", best, maxSessionStateFile)
+	}
+	var doc any
+	if err := json.Unmarshal(b, &doc); err != nil {
+		return "", fmt.Errorf("session_id_from: %s: %w", best, err)
+	}
+	cur := doc
+	for _, part := range strings.Split(s.Key, ".") {
+		obj, ok := cur.(map[string]any)
+		if !ok {
+			return "", fmt.Errorf("session_id_from: %s has no %q", best, s.Key)
+		}
+		cur, ok = obj[part]
+		if !ok {
+			return "", fmt.Errorf("session_id_from: %s has no %q", best, s.Key)
+		}
+	}
+	id, ok := cur.(string)
+	if !ok || id == "" {
+		return "", fmt.Errorf("session_id_from: %s: %q is not a string", best, s.Key)
+	}
+	return id, nil
+}
+
+// maxSessionStateFile bounds how much of a harness state file Extract reads.
+const maxSessionStateFile = 4 << 20

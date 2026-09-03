@@ -13,3 +13,7 @@ env:
 command: ["cline", "-y", "{{.Task}}"]
 state_dirs: [".cline"]
 path_keyed: true
+# ACP (verified: https://docs.cline.bot/usage/acp): the flag form, not a
+# subcommand.
+acp:
+  command: ["cline", "--acp"]

@@ -17,3 +17,6 @@ sandbox_flags:
   full: ["--approval-mode", "yolo"]
 state_dirs: [".gemini"]
 path_keyed: true
+# ACP (verified: gemini-cli docs/cli/acp-mode.md).
+acp:
+  command: ["gemini", "--acp"]

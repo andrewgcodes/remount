@@ -35,3 +35,14 @@ command: ["opencode", "run", "{{.Task}}"]
 resume_command: ["opencode", "run", "--continue", "{{.Task}}"]
 state_dirs: [".local/share/opencode"]
 path_keyed: true
+# ACP (verified: https://opencode.ai/docs/acp/). Session files are one JSON
+# per conversation under storage/session/<project>/, keyed by "id".
+acp:
+  command: ["opencode", "acp"]
+  load_session: true
+ui:
+  command: ["opencode", "web", "--port", "{{.Port}}", "--hostname", "127.0.0.1"]
+  port: 4096
+session_id_from:
+  glob: ".local/share/opencode/storage/session/*/ses_*.json"
+  key: id

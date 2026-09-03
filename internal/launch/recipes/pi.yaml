@@ -1,0 +1,34 @@
+# pi coding agent (earendil-works/pi). https://github.com/earendil-works/pi
+# ACP through the community adapter `pi-acp`, which spawns `pi --mode rpc`;
+# pi's own RPC mode is the steering-capable alternative.
+name: pi
+description: pi coding agent
+auth: api_key
+providers: [anthropic, openai, openrouter, google, groq, xai, mistral]
+hosts:
+  - registry.npmjs.org
+install: |
+  command -v pi >/dev/null 2>&1 || npm install -g @earendil-works/pi-coding-agent
+env:
+  PI_CODING_AGENT_DIR: "$PWD/.pi/agent"
+configure:
+  # models.json overrides a native provider's base URL; the apiKey value is an
+  # env reference pi resolves at request time, so the file holds no key.
+  - path: .pi/agent/models.json
+    content: |
+      {
+        "providers": {
+          {{- if .Primary}}
+          {{json .Primary}}: {
+            "baseUrl": "{{baseURL .Primary}}",
+            "apiKey": "\{{key .Primary}}"
+          }
+          {{- end}}
+        }
+      }
+command: ["pi", "-p", "--no-approve", "{{.Task}}"]
+resume_command: ["pi", "--continue", "-p", "--no-approve", "{{.Task}}"]
+state_dirs: [".pi"]
+acp:
+  command: ["npx", "-y", "pi-acp"]
+  adapter: pi-acp
