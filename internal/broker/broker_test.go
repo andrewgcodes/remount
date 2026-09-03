@@ -297,6 +297,76 @@ func TestSubstitutesBearerForBoundHost(t *testing.T) {
 	}
 }
 
+// A workspace on a non-loopback path to its broker (Docker's
+// host.docker.internal) must exempt that host from the forward proxy, or a
+// proxy-honoring client sends its capability URL through the proxy and the
+// broker sees a placeholder addressed to itself.
+func TestEnvExemptsAdvertisedBrokerHostFromProxy(t *testing.T) {
+	up := newUpstream(t)
+	rec := &recorder{}
+	lease := proto.BindingLease{ID: "b_gh", Secret: "ghp_REAL", Destinations: []string{up.host}}
+	b := New(Options{
+		WS: "ws_t", Principal: "a_test", Leases: []proto.BindingLease{lease},
+		AllowPrivate: []string{"127.0.0.1", "localhost"}, Audit: rec.add, RootCAs: up.pool(),
+		Listen: "127.0.0.1:0", AdvertiseHost: "host.docker.internal",
+	})
+	if _, err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	env := map[string]string{}
+	for _, kv := range b.EnvFor() {
+		k, v, _ := strings.Cut(kv, "=")
+		env[k] = v
+	}
+	for _, k := range []string{"NO_PROXY", "no_proxy"} {
+		got := strings.Split(env[k], ",")
+		want := map[string]bool{"127.0.0.1": false, "localhost": false, "host.docker.internal": false}
+		for _, h := range got {
+			if _, ok := want[h]; ok {
+				want[h] = true
+			}
+		}
+		for h, seen := range want {
+			if !seen {
+				t.Fatalf("%s=%q lacks %s", k, env[k], h)
+			}
+		}
+	}
+	if !strings.Contains(env["REMOUNT_BROKER"], "host.docker.internal") || !strings.Contains(env["HTTPS_PROXY"], "host.docker.internal") {
+		t.Fatalf("%+v", env)
+	}
+	if b.AdvertisedHost() != "host.docker.internal" {
+		t.Fatal(b.AdvertisedHost())
+	}
+	// Defence in depth: a client that ignores NO_PROXY and forwards the
+	// capability URL through the proxy is served directly, not recorded as a
+	// leak. Dial the listener but address the request to the advertised host.
+	_, port, _ := net.SplitHostPort(b.ln.Addr().String())
+	target := "http://" + net.JoinHostPort("host.docker.internal", port) + "/c/" + b.token + "/d/" + up.host + "/repos"
+	req, _ := http.NewRequest("GET", target, nil)
+	req.Header.Set("Authorization", "Bearer ref:b_gh")
+	proxyURL, _ := url.Parse(strings.Replace(b.ProxyURL(), "host.docker.internal", "127.0.0.1", 1))
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "auth=Bearer ghp_REAL;key=" {
+		t.Fatalf("%d %q", resp.StatusCode, body)
+	}
+	if rec.count(DecisionLeakBlocked) != 0 || rec.count(DecisionSubstituted) != 1 {
+		t.Fatalf("leak_blocked=%d substituted=%d", rec.count(DecisionLeakBlocked), rec.count(DecisionSubstituted))
+	}
+	// Loopback brokers do not repeat the loopback entries.
+	plain := start(t, up, nil, nil, &recorder{})
+	if plain.NoProxy() != "127.0.0.1,localhost" {
+		t.Fatal(plain.NoProxy())
+	}
+}
+
 func TestBlocksPlaceholderToForeignHost(t *testing.T) {
 	up := newUpstream(t)
 	rec := &recorder{}
