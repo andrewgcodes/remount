@@ -306,7 +306,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 // ---------------------------------------------------------------------------
 
 // handleSessionCreate exchanges a header credential for a cookie so a
-// browser can open a preview or a WebSocket. The cookie holds the same
+// browser can load a preview and its subresources. The cookie holds the same
 // credential the header did; it is HttpOnly and SameSite=Strict so no other
 // site can ride on it, and Secure whenever the request arrived over TLS.
 func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
@@ -474,7 +474,9 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request) {
 // handleAgentLink is the stable per-agent URL. It is an API resource, not a
 // page: with an operator UI configured it redirects there, otherwise it is
 // the agent itself. There is no capability in the URL; the caller
-// authenticates like everywhere else.
+// authenticates like everywhere else, and the JSON fallback takes the header
+// only: the record holds the task and inbox text, which a preview page
+// carrying the cookie must not read.
 func (s *Server) handleAgentLink(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !plainID(id) {
@@ -492,7 +494,7 @@ func (s *Server) handleAgentLink(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, target, http.StatusFound)
 		return
 	}
-	cl, release := s.apiClient(w, r, true)
+	cl, release := s.apiClient(w, r, false)
 	if cl == nil {
 		return
 	}

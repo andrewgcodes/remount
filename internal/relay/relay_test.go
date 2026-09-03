@@ -212,3 +212,106 @@ func TestHelloReturnsDeepCopy(t *testing.T) {
 		t.Fatalf("stored hello was mutated through returned value: %+v", want)
 	}
 }
+
+// orderingController records the lifecycle calls it receives for one peer id
+// and lets the test hold the second hello open inside Authenticate.
+type orderingController struct {
+	mu      sync.Mutex
+	calls   []string
+	hellos  int
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *orderingController) record(s string) {
+	c.mu.Lock()
+	c.calls = append(c.calls, s)
+	c.mu.Unlock()
+}
+
+func (c *orderingController) Authenticate(_ context.Context, h *proto.Hello) (string, *proto.HelloOK, error) {
+	c.mu.Lock()
+	c.hellos++
+	n := c.hellos
+	c.calls = append(c.calls, "auth")
+	c.mu.Unlock()
+	if n == 2 {
+		close(c.started)
+		<-c.release
+	}
+	return h.Peer, &proto.HelloOK{Peer: h.Peer, Caps: []string{proto.CapabilityV1}}, nil
+}
+func (c *orderingController) HandleFrame(context.Context, *proto.Frame) {}
+func (c *orderingController) PeerConnected(context.Context, string, *proto.Hello) {
+	c.record("connected")
+}
+func (c *orderingController) PeerGone(context.Context, string) { c.record("gone") }
+
+func (c *orderingController) snapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.calls...)
+}
+
+// A peer that reconnects while its previous connection is still being torn
+// down must never be reported gone after its new hello was accepted: the
+// controller would drop the subject the new connection just authenticated
+// and every later request from it would fail until the client gave up.
+func TestReplacedConnectionIsNeverReportedGoneAfterNewHello(t *testing.T) {
+	ctrl := &orderingController{started: make(chan struct{}), release: make(chan struct{})}
+	r := New(ctrl)
+	defer r.Close()
+	ctx := context.Background()
+	hello := proto.Hello{Peer: "c_same", Role: proto.RoleClient, Caps: proto.PeerCapabilities()}
+
+	c1, s1 := transport.Pipe(16)
+	go func() { _ = r.Serve(ctx, s1) }()
+	p1 := transport.NewPeer(c1, nil)
+	if _, err := transport.Hello(ctx, p1, hello); err != nil {
+		t.Fatal(err)
+	}
+
+	c2, s2 := transport.Pipe(16)
+	go func() { _ = r.Serve(ctx, s2) }()
+	p2 := transport.NewPeer(c2, nil)
+	defer p2.Close()
+	helloDone := make(chan error, 1)
+	go func() {
+		_, err := transport.Hello(ctx, p2, hello)
+		helloDone <- err
+	}()
+	select {
+	case <-ctrl.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second hello never reached Authenticate")
+	}
+	// The old connection dies while the new hello is mid-authentication,
+	// which is exactly what a network cut followed by an immediate redial
+	// looks like from the relay.
+	p1.Close()
+	time.Sleep(100 * time.Millisecond)
+	close(ctrl.release)
+	select {
+	case err := <-helloDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second hello did not complete")
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	calls := ctrl.snapshot()
+	want := []string{"auth", "connected", "auth", "connected"}
+	if len(calls) != len(want) {
+		t.Fatalf("lifecycle calls = %v, want %v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("lifecycle calls = %v, want %v", calls, want)
+		}
+	}
+	if !r.Online("c_same") {
+		t.Fatal("reconnected peer is not online")
+	}
+}

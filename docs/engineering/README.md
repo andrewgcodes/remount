@@ -6,6 +6,14 @@ statements that the described controls already exist.
 
 ## Documents
 
+### [Build handoff — 2026-09-03](./handoff-2026-09-03.md)
+
+The current status document for the build plan: what Remount is, what the
+Phase 0 / 1 / 1A build delivered (with commits, ADRs and the honest state of
+every acceptance scenario), the reconnect fix in flight, and the full text of
+Phases 2–6 that remain, the verification lanes and secrets they need, and how
+to split the remaining work across parallel agents. Start here.
+
 ### [Hardening lessons and review playbook](./hardening-lessons.md)
 
 A living synthesis of the failure patterns behind the audits and fixes. It

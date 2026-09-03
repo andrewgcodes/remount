@@ -57,6 +57,14 @@ type Relay struct {
 	// peer.gone can be delivered to the right places without content
 	// inspection.
 	recent map[string]map[string]struct{}
+	// idLocks serializes the connect and disconnect bookkeeping of one peer
+	// id. A reconnecting peer's hello and the teardown of its previous
+	// connection start from the same event, so without this the controller
+	// could learn the peer is gone after the newer connection authenticated,
+	// and a peer.gone could reach a node after that node accepted the newer
+	// connection's attach (docs/adr/0059-per-peer-lifecycle-ordering.md).
+	idMu    sync.Mutex
+	idLocks map[string]*idLock
 
 	pendMu  sync.Mutex
 	pending map[uint64]relayPending
@@ -76,6 +84,11 @@ type relayPending struct {
 	ch   chan *proto.Frame
 }
 
+type idLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
 const maxPendingRequests = 4096
 
 // New creates a relay for the controller.
@@ -83,7 +96,34 @@ func New(ctrl Controller) *Relay {
 	return &Relay{
 		ctrl: ctrl, peers: map[string]*transport.Peer{}, hellos: map[string]*proto.Hello{},
 		active: map[*serveCall]struct{}{}, recent: map[string]map[string]struct{}{},
-		pending: map[uint64]relayPending{},
+		idLocks: map[string]*idLock{}, pending: map[uint64]relayPending{},
+	}
+}
+
+// lockID takes the per-id lifecycle lock and returns its release. The empty
+// id belongs to a connection that has not claimed one yet; nothing can race
+// with it, so it is not serialized.
+func (r *Relay) lockID(id string) func() {
+	if id == "" {
+		return func() {}
+	}
+	r.idMu.Lock()
+	l := r.idLocks[id]
+	if l == nil {
+		l = &idLock{}
+		r.idLocks[id] = l
+	}
+	l.refs++
+	r.idMu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		r.idMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(r.idLocks, id)
+		}
+		r.idMu.Unlock()
 	}
 }
 
@@ -123,8 +163,12 @@ func (r *Relay) Serve(ctx context.Context, conn transport.Conn) error {
 		conn.Close()
 		return err
 	}
+	// The claimed id is the one a reconnecting peer reuses; Authenticate
+	// registers state under it, so its side effects belong inside the lock.
+	unlock := r.lockID(h.Peer)
 	id, ok, err := r.ctrl.Authenticate(ctx, &h)
 	if err != nil {
+		unlock()
 		e := proto.Err(proto.CodeUnauthorized, "%v", err)
 		var pe *proto.Error
 		if errors.As(err, &pe) {
@@ -134,6 +178,10 @@ func (r *Relay) Serve(ctx context.Context, conn transport.Conn) error {
 		conn.Close()
 		return err
 	}
+	if id != h.Peer {
+		unlock()
+		unlock = r.lockID(id)
+	}
 	peer := transport.NewPeer(conn, transport.HandlerFunc(func(ctx context.Context, p *transport.Peer, f *proto.Frame) {
 		f.From = id // never trust the sender's claim
 		r.route(ctx, f)
@@ -142,6 +190,7 @@ func (r *Relay) Serve(ctx context.Context, conn transport.Conn) error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
+		unlock()
 		_ = peer.Close()
 		return transport.ErrClosed
 	}
@@ -153,17 +202,30 @@ func (r *Relay) Serve(ctx context.Context, conn transport.Conn) error {
 	r.hellos[id] = &h
 	r.mu.Unlock()
 	if err := peer.Send(ctx, &proto.Frame{V: proto.Version, T: proto.KindRes, ID: first.ID, Body: proto.MustMarshal(ok)}); err != nil {
-		r.remove(ctx, id, peer)
+		r.removeLocked(ctx, id, peer)
+		unlock()
 		return err
 	}
 	metrics.PeersConnected.Set(int64(len(r.Peers())))
 	r.ctrl.PeerConnected(ctx, id, &h)
+	unlock()
 	<-peer.Done()
 	r.remove(ctx, id, peer)
 	return peer.Err()
 }
 
+// remove forgets peer if it is still the connection registered for id and
+// tells the controller and the peers it talked to. It holds the id's
+// lifecycle lock so a newer connection for the same id cannot authenticate
+// or attach anywhere until the disconnect is fully delivered.
 func (r *Relay) remove(ctx context.Context, id string, peer *transport.Peer) {
+	unlock := r.lockID(id)
+	defer unlock()
+	r.removeLocked(ctx, id, peer)
+}
+
+// removeLocked is remove for a caller already holding id's lifecycle lock.
+func (r *Relay) removeLocked(ctx context.Context, id string, peer *transport.Peer) {
 	r.mu.Lock()
 	if r.peers[id] != peer {
 		r.mu.Unlock()
