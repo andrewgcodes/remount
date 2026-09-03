@@ -27,6 +27,7 @@ type agentFixture struct {
 	runs   []proto.AgentRunReq
 	ops    []string
 	fail   atomic.Bool
+	refuse map[string]bool // ops the node refuses while fail is off
 	clock  atomic.Int64
 	// nodeKey is n_one's identity; a restarted fixture reuses it so the node
 	// is the same peer to the control plane, not an impostor with a new key.
@@ -59,8 +60,9 @@ func newAgentFixtureWithNode(t *testing.T, path string, nodeKey ed25519.PrivateK
 	af.sender.request = func(_ context.Context, to, op string, body, out any) error {
 		af.mu.Lock()
 		af.ops = append(af.ops, op)
+		refused := af.refuse[op]
 		af.mu.Unlock()
-		if af.fail.Load() {
+		if af.fail.Load() || refused {
 			return proto.Err(proto.CodeUnreachable, "node refused %s", op)
 		}
 		switch op {
@@ -1449,5 +1451,44 @@ func TestChildSecurityNeverWeakerThanParent(t *testing.T) {
 	req = &proto.AgentCreateReq{Workspace: &proto.WorkspaceSpec{Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Default: proto.NetworkDefaultAllow}}}}
 	if err := inheritFromParent(req, parent, pws); !errors.Is(err, &proto.Error{Code: proto.CodeDenied}) {
 		t.Fatalf("partially set weaker child security: err = %v, want denied", err)
+	}
+}
+
+// A policy sleep the node refuses is retried after the backoff, not on every
+// tick: each attempt is a release round trip, and the kick that follows a
+// finished action would otherwise turn the refusal into a hot loop.
+func TestAgentPolicySleepFailureBacksOff(t *testing.T) {
+	af := newAgentFixture(t, "", nil)
+	a, run := af.start(t, localSubject(), "task")
+	af.report(t, run, 2, proto.AgentReport{Kind: proto.AgentReportTurnStarted, Message: run.Messages[0].ID})
+	af.report(t, run, 3, proto.AgentReport{Kind: proto.AgentReportTurnFinished, StopReason: "end_turn"})
+	af.c.mu.Lock()
+	af.c.agents[a.ID].Policy.SleepAfterSec = 30
+	af.c.mu.Unlock()
+	af.advance(31 * time.Second)
+	af.mu.Lock()
+	af.refuse = map[string]bool{proto.OpWSRelease: true}
+	af.mu.Unlock()
+	af.c.agentReconcile(context.Background())
+	first := af.opCount(proto.OpWSRelease)
+	if first == 0 {
+		t.Fatal("policy sleep was never attempted")
+	}
+	if got := af.agent(t, a.ID); got.Status == proto.AgentSleeping {
+		t.Fatalf("agent slept although the node refused: %+v", got)
+	}
+	for i := 0; i < 5; i++ {
+		af.c.agentReconcile(context.Background())
+	}
+	if again := af.opCount(proto.OpWSRelease); again != first {
+		t.Fatalf("sleep retried %d times inside the backoff window", again-first)
+	}
+	af.mu.Lock()
+	af.refuse = nil
+	af.mu.Unlock()
+	af.advance(agentRetryBackoff + time.Second)
+	af.c.agentReconcile(context.Background())
+	if got := af.agent(t, a.ID); got.Status != proto.AgentSleeping {
+		t.Fatalf("policy sleep did not retry after the backoff: %s", got.Status)
 	}
 }

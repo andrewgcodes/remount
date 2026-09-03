@@ -64,6 +64,11 @@ type agentRun struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
+	// softCtx ends on any cancel, hard or soft. Work that has no ACP-level
+	// cancel of its own (the recipe install) waits on it, so a control-plane
+	// agent.run.cancel is honoured before the harness ever starts.
+	softCtx    context.Context
+	softCancel context.CancelFunc
 
 	transcript *session.Session
 	redact     *redactor
@@ -499,8 +504,10 @@ func (n *Node) agentRunStart(ctx context.Context, p *transport.Peer, req *proto.
 		}
 	}
 	rctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	sctx, scancel := context.WithCancel(rctx)
 	r := &agentRun{
 		n: n, w: w, req: *req, key: key, ctx: rctx, cancel: cancel, done: make(chan struct{}),
+		softCtx: sctx, softCancel: scancel,
 		seen: map[string]bool{}, wake: make(chan struct{}, 1),
 		approvals: map[string]chan proto.ApprovalDecision{}, terminals: map[string]*agentTerminal{},
 	}
@@ -638,6 +645,7 @@ func (r *agentRun) requestCancel(reason string) {
 	r.cancelReason = reason
 	tc := r.turnCancel
 	r.mu.Unlock()
+	r.softCancel()
 	if tc != nil {
 		tc()
 	}
@@ -1008,7 +1016,7 @@ func (r *agentRun) installHarness() error {
 		return proto.Err(proto.CodeInternal, "install %s: %v", recipe.Name, err)
 	}
 	defer r.n.sessions.Remove(s.ID, true)
-	exit, err := s.Wait(r.ctx)
+	exit, err := s.Wait(r.softCtx)
 	if err != nil {
 		s.Kill()
 		if r.isCancelled() {
@@ -1132,18 +1140,48 @@ func (r *agentRun) stopProcess(cmd *exec.Cmd, client *acp.Client) int {
 	if hard {
 		_ = session.SignalProcess(cmd, "KILL")
 		r.awaitReader(client, agentStopGrace)
-		return harnessExit(cmd)
+		return harnessExit(cmd, agentStopGrace)
 	}
 	if r.awaitReader(client, 2*time.Second) {
-		return harnessExit(cmd)
+		return harnessExit(cmd, agentStopGrace)
 	}
 	_ = session.SignalProcess(cmd, "TERM")
 	if r.awaitReader(client, agentStopGrace) {
-		return harnessExit(cmd)
+		return harnessExit(cmd, agentStopGrace)
 	}
 	_ = session.SignalProcess(cmd, "KILL")
 	r.awaitReader(client, agentStopGrace)
-	return harnessExit(cmd)
+	return harnessExit(cmd, agentStopGrace)
+}
+
+// harnessExitCode is what a run records when the harness's process group
+// outlived the stop ladder and could not be waited on.
+const harnessExitCode = -1
+
+// harnessExit joins the harness process with a bound. A harness that closes
+// its stdout and keeps running (the reader is done, so the ladder above never
+// escalates) would otherwise pin cmd.Wait, and with it the run slot, the
+// transcript and the agent's capacity, for as long as its tree lives. Past
+// the grace period the whole group is killed; a group that still does not
+// exit is abandoned to the reaper and reported as harnessExitCode.
+func harnessExit(cmd *exec.Cmd, grace time.Duration) int {
+	done := make(chan int, 1)
+	go func() {
+		code, _ := session.ExitStatus(cmd.Wait())
+		done <- code
+	}()
+	select {
+	case code := <-done:
+		return code
+	case <-time.After(grace):
+	}
+	_ = session.SignalProcess(cmd, "KILL")
+	select {
+	case code := <-done:
+		return code
+	case <-time.After(grace):
+		return harnessExitCode
+	}
 }
 
 // awaitReader reports whether the ACP reader reached the end of the
@@ -1155,11 +1193,6 @@ func (r *agentRun) awaitReader(client *acp.Client, d time.Duration) bool {
 	case <-time.After(d):
 		return false
 	}
-}
-
-func harnessExit(cmd *exec.Cmd) int {
-	code, _ := session.ExitStatus(cmd.Wait())
-	return code
 }
 
 // handshake initializes the connection and opens or reopens the session.

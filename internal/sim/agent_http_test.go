@@ -433,10 +433,11 @@ func TestAgentHTTPAuthAndLifecycle(t *testing.T) {
 	}
 	viaCookie := w.api("")
 	cookieHdr := map[string]string{"Cookie": "remount_session=" + cookie}
-	if res := viaCookie.do(ctx, "GET", "/a/"+a.ID, nil, cookieHdr); res.status != 200 || !bytes.Contains(res.body, []byte(a.ID)) {
-		t.Fatalf("cookie stable link = %d %s", res.status, res.body)
-	}
+	// The stable link without an operator UI is the agent record itself
+	// (task, inbox text, parent); a preview page must not read it with the
+	// cookie either.
 	for _, c := range []struct{ method, path string }{
+		{"GET", "/a/" + a.ID},
 		{"GET", "/v1/agents"},
 		{"GET", "/v1/agents/" + a.ID},
 		{"GET", "/v1/agents/" + a.ID + "/transcript"},
@@ -463,14 +464,6 @@ func TestAgentHTTPAuthAndLifecycle(t *testing.T) {
 	if _, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(w.http.URL, "http")+"/v1/agents/"+a.ID+"/transcript", &websocket.DialOptions{HTTPHeader: http.Header{"Cookie": {"remount_session=" + cookie}}}); err == nil || resp == nil || resp.StatusCode != 401 {
 		t.Fatalf("cookie transcript ws accepted: err=%v", err)
 	}
-	crossSite := map[string]string{"Cookie": "remount_session=" + cookie, "Origin": "https://evil.example"}
-	if res := viaCookie.do(ctx, "GET", "/a/"+a.ID, nil, crossSite); res.status != 403 {
-		t.Fatalf("cross-site cookie read = %d %s", res.status, res.body)
-	}
-	sameSite := map[string]string{"Cookie": "remount_session=" + cookie, "Origin": "https://ui.example"}
-	if res := viaCookie.do(ctx, "GET", "/a/"+a.ID, nil, sameSite); res.status != 200 {
-		t.Fatalf("listed-origin cookie read = %d %s", res.status, res.body)
-	}
 
 	// Preview proxy: a program listening inside the workspace answers under
 	// /v1/agents/{id}/ports/{port}/ with the prefix it is mounted at and
@@ -496,6 +489,14 @@ func TestAgentHTTPAuthAndLifecycle(t *testing.T) {
 	}
 	if res := w.api("").do(ctx, "GET", prefix+"/", nil, nil); res.status != 401 {
 		t.Fatalf("unauthenticated preview = %d", res.status)
+	}
+	crossSite := map[string]string{"Cookie": "remount_session=" + cookie, "Origin": "https://evil.example"}
+	if res := viaCookie.do(ctx, "GET", prefix+"/app/index.html", nil, crossSite); res.status != 403 {
+		t.Fatalf("cross-site cookie preview = %d %s", res.status, res.body)
+	}
+	sameSite := map[string]string{"Cookie": "remount_session=" + cookie, "Origin": "https://ui.example"}
+	if res := viaCookie.do(ctx, "GET", prefix+"/app/index.html", nil, sameSite); res.status != 200 {
+		t.Fatalf("listed-origin cookie preview = %d %s", res.status, res.body)
 	}
 	// A browser WebSocket through the proxy carries the credential as a
 	// subprotocol; that token is stripped like the header and the program's
