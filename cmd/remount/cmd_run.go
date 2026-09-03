@@ -15,13 +15,14 @@ import (
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/launch"
 	"remount.dev/remount/internal/localfs"
+	"remount.dev/remount/internal/proto"
 )
 
 // ---------------------------------------------------------------------------
 // run: seed a workspace, install a harness, launch it against brokered keys
 // ---------------------------------------------------------------------------
 
-const runUsage = "run RECIPE [--dir PATH | --base NAME | --ws WS] [--binding ID[:PRESET]]... [--security P] [--sandbox M] [--approve M] [--mount-path /abs] [--detach] -- TASK…\n    run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM] | --queue-continue QUEUE"
+const runUsage = "run RECIPE [--dir PATH | --base NAME | --repo URL[@REF] | --ws WS] [--binding ID[:PRESET]]... [--security P] [--sandbox M] [--approve M] [--mount-path /abs] [--detach] -- TASK…\n    run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM] | --queue-continue QUEUE"
 
 func cmdRun(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
@@ -31,7 +32,8 @@ func cmdRun(ctx context.Context, args []string) error {
 	// Unlike ws create, .git is kept by default: the harness is expected to
 	// commit its work.
 	includeGit := fs.Bool("include-git", true, "with --dir, include the .git directory")
-	repo := fs.String("repo", "", "seed from a git URL (needs the git connector)")
+	repo := fs.String("repo", "", "clone this repository into a fresh workspace: URL[@REF]; the node clones through the broker")
+	repoDepth := fs.Int("repo-depth", 0, "with --repo, shallow-clone depth (0 = full history)")
 	base := fs.String("base", "", "seed from a named base (remount base ls)")
 	wsID := fs.String("ws", "", "run in an existing workspace")
 	image := fs.String("image", "", "container image (default: the recipe's)")
@@ -112,7 +114,7 @@ func cmdRun(ctx context.Context, args []string) error {
 	}
 
 	o := launch.Options{
-		Recipe: recipe, WS: *wsID, Base: *base, Repo: *repo, Name: *name, Image: *image, Backend: *backend,
+		Recipe: recipe, WS: *wsID, Base: *base, Name: *name, Image: *image, Backend: *backend,
 		Security: *security, Sandbox: *sandbox, Approve: *approve, Model: *model, Exclude: exclude, Resume: *resume,
 		Timeout: *timeout, Stderr: os.Stderr, MountPath: *mountPath,
 	}
@@ -137,6 +139,18 @@ func cmdRun(ctx context.Context, args []string) error {
 	}
 	if *dir != "" && *base != "" {
 		return errors.New("--dir and --base are mutually exclusive")
+	}
+	if *repo != "" {
+		if *dir != "" {
+			return errors.New("--dir and --repo are mutually exclusive")
+		}
+		r, err := proto.ParseRepoFlag(*repo, *repoDepth)
+		if err != nil {
+			return err
+		}
+		o.Repo = r
+	} else if *repoDepth != 0 {
+		return errors.New("--repo-depth needs --repo")
 	}
 	stdinTTY := term.IsTerminal(int(os.Stdin.Fd()))
 	pty := !*detach && stdinTTY && term.IsTerminal(int(os.Stdout.Fd()))

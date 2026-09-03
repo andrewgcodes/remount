@@ -330,6 +330,46 @@ read endpoint. The built-in process and Docker backends remain
 `cooperative_proxy`, so they cannot satisfy `isolated` or `multi_tenant`
 profiles.
 
+## Repositories: the git connector and the `/d/` stopgap
+
+Two ways exist to reach a repository from a workspace.
+
+The **stopgap** is the generic reverse proxy. With a binding whose hosts cover
+`github.com` and a placeholder in the URL's userinfo, this routes every
+`https://github.com/` URL through the broker and works because smart HTTP is
+plain GET/POST:
+
+```sh
+. .remount/env
+git config --global url."$REMOUNT_BROKER/d/github.com/".insteadOf https://github.com/
+git config --global http."$REMOUNT_BROKER/d/github.com/".extraHeader \
+  "Authorization: Basic $(printf 'x-access-token:%s' "$REMOUNT_REF_GH" | base64 -w0)"
+```
+
+It authorizes a *host*: anything the token can see on github.com — every
+repository, the REST API, release assets, LFS — is reachable. Use it only for a
+`local` profile you trust.
+
+The **typed connector** (`connector: "git"`, ADR 0054) authorizes a
+*repository*. Declare it on the workspace and the node does the rest:
+
+```sh
+remount ws create --repo github.com/acme/app@main --repo-depth 1 --binding b_gh
+remount run codex --repo github.com/acme/app -- "fix the flaky test"
+```
+
+The node clones through its own broker **before** the workspace is `claimed`,
+so the first `ls` shows the checkout and `repo.cloned{commit}` names the SHA
+that was served. The tree's git configuration arrives as `GIT_CONFIG_*` in
+`.remount/env` — insteadOf routing to `$REMOUNT_GIT_CONNECTOR/<host>/`,
+credential helpers disabled, prompts off — so `git fetch` and `git push` inside
+a session go through the same connector with the same placeholder. Only the
+declared repository is reachable (or the `repos:` patterns of a typed rule,
+with `push: true` required for `git-receive-pack`); `/api/`, raw files, LFS
+and every sibling repository are denied before any credential is substituted.
+A clone that fails never becomes an empty workspace: the tree is destroyed,
+the claim released, and the retry backed off.
+
 ## Writing your own loop
 
 The supported Go SDK is `remount.dev/remount/client`; its stable resource model

@@ -238,8 +238,12 @@ SecuritySpec { profile, min_isolation, require_sibling_isolation,
 NetworkPolicy { default: "deny"|"allow", rules: [EgressRule] }
 EgressRule { id, connector?, protocol, hosts, ports, methods, path_prefixes,
              max_requests, max_request_bytes, max_response_bytes,
-             shared_state }
+             shared_state, repos?, push? }
+RepoSpec    { url, ref?, depth? }
 ```
+
+`WorkspaceSpec.repo` names a repository the node clones into the tree before
+`ws.ready` (§10.2). It is mutually exclusive with `base` and `restore_from`.
 
 Profiles are `local`, `isolated`, and `multi_tenant`. `isolated` and
 `multi_tenant` require an enforced egress backend; `multi_tenant` additionally
@@ -342,7 +346,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `ws.claim` | N | `WSClaimReq{id}` → `WSClaimRes{workspace, lease_sec}` |
 | `ws.ready` | N | `WSReadyReq{id, gen}` → `{}` |
 | `ws.renew` | N | `WSRenewReq{ids, gen, authz}` → `WSRenewRes{results}`; each result explicitly says continue/fence/destroy/reconcile and, for a continued lease, carries `authz_revision`, `revoked`, `authz_reset` (§4.1) |
-| `ws.released` | N | `WSReleasedReq{id, gen, snapshot, reason}` → `{}` |
+| `ws.released` | N | `WSReleasedReq{id, gen, snapshot, reason, failed?}` → `{}`; `failed:true` means materialization could not complete and control holds the workspace out of placement with a growing delay (1s doubling to 30s, reset by the next `ws.ready`) instead of re-offering it at once |
 | `ws.snapshot.commit` | N | `WSSnapshotCommitReq{id, gen, snapshot}` → `{}` |
 | `binding.lease` | N | `BindingLeaseReq{ws}` → `BindingLeaseRes{leases}` |
 | `diag` | C | `DiagReq{verify}` → control diagnostics |
@@ -602,8 +606,25 @@ the header is stripped upstream. `X-Remount-Content-Digest` reports provenance
 without exposing a cache path or hit state. Audits additionally carry the
 connector and digest.
 
+`connector: "git"` is the smart-HTTP capability, reachable only as
+`$REMOUNT_GIT_CONNECTOR/<host>/<owner>/<repo>[.git]/{info/refs,git-upload-pack,git-receive-pack}`.
+A git rule requires HTTPS, scopes by `repos` (exact `owner/name` or
+`owner/*`) rather than `path_prefixes`, admits only `GET info/refs?service=`
+and `POST` to the two pack endpoints with no other query, and never follows a
+redirect. Dumb-HTTP object paths, the hosting service's API, raw-file and LFS
+endpoints are outside the grammar and are denied before any credential is
+substituted. `push:false` (the default) denies `git-receive-pack` at
+advertisement time so `git push` fails before a packfile is sent. A workspace
+whose `spec.repo` names a repository gets an implicit rule `repo` covering
+exactly that repository (fetch and push) when its policy declares no typed git
+rule; nothing else is opened. Audits carry `connector: git`, `op: fetch|push`
+and `repo: owner/name`. The `/d/<host>/` reverse proxy remains usable as a
+stopgap (`url.$REMOUNT_BROKER/d/github.com/.insteadOf`), but it is the generic
+substitution path and enforces none of the grammar above.
+
 The scheduler MUST require `package` in `NodeInfo.connectors` before assigning
-a workspace containing such a rule. Absence fails closed, including for older
+a workspace containing such a rule, and `git` for a workspace with a git rule
+or a `spec.repo`. Absence fails closed, including for older
 nodes that do not send the additive field. Production enrollment binds this
 list to operator-approved node information rather than trusting a node's
 self-report.
@@ -674,6 +695,31 @@ whose idempotency key was first used with `base: NAME` returns the original
 workspace even after that base is removed — the fingerprint covers the request
 as sent, not the resolved artifact.
 
+### 10.2 Repositories
+
+`WorkspaceSpec.repo{url, ref, depth}` seeds a fresh workspace from a git
+repository instead of an artifact. `url` is canonicalized to
+`https://<host>/<owner>/<name>` (userinfo, query, fragment and non-HTTPS
+schemes are refused); `ref` is a branch, tag or full commit SHA; `depth > 0`
+requests a shallow clone. The node clones **before** `ws.ready`, through its
+own broker with the workspace's binding placeholder, so the credential is
+substituted at the node edge and never enters the tree, `.remount/env`, the
+node log or an event payload. The tree's git configuration is delivered as
+`GIT_CONFIG_*` environment (routing `https://<host>/` through
+`$REMOUNT_GIT_CONNECTOR`, disabling credential helpers, terminal prompts and
+every protocol but HTTP(S)); it is regenerated on every materialization
+because the broker address changes on every move.
+
+A clone that fails does not produce a workspace: the node destroys the fresh
+tree, releases the claim with `failed:true`, and control backs the retry off.
+A node that adopts a tree whose clone never completed (it died mid-fetch)
+discards it rather than serving an empty checkout; the completion marker
+lives under `.remount/` and, like `.remount/env`, never travels in a snapshot.
+A restore (`restore_from`, a move, a wake) never re-clones: the snapshot
+already carries the checkout. Success emits `repo.cloned{repo, ref, commit,
+depth, backend}` where `commit` is `git rev-parse --verify HEAD` of the tree
+as served.
+
 ## 11. The event log
 
 Every consequential action is an event. Transactionally persisted resource
@@ -711,8 +757,8 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `peer.gone`, `ws.fenced`, `ws.state_changed`, `event.producer_gap`,
 `fleet.quarantine.requested`, `fleet.quarantine.target`,
 `fleet.quarantine.completed`, `base.created`, `base.removed`, `run.started`,
-`run.finished`, `auth.workspace_resident`, `queue.created` and
-`queue.advanced`.
+`run.finished`, `auth.workspace_resident`, `queue.created`,
+`queue.advanced` and `repo.cloned`.
 
 `run.started` carries `s`, `recipe`, `task_hash`, `sandbox` and `auth`;
 `run.finished` carries `s`, `recipe`, `exit` and `signal`;
@@ -722,6 +768,12 @@ None carries the task text, the harness argv or a provider key.
 `queue.created` carries `queue`, `ws` and `items` (a count); `queue.advanced`
 carries `queue`, `index`, `exit`, `signal`, `status` and `cursor`. Both are on
 the workspace stream and neither carries a task's text.
+
+`repo.cloned` carries `repo` (canonical URL), `ref`, `depth`, `commit` and
+`backend`; it never carries the binding, its placeholder or the broker URL.
+`egress.allowed`/`egress.denied` from the git connector add `connector: git`,
+`op: fetch|push` and `repo: owner/name`. A `ws.released` for a failed
+materialization carries `retry_after_ms`.
 
 `base.created` and `base.removed` are tenant-scoped rather than
 workspace-scoped: `stream` is the base name, `tenant` is set, `workspace` is

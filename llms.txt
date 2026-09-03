@@ -41,6 +41,7 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/re
 - [Verified: OpenAI Codex CLI](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#verified-openai-codex-cli): We ran Codex CLI 0.152.1 inside a Remount workspace on macOS with the `process` backend.
 - [The general pattern for any harness](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#the-general-pattern-for-any-harness): Every harness has a variable for where the model lives and a variable for the key.
 - [HTTP_PROXY mode](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#http_proxy-mode): The broker is also an ordinary HTTP forward proxy.
+- [Repositories: the git connector and the `/d/` stopgap](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#repositories-the-git-connector-and-the-d-stopgap): Two ways exist to reach a repository from a workspace.
 - [Writing your own loop](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#writing-your-own-loop): The supported Go SDK is `remount.dev/remount/client`; its stable resource model and error codes are in `remount.dev/remount/api`.
 - [What a harness gets for free](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#what-a-harness-gets-for-free): Truthful bounded replay.
 

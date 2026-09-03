@@ -343,6 +343,7 @@ func NormalizeSecurity(s SecuritySpec) (SecuritySpec, error) {
 		for i := range s.Network.Rules {
 			rule := &s.Network.Rules[i]
 			rule.Hosts = append([]string(nil), rule.Hosts...)
+			rule.Repos = append([]string(nil), rule.Repos...)
 			rule.Ports = append([]uint16(nil), rule.Ports...)
 			rule.Methods = append([]string(nil), rule.Methods...)
 			rule.PathPrefixes = append([]string(nil), rule.PathPrefixes...)
@@ -418,9 +419,12 @@ func normalizeEgressRule(rule *EgressRule, seen map[string]struct{}) error {
 	rule.Protocol = strings.ToLower(strings.TrimSpace(rule.Protocol))
 	rule.Connector = strings.ToLower(strings.TrimSpace(rule.Connector))
 	switch rule.Connector {
-	case "", EgressConnectorPackage:
+	case "", EgressConnectorPackage, EgressConnectorGit:
 	default:
 		return Err(CodeBadRequest, "egress rule %q has unsupported connector %q", rule.ID, rule.Connector)
+	}
+	if rule.Connector != EgressConnectorGit && (len(rule.Repos) != 0 || rule.Push) {
+		return Err(CodeBadRequest, "egress rule %q sets repos/push but is not a git connector rule", rule.ID)
 	}
 	switch rule.Protocol {
 	case EgressProtocolHTTP, EgressProtocolHTTPS, EgressProtocolConnect:
@@ -512,6 +516,36 @@ func normalizeEgressRule(rule *EgressRule, seen map[string]struct{}) error {
 		}
 		if rule.MaxRequestBytes != 0 {
 			return Err(CodeBadRequest, "package connector rule %q cannot permit a request body", rule.ID)
+		}
+	}
+	if rule.Connector == EgressConnectorGit {
+		if rule.Protocol != EgressProtocolHTTPS {
+			return Err(CodeBadRequest, "git connector rule %q requires HTTPS", rule.ID)
+		}
+		if len(rule.Repos) == 0 {
+			return Err(CodeBadRequest, "git connector rule %q requires at least one repo pattern", rule.ID)
+		}
+		rule.Repos = append([]string(nil), rule.Repos...)
+		for i, pattern := range rule.Repos {
+			pattern = strings.TrimSpace(pattern)
+			if err := ValidateRepoPattern(pattern); err != nil {
+				return Err(CodeBadRequest, "git connector rule %q: %v", rule.ID, err)
+			}
+			rule.Repos[i] = pattern
+		}
+		if len(rule.PathPrefixes) != 0 {
+			return Err(CodeBadRequest, "git connector rule %q scopes by repos, not path prefixes", rule.ID)
+		}
+		if len(rule.Methods) == 0 {
+			rule.Methods = []string{"GET", "POST"}
+		}
+		for _, method := range rule.Methods {
+			if method != "GET" && method != "POST" {
+				return Err(CodeBadRequest, "git connector rule %q permits non-smart-HTTP method %s", rule.ID, method)
+			}
+		}
+		if rule.SharedState == SharedStateImmutableRead {
+			return Err(CodeBadRequest, "git connector rule %q cannot claim immutable-read semantics", rule.ID)
 		}
 	}
 	sort.Slice(rule.Ports, func(i, j int) bool { return rule.Ports[i] < rule.Ports[j] })

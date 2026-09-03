@@ -186,7 +186,7 @@ func usage() {
   remount up          enroll this machine as a node (outbound only)
   remount standalone  server + node in one process (try it on a laptop)
 
-  remount ws create [--name N] [--dir PATH | --base NAME] [--backend B] [--image IMG] [--security PROFILE] [--egress-rule JSON] [--binding ID]
+  remount ws create [--name N] [--dir PATH | --base NAME | --repo URL[@REF]] [--backend B] [--image IMG] [--security PROFILE] [--egress-rule JSON] [--binding ID]
   remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS [--authoritative] [--as-base NAME] | acl WS [--reader P]... [--writer P]...
   remount exec WS -- cmd args...      run a command (stdout/stderr/exit streamed)
   remount sh WS [cmd]                 interactive shell (pty)
@@ -197,7 +197,7 @@ func usage() {
   remount port WS PORT [--local 127.0.0.1:PORT]
   remount fleet quarantine --action freeze (--all | SELECTORS...) | ls | get OPERATION
   remount base ls | rm NAME                                              named snapshots for ws create --base (pinned until rm)
-  remount run RECIPE [--dir . | --base NAME | --ws WS] [--binding b_openai]... [--detach] -- TASK
+  remount run RECIPE [--dir . | --base NAME | --repo URL[@REF] | --ws WS] [--binding b_openai]... [--detach] -- TASK
                                       seed a workspace, install a harness (claude, codex, opencode, openhands, goose, gemini, aider, cline, custom), run it
   remount run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM]   run the file's tasks in order in one workspace, checkpointing or sleeping between them
   remount handoff [--recipe R] [--task T] [--dir .]                      move this checkout and the harness's conversation into a workspace and keep it going
@@ -725,6 +725,8 @@ func cmdWS(ctx context.Context, args []string) error {
 		includeGit := fs.Bool("include-git", true, "with --dir: include .git so the agent can commit")
 		restoreFrom := fs.String("restore-from", "", "seed the workspace from an existing artifact id")
 		base := fs.String("base", "", "seed the workspace from a named base (see remount base ls)")
+		repo := fs.String("repo", "", "clone this repository into the fresh workspace: URL[@REF]; the node clones through the broker (ADR 0054)")
+		repoDepth := fs.Int("repo-depth", 0, "with --repo, shallow-clone depth (0 = full history)")
 		securityProfile := fs.String("security", "", "security profile: local, isolated, multi_tenant")
 		minIsolation := fs.String("min-isolation", "", "minimum backend isolation: none, process_sandbox, container, microvm")
 		requireSiblingIsolation := fs.Bool("require-sibling-isolation", false, "require a backend with sibling isolation")
@@ -742,13 +744,23 @@ func cmdWS(ctx context.Context, args []string) error {
 			return errors.New("--principal is not supported; authenticated caller identity is authoritative")
 		}
 		seeds := 0
-		for _, set := range []bool{*dir != "", *restoreFrom != "", *base != ""} {
+		for _, set := range []bool{*dir != "", *restoreFrom != "", *base != "", *repo != ""} {
 			if set {
 				seeds++
 			}
 		}
 		if seeds > 1 {
-			return errors.New("--dir, --restore-from and --base are mutually exclusive")
+			return errors.New("--dir, --restore-from, --base and --repo are mutually exclusive")
+		}
+		var repoSpec proto.RepoSpec
+		if *repo != "" {
+			r, err := proto.ParseRepoFlag(*repo, *repoDepth)
+			if err != nil {
+				return err
+			}
+			repoSpec = r
+		} else if *repoDepth != 0 {
+			return errors.New("--repo-depth needs --repo")
 		}
 		cl := c.client()
 		defer cl.Close()
@@ -760,7 +772,7 @@ func cmdWS(ctx context.Context, args []string) error {
 			*restoreFrom = id
 		}
 		spec := proto.WorkspaceSpec{
-			Name: *name, Run: *run, Model: *model, Labels: workspaceLabels, Image: *image, RestoreFrom: *restoreFrom, Base: *base,
+			Name: *name, Run: *run, Model: *model, Labels: workspaceLabels, Image: *image, RestoreFrom: *restoreFrom, Base: *base, Repo: repoSpec,
 			Requires:  proto.Requires{Backend: *backend, CPU: *cpu, MemMiB: *mem},
 			Placement: proto.Placement{Allow: labels, Node: *nodeID},
 			Bindings:  bindings, Env: env, Exclude: exclude,

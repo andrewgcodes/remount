@@ -217,6 +217,10 @@ var (
 	PackageResponseBytes    = Count("remount_connector_package_response_bytes_total", "bytes staged by the managed package connector")
 	PackageFailures         = Count("remount_connector_package_failures_total", "managed package requests rejected after connector dispatch")
 	PackageQuotaRejected    = Count("remount_connector_package_quota_rejections_total", "managed package requests rejected by cache capacity limits")
+	GitUpstreamRequests     = Count("remount_connector_git_upstream_requests_total", "git smart-HTTP requests sent upstream by the managed git connector")
+	GitFailures             = Count("remount_connector_git_failures_total", "git smart-HTTP requests rejected after connector dispatch")
+	RepoClones              = Count("remount_repo_clones_total", "repositories cloned during materialization")
+	RepoCloneFailures       = Count("remount_repo_clone_failures_total", "materializations that failed because the clone failed")
 
 	EventsAppended        = Count("remount_events_total", "events appended to the canonical log")
 	EventsPruned          = Count("remount_events_pruned_total", "events removed from the retained sequence prefix")
