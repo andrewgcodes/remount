@@ -95,6 +95,43 @@ func waitAgent(t *testing.T, ctx context.Context, c *client.Client, id string, w
 	}
 }
 
+// mirrorBytes reads the ACP streams of the control plane's transcript
+// mirror, waiting until it has caught up to at least wantBytes of record data
+// (the node ships records asynchronously) or a short deadline passes.
+func mirrorBytes(t *testing.T, ctx context.Context, c *client.Client, agent string, wantBytes uint64) []byte {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var b bytes.Buffer
+		var from uint64
+		for {
+			page, err := c.Transcript(ctx, agent, from, 3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if page.Gap != nil {
+				t.Fatalf("unexpected gap %+v", page.Gap)
+			}
+			for _, rec := range page.Records {
+				if rec.Index != from {
+					t.Fatalf("record index %d, want %d", rec.Index, from)
+				}
+				from++
+				if rec.Stream == proto.StreamACPIn || rec.Stream == proto.StreamACPOut {
+					b.Write(rec.Data)
+				}
+			}
+			if len(page.Records) == 0 || page.Next != from {
+				break
+			}
+		}
+		if uint64(b.Len()) >= wantBytes || time.Now().After(deadline) {
+			return b.Bytes()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // transcriptBytes attaches to the agent's transcript session from seq 0 and
 // returns the bytes of both ACP streams read so far.
 func transcriptBytes(t *testing.T, ctx context.Context, c *client.Client, a *proto.Agent) []byte {
@@ -174,6 +211,12 @@ func TestAgentEndToEndTurnsAndTranscript(t *testing.T) {
 	tr := transcriptBytes(t, ctx, c, again)
 	if !bytes.Contains(tr, []byte("say hello")) || !bytes.Contains(tr, []byte("and again")) || !bytes.Contains(tr, []byte("agent_message_chunk")) {
 		t.Fatalf("transcript lacks the conversation: %s", tr)
+	}
+	// The control plane's mirror holds the same bytes, in order, and pages
+	// through a cursor; it is what a reader uses when the workspace is asleep.
+	mirror := mirrorBytes(t, ctx, c, a.ID, uint64(len(tr)))
+	if !bytes.Equal(mirror, tr) {
+		t.Fatalf("mirror differs from node transcript:\nmirror: %s\nnode:   %s", mirror, tr)
 	}
 	// Events carry hashes, ids and reasons: never prompt text.
 	evs, err := c.ReadEvents(ctx, 0, a.WS)
@@ -335,6 +378,11 @@ func TestAgentEndToEndTranscriptNeverHoldsCredentials(t *testing.T) {
 	}
 	if bytes.Contains(tr, []byte("sk-simcanary0123456789")) {
 		t.Fatal("provider key reached the transcript")
+	}
+	if mirror := mirrorBytes(t, ctx, c, a.ID, uint64(len(tr))); bytes.Contains(mirror, []byte("sk-simcanary0123456789")) {
+		t.Fatal("provider key reached the control plane's transcript mirror")
+	} else if !bytes.Contains(mirror, []byte("OPENAI_API_KEY=")) {
+		t.Fatalf("mirror did not receive the harness output: %s", mirror)
 	}
 	// The broker URL in .remount/env carries the capability token; the
 	// transcript keeps the host and drops the token.

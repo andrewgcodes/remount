@@ -82,6 +82,15 @@ func (c *Client) DestroyAgent(ctx context.Context, id string, options ...Operati
 	return c.call(ctx, proto.PeerControl, proto.OpAgentDestroy, req, nil)
 }
 
+// Transcript reads one page of the agent's transcript from the control
+// plane's durable mirror, starting at index from. It never wakes a sleeping
+// workspace. A Gap in the result names records that were evicted.
+func (c *Client) Transcript(ctx context.Context, id string, from uint64, limit int) (*proto.AgentTranscriptRes, error) {
+	var res proto.AgentTranscriptRes
+	err := c.call(ctx, proto.PeerControl, proto.OpAgentTranscript, proto.AgentTranscriptReq{ID: id, From: from, Limit: limit}, &res)
+	return &res, err
+}
+
 // ListApprovals returns pending approvals, or those matching the filter.
 func (c *Client) ListApprovals(ctx context.Context, req proto.ApprovalListReq) ([]proto.Approval, error) {
 	var res proto.ApprovalListRes

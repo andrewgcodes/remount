@@ -163,6 +163,10 @@ type Options struct {
 	MaxAgentsPerTenant int
 	// MaxApprovalsPerAgent bounds parked approvals per agent. Zero selects 64.
 	MaxApprovalsPerAgent int
+	// MaxTranscriptBytesPerAgent bounds the transcript mirror kept per agent;
+	// oldest records are evicted past it and readers see a gap. Zero selects
+	// proto.MaxTranscriptBytesPerAgent.
+	MaxTranscriptBytesPerAgent int64
 	// PublicURL is the server's externally reachable base (https://host), used
 	// to mint stable agent URLs. Empty leaves Agent.URL empty.
 	PublicURL string
@@ -206,6 +210,7 @@ type Control struct {
 	agents                map[string]*proto.Agent
 	approvals             map[string]*proto.Approval
 	dirtyApprovals        map[string]*proto.Approval // touched under c.mu, flushed by the next agent commit
+	transcriptWaiters     map[string]chan struct{}   // agent -> closed when its mirror grows or it ends
 	agentRetry            map[string]time.Time       // agent -> no launch before
 	agentDelivered        map[string]time.Time       // inbox message -> last deliver attempt
 	agentKick             chan struct{}
@@ -325,6 +330,9 @@ func New(opts Options) (*Control, error) {
 	if opts.MaxApprovalsPerAgent <= 0 {
 		opts.MaxApprovalsPerAgent = 64
 	}
+	if opts.MaxTranscriptBytesPerAgent <= 0 {
+		opts.MaxTranscriptBytesPerAgent = proto.MaxTranscriptBytesPerAgent
+	}
 	requestCtx, requestCancel := context.WithCancel(context.Background())
 	overloadLimit := opts.MaxConcurrentRequests / 8
 	if overloadLimit < 8 {
@@ -346,6 +354,7 @@ func New(opts Options) (*Control, error) {
 		agents:                map[string]*proto.Agent{},
 		approvals:             map[string]*proto.Approval{},
 		dirtyApprovals:        map[string]*proto.Approval{},
+		transcriptWaiters:     map[string]chan struct{}{},
 		agentRetry:            map[string]time.Time{},
 		agentDelivered:        map[string]time.Time{},
 		agentKick:             make(chan struct{}, 1),
@@ -451,6 +460,16 @@ CREATE TABLE IF NOT EXISTS bases (tenant TEXT NOT NULL, name TEXT NOT NULL, data
 CREATE TABLE IF NOT EXISTS queues (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, data BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS transcripts (
+	agent TEXT NOT NULL,
+	idx INTEGER NOT NULL,
+	run TEXT NOT NULL,
+	seq INTEGER NOT NULL,
+	stream INTEGER NOT NULL,
+	at INTEGER NOT NULL,
+	data BLOB NOT NULL,
+	PRIMARY KEY(agent, idx)
+);
 CREATE TABLE IF NOT EXISTS keys (name TEXT PRIMARY KEY, priv BLOB NOT NULL);
 `)
 	return err
@@ -995,6 +1014,9 @@ func (c *Control) PruneRecords(ctx context.Context, before time.Time, limit int)
 	}
 	for _, id := range agentCandidates {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE id=?`, id); err != nil {
+			return RecordPruneResult{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM transcripts WHERE agent=?`, id); err != nil {
 			return RecordPruneResult{}, err
 		}
 	}
@@ -1886,6 +1908,16 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return struct{}{}, c.agentDestroy(ctx, subject, req)
+	case proto.OpAgentTranscript:
+		req, err := decode[proto.AgentTranscriptReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.agentTranscript(ctx, subject, req)
 	case proto.OpApprovalList:
 		req, err := decode[proto.ApprovalListReq](f)
 		if err != nil {

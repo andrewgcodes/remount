@@ -138,6 +138,9 @@ func (c *Control) persistAgentRows(a *proto.Agent, scope, key, op string, reques
 		for id := range c.dirtyApprovals {
 			delete(c.dirtyApprovals, id)
 		}
+		if agentTerminal(a.Status) {
+			c.wakeTranscriptWaitersLocked(a.ID)
+		}
 	}
 	return err
 }
