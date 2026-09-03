@@ -155,7 +155,9 @@ given as an environment reference so the file stays clean.
 ```
 
 Start the server with the binding and with the package registry allowed, since
-the install goes through the broker too.
+the install goes through the broker too. (`remount run` does all of this for
+you when nothing is listening locally: it starts a standalone whose bindings
+reference the provider keys in your environment by name; see the tutorial.)
 
 ```sh
 export OPENAI_API_KEY=...

@@ -170,6 +170,9 @@ func cmdRun(ctx context.Context, args []string) error {
 			return err
 		}
 	}
+	if o.Bindings, err = defaultBindings(recipe, o.Bindings, c.localBindings(ctx)); err != nil {
+		return err
+	}
 	// Fail on flag errors before uploading anything.
 	probe := o
 	if queued {
@@ -179,6 +182,9 @@ func cmdRun(ctx context.Context, args []string) error {
 		}
 	}
 	if _, err := probe.Validate(); err != nil {
+		return err
+	}
+	if _, err := c.ensureLocalServer(ctx); err != nil {
 		return err
 	}
 	cl := c.client()

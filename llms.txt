@@ -10,7 +10,7 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/re
 
 ## README
 
-- [Try it in 60 seconds](https://github.com/remount-dev/remount/blob/main/README.md#try-it-in-60-seconds): Kill the network mid-command and the process keeps running; reattach and the output replays from where you left off:
+- [Try it in 60 seconds](https://github.com/remount-dev/remount/blob/main/README.md#try-it-in-60-seconds): One command runs a coding harness in a fresh workspace against a key it never sees.
 - [Move a running workspace to another machine](https://github.com/remount-dev/remount/blob/main/README.md#move-a-running-workspace-to-another-machine): The filesystem is snapshotted, the workspace is re-queued, a node in that zone claims it, and your files are there.
 - [Sleep for days at storage-only cost](https://github.com/remount-dev/remount/blob/main/README.md#sleep-for-days-at-storage-only-cost): A sleeping workspace has no node and costs nothing but storage.
 - [Brokered credentials without placing keys in the workspace](https://github.com/remount-dev/remount/blob/main/README.md#brokered-credentials-without-placing-keys-in-the-workspace): Define a binding once, on the server:
@@ -25,14 +25,15 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/re
 ## Tutorial
 
 - [1. Build](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#1-build): Remount is one Go binary with no runtime dependencies.
-- [2. Start standalone and run a command](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#2-start-standalone-and-run-a-command): `remount standalone` runs the control plane, the relay and one node in a single process.
-- [3. An interactive shell](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#3-an-interactive-shell): `remount sh` opens a session of kind `pty`.
-- [4. The filesystem](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#4-the-filesystem): Every filesystem operation is served by the node and jailed to the workspace root.
-- [5. Reconnect without losing output](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#5-reconnect-without-losing-output): Start a command that runs for a while, then kill the client half way through.
-- [6. A second machine, and a move](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#6-a-second-machine-and-a-move): On another computer, enroll it as a node.
-- [7. Sleep and wake](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#7-sleep-and-wake): A sleeping workspace has no node.
-- [8. Secrets the workspace never holds](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#8-secrets-the-workspace-never-holds): Stop the standalone process and write a bindings file.
-- [9. Watch everything](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#9-watch-everything): Transactional resource rows are the source of lifecycle/recovery truth.
+- [2. One command](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#2-one-command): If you have a provider key in your environment, the whole thing is one command.
+- [3. Start standalone by hand and run a command](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#3-start-standalone-by-hand-and-run-a-command): `remount standalone` runs the control plane, the relay and one node in a single process.
+- [4. An interactive shell](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#4-an-interactive-shell): `remount sh` opens a session of kind `pty`.
+- [5. The filesystem](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#5-the-filesystem): Every filesystem operation is served by the node and jailed to the workspace root.
+- [6. Reconnect without losing output](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#6-reconnect-without-losing-output): Start a command that runs for a while, then kill the client half way through.
+- [7. A second machine, and a move](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#7-a-second-machine-and-a-move): On another computer, enroll it as a node.
+- [8. Sleep and wake](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#8-sleep-and-wake): A sleeping workspace has no node.
+- [9. Secrets the workspace never holds](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#9-secrets-the-workspace-never-holds): Stop the standalone process and write a bindings file.
+- [10. Watch everything](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#10-watch-everything): Transactional resource rows are the source of lifecycle/recovery truth.
 - [Where to go next](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#where-to-go-next)
 
 ## Harness integration

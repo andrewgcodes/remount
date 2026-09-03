@@ -42,7 +42,7 @@ func newGitWorld(t *testing.T) *gitWorld {
 
 // scanForToken counts the regular files under root that contain the token.
 // It is a count, not a boolean, so a planted canary proves the scan runs.
-func scanForToken(t *testing.T, root string) []string {
+func scanForToken(t *testing.T, root, token string) []string {
 	t.Helper()
 	var hits []string
 	err := filepath.Walk(root, func(p string, fi os.FileInfo, err error) error {
@@ -54,7 +54,7 @@ func scanForToken(t *testing.T, root string) []string {
 			if err != nil {
 				return err
 			}
-			if bytes.Contains(b, []byte(fakeInstallationToken)) {
+			if bytes.Contains(b, []byte(token)) {
 				hits = append(hits, p)
 			}
 		}
@@ -144,13 +144,13 @@ func TestRepoClonedAtMaterializeWithoutTokenInWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hits := scanForToken(t, info.Root); len(hits) != 0 {
+	if hits := scanForToken(t, info.Root, fakeInstallationToken); len(hits) != 0 {
 		t.Fatalf("token on workspace disk: %v", hits)
 	}
 	if err := c.WriteFile(ctx, ws.ID, "canary.txt", []byte("x "+fakeInstallationToken+" y\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if hits := scanForToken(t, info.Root); len(hits) != 1 || filepath.Base(hits[0]) != "canary.txt" {
+	if hits := scanForToken(t, info.Root, fakeInstallationToken); len(hits) != 1 || filepath.Base(hits[0]) != "canary.txt" {
 		t.Fatalf("scan did not find the planted canary: %v", hits)
 	}
 	out, _, _, _ := c.Run(ctx, ws.ID, "sh", "-c", `env | grep -c `+fakeInstallationToken+` || true`)
