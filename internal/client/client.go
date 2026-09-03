@@ -481,6 +481,42 @@ func (c *Client) RemoveBase(ctx context.Context, name string, options ...Operati
 	return c.call(ctx, proto.PeerControl, proto.OpBaseRemove, proto.BaseRemoveReq{Name: name, IdempotencyKey: idem}, nil)
 }
 
+// CreatePool records tenant-scoped desired node capacity. Provider
+// credentials remain server-side and are not part of the request.
+func (c *Client) CreatePool(ctx context.Context, spec proto.PoolSpec, options ...OperationOption) (*proto.Pool, error) {
+	idem, set := operationKey(options)
+	if !set {
+		idem = ids.New("idem")
+	}
+	var pool proto.Pool
+	err := c.call(ctx, proto.PeerControl, proto.OpPoolCreate, proto.PoolCreateReq{Spec: spec, IdempotencyKey: idem}, &pool)
+	return &pool, err
+}
+
+// GetPool returns a tenant-scoped pool by name.
+func (c *Client) GetPool(ctx context.Context, name string) (*proto.Pool, error) {
+	var pool proto.Pool
+	err := c.call(ctx, proto.PeerControl, proto.OpPoolGet, proto.PoolGetReq{Name: name}, &pool)
+	return &pool, err
+}
+
+// ListPools returns the caller's tenant-scoped pools sorted by name.
+func (c *Client) ListPools(ctx context.Context) ([]proto.Pool, error) {
+	var response proto.PoolListRes
+	err := c.call(ctx, proto.PeerControl, proto.OpPoolList, nil, &response)
+	return response.Pools, err
+}
+
+// RemovePool removes an empty pool resource. Provider machines are never
+// destroyed as an implicit side effect of this call.
+func (c *Client) RemovePool(ctx context.Context, name string, options ...OperationOption) error {
+	idem, set := operationKey(options)
+	if !set {
+		idem = ids.New("idem")
+	}
+	return c.call(ctx, proto.PeerControl, proto.OpPoolRemove, proto.PoolRemoveReq{Name: name, IdempotencyKey: idem}, nil)
+}
+
 // CreateQueue records a durable task list for a workspace (ADR 0041). A
 // missing idempotency key is generated so a retry cannot create two queues.
 func (c *Client) CreateQueue(ctx context.Context, req proto.QueueCreateReq, options ...OperationOption) (*proto.Queue, error) {
