@@ -27,3 +27,7 @@ func signalProcess(cmd *exec.Cmd, name string) error {
 func platformExitSignal(err *exec.ExitError) (string, int, bool) {
 	return "", 0, false
 }
+
+func isPTYEOF(error) bool {
+	return false
+}

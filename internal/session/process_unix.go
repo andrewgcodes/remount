@@ -3,6 +3,7 @@
 package session
 
 import (
+	"errors"
 	"os/exec"
 	"syscall"
 
@@ -35,4 +36,8 @@ func platformExitSignal(err *exec.ExitError) (string, int, bool) {
 		return "", 0, false
 	}
 	return status.Signal().String(), 128 + int(status.Signal()), true
+}
+
+func isPTYEOF(err error) bool {
+	return errors.Is(err, syscall.EIO)
 }

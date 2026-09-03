@@ -811,7 +811,13 @@ func (s *Session) startPTY(spec Spec) error {
 	s.mu.Unlock()
 	go func() {
 		<-s.outputReady
-		s.recordLogError(pump(s.Log, proto.StreamStdout, ptmx))
+		logErr := pump(s.Log, proto.StreamStdout, ptmx)
+		// Linux PTY masters report EIO, rather than EOF, after the slave has
+		// closed. Treat that terminal condition as a cleanly drained stream.
+		if isPTYEOF(logErr) {
+			logErr = nil
+		}
+		s.recordLogError(logErr)
 		err := cmd.Wait()
 		_ = ptmx.Close()
 		s.finish(exitInfo(err, cmd))
