@@ -6,9 +6,90 @@ through one interface and adds what no single machine gives you: sessions that
 survive a dropped connection, workspaces that move between machines, and egress
 that never exposes a real credential to the agent.
 
-This document covers three things. It shows the recipe we verified against
-OpenAI's Codex CLI. It gives the general pattern for pointing any harness at the
-broker. And it walks through writing your own loop against the Go SDK.
+This document covers four things. It shows `remount run`, which launches a
+harness from a recipe with one command. It shows the recipe we verified by
+hand against OpenAI's Codex CLI. It gives the general pattern for pointing any
+harness at the broker. And it walks through writing your own loop against the
+Go SDK.
+
+## `remount run`: one command from a checkout to a working agent
+
+```sh
+remount run opencode --dir . --binding b_openai --model openai/gpt-4o-mini \
+  -- 'Create a file named GREETING.txt containing exactly the word hello.'
+```
+
+`run` creates a workspace from `--dir` (or `--base NAME`, or reuses `--ws WS`),
+installs the harness if the image lacks it, writes a launcher under
+`.remount/launch/`, and opens a session that runs it. The launcher sources
+`.remount/env` when it starts, so the broker's address is discovered at run
+time and is never baked into a file that moves with the workspace. Ctrl-C
+detaches; `--detach` prints `WS SID` and the `attach` line and returns at
+once. Every launch is bracketed by `run.started{recipe, task_hash, sandbox,
+auth}` and `run.finished{exit}` in the event log; the task text is never
+logged.
+
+### Recipes
+
+A recipe is a YAML file embedded in the binary (`internal/launch/recipes/`).
+`--recipe-file PATH` loads your own with the same validator; adding a harness is
+a YAML pull request, not Go.
+
+| Recipe | Harness | Auth | Providers | `--sandbox` mapping | State that travels |
+|---|---|---|---|---|---|
+| `claude` | Claude Code | key or login | anthropic | `--permission-mode plan` / `acceptEdits` / `--dangerously-skip-permissions` | `.claude/`, `.claude.json` |
+| `codex` | Codex CLI | key or login | openai, azure-openai, openrouter | `--sandbox read-only` / `workspace-write` / `danger-full-access` | `.codex/` |
+| `opencode` | OpenCode | key or login | anthropic, openai, google, openrouter, groq, deepseek, xai, mistral | `permission.edit/bash/webfetch` in a generated config | `.local/share/opencode/` |
+| `openhands` | OpenHands CLI | key | anthropic, openai, google, openrouter, groq, together, fireworks, deepseek, xai, mistral | harness default | `.openhands/` |
+| `goose` | Goose | key | openai, anthropic, google, openrouter, groq | harness default | `.local/share/goose/`, `.config/goose/` |
+| `gemini` | Gemini CLI | key or login | google | harness default | `.gemini/` |
+| `aider` | aider | key | openai, anthropic, google, openrouter, groq, deepseek, xai, mistral | harness default | `.aider.*` in the workspace |
+| `cline` | Cline CLI | key or login | anthropic, openai, openrouter, google, xai, deepseek, mistral, groq | harness default | `.cline/` |
+| `custom` | anything after `--` | key or login | every preset | env only | none |
+
+Every backend sets `HOME` to the workspace root, so the state column is where
+the harness's `~/.something` actually lands: inside the workspace, in every
+snapshot, and back on your disk after `remount pull`. `--exclude` drops what
+you would rather not carry.
+
+Anything built on an SDK that honors `<PROVIDER>_API_KEY` and
+`<PROVIDER>_BASE_URL` needs no recipe: `remount run custom --binding b_openai
+-- python agent.py` gets the placeholder key and the broker URL in its
+environment.
+
+`--sandbox` names what the harness may write; it also shapes egress. Under
+`--security local`, `read-only` and `workspace-write` (the default) keep the
+node's own allow list and `full` opens it. Under `isolated` and `multi_tenant`
+the policy is deny-by-default, admits the bound providers over HTTPS and the
+recipe's declared `hosts` for `GET`/`HEAD` (so the harness can install itself
+even when read-only), and `full` adds `CONNECT` to those hosts. Those two profiles need
+a node whose backend enforces egress; the `process` and `docker` backends only
+cooperate through `HTTPS_PROXY`, so they serve `local`.
+
+### Provider bindings are presets
+
+A binding is a secret the node holds; a preset says how a harness consumes
+it. `remount binding preset ls` lists them: `anthropic`, `openai`, `google`,
+`openrouter`, `bedrock`, `vertex`, `azure-openai`, `mistral`, `groq`,
+`together`, `fireworks`, `deepseek`, `xai`. `--binding b_openai` picks the
+preset by id suffix; `--binding b_team:openai` names it; `--binding
+b_bedrock:bedrock?host=us-east-1` fills a region. The workspace receives
+`OPENAI_API_KEY=ref:b_openai` and
+`OPENAI_BASE_URL=${REMOUNT_BROKER}/d/api.openai.com/v1`; the broker
+substitutes the real key on the way out and records `cred.used`.
+
+### Two kinds of auth, stated plainly
+
+Remount brokers **API keys**. Claude Max, ChatGPT/Codex sign-in, Gemini's
+Google sign-in and Copilot are **harness-native logins**: the harness runs its
+own OAuth flow inside the workspace and keeps the token in its state directory.
+That token travels with the workspace, is visible to anything running in it,
+and is not secret-blind. When a recipe that supports a login is launched
+without a provider binding, `run` marks the session `auth: workspace_resident`
+and the node records `auth.workspace_resident{recipe}`. `--security isolated`
+and `multi_tenant` refuse such a launch. Remount never proxies or rewrites a
+subscription token; their terms restrict third-party use and the broker is not
+the place to argue with that.
 
 ## Verified: OpenAI Codex CLI
 
@@ -155,7 +236,7 @@ a byte leaves the machine.
 |---|---|---|---|---|
 | Codex CLI | `base_url` in `.codex/config.toml` | `env_key` names an env var | `Authorization: Bearer` | Verified here, 0.152.1 |
 | Claude Code | `ANTHROPIC_BASE_URL` | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` | `x-api-key` and, on newer builds, `Authorization: Bearer` | Documented upstream, not tested here |
-| OpenCode | `provider.<id>.options.baseURL` in `opencode.json` | provider `apiKey` or env | SDK dependent, `x-api-key` for Anthropic | Documented upstream, not tested here |
+| OpenCode | `provider.<id>.options.baseURL` in `opencode.json` | provider `apiKey` or env | SDK dependent, `x-api-key` for Anthropic | Verified via `remount run opencode` (docker lane, 1.18.x) |
 | aider | `OPENAI_API_BASE` | `OPENAI_API_KEY` | `Authorization: Bearer` | Documented upstream, not tested here |
 
 The broker matches on the placeholder string wherever it appears in a header,

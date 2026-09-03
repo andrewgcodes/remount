@@ -1,0 +1,26 @@
+# Claude Code (Anthropic). https://docs.anthropic.com/en/docs/claude-code
+name: claude
+description: Claude Code CLI
+auth: either
+providers: [anthropic]
+hosts:
+  - registry.npmjs.org
+  - statsig.anthropic.com
+  - platform.claude.com
+install: |
+  command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code
+env:
+  # No update checks, telemetry or error reporting from inside a workspace.
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+  DISABLE_AUTOUPDATER: "1"
+  DISABLE_TELEMETRY: "1"
+  DISABLE_ERROR_REPORTING: "1"
+  ANTHROPIC_MODEL: "{{.Model}}"
+command: ["claude", "-p", "{{.Task}}", "--output-format", "text"]
+resume_command: ["claude", "--continue", "-p", "{{.Task}}", "--output-format", "text"]
+sandbox_flags:
+  read-only: ["--permission-mode", "plan"]
+  workspace-write: ["--permission-mode", "acceptEdits"]
+  full: ["--dangerously-skip-permissions"]
+state_dirs: [".claude", ".claude.json"]
+path_keyed: true

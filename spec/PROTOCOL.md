@@ -331,7 +331,7 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 
 | op | Body → Response |
 |---|---|
-| `s.open` | `SOpenReq{ws, kind, program, cwd, env, rows, cols, stdin, timeout_sec, idem}` → `SOpenRes{s, next}` |
+| `s.open` | `SOpenReq{ws, kind, program, cwd, env, rows, cols, stdin, timeout_sec, idem, run?}` → `SOpenRes{s, next}` |
 | `s.attach` | `SAttachReq{s, from}` → `SOpenRes{s, next}` |
 | `s.input` | `SInputReq{s, iseq, d, eof}` → `{}` |
 | `s.resize` | `SResizeReq{s, rows, cols}` → `{}` |
@@ -480,6 +480,21 @@ chunk-count budget long before a byte budget.
 Input is idempotent. `s.input` carries `iseq`, a client-side counter. A node
 drops any `iseq` at or below the last one it applied. Without this, a keystroke
 retried after a dropped connection is typed twice.
+
+### 8.1 Harness runs
+
+`s.open` MAY carry `run: RunInfo{recipe, task_hash?, sandbox?, auth?}` to mark
+the session as a harness launch (`remount run`). `recipe` is the recipe name
+(`^[a-z0-9][a-z0-9_-]{0,63}$`); `task_hash` is a short digest of the task text,
+never the text; `sandbox` is `read-only`, `workspace-write` or `full`; `auth`
+is `api_key` (the harness reads a brokered placeholder from its environment)
+or `workspace_resident` (the harness keeps its own login token in the
+workspace, outside the broker's view). The node validates `run` fail-closed
+(`bad_request`), copies it into `SessionInfo.run`, and emits `run.started`
+once when the session is created — an idempotent replay of the open emits
+nothing — and `run.finished` from the session's exit path, so a client that
+detached still gets both records. When `auth` is `workspace_resident` the node
+also emits `auth.workspace_resident`.
 
 ## 9. Secret-blind execution
 
@@ -665,7 +680,13 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `cred.used`, `egress.allowed`, `egress.denied`, `timer.set`, `timer.fired`,
 `peer.gone`, `ws.fenced`, `ws.state_changed`, `event.producer_gap`,
 `fleet.quarantine.requested`, `fleet.quarantine.target`,
-`fleet.quarantine.completed`, `base.created`, and `base.removed`.
+`fleet.quarantine.completed`, `base.created`, `base.removed`, `run.started`,
+`run.finished`, and `auth.workspace_resident`.
+
+`run.started` carries `s`, `recipe`, `task_hash`, `sandbox` and `auth`;
+`run.finished` carries `s`, `recipe`, `exit` and `signal`;
+`auth.workspace_resident` carries `s` and `recipe`. All three set `session`.
+None carries the task text, the harness argv or a provider key.
 
 `base.created` and `base.removed` are tenant-scoped rather than
 workspace-scoped: `stream` is the base name, `tenant` is set, `workspace` is

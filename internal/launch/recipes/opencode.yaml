@@ -1,0 +1,37 @@
+# OpenCode (SST). https://opencode.ai/docs
+name: opencode
+description: OpenCode terminal agent
+auth: either
+providers: [anthropic, openai, google, openrouter, groq, deepseek, xai, mistral]
+hosts:
+  - registry.npmjs.org
+  - models.dev
+  - models.opencode.ai
+install: |
+  command -v opencode >/dev/null 2>&1 || npm install -g opencode-ai
+env:
+  OPENCODE_DISABLE_AUTOUPDATE: "1"
+  # Custom config sits between the global and the project opencode.json, so
+  # a project's own settings still win and nothing in the repo is clobbered.
+  OPENCODE_CONFIG: "$PWD/.remount/launch/opencode.json"
+configure:
+  - path: .remount/launch/opencode.json
+    content: |
+      {
+        "\$schema": "https://opencode.ai/config.json",
+        {{- if .Model}}
+        "model": {{json .Model}},
+        {{- end}}
+        "permission": {
+          "edit": {{if eq .Sandbox "read-only"}}"deny"{{else}}"allow"{{end}},
+          "bash": {{if eq .Sandbox "read-only"}}"ask"{{else}}"allow"{{end}},
+          "webfetch": {{if eq .Sandbox "full"}}"allow"{{else}}"deny"{{end}}
+        }{{if .Primary}},
+        "provider": {
+          {{json .Primary}}: { "options": { "baseURL": "{{baseURL .Primary}}", "apiKey": "{{key .Primary}}" } }
+        }{{end}}
+      }
+command: ["opencode", "run", "{{.Task}}"]
+resume_command: ["opencode", "run", "--continue", "{{.Task}}"]
+state_dirs: [".local/share/opencode"]
+path_keyed: true

@@ -351,3 +351,103 @@ func TestBaseSubcommandsValidateBeforeDialing(t *testing.T) {
 		t.Fatalf("error=%v", err)
 	}
 }
+
+func TestRunValidatesBeforeDialing(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"no recipe", nil, "recipes:"},
+		{"unknown recipe", []string{"nope", "--", "x"}, "nope"},
+		{"custom needs argv", []string{"custom"}, "after --"},
+		{"task required", []string{"opencode", "--binding", "b_openai"}, "needs a task"},
+		{"bad sandbox", []string{"opencode", "--binding", "b_openai", "--sandbox", "loose", "--", "x"}, "--sandbox"},
+		{"bad approve", []string{"opencode", "--binding", "b_openai", "--approve", "always", "--", "x"}, "--approve"},
+		{"bad security", []string{"opencode", "--binding", "b_openai", "--security", "paranoid", "--", "x"}, "--security"},
+		{"bad preset", []string{"opencode", "--binding", "b_x:nopreset", "--", "x"}, "nopreset"},
+		{"foreign provider", []string{"claude", "--binding", "b_openai", "--", "x"}, "does not consume"},
+		{"dir and ws", []string{"custom", "--dir", ".", "--ws", "ws_a", "--", "true"}, "mutually exclusive"},
+		{"dir and base", []string{"custom", "--dir", ".", "--base", "b", "--", "true"}, "mutually exclusive"},
+		{"repo unsupported", []string{"custom", "--repo", "https://x/y.git", "--", "true"}, "git connector"},
+		{"negative timeout", []string{"custom", "--timeout", "-1s", "--", "true"}, "negative"},
+		{"resident under isolated", []string{"claude", "--security", "isolated", "--", "x"}, "inside the workspace"},
+		{"duplicate binding", []string{"opencode", "--binding", "b_openai", "--binding", "b_openai", "--", "x"}, "twice"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := cmdRun(ctx, tc.args)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("args=%q error=%v want %q", tc.args, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunRecipeFileMustMatchAndParse(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	good := filepath.Join(dir, "mine.yaml")
+	if err := os.WriteFile(good, []byte("name: mine\ncommand: [sh, -c, 'echo \"$TASK\"']\ncommand_from_args: false\nproviders: [openai]\nauth: api_key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := cmdRun(ctx, []string{"other", "--recipe-file", good, "--", "x"})
+	if err == nil || !strings.Contains(err.Error(), `declares recipe "mine"`) {
+		t.Fatalf("error=%v", err)
+	}
+	bad := filepath.Join(dir, "bad.yaml")
+	if err := os.WriteFile(bad, []byte("name: [\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdRun(ctx, []string{"bad", "--recipe-file", bad, "--", "x"}); err == nil || !strings.Contains(err.Error(), "bad.yaml") {
+		t.Fatalf("error=%v", err)
+	}
+	if err := cmdRun(ctx, []string{"x", "--recipe-file", filepath.Join(dir, "missing.yaml"), "--", "x"}); err == nil {
+		t.Fatal("missing recipe file accepted")
+	}
+}
+
+func TestBindingPresetLsIsTheOnlySubcommand(t *testing.T) {
+	ctx := context.Background()
+	for _, args := range [][]string{nil, {"preset"}, {"ls"}, {"preset", "rm"}} {
+		if err := cmdBinding(ctx, args); err == nil {
+			t.Fatalf("binding %q accepted", args)
+		}
+	}
+	if err := cmdBinding(ctx, []string{"preset", "ls", "extra"}); err == nil {
+		t.Fatal("extra positional accepted")
+	}
+	out := captureStdout(t, func() {
+		if err := cmdBinding(ctx, []string{"preset", "ls", "--json"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	for _, want := range []string{`"name": "openai"`, `"name": "anthropic"`, `"hosts"`, `"key_env"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("preset ls --json missing %s:\n%s", want, out)
+		}
+	}
+}
+
+// captureStdout runs f with os.Stdout redirected to a pipe and returns what
+// it wrote. Commands print with printJSON and tabWriter, both of which write
+// to os.Stdout directly.
+func captureStdout(t *testing.T, f func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	done := make(chan string)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	f()
+	os.Stdout = old
+	_ = w.Close()
+	return <-done
+}

@@ -1,0 +1,51 @@
+# Remount
+
+> Any agent, any machine, never holding the keys, never losing its place.
+
+Remount is an open protocol and a single static Go binary that gives an AI
+agent a workspace it can run on from anywhere: snapshotted, moved between
+machines, put to sleep, reattached mid-command, and never holding a
+credential. `remount run RECIPE -- TASK` launches a coding harness in one
+command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/remount-dev/remount/blob/main/spec/PROTOCOL.md).
+
+## README
+
+- [Try it in 60 seconds](https://github.com/remount-dev/remount/blob/main/README.md#try-it-in-60-seconds): Kill the network mid-command and the process keeps running; reattach and the output replays from where you left off:
+- [Move a running workspace to another machine](https://github.com/remount-dev/remount/blob/main/README.md#move-a-running-workspace-to-another-machine): The filesystem is snapshotted, the workspace is re-queued, a node in that zone claims it, and your files are there.
+- [Sleep for days at storage-only cost](https://github.com/remount-dev/remount/blob/main/README.md#sleep-for-days-at-storage-only-cost): A sleeping workspace has no node and costs nothing but storage.
+- [Brokered credentials without placing keys in the workspace](https://github.com/remount-dev/remount/blob/main/README.md#brokered-credentials-without-placing-keys-in-the-workspace): Define a binding once, on the server:
+- [Everything is an event](https://github.com/remount-dev/remount/blob/main/README.md#everything-is-an-event): SQLite resource rows are the transactional source of lifecycle state; the append-only event log is the durable audit and observation record.
+- [Commands](https://github.com/remount-dev/remount/blob/main/README.md#commands): Sessions belong to the node, not to the terminal that started them.
+- [Go SDK](https://github.com/remount-dev/remount/blob/main/README.md#go-sdk): Applications import the supported public packages, not `internal/`:
+- [Seeing what is happening](https://github.com/remount-dev/remount/blob/main/README.md#seeing-what-is-happening): All three take `--json`.
+- [Documentation](https://github.com/remount-dev/remount/blob/main/README.md#documentation)
+- [Status](https://github.com/remount-dev/remount/blob/main/README.md#status): Working and tested: exec and pty sessions with replayable reconnect, workspace filesystem with server-side search and atomic edits, snapshots and cross-node moves, sleep and wake with durable timers, the credential broker, the claim queue with leases, the event log, port forwarding, and both `process` and `docker` backends.
+- [License](https://github.com/remount-dev/remount/blob/main/README.md#license): Apache-2.0.
+
+## Tutorial
+
+- [1. Build](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#1-build): Remount is one Go binary with no runtime dependencies.
+- [2. Start standalone and run a command](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#2-start-standalone-and-run-a-command): `remount standalone` runs the control plane, the relay and one node in a single process.
+- [3. An interactive shell](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#3-an-interactive-shell): `remount sh` opens a session of kind `pty`.
+- [4. The filesystem](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#4-the-filesystem): Every filesystem operation is served by the node and jailed to the workspace root.
+- [5. Reconnect without losing output](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#5-reconnect-without-losing-output): Start a command that runs for a while, then kill the client half way through.
+- [6. A second machine, and a move](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#6-a-second-machine-and-a-move): On another computer, enroll it as a node.
+- [7. Sleep and wake](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#7-sleep-and-wake): A sleeping workspace has no node.
+- [8. Secrets the workspace never holds](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#8-secrets-the-workspace-never-holds): Stop the standalone process and write a bindings file.
+- [9. Watch everything](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#9-watch-everything): Transactional resource rows are the source of lifecycle/recovery truth.
+- [Where to go next](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#where-to-go-next)
+
+## Harness integration
+
+- [`remount run`: one command from a checkout to a working agent](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#remount-run-one-command-from-a-checkout-to-a-working-agent): `run` creates a workspace from `--dir` (or `--base NAME`, or reuses `--ws WS`), installs the harness if the image lacks it, writes a launcher under `.remount/launch/`, and opens a session that runs it.
+- [Verified: OpenAI Codex CLI](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#verified-openai-codex-cli): We ran Codex CLI 0.152.1 inside a Remount workspace on macOS with the `process` backend.
+- [The general pattern for any harness](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#the-general-pattern-for-any-harness): Every harness has a variable for where the model lives and a variable for the key.
+- [HTTP_PROXY mode](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#http_proxy-mode): The broker is also an ordinary HTTP forward proxy.
+- [Writing your own loop](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#writing-your-own-loop): The supported Go SDK is `remount.dev/remount/client`; its stable resource model and error codes are in `remount.dev/remount/api`.
+- [What a harness gets for free](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#what-a-harness-gets-for-free): Truthful bounded replay.
+
+## Optional
+
+- [design.md](https://github.com/remount-dev/remount/blob/main/docs/design.md): why each piece is shaped the way it is, and the failure model.
+- [operations.md](https://github.com/remount-dev/remount/blob/main/docs/operations.md): tokens, TLS, backends, leases, backups.
+- [ADRs](https://github.com/remount-dev/remount/blob/main/docs/adr): one decision per file, never edited after the fact.
