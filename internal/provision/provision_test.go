@@ -34,6 +34,17 @@ func TestRequestValidateAndNodeArgsKeepEnrollmentOutOfArgv(t *testing.T) {
 	}
 }
 
+func TestBootstrapTemplateValidatesBeforeTokenIssuance(t *testing.T) {
+	bootstrap := validRequest().Bootstrap
+	bootstrap.EnrollmentToken = ""
+	if err := bootstrap.ValidateTemplate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := bootstrap.Validate(); err == nil || !strings.Contains(err.Error(), "enrollment token") {
+		t.Fatalf("Validate() = %v, want enrollment token error", err)
+	}
+}
+
 func TestRequestValidateRejectsUnsafeOrIncompleteBootstrap(t *testing.T) {
 	tests := []struct {
 		name string
