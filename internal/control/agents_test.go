@@ -1,6 +1,7 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1110,5 +1111,99 @@ func TestApprovalUndeliveredDecisionStopsRetryingWhenRunEnds(t *testing.T) {
 	}
 	if af.opCount(proto.OpAgentApprovalDecided) != sends {
 		t.Fatalf("decision re-sent after the run ended: %d -> %d", sends, af.opCount(proto.OpAgentApprovalDecided))
+	}
+}
+
+func TestAgentTranscriptMirrorPagesEvictsAndWaits(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.db")
+	af := newAgentFixture(t, path, func(o *Options) { o.MaxTranscriptBytesPerAgent = 1000 })
+	a, run := af.start(t, localSubject(), "talk")
+	ctx := context.Background()
+	chunk := func(seq uint64, size int) proto.TranscriptChunk {
+		return proto.TranscriptChunk{Seq: seq, Stream: proto.StreamACPOut, At: 1, Data: bytes.Repeat([]byte{byte('a' + seq%26)}, size)}
+	}
+	// Nothing yet: an empty page, no gap, not done.
+	page, err := af.c.agentTranscript(ctx, localSubject(), &proto.AgentTranscriptReq{ID: a.ID})
+	if err != nil || len(page.Records) != 0 || page.Next != 0 || page.Gap != nil || page.Done {
+		t.Fatalf("empty page = %+v err=%v", page, err)
+	}
+	wait := af.c.TranscriptWait(a.ID, 0)
+	select {
+	case <-wait:
+		t.Fatal("wait released before any record")
+	default:
+	}
+	af.report(t, run, 2, proto.AgentReport{Kind: proto.AgentReportTranscript, Chunks: []proto.TranscriptChunk{chunk(1, 300), chunk(2, 300), chunk(3, 300)}})
+	select {
+	case <-wait:
+	case <-time.After(time.Second):
+		t.Fatal("wait not released by a mirrored batch")
+	}
+	page, err = af.c.agentTranscript(ctx, localSubject(), &proto.AgentTranscriptReq{ID: a.ID, Limit: 2})
+	if err != nil || len(page.Records) != 2 || page.Next != 2 || page.Gap != nil {
+		t.Fatalf("first page = %+v err=%v", page, err)
+	}
+	if page.Records[0].Index != 0 || page.Records[0].Seq != 1 || page.Records[0].Run != run.Run || page.Records[1].Index != 1 || len(page.Records[1].Data) != 300 {
+		t.Fatalf("records = %+v", page.Records)
+	}
+	page, err = af.c.agentTranscript(ctx, localSubject(), &proto.AgentTranscriptReq{ID: a.ID, From: page.Next})
+	if err != nil || len(page.Records) != 1 || page.Next != 3 || page.Records[0].Index != 2 {
+		t.Fatalf("second page = %+v err=%v", page, err)
+	}
+	// A stranger cannot read; a reader without a subject in the tenant is denied.
+	if _, err := af.c.agentTranscript(ctx, Subject{ID: "mallory", Tenant: "tenant-b"}, &proto.AgentTranscriptReq{ID: a.ID}); codeOf(err) != proto.CodeDenied {
+		t.Fatalf("stranger read = %v", err)
+	}
+	// Past the budget: the oldest records go, and a reader below the new
+	// first index is told about the gap rather than handed a shorter log.
+	af.report(t, run, 3, proto.AgentReport{Kind: proto.AgentReportTranscript, Chunks: []proto.TranscriptChunk{chunk(4, 300), chunk(5, 300)}})
+	got := af.agent(t, a.ID)
+	if got.TranscriptNext != 5 || got.TranscriptFirst != 2 || got.TranscriptBytes != 900 {
+		t.Fatalf("bounds after eviction: next=%d first=%d bytes=%d", got.TranscriptNext, got.TranscriptFirst, got.TranscriptBytes)
+	}
+	page, err = af.c.agentTranscript(ctx, localSubject(), &proto.AgentTranscriptReq{ID: a.ID, From: 0})
+	if err != nil || page.Gap == nil || page.Gap.From != 0 || page.Gap.To != 2 || len(page.Records) != 3 || page.Records[0].Index != 2 || page.Next != 5 {
+		t.Fatalf("page across the gap = %+v gap=%+v err=%v", page, page.Gap, err)
+	}
+	page, err = af.c.agentTranscript(ctx, localSubject(), &proto.AgentTranscriptReq{ID: a.ID, From: 2})
+	if err != nil || page.Gap != nil || len(page.Records) != 3 {
+		t.Fatalf("page from first = %+v err=%v", page, err)
+	}
+	// The mirror survives a restart: the bounds live on the agent row and
+	// the rows in their own table.
+	af.c.Stop()
+	_ = af.log.Close()
+	again := newControlFixture(t, path, func(o *Options) { o.PublicURL = "https://remount.example"; o.MaxTranscriptBytesPerAgent = 1000 })
+	page, err = again.c.agentTranscript(ctx, localSubject(), &proto.AgentTranscriptReq{ID: a.ID, From: 3})
+	if err != nil || len(page.Records) != 2 || page.Records[0].Index != 3 || page.Next != 5 || page.Done {
+		t.Fatalf("page after reopen = %+v err=%v", page, err)
+	}
+	af.controlFixture = again
+	af.c.Attach(af.sender)
+	// An oversized report is refused as malformed, not stored.
+	big := proto.AgentReport{Kind: proto.AgentReportTranscript, Chunks: []proto.TranscriptChunk{chunk(6, proto.MaxACPTranscriptFrame+8192)}}
+	big.Agent, big.Run, big.WS, big.Gen, big.Seq = run.Agent, run.Run, run.WS, run.Gen, 4
+	if err := af.c.agentReport(ctx, "n_one", &big); codeOf(err) != proto.CodeBadRequest {
+		t.Fatalf("oversized chunk = %v", err)
+	}
+	// A tail parked past the end is released when the agent ends, and the
+	// page it then reads says done.
+	wait = af.c.TranscriptWait(a.ID, 5)
+	if err := af.c.agentDestroy(ctx, localSubject(), &proto.AgentGetReq{ID: a.ID}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-wait:
+	case <-time.After(time.Second):
+		t.Fatal("wait not released by destroy")
+	}
+	page, err = af.c.agentTranscript(ctx, localSubject(), &proto.AgentTranscriptReq{ID: a.ID, From: 5})
+	if err != nil || len(page.Records) != 0 || !page.Done {
+		t.Fatalf("page after destroy = %+v err=%v", page, err)
+	}
+	// Records of a destroyed agent stay readable until the row is pruned.
+	page, err = af.c.agentTranscript(ctx, localSubject(), &proto.AgentTranscriptReq{ID: a.ID, From: 2})
+	if err != nil || len(page.Records) != 3 {
+		t.Fatalf("page after destroy from 2 = %+v err=%v", page, err)
 	}
 }

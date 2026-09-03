@@ -111,6 +111,86 @@ type agentReporter struct {
 	kick chan struct{}
 	done chan struct{}
 	end  bool
+	// Transcript records wait here until the batch is big enough, old
+	// enough, or another report needs to overtake them; they then ship as one
+	// transcript report so the mirror keeps seq order relative to lifecycle
+	// reports.
+	chunks     []proto.TranscriptChunk
+	chunkBytes int
+	flushTimer *time.Timer
+}
+
+// agentTranscriptFlushAfter bounds how stale the control plane's copy of a
+// quiet run gets; agentTranscriptFlushBytes bounds the batch for a busy one.
+const (
+	agentTranscriptFlushAfter = 250 * time.Millisecond
+	agentTranscriptFlushBytes = 64 << 10
+)
+
+// chunk queues one transcript record for mirroring.
+func (r *agentReporter) chunk(ch proto.TranscriptChunk) {
+	r.mu.Lock()
+	if r.end {
+		r.mu.Unlock()
+		return
+	}
+	r.chunks = append(r.chunks, ch)
+	r.chunkBytes += len(ch.Data)
+	if r.chunkBytes >= agentTranscriptFlushBytes {
+		r.flushChunksLocked()
+		r.mu.Unlock()
+		r.wake()
+		return
+	}
+	if r.flushTimer == nil {
+		r.flushTimer = time.AfterFunc(agentTranscriptFlushAfter, r.flushChunks)
+	}
+	r.mu.Unlock()
+}
+
+func (r *agentReporter) flushChunks() {
+	r.mu.Lock()
+	r.flushTimer = nil
+	if len(r.chunks) == 0 || r.end {
+		r.mu.Unlock()
+		return
+	}
+	r.flushChunksLocked()
+	r.mu.Unlock()
+	r.wake()
+}
+
+// flushChunksLocked moves the pending chunks into a transcript report. It
+// splits a batch that outgrew the report bound. Caller holds r.mu.
+func (r *agentReporter) flushChunksLocked() {
+	if r.flushTimer != nil {
+		r.flushTimer.Stop()
+		r.flushTimer = nil
+	}
+	for len(r.chunks) > 0 {
+		n, size := 0, 0
+		for n < len(r.chunks) && (n == 0 || size+len(r.chunks[n].Data) <= proto.MaxTranscriptReportBytes) {
+			size += len(r.chunks[n].Data)
+			n++
+		}
+		batch := append([]proto.TranscriptChunk(nil), r.chunks[:n]...)
+		r.chunks = r.chunks[n:]
+		r.seq++
+		r.q = append(r.q, &proto.AgentReport{
+			Agent: r.run.req.Agent, Run: r.run.req.Run, WS: r.run.req.WS, Gen: r.run.req.Gen,
+			Seq: r.seq, Kind: proto.AgentReportTranscript, At: time.Now().UnixMilli(), Chunks: batch,
+		})
+	}
+	r.chunks = nil
+	r.chunkBytes = 0
+}
+
+// wake nudges the loop; call it after releasing r.mu.
+func (r *agentReporter) wake() {
+	select {
+	case r.kick <- struct{}{}:
+	default:
+	}
 }
 
 func (r *agentReporter) report(kind string, fill func(*proto.AgentReport)) {
@@ -119,6 +199,7 @@ func (r *agentReporter) report(kind string, fill func(*proto.AgentReport)) {
 		r.mu.Unlock()
 		return
 	}
+	r.flushChunksLocked()
 	r.seq++
 	rep := &proto.AgentReport{
 		Agent: r.run.req.Agent, Run: r.run.req.Run, WS: r.run.req.WS, Gen: r.run.req.Gen,
@@ -788,9 +869,20 @@ func (r *agentRun) recordInstallOutput(s *session.Session, redact *redactor) {
 	}
 	out, _ = redact.apply(out)
 	if len(out) > 0 {
-		if _, err := r.transcript.Record(proto.StreamStderr, out); err != nil {
-			r.n.logger.Warn("acp transcript record", "agent", r.req.Agent, "run", r.req.Run, "err", err)
-		}
+		r.record(proto.StreamStderr, out)
+	}
+}
+
+// record appends one redacted, bounded chunk to the transcript session and
+// queues the same bytes for the control plane's mirror.
+func (r *agentRun) record(stream uint8, data []byte) {
+	seq, err := r.transcript.Record(stream, data)
+	if err != nil {
+		r.n.logger.Warn("acp transcript record", "agent", r.req.Agent, "run", r.req.Run, "err", err)
+		return
+	}
+	if r.reporter != nil {
+		r.reporter.chunk(proto.TranscriptChunk{Seq: seq, Stream: stream, At: time.Now().UnixMilli(), Data: data})
 	}
 }
 
@@ -1143,9 +1235,7 @@ func (r *agentRun) recordFrame(f acp.Frame) {
 		stream = proto.StreamACPIn
 		rec.Replayed = replaying && isSessionUpdate(f.Raw)
 	}
-	if _, err := r.transcript.Record(stream, proto.MustMarshal(rec)); err != nil {
-		r.n.logger.Warn("acp transcript record", "agent", r.req.Agent, "run", r.req.Run, "err", err)
-	}
+	r.record(stream, proto.MustMarshal(rec))
 }
 
 func isSessionUpdate(raw []byte) bool {

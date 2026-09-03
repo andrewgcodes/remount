@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"remount.dev/remount/internal/session"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -143,6 +145,8 @@ type agentFixture struct {
 	n       *Node
 	w       *ws
 	reports chan *proto.AgentReport
+	mu      sync.Mutex
+	all     []*proto.AgentReport
 }
 
 func newAgentFixture(t *testing.T) *agentFixture {
@@ -150,6 +154,9 @@ func newAgentFixture(t *testing.T) *agentFixture {
 	n := newTestNode(t, nil)
 	f := &agentFixture{n: n, reports: make(chan *proto.AgentReport, 256)}
 	n.agentReportSink = func(ctx context.Context, rep *proto.AgentReport) error {
+		f.mu.Lock()
+		f.all = append(f.all, rep)
+		f.mu.Unlock()
 		select {
 		case f.reports <- rep:
 		case <-ctx.Done():
@@ -318,6 +325,67 @@ func TestAgentRunEchoTurnsAndCancel(t *testing.T) {
 	s, _ := f.n.sessions.Get(started.Transcript)
 	if exit := s.ExitInfo(); exit == nil || exit.Reason != "cancelled" {
 		t.Fatalf("transcript exit = %+v", exit)
+	}
+	f.assertMirrored(t, s)
+}
+
+// assertMirrored checks the transcript reports the node sent reproduce the
+// session log exactly and in order, within the report bound, and all before
+// finished.
+func (f *agentFixture) assertMirrored(t *testing.T, s *session.Session) {
+	t.Helper()
+	chunks, err := s.Log.Read(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[uint64][]byte{}
+	for _, c := range chunks {
+		if c.Stream == proto.StreamACPIn || c.Stream == proto.StreamACPOut || c.Stream == proto.StreamStderr {
+			want[c.Seq] = c.Data
+		}
+	}
+	f.mu.Lock()
+	all := append([]*proto.AgentReport(nil), f.all...)
+	f.mu.Unlock()
+	var (
+		lastSeq  uint64
+		got      int
+		finished bool
+		lastRep  uint64
+	)
+	for _, rep := range all {
+		if rep.Seq <= lastRep {
+			t.Fatalf("report seq %d after %d", rep.Seq, lastRep)
+		}
+		lastRep = rep.Seq
+		if rep.Kind == proto.AgentReportFinished {
+			finished = true
+			continue
+		}
+		if rep.Kind != proto.AgentReportTranscript {
+			continue
+		}
+		if finished {
+			t.Fatal("transcript report after finished")
+		}
+		size := 0
+		for _, ch := range rep.Chunks {
+			size += len(ch.Data)
+			if ch.Seq <= lastSeq {
+				t.Fatalf("chunk seq %d after %d", ch.Seq, lastSeq)
+			}
+			lastSeq = ch.Seq
+			if !bytes.Equal(want[ch.Seq], ch.Data) {
+				t.Fatalf("chunk seq %d differs from the session log", ch.Seq)
+			}
+			got++
+		}
+		if size > proto.MaxTranscriptReportBytes {
+			t.Fatalf("transcript report of %d bytes exceeds the bound", size)
+		}
+	}
+	if got != len(want) || got == 0 {
+		t.Fatalf("mirrored %d of %d transcript records", got, len(want))
 	}
 }
 

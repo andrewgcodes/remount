@@ -342,6 +342,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `agent.sleep` | C | `AgentGetReq{id, idem}` → `Agent`; stops the run, checkpoints and pauses the workspace |
 | `agent.fork` | C | `AgentForkReq{id, name?, task?, policy?, idem}` → `Agent`; snapshots the workspace and starts a child from the copy with the same harness session |
 | `agent.destroy` | C | `AgentGetReq{id, idem}` → `{}`; destroys the workspace only if the agent created it |
+| `agent.transcript` | C | `AgentTranscriptReq{id, from?, limit?}` → `AgentTranscriptRes{records, next, gap?, done?}`; a page of the durable transcript mirror from cursor `from`, never touching the workspace (§6.2) |
 | `approval.list` | C | `ApprovalListReq{agent?, status?}` → `ApprovalListRes{approvals}`; pending only unless `status` is given |
 | `approval.get` | C | `ApprovalGetReq{id}` → `Approval` |
 | `approval.decide` | C | `ApprovalDecideReq{id, option?, denied?, content?, idem}` → `Approval`; the decision commits before it is handed to the run |
@@ -360,7 +361,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `ws.released` | N | `WSReleasedReq{id, gen, snapshot, reason, failed?}` → `{}`; `failed:true` means materialization could not complete and control holds the workspace out of placement with a growing delay (1s doubling to 30s, reset by the next `ws.ready`) instead of re-offering it at once |
 | `ws.snapshot.commit` | N | `WSSnapshotCommitReq{id, gen, snapshot}` → `{}` |
 | `binding.lease` | N | `BindingLeaseReq{ws}` → `BindingLeaseRes{leases}` |
-| `agent.report` | N | `AgentReport{agent, run, ws, gen, seq, kind, ...}` → `{}`; one observation about a run, fenced to the node, generation and run, deduplicated by `seq` (§6.1) |
+| `agent.report` | N | `AgentReport{agent, run, ws, gen, seq, kind, ...}` → `{}`; one observation about a run, fenced to the node, generation and run, deduplicated by `seq` (§6.1); `kind: transcript` carries `chunks[]` for the mirror (§6.2) |
 | `diag` | C | `DiagReq{verify}` → control diagnostics |
 
 Every mutating request carries an `idem` key. Replaying a request with the same
@@ -383,6 +384,7 @@ loss, a move or a sleep never loses the conversation.
 Agent { id, tenant, owner, name, ws, owns_ws, spec, mode, acp_session_id,
         capabilities, status, status_reason, inbox[], runs[], turns, parent,
         forked_from, policy, transcript_session, transcript_node,
+        transcript_next, transcript_first, transcript_bytes,
         pending_approvals, url, created_at, updated_at, wake_timer,
         idle_since, failures }
 ```
@@ -471,6 +473,40 @@ decision always carries `option: allow|deny`. A node may only park
 `tool_call` and `elicitation`; `egress` rows come from the broker. A second
 decision on any row is `conflict`; a replay with the same idempotency key
 returns the row as decided.
+
+### 6.2 Transcript mirror
+
+The node writes the harness conversation to a session log (`kind: acp`) in the
+workspace's node, where `s.attach` replays it. That log dies with the node and
+sleeps with the workspace, so the node also ships every record to the control
+plane as it is written: `agent.report{kind: transcript, chunks[]}` carries
+`TranscriptChunk{seq, stream, at, data}` for each session-log record on the
+`acp_in`, `acp_out` and `stderr` streams, after the same redaction and bound
+(`MaxACPTranscriptFrame`) the session log applied. The node batches records
+for at most 250 ms or 64 KiB and never lets a lifecycle report overtake a
+queued record: `turn_finished` for a message follows every chunk of that
+turn. One report carries at most `MaxTranscriptReportBytes` (256 KiB) and is
+refused with `bad_request` beyond it.
+
+The control plane appends the chunks to a per-agent log with a contiguous
+agent-wide index that spans runs, retries and moves, and records the bounds
+on the agent: `transcript_next` is the index the next record takes,
+`transcript_first` the oldest index still held, `transcript_bytes` the data
+held. A mirror is bounded (64 MiB per agent by default); past the bound the
+oldest records are evicted and `transcript_first` moves up. Rows and bounds
+commit in one transaction with the report's dedupe mark, so a replayed report
+never duplicates a record. A transcript report is data, not a state change,
+and emits no event.
+
+`agent.transcript{id, from, limit}` returns `records[]` (`TranscriptRecord{
+index, run, seq, stream, at, data}`) from `from` in index order, at most
+`limit` (default and cap 1000), and `next`, the cursor to continue from. A
+`from` below `transcript_first` returns `gap{from, to}` naming the evicted
+range and the page starts at `to`; a reader never sees a shorter log without
+being told. `done: true` is set when the agent is terminal and the page
+reached `next`: nothing more will ever arrive. Reading the mirror needs read
+authority on the agent and never wakes a sleeping workspace; the node-side
+session log remains the source for byte-exact replay of a live run.
 
 ## 7. Node operations
 

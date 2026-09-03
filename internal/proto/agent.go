@@ -44,6 +44,13 @@ type Agent struct {
 	// transcript of the current or last run.
 	TranscriptSession string `cbor:"transcript_session,omitempty" json:"transcript_session,omitempty"`
 	TranscriptNode    string `cbor:"transcript_node,omitempty" json:"transcript_node,omitempty"`
+	// TranscriptNext is the index the next mirrored transcript record gets;
+	// TranscriptFirst is the oldest index still retained (records below it
+	// were evicted to stay within MaxTranscriptBytesPerAgent, accounted in
+	// TranscriptBytes). A reader at TranscriptNext has everything.
+	TranscriptNext  uint64 `cbor:"transcript_next,omitempty" json:"transcript_next,omitempty"`
+	TranscriptFirst uint64 `cbor:"transcript_first,omitempty" json:"transcript_first,omitempty"`
+	TranscriptBytes int64  `cbor:"transcript_bytes,omitempty" json:"transcript_bytes,omitempty"`
 	// PendingApprovals counts approvals waiting on a human; it is what makes
 	// status waiting_approval.
 	PendingApprovals int    `cbor:"pending_approvals,omitempty" json:"pending_approvals,omitempty"`
@@ -356,6 +363,9 @@ const (
 	OpAgentSleep   = "agent.sleep"   // AgentGetReq -> Agent
 	OpAgentFork    = "agent.fork"    // AgentForkReq -> Agent
 	OpAgentDestroy = "agent.destroy" // AgentGetReq -> {}
+	// OpAgentTranscript reads the control plane's durable copy of the
+	// transcript. It never touches the node, so it never wakes a workspace.
+	OpAgentTranscript = "agent.transcript" // AgentTranscriptReq -> AgentTranscriptRes
 
 	OpApprovalList   = "approval.list"   // ApprovalListReq -> ApprovalListRes
 	OpApprovalGet    = "approval.get"    // ApprovalGetReq -> Approval
@@ -433,6 +443,65 @@ type AgentForkReq struct {
 	Policy         *AgentPolicy `cbor:"policy,omitempty" json:"policy,omitempty"`
 	IdempotencyKey string       `cbor:"idem,omitempty" json:"idem,omitempty"`
 }
+
+// AgentTranscriptReq reads transcript records from index From (inclusive).
+// Limit bounds records per page; zero selects the server default.
+type AgentTranscriptReq struct {
+	ID    string `cbor:"id" json:"id"`
+	From  uint64 `cbor:"from,omitempty" json:"from,omitempty"`
+	Limit int    `cbor:"limit,omitempty" json:"limit,omitempty"`
+}
+
+// AgentTranscriptRes is one page. Next is the index to ask for next; Gap is
+// set when From was below the oldest retained record, and names the first
+// index that is retained, so a reader learns about the loss rather than
+// silently skipping it. Done is true once the agent is terminal and every
+// record it will ever have is below Next.
+type AgentTranscriptRes struct {
+	Records []TranscriptRecord `cbor:"records" json:"records"`
+	Next    uint64             `cbor:"next" json:"next"`
+	Gap     *TranscriptGap     `cbor:"gap,omitempty" json:"gap,omitempty"`
+	Done    bool               `cbor:"done,omitempty" json:"done,omitempty"`
+}
+
+// TranscriptGap says records [From, To) are gone.
+type TranscriptGap struct {
+	From uint64 `cbor:"from" json:"from"`
+	To   uint64 `cbor:"to" json:"to"`
+}
+
+// TranscriptRecord is one transcript chunk as the control plane keeps it.
+// Index is the agent-wide position (monotonic across runs); Seq is the
+// position in the run's node session log; Stream is the session stream
+// (StreamACPIn/StreamACPOut for ACP frames, StreamStderr for install and
+// harness noise). Data is the redacted chunk: an ACPFrameRecord for the ACP
+// streams.
+type TranscriptRecord struct {
+	Index  uint64 `cbor:"index" json:"index"`
+	Run    string `cbor:"run" json:"run"`
+	Seq    uint64 `cbor:"seq" json:"seq"`
+	Stream uint8  `cbor:"stream" json:"stream"`
+	At     int64  `cbor:"at" json:"at"`
+	Data   []byte `cbor:"data" json:"data"`
+}
+
+// TranscriptChunk is what a node ships in an AgentReportTranscript report:
+// one record of the run's transcript session, already redacted and bounded.
+type TranscriptChunk struct {
+	Seq    uint64 `cbor:"seq" json:"seq"`
+	Stream uint8  `cbor:"stream" json:"stream"`
+	At     int64  `cbor:"at" json:"at"`
+	Data   []byte `cbor:"data" json:"data"`
+}
+
+// Transcript mirror bounds. A report carries at most MaxTranscriptReportBytes
+// of chunk data; the control plane retains at most MaxTranscriptBytesPerAgent
+// per agent and evicts oldest-first, reporting the loss as a gap.
+const (
+	MaxTranscriptReportBytes   = 256 << 10
+	MaxTranscriptBytesPerAgent = 64 << 20
+	MaxTranscriptPage          = 1000
+)
 
 // ApprovalListReq filters approvals.
 type ApprovalListReq struct {
@@ -538,6 +607,9 @@ type AgentReport struct {
 	// Approval fields (AgentReportPermission, AgentReportElicitation).
 	Approval *Approval   `cbor:"approval,omitempty" json:"approval,omitempty"`
 	Usage    *AgentUsage `cbor:"usage,omitempty" json:"usage,omitempty"`
+	// Chunks (AgentReportTranscript) mirror the run's transcript session in
+	// seq order so the control plane can serve it without the node.
+	Chunks []TranscriptChunk `cbor:"chunks,omitempty" json:"chunks,omitempty"`
 }
 
 // AgentUsage is token accounting when the harness reports it.
@@ -556,6 +628,7 @@ const (
 	AgentReportPermission   = "permission"  // Approval carries the parked request
 	AgentReportElicitation  = "elicitation" // Approval carries the parked question
 	AgentReportFinished     = "finished"    // process gone; Error/ExitCode/Cancelled
+	AgentReportTranscript   = "transcript"  // Chunks: a batch of transcript records
 )
 
 // ---------------------------------------------------------------------------

@@ -1224,6 +1224,8 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 				c.agentRetry[a.ID] = c.now().Add(agentRetryBackoff)
 			}
 		}
+	case proto.AgentReportTranscript:
+		// Bulk data, not a state change: it is stored, not evented.
 	default:
 		c.mu.Unlock()
 		return proto.Err(proto.CodeBadRequest, "unknown agent report kind %q", rep.Kind)
@@ -1234,7 +1236,12 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 		return err
 	}
 	events = append(events, more...)
-	if err := c.persistAgent(a, events...); err != nil {
+	if rep.Kind == proto.AgentReportTranscript {
+		err = c.mirrorTranscriptLocked(a, run, rep.Chunks, events)
+	} else {
+		err = c.persistAgent(a, events...)
+	}
+	if err != nil {
 		c.mu.Unlock()
 		return err
 	}
