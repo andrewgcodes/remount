@@ -191,6 +191,13 @@ type NetworkController interface {
 	RevokeNetwork(context.Context) error
 }
 
+// BrokerAdvertiser exposes the exact node-owned address a workspace boundary
+// can reach before its broker is started. Enforced gateways use a private host
+// veth address; returning a wildcard or loopback would fail policy activation.
+type BrokerAdvertiser interface {
+	BrokerAdvertiseHost() string
+}
+
 // BaseEnv is the environment every session starts from, before workspace
 // and session env. HOME is the workspace root so dotfiles live with it.
 func BaseEnv(root string) []string {
