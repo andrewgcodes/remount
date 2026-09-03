@@ -52,50 +52,7 @@ func main() {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	var err error
-	switch os.Args[1] {
-	case "server":
-		err = cmdServer(ctx, os.Args[2:])
-	case "up":
-		err = cmdUp(ctx, os.Args[2:])
-	case "standalone":
-		err = cmdStandalone(ctx, os.Args[2:])
-	case "ws":
-		err = cmdWS(ctx, os.Args[2:])
-	case "exec":
-		err = cmdExec(ctx, os.Args[2:], false)
-	case "sh":
-		err = cmdExec(ctx, os.Args[2:], true)
-	case "attach":
-		err = cmdAttach(ctx, os.Args[2:])
-	case "fs":
-		err = cmdFS(ctx, os.Args[2:])
-	case "port":
-		err = cmdPort(ctx, os.Args[2:])
-	case "fleet":
-		err = cmdFleet(ctx, os.Args[2:])
-	case "status":
-		err = cmdStatus(ctx, os.Args[2:])
-	case "inspect":
-		err = cmdInspect(ctx, os.Args[2:])
-	case "doctor":
-		err = cmdDoctor(ctx, os.Args[2:])
-	case "metrics":
-		err = cmdMetrics(ctx, os.Args[2:])
-	case "nodes":
-		err = cmdNodes(ctx, os.Args[2:])
-	case "events":
-		err = cmdEvents(ctx, os.Args[2:])
-	case "timers":
-		err = cmdTimers(ctx, os.Args[2:])
-	case "version":
-		fmt.Println("remount", version)
-	case "help", "-h", "--help":
-		usage()
-	default:
-		usage()
-		os.Exit(2)
-	}
+	err := run(ctx, os.Args[1:])
 	if err != nil {
 		var ee exitError
 		if errors.As(err, &ee) {
@@ -105,6 +62,102 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// run dispatches one invocation. Global flags (--server, --token, --json) may
+// precede the command as well as follow it; they are moved after the
+// (sub)command name so every FlagSet sees them.
+func run(ctx context.Context, argv []string) error {
+	globals, argv := splitGlobalFlags(argv)
+	if len(argv) == 0 {
+		usage()
+		return exitError(2)
+	}
+	cmd, args := argv[0], argv[1:]
+	switch cmd {
+	case "ws", "fs", "fleet":
+		if len(args) > 0 && !isFlag(args[0]) {
+			args = append(append([]string{args[0]}, globals...), args[1:]...)
+		} else {
+			args = append(globals, args...)
+		}
+	case "server", "standalone", "version", "help", "-h", "--help":
+		if len(globals) > 0 {
+			return fmt.Errorf("%s does not accept %s before the command", cmd, globals[0])
+		}
+	default:
+		args = append(globals, args...)
+	}
+	switch cmd {
+	case "server":
+		return cmdServer(ctx, args)
+	case "up":
+		return cmdUp(ctx, args)
+	case "standalone":
+		return cmdStandalone(ctx, args)
+	case "ws":
+		return cmdWS(ctx, args)
+	case "exec":
+		return cmdExec(ctx, args, false)
+	case "sh":
+		return cmdExec(ctx, args, true)
+	case "attach":
+		return cmdAttach(ctx, args)
+	case "fs":
+		return cmdFS(ctx, args)
+	case "port":
+		return cmdPort(ctx, args)
+	case "fleet":
+		return cmdFleet(ctx, args)
+	case "status":
+		return cmdStatus(ctx, args)
+	case "inspect":
+		return cmdInspect(ctx, args)
+	case "doctor":
+		return cmdDoctor(ctx, args)
+	case "metrics":
+		return cmdMetrics(ctx, args)
+	case "nodes":
+		return cmdNodes(ctx, args)
+	case "events":
+		return cmdEvents(ctx, args)
+	case "timers":
+		return cmdTimers(ctx, args)
+	case "version":
+		fmt.Println("remount", version)
+		return nil
+	case "help", "-h", "--help":
+		usage()
+		return nil
+	}
+	usage()
+	return exitError(2)
+}
+
+// globalFlags are accepted before the command name.
+var globalFlags = map[string]bool{"server": true, "token": true, "json": false}
+
+// splitGlobalFlags peels leading global flags off argv. The bool records
+// whether the flag takes a value.
+func splitGlobalFlags(argv []string) (globals, rest []string) {
+	for len(argv) > 0 && isFlag(argv[0]) {
+		name, _, hasValue := strings.Cut(strings.TrimLeft(argv[0], "-"), "=")
+		takesValue, known := globalFlags[name]
+		if !known {
+			break
+		}
+		globals = append(globals, argv[0])
+		argv = argv[1:]
+		if takesValue && !hasValue && len(argv) > 0 {
+			globals = append(globals, argv[0])
+			argv = argv[1:]
+		}
+	}
+	return globals, argv
+}
+
+func isFlag(a string) bool { return len(a) > 1 && a[0] == '-' }
+
+func isHelp(a string) bool { return a == "help" || a == "-h" || a == "--help" }
 
 type exitError int
 
@@ -117,8 +170,8 @@ func usage() {
   remount up          enroll this machine as a node (outbound only)
   remount standalone  server + node in one process (try it on a laptop)
 
-	  remount ws create [--name N] [--backend B] [--security PROFILE] [--egress-rule JSON] [--binding ID]
-	  remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS [--authoritative]
+  remount ws create [--name N] [--backend B] [--image IMG] [--security PROFILE] [--egress-rule JSON] [--binding ID]
+  remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS [--authoritative]
   remount exec WS -- cmd args...      run a command (stdout/stderr/exit streamed)
   remount sh WS [cmd]                 interactive shell (pty)
   remount attach WS SESSION [--from N]
@@ -133,7 +186,7 @@ Inspection, at three depths. All take --json.
   remount doctor                      every check for damage, loss or disagreement
   remount metrics [--node ID]         raw counters
 
-Common flags (or env): --server REMOUNT_SERVER (default http://127.0.0.1:7443) --token REMOUNT_TOKEN
+Common flags (or env), before or after the command: --server REMOUNT_SERVER (default http://127.0.0.1:7443) --token REMOUNT_TOKEN --json
 `)
 }
 
@@ -188,6 +241,44 @@ func parse(fs *flag.FlagSet, args []string) {
 		positional = append(positional, a)
 	}
 	_ = fs.Parse(append(flags, positional...))
+}
+
+// arity enforces the positional count of a subcommand after parse. Extra
+// positionals are an error rather than silently ignored: `ws create
+// python:3.12` was accepted and created a workspace with the default image.
+func arity(fs *flag.FlagSet, min, max int, usage string) error {
+	args := fs.Args()
+	if len(args) < min {
+		return fmt.Errorf("missing argument: %s", usage)
+	}
+	if max >= 0 && len(args) > max {
+		extra := args[max]
+		if looksLikeImage(extra) {
+			return fmt.Errorf("unexpected argument %q: did you mean --image %s? usage: %s", extra, extra, usage)
+		}
+		return fmt.Errorf("unexpected argument %q: %s", extra, usage)
+	}
+	return nil
+}
+
+// looksLikeImage recognises the shapes people type for container images
+// (name:tag, registry/name, name@sha256:...).
+func looksLikeImage(s string) bool {
+	if s == "" || strings.ContainsAny(s, " \t") || strings.HasPrefix(s, "ws_") {
+		return false
+	}
+	return strings.Contains(s, ":") || strings.Contains(s, "/") || strings.Contains(s, "@sha256")
+}
+
+// mutationResult is the --json shape of a mutating command that has no
+// richer object to print.
+type mutationResult struct {
+	OK        bool   `json:"ok"`
+	Operation string `json:"operation"`
+	Workspace string `json:"workspace,omitempty"`
+	Path      string `json:"path,omitempty"`
+	To        string `json:"to,omitempty"`
+	Count     *int   `json:"count,omitempty"`
 }
 
 // absFlagPath resolves a directory flag against the current working directory.
@@ -576,7 +667,7 @@ func cmdStandalone(ctx context.Context, args []string) error {
 // ---------------------------------------------------------------------------
 
 func cmdWS(ctx context.Context, args []string) error {
-	if len(args) == 0 {
+	if len(args) == 0 || isHelp(args[0]) {
 		return errors.New("ws: create|ls|get|destroy|move|sleep|wake|snapshot")
 	}
 	sub, rest := args[0], args[1:]
@@ -612,6 +703,9 @@ func cmdWS(ctx context.Context, args []string) error {
 		fs.Var(&egressRules, "egress-rule", "typed egress rule as JSON or @path (repeatable)")
 		wait := fs.Bool("wait", true, "wait until claimed")
 		parse(fs, rest)
+		if err := arity(fs, 0, 0, "ws create [--name N] [--image IMG] [flags]"); err != nil {
+			return err
+		}
 		if *principal != "" {
 			return errors.New("--principal is not supported; authenticated caller identity is authoritative")
 		}
@@ -654,6 +748,9 @@ func cmdWS(ctx context.Context, args []string) error {
 		}
 	case "ls":
 		parse(fs, rest)
+		if err := arity(fs, 0, 0, "ws ls"); err != nil {
+			return err
+		}
 		cl := c.client()
 		defer cl.Close()
 		list, err := cl.ListWorkspaces(ctx)
@@ -672,8 +769,8 @@ func cmdWS(ctx context.Context, args []string) error {
 		tw.Flush()
 	case "get":
 		parse(fs, rest)
-		if fs.NArg() < 1 {
-			return errors.New("ws get WS")
+		if err := arity(fs, 1, 1, "ws get WS"); err != nil {
+			return err
 		}
 		cl := c.client()
 		defer cl.Close()
@@ -684,12 +781,17 @@ func cmdWS(ctx context.Context, args []string) error {
 		printJSON(ws)
 	case "destroy":
 		parse(fs, rest)
-		if fs.NArg() < 1 {
-			return errors.New("ws destroy WS")
+		if err := arity(fs, 1, 1, "ws destroy WS"); err != nil {
+			return err
 		}
 		cl := c.client()
 		defer cl.Close()
-		return cl.DestroyWorkspace(ctx, fs.Arg(0))
+		if err := cl.DestroyWorkspace(ctx, fs.Arg(0)); err != nil {
+			return err
+		}
+		if c.json {
+			printJSON(mutationResult{OK: true, Operation: "ws.destroy", Workspace: fs.Arg(0)})
+		}
 	case "move":
 		nodeID := fs.String("node", "", "pin to node id")
 		cpu := fs.Int("cpu", 0, "required cpus")
@@ -698,8 +800,8 @@ func cmdWS(ctx context.Context, args []string) error {
 		labels := kvFlag{}
 		fs.Var(labels, "label", "placement label k=v")
 		parse(fs, rest)
-		if fs.NArg() < 1 {
-			return errors.New("ws move WS [--node ID] [--cpu N] [--label k=v]")
+		if err := arity(fs, 1, 1, "ws move WS [--node ID] [--cpu N] [--label k=v]"); err != nil {
+			return err
 		}
 		cl := c.client()
 		defer cl.Close()
@@ -749,12 +851,19 @@ func cmdWS(ctx context.Context, args []string) error {
 			}
 			return err
 		}
+		if c.json {
+			printJSON(ws)
+			return nil
+		}
 		fmt.Fprintf(os.Stderr, "moved: node=%s gen=%d restored_from=%s\n", ws.Node, ws.Generation, short(ws.LastSnapshot))
 	case "sleep":
 		after := fs.Duration("after", 0, "wake after duration")
 		on := fs.String("on", "", "wake on event type")
 		parse(fs, rest)
-		if fs.NArg() < 1 || (*after == 0 && *on == "") {
+		if err := arity(fs, 1, 1, "ws sleep WS --after 1h | --on github.pr.merged"); err != nil {
+			return err
+		}
+		if *after == 0 && *on == "" {
 			return errors.New("ws sleep WS --after 1h | --on github.pr.merged")
 		}
 		cl := c.client()
@@ -766,8 +875,8 @@ func cmdWS(ctx context.Context, args []string) error {
 		printJSON(t)
 	case "wake":
 		parse(fs, rest)
-		if fs.NArg() < 1 {
-			return errors.New("ws wake WS")
+		if err := arity(fs, 1, 1, "ws wake WS"); err != nil {
+			return err
 		}
 		cl := c.client()
 		defer cl.Close()
@@ -778,13 +887,17 @@ func cmdWS(ctx context.Context, args []string) error {
 		if ws, err = cl.WaitClaimed(ctx, ws.ID); err != nil {
 			return err
 		}
+		if c.json {
+			printJSON(ws)
+			return nil
+		}
 		fmt.Fprintf(os.Stderr, "awake: node=%s gen=%d\n", ws.Node, ws.Generation)
 	case "snapshot":
 		authoritative := fs.Bool("authoritative", false, "quiesce managed execution and commit as failover state")
 		upload := fs.Bool("upload", true, "upload the snapshot to the control-plane artifact store")
 		parse(fs, rest)
-		if fs.NArg() < 1 {
-			return errors.New("ws snapshot WS [--authoritative] [--upload=true]")
+		if err := arity(fs, 1, 1, "ws snapshot WS [--authoritative] [--upload=true]"); err != nil {
+			return err
 		}
 		cl := c.client()
 		defer cl.Close()
@@ -800,6 +913,10 @@ func cmdWS(ctx context.Context, args []string) error {
 		}
 		if err != nil {
 			return err
+		}
+		if c.json {
+			printJSON(res)
+			return nil
 		}
 		fmt.Println(res.Artifact)
 		fmt.Fprintf(os.Stderr, "%d bytes, consistency=%s, authoritative=%t\n", res.Bytes, res.Consistency, res.Authoritative)
@@ -825,7 +942,7 @@ func parseRFC3339Millis(value string) (int64, error) {
 }
 
 func cmdFleet(ctx context.Context, args []string) error {
-	if len(args) == 0 {
+	if len(args) == 0 || isHelp(args[0]) {
 		return errors.New("fleet: quarantine|ls|get")
 	}
 	sub, rest := args[0], args[1:]
@@ -850,6 +967,9 @@ func cmdFleet(ctx context.Context, args []string) error {
 		labels := kvFlag{}
 		fs.Var(labels, "label", "workspace label selector k=v (repeatable)")
 		parse(fs, rest)
+		if err := arity(fs, 0, 0, "fleet quarantine --action A (--all | selectors)"); err != nil {
+			return err
+		}
 		afterMillis, err := parseRFC3339Millis(*createdAfter)
 		if err != nil {
 			return err
@@ -885,8 +1005,8 @@ func cmdFleet(ctx context.Context, args []string) error {
 		printFleetOperation(operation, commonFlags.json)
 	case "get":
 		parse(fs, rest)
-		if fs.NArg() != 1 {
-			return errors.New("fleet get OPERATION")
+		if err := arity(fs, 1, 1, "fleet get OPERATION"); err != nil {
+			return err
 		}
 		cl := commonFlags.client()
 		defer cl.Close()
@@ -897,6 +1017,9 @@ func cmdFleet(ctx context.Context, args []string) error {
 		printFleetOperation(operation, commonFlags.json)
 	case "ls":
 		parse(fs, rest)
+		if err := arity(fs, 0, 0, "fleet ls"); err != nil {
+			return err
+		}
 		cl := commonFlags.client()
 		defer cl.Close()
 		operations, err := cl.ListFleetOperations(ctx)
@@ -995,8 +1118,8 @@ func cmdAttach(ctx context.Context, args []string) error {
 	c.flags(fs)
 	from := fs.Uint64("from", 0, "replay from seq")
 	parse(fs, args)
-	if fs.NArg() < 2 {
-		return errors.New("attach WS SESSION [--from N]")
+	if err := arity(fs, 2, 2, "attach WS SESSION [--from N]"); err != nil {
+		return err
 	}
 	cl := c.client()
 	defer cl.Close()
@@ -1056,8 +1179,8 @@ func drive(ctx context.Context, s *client.Session, raw, forwardStdin bool) error
 // ---------------------------------------------------------------------------
 
 func cmdFS(ctx context.Context, args []string) error {
-	if len(args) == 0 {
-		return errors.New("fs read|write|ls|stat|rm|mv|search|edit WS PATH…")
+	if len(args) == 0 || isHelp(args[0]) {
+		return errors.New("fs read|write|ls|stat|rm|mv|mkdir|search|edit WS PATH…")
 	}
 	sub, rest := args[0], args[1:]
 	fs := flag.NewFlagSet("fs "+sub, flag.ExitOnError)
@@ -1068,38 +1191,75 @@ func cmdFS(ctx context.Context, args []string) error {
 	max := fs.Int("max", 0, "max results (search)")
 	all := fs.Bool("all", false, "replace all occurrences (edit)")
 	parse(fs, rest)
-	cl := c.client()
-	defer cl.Close()
 	a := fs.Args()
-	need := func(n int, u string) error {
-		if len(a) < n {
-			return errors.New(u)
+	need := func(min, max int, u string) error { return arity(fs, min, max, u) }
+	mutation := func(m mutationResult) {
+		if c.json {
+			m.OK = true
+			printJSON(m)
 		}
-		return nil
 	}
+	// Arity is checked before dialing so a typo never costs a connection.
 	switch sub {
 	case "read", "cat":
-		if err := need(2, "fs read WS PATH"); err != nil {
+		if err := need(2, 2, "fs read WS PATH"); err != nil {
 			return err
 		}
+	case "write":
+		if err := need(2, 2, "fs write WS PATH < data"); err != nil {
+			return err
+		}
+	case "ls":
+		if err := need(1, 2, "fs ls WS [PATH]"); err != nil {
+			return err
+		}
+	case "stat":
+		if err := need(2, 2, "fs stat WS PATH"); err != nil {
+			return err
+		}
+	case "rm":
+		if err := need(2, 2, "fs rm [-r] WS PATH"); err != nil {
+			return err
+		}
+	case "mv":
+		if err := need(3, 3, "fs mv WS FROM TO"); err != nil {
+			return err
+		}
+	case "mkdir":
+		if err := need(2, 2, "fs mkdir WS PATH"); err != nil {
+			return err
+		}
+	case "search", "grep":
+		if err := need(2, 3, "fs search WS PATTERN [PATH]"); err != nil {
+			return err
+		}
+	case "edit":
+		if err := need(4, 4, "fs edit [--all] WS PATH OLD NEW"); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unknown fs subcommand %q", sub)
+	}
+	cl := c.client()
+	defer cl.Close()
+	switch sub {
+	case "read", "cat":
 		b, err := cl.ReadFile(ctx, a[0], a[1])
 		if err != nil {
 			return err
 		}
 		_, _ = os.Stdout.Write(b)
 	case "write":
-		if err := need(2, "fs write WS PATH < data"); err != nil {
-			return err
-		}
 		data, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
-		return cl.WriteFile(ctx, a[0], a[1], data, 0)
-	case "ls":
-		if err := need(1, "fs ls WS [PATH]"); err != nil {
+		if err := cl.WriteFile(ctx, a[0], a[1], data, 0); err != nil {
 			return err
 		}
+		n := len(data)
+		mutation(mutationResult{Operation: "fs.write", Workspace: a[0], Path: a[1], Count: &n})
+	case "ls":
 		p := "/"
 		if len(a) > 1 {
 			p = a[1]
@@ -1122,33 +1282,27 @@ func cmdFS(ctx context.Context, args []string) error {
 			fmt.Printf("%s %04o %10d %s %s\n", kind, e.Mode, e.Size, time.UnixMilli(e.ModTime).Format("2006-01-02 15:04"), e.Name)
 		}
 	case "stat":
-		if err := need(2, "fs stat WS PATH"); err != nil {
-			return err
-		}
 		e, err := cl.Stat(ctx, a[0], a[1])
 		if err != nil {
 			return err
 		}
 		printJSON(e)
 	case "rm":
-		if err := need(2, "fs rm [-r] WS PATH"); err != nil {
+		if err := cl.Remove(ctx, a[0], a[1], *recursive); err != nil {
 			return err
 		}
-		return cl.Remove(ctx, a[0], a[1], *recursive)
+		mutation(mutationResult{Operation: "fs.rm", Workspace: a[0], Path: a[1]})
 	case "mv":
-		if err := need(3, "fs mv WS FROM TO"); err != nil {
+		if err := cl.Rename(ctx, a[0], a[1], a[2]); err != nil {
 			return err
 		}
-		return cl.Rename(ctx, a[0], a[1], a[2])
+		mutation(mutationResult{Operation: "fs.mv", Workspace: a[0], Path: a[1], To: a[2]})
 	case "mkdir":
-		if err := need(2, "fs mkdir WS PATH"); err != nil {
+		if err := cl.Mkdir(ctx, a[0], a[1]); err != nil {
 			return err
 		}
-		return cl.Mkdir(ctx, a[0], a[1])
+		mutation(mutationResult{Operation: "fs.mkdir", Workspace: a[0], Path: a[1]})
 	case "search", "grep":
-		if err := need(2, "fs search WS PATTERN [PATH]"); err != nil {
-			return err
-		}
 		p := "/"
 		if len(a) > 2 {
 			p = a[2]
@@ -1164,16 +1318,15 @@ func cmdFS(ctx context.Context, args []string) error {
 			fmt.Fprintln(os.Stderr, "(truncated)")
 		}
 	case "edit":
-		if err := need(4, "fs edit [--all] WS PATH OLD NEW"); err != nil {
-			return err
-		}
 		n, err := cl.Edit(ctx, a[0], a[1], []proto.FSEdit{{Old: a[2], New: a[3], All: *all}})
 		if err != nil {
 			return err
 		}
+		if c.json {
+			mutation(mutationResult{Operation: "fs.edit", Workspace: a[0], Path: a[1], Count: &n})
+			return nil
+		}
 		fmt.Fprintf(os.Stderr, "%d replacement(s)\n", n)
-	default:
-		return fmt.Errorf("unknown fs subcommand %q", sub)
 	}
 	return nil
 }
@@ -1188,12 +1341,12 @@ func cmdPort(ctx context.Context, args []string) error {
 	c.flags(fs)
 	local := fs.String("local", "", "local listen address (default 127.0.0.1:PORT)")
 	parse(fs, args)
-	if fs.NArg() < 2 {
-		return errors.New("port WS PORT [--local ADDR]")
+	if err := arity(fs, 2, 2, "port WS PORT [--local ADDR]"); err != nil {
+		return err
 	}
 	port, err := strconv.Atoi(fs.Arg(1))
-	if err != nil {
-		return err
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("PORT %q must be 1-65535", fs.Arg(1))
 	}
 	if *local == "" {
 		*local = "127.0.0.1:" + fs.Arg(1)
@@ -1258,6 +1411,9 @@ func cmdNodes(ctx context.Context, args []string) error {
 	var c common
 	c.flags(fs)
 	parse(fs, args)
+	if err := arity(fs, 0, 0, "nodes"); err != nil {
+		return err
+	}
 	cl := c.client()
 	defer cl.Close()
 	nodes, err := cl.ListNodes(ctx)
@@ -1285,6 +1441,9 @@ func cmdEvents(ctx context.Context, args []string) error {
 	ws := fs.String("ws", "", "filter by workspace")
 	from := fs.Uint64("from", 1, "first seq")
 	parse(fs, args)
+	if err := arity(fs, 0, 0, "events [--follow] [--ws WS] [--from N]"); err != nil {
+		return err
+	}
 	cl := c.client()
 	defer cl.Close()
 	print := func(e proto.Event) {
@@ -1324,6 +1483,9 @@ func cmdTimers(ctx context.Context, args []string) error {
 	var c common
 	c.flags(fs)
 	parse(fs, args)
+	if err := arity(fs, 0, 0, "timers"); err != nil {
+		return err
+	}
 	cl := c.client()
 	defer cl.Close()
 	timers, err := cl.ListTimers(ctx)
