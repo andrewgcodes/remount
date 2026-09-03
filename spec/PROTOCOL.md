@@ -237,7 +237,7 @@ SecuritySpec { profile, min_isolation, require_sibling_isolation,
                require_enforced_egress, secret_mode, network, audit }
 NetworkPolicy { default: "deny"|"allow", rules: [EgressRule] }
 EgressRule { id, connector?, protocol, hosts, ports, methods, path_prefixes,
-             max_requests, max_request_bytes, max_response_bytes,
+             max_requests, max_request_bytes, max_response_bytes, redact?,
              shared_state, repos?, push? }
 RepoSpec    { url, ref?, depth? }
 ```
@@ -253,6 +253,12 @@ every requested capability. A node MUST revalidate the descriptor and install
 the network policy before reporting `ws.ready`; advertising
 `enforced_gateway` without implementing the network-controller contract is an
 error, not evidence of enforcement.
+
+`redact` is a bounded list of RE2 expressions applied to an HTTP response
+before any response byte enters the workspace. It is unavailable for CONNECT
+and managed connectors. A redacted response is buffered up to 16 MiB (or the
+smaller `max_response_bytes`); encoded or larger responses fail closed instead
+of crossing unchanged. A rewrite emits `egress.redacted` with a match count.
 
 **Re-adoption.** If a node reconnects and asks to claim a workspace it already
 holds, the control plane returns it at the *same* generation and moves it to
@@ -990,7 +996,7 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `ws.resumed`, `ws.snapshot`, `ws.restored`, `ws.destroyed`,
 `ws.lease_expired`, `ws.acl`, `authz.revoked`, `s.opened`, `s.exited`,
 `fs.write`, `fs.edit`, `fs.remove`, `fs.apply_tar`,
-`cred.used`, `egress.allowed`, `egress.denied`, `timer.set`, `timer.fired`,
+`cred.used`, `egress.allowed`, `egress.denied`, `egress.redacted`, `timer.set`, `timer.fired`,
 `peer.gone`, `ws.fenced`, `ws.state_changed`, `event.producer_gap`,
 `fleet.quarantine.requested`, `fleet.quarantine.target`,
 `fleet.quarantine.completed`, `base.created`, `base.removed`, `run.started`,

@@ -35,6 +35,7 @@ import (
 	"net/url"
 	"os"
 	pathpkg "path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -56,6 +57,7 @@ const (
 	DecisionExpired         = "expired"         // lease TTL passed; fail closed
 	DecisionUnauthenticated = "unauthenticated" // caller lacks this workspace broker's capability
 	DecisionLimitExceeded   = "limit_exceeded"  // a typed rule exhausted its request or byte budget
+	DecisionRedacted        = "redacted"        // an allowed response was rewritten by a typed rule
 )
 
 // Upstream failure classes recorded on a credential-use audit whose request
@@ -100,6 +102,7 @@ type Audit struct {
 	Error         string // ErrorClass* when a credential was released but the upstream failed
 	RequestBytes  int64
 	ResponseBytes int64
+	Redactions    int
 }
 
 // Options configure a per-workspace broker.
@@ -154,6 +157,7 @@ type Broker struct {
 	client       *http.Transport
 	suspended    bool
 	ruleRequests map[string]int64
+	redactors    map[string][]*regexp.Regexp
 	tunnels      map[*brokerTunnel]struct{}
 	requestSlots chan struct{}
 	connectors   map[string]connector.Connector
@@ -229,9 +233,10 @@ func New(opts Options) *Broker {
 		rule.Ports = append([]uint16(nil), rule.Ports...)
 		rule.Methods = append([]string(nil), rule.Methods...)
 		rule.PathPrefixes = append([]string(nil), rule.PathPrefixes...)
+		rule.Redact = append([]string(nil), rule.Redact...)
 	}
 	b := &Broker{
-		opts: opts, leases: cloneLeases(opts.Leases), ruleRequests: map[string]int64{},
+		opts: opts, leases: cloneLeases(opts.Leases), ruleRequests: map[string]int64{}, redactors: map[string][]*regexp.Regexp{},
 		tunnels: map[*brokerTunnel]struct{}{}, requestSlots: make(chan struct{}, opts.MaxConcurrentRequests),
 		connectors: map[string]connector.Connector{},
 	}
@@ -278,6 +283,13 @@ func (b *Broker) Start() (string, error) {
 	for _, rule := range b.opts.Network.Rules {
 		if rule.Connector != "" && b.connectors[rule.Connector] == nil {
 			return "", fmt.Errorf("broker: connector %q required by rule %q is unavailable", rule.Connector, rule.ID)
+		}
+		for _, expression := range rule.Redact {
+			compiled, err := regexp.Compile(expression)
+			if err != nil {
+				return "", fmt.Errorf("broker: rule %q redaction %q: %w", rule.ID, expression, err)
+			}
+			b.redactors[rule.ID] = append(b.redactors[rule.ID], compiled)
 		}
 	}
 	addr := b.opts.Listen
@@ -643,6 +655,50 @@ type policyAuthorization struct {
 }
 
 var errResponseLimit = errors.New("response body exceeds rule limit")
+var errResponseRedaction = errors.New("response cannot be safely redacted")
+
+const maxRedactedResponseBytes int64 = 16 << 20
+
+func redactResponse(resp *http.Response, expressions []*regexp.Regexp, configuredLimit int64) (int, int64, error) {
+	if len(expressions) == 0 {
+		return 0, resp.ContentLength, nil
+	}
+	if encoding := strings.TrimSpace(resp.Header.Get("Content-Encoding")); encoding != "" && !strings.EqualFold(encoding, "identity") {
+		_ = resp.Body.Close()
+		return 0, resp.ContentLength, fmt.Errorf("%w: encoded body", errResponseRedaction)
+	}
+	limit := maxRedactedResponseBytes
+	if configuredLimit > 0 && configuredLimit < limit {
+		limit = configuredLimit
+	}
+	if resp.ContentLength > limit {
+		_ = resp.Body.Close()
+		return 0, resp.ContentLength, errResponseLimit
+	}
+	defer resp.Body.Close()
+	var buffered bytes.Buffer
+	n, err := io.Copy(&buffered, io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return 0, n, fmt.Errorf("%w: read body", errResponseRedaction)
+	}
+	if n > limit {
+		return 0, n, errResponseLimit
+	}
+	body := buffered.Bytes()
+	redactions := 0
+	for _, expression := range expressions {
+		redactions += len(expression.FindAllIndex(body, -1))
+		body = expression.ReplaceAll(body, []byte("[redacted]"))
+	}
+	if int64(len(body)) > limit {
+		return 0, n, errResponseLimit
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+	resp.Header.Del("Content-Encoding")
+	return redactions, n, nil
+}
 
 type budgetReadCloser struct {
 	io.ReadCloser
@@ -1340,6 +1396,9 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 			pr.Out.Header.Del("X-Forwarded-For")
 			pr.Out.Header.Del("X-Forwarded-Host")
 			pr.Out.Header.Del("X-Forwarded-Proto")
+			if len(b.redactors[policy.rule.ID]) > 0 {
+				pr.Out.Header.Del("Accept-Encoding")
+			}
 		},
 		Transport:     b.client,
 		FlushInterval: -1, // stream SSE / chunked LLM responses immediately
@@ -1348,6 +1407,9 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 			if errors.Is(err, errResponseLimit) {
 				audit.Decision, audit.Reason, audit.Status = DecisionLimitExceeded, errResponseLimit.Error(), http.StatusBadGateway
 				emit = false // ModifyResponse recorded the rejected response.
+			} else if errors.Is(err, errResponseRedaction) {
+				audit.Decision, audit.Reason, audit.Status = DecisionDenied, errResponseRedaction.Error(), http.StatusBadGateway
+				emit = false
 			} else if errors.Is(err, errRedirectRejected) {
 				emit = false // ModifyResponse recorded the rejected redirect.
 			} else {
@@ -1366,6 +1428,20 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 				audit.Decision, audit.Reason = DecisionDenied, err.Error()
 				b.emit(audit)
 				return fmt.Errorf("%w: %v", errRedirectRejected, err)
+			}
+			redactions, upstreamBytes, err := redactResponse(resp, b.redactors[policy.rule.ID], policy.rule.MaxResponseBytes)
+			if err != nil {
+				credUse(resp.StatusCode, ErrorClassLimit)
+				audit.Decision, audit.Reason, audit.ResponseBytes = DecisionDenied, err.Error(), upstreamBytes
+				if errors.Is(err, errResponseLimit) {
+					audit.Decision, audit.Reason = DecisionLimitExceeded, errResponseLimit.Error()
+				}
+				b.emit(audit)
+				return err
+			}
+			audit.Redactions = redactions
+			if len(b.redactors[policy.rule.ID]) > 0 {
+				audit.ResponseBytes = upstreamBytes
 			}
 			if policy.rule.MaxResponseBytes > 0 {
 				audit.ResponseBytes = resp.ContentLength
@@ -1388,7 +1464,11 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 			}
 			credUse(resp.StatusCode, "")
 			a := audit
-			a.Decision = DecisionAllowed
+			if redactions > 0 {
+				a.Decision, a.Reason = DecisionRedacted, "response controls applied"
+			} else {
+				a.Decision = DecisionAllowed
+			}
 			b.emit(a)
 			return nil
 		},

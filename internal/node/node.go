@@ -2831,6 +2831,8 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 			case broker.DecisionDenied, broker.DecisionLeakBlocked, broker.DecisionExpired,
 				broker.DecisionUnauthenticated, broker.DecisionLimitExceeded:
 				typ = proto.EvEgressDenied
+			case broker.DecisionRedacted:
+				typ = proto.EvEgressRedacted
 			}
 			n.emit(typ, a.WS, a.Principal, map[string]any{
 				"generation": a.Generation, "decision": a.Decision, "binding": a.Binding,
@@ -2838,6 +2840,7 @@ func (n *Node) materialize(ctx context.Context, w proto.Workspace, adopt bool) e
 				"connector": a.Connector, "op": a.Op, "repo": a.Repo, "digest": a.Digest, "cached": a.Cached,
 				"host": a.Host, "method": a.Method, "path": a.Path, "reason": a.Reason,
 				"status": a.Status, "error": a.Error, "request_bytes": a.RequestBytes, "response_bytes": a.ResponseBytes,
+				"redactions": a.Redactions,
 			})
 		},
 	}

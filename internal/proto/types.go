@@ -238,6 +238,7 @@ type EgressRule struct {
 	MaxRequests      int64    `cbor:"max_requests,omitempty" json:"max_requests,omitempty"`
 	MaxRequestBytes  int64    `cbor:"max_request_bytes,omitempty" json:"max_request_bytes,omitempty"`
 	MaxResponseBytes int64    `cbor:"max_response_bytes,omitempty" json:"max_response_bytes,omitempty"`
+	Redact           []string `cbor:"redact,omitempty" json:"redact,omitempty"` // RE2 expressions replaced before the response crosses into the workspace
 	SharedState      string   `cbor:"shared_state,omitempty" json:"shared_state,omitempty"`
 	// Repos names the repositories a git connector rule covers as
 	// "owner/name" or "owner/*"; Push additionally permits git-receive-pack.
@@ -1475,6 +1476,7 @@ const (
 	EvCredUsed       = "cred.used"
 	EvEgressAllowed  = "egress.allowed"
 	EvEgressDenied   = "egress.denied"
+	EvEgressRedacted = "egress.redacted"
 	EvTimerSet       = "timer.set"
 	EvTimerFired     = "timer.fired"
 	EvPeerGone       = "peer.gone"
