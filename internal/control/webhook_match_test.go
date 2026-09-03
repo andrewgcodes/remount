@@ -12,11 +12,13 @@ func TestTimerPayloadMatch(t *testing.T) {
 		"action":     "created",
 		"repository": map[string]any{"full_name": "acme/widgets"},
 		"issue":      map[string]any{"labels": []any{map[string]any{"name": "agent"}, map[string]any{"name": "urgent"}}},
+		"reviews":    []any{map[string]any{"author": map[string]any{"login": "alice"}}},
 	}
 	event := proto.Event{Type: "webhook.github.issue_comment", Payload: proto.MustMarshal(payload)}
 	for name, timer := range map[string]*proto.Timer{
-		"exact":   {OnEvent: event.Type, Match: map[string]string{"repository.full_name": "acme/widgets", "action": "created"}},
-		"aliases": {OnEvent: event.Type, Match: map[string]string{"repo": "acme/widgets", "label": "agent"}},
+		"exact":        {OnEvent: event.Type, Match: map[string]string{"repository.full_name": "acme/widgets", "action": "created"}},
+		"aliases":      {OnEvent: event.Type, Match: map[string]string{"repo": "acme/widgets", "label": "agent"}},
+		"nested array": {OnEvent: event.Type, Match: map[string]string{"reviews.author.login": "alice"}},
 	} {
 		if !timerMatchesEvent(timer, event) {
 			t.Fatalf("%s did not match", name)
