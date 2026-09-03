@@ -1,7 +1,6 @@
 package control
 
 import (
-	"context"
 	"math"
 
 	"remount.dev/remount/internal/proto"
@@ -206,15 +205,18 @@ func transitionWorkspace(current *proto.Workspace, request lifecycleTransition) 
 	return next, nil
 }
 
-func (c *Control) emitWorkspaceTransition(ctx context.Context, before string, next proto.Workspace, request lifecycleTransition) {
+// transitionEvent is the ws.state_changed event for a validated transition,
+// built so it can commit in the same transaction as the workspace row. It is
+// nil when the state did not change.
+func (c *Control) transitionEvent(before string, next *proto.Workspace, request lifecycleTransition) *proto.Event {
 	if before == next.State {
-		return
+		return nil
 	}
 	node := next.Node
 	if node == "" && request.expectNode {
 		node = request.node
 	}
-	c.emit(context.WithoutCancel(ctx), proto.EvWSStateChanged, next.ID, next.Owner, node, map[string]any{
+	return c.wsEvent(next, proto.EvWSStateChanged, next.Owner, node, map[string]any{
 		"from": before, "to": next.State, "operation": request.operation,
 		"actor": request.actor, "generation": next.Generation, "node": node,
 	})
