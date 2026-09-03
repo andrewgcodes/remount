@@ -1,0 +1,90 @@
+name: MCP distribution
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  no-key-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+      - name: Deterministic MCP and E13 contracts
+        run: go test -race ./internal/mcp -run 'Test(E13NoKeyContract|ManifestCoversEveryProtocolOperation|StdioCancellationAndJoin|HTTPAuthOriginAndRoutingHeaders|HTTPRequiresMatchingModernMetadataAndAccept)$' -count=10
+
+  e13-codex:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - id: gate
+        name: Detect Codex credential
+        env:
+          MODEL_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [[ -n "$MODEL_KEY" ]]; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+            echo 'E13 Codex lane enabled' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'E13 Codex lane SKIPPED: OPENAI_API_KEY is absent' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Build candidate
+        if: steps.gate.outputs.enabled == 'true'
+        run: CGO_ENABLED=0 go build -o "$RUNNER_TEMP/remount" ./cmd/remount
+      - name: Install official Codex CLI
+        if: steps.gate.outputs.enabled == 'true'
+        run: npm install --global @openai/codex
+      - name: E13 Codex headless lifecycle
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          REMOUNT_E13_BINARY: ${{ runner.temp }}/remount
+          REMOUNT_E13_MODEL_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: integration/mcp/e13-headless.sh codex openai
+
+  e13-claude:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - id: gate
+        name: Detect OpenRouter credential
+        env:
+          MODEL_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [[ -n "$MODEL_KEY" ]]; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+            echo 'E13 Claude Code lane enabled through OpenRouter' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'E13 Claude Code lane SKIPPED: OPENROUTER_API_KEY is absent' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Build candidate
+        if: steps.gate.outputs.enabled == 'true'
+        run: CGO_ENABLED=0 go build -o "$RUNNER_TEMP/remount" ./cmd/remount
+      - name: Install official Claude Code CLI
+        if: steps.gate.outputs.enabled == 'true'
+        run: npm install --global @anthropic-ai/claude-code
+      - name: E13 Claude Code headless lifecycle
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          REMOUNT_E13_BINARY: ${{ runner.temp }}/remount
+          REMOUNT_E13_MODEL_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: integration/mcp/e13-headless.sh claude openrouter

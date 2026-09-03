@@ -77,7 +77,7 @@ func run(ctx context.Context, argv []string) error {
 	}
 	cmd, args := argv[0], argv[1:]
 	switch cmd {
-	case "ws", "fs", "fleet", "pool", "budget", "run", "agent":
+	case "ws", "fs", "fleet", "pool", "budget", "run", "agent", "mcp":
 		if len(args) > 0 && !isFlag(args[0]) {
 			args = append(append([]string{args[0]}, globals...), args[1:]...)
 		} else {
@@ -135,6 +135,8 @@ func run(ctx context.Context, argv []string) error {
 		return cmdAgent(ctx, args)
 	case "approvals":
 		return cmdApprovals(ctx, args)
+	case "mcp":
+		return cmdMCP(ctx, args)
 	case "approve":
 		return cmdApprove(ctx, args)
 	case "status":
@@ -228,6 +230,7 @@ func usage() {
   remount approvals approve ID [--remember none|host|rule]               allow a pending request
   remount approvals deny ID                                               deny a pending request
   remount approve ID [--option X | --deny | --content JSON]              compatibility shorthand
+  remount mcp serve | config HOST | wrap -- SERVER                      expose Remount and wrapped servers over MCP
   remount nodes | events [--follow] [--ws WS] | timers
 
 Inspection, at three depths. All take --json.
