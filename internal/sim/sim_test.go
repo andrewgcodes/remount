@@ -62,6 +62,7 @@ type world struct {
 	mu          sync.Mutex
 	conns       []*fault // every live pipe end handed to a dialer
 	nodeCancels map[string]context.CancelFunc
+	nodeDone    map[string]<-chan error
 	// peerHooks and serverHooks rewrite or drop frames sent by, respectively,
 	// the named peer and the server on that peer's connections. They model a
 	// peer built from a different release.
@@ -96,7 +97,7 @@ func newWorldWith(t *testing.T, adjust func(*server.Options)) *world {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &world{
 		t: t, artifactDir: filepath.Join(dataDir, "artifacts"), srv: srv,
-		http: hs, ctx: ctx, cancel: cancel, nodeCancels: make(map[string]context.CancelFunc),
+		http: hs, ctx: ctx, cancel: cancel, nodeCancels: make(map[string]context.CancelFunc), nodeDone: make(map[string]<-chan error),
 		peerHooks: make(map[string]func(*proto.Frame) bool), serverHooks: make(map[string]func(*proto.Frame) bool),
 	}
 	t.Cleanup(func() {
@@ -151,12 +152,24 @@ func (w *world) cut(who string) int {
 func (w *world) stopNode(name string) {
 	w.mu.Lock()
 	cancel := w.nodeCancels[name]
+	done := w.nodeDone[name]
 	delete(w.nodeCancels, name)
+	delete(w.nodeDone, name)
 	w.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	w.cut(name)
+	if done != nil {
+		select {
+		case err := <-done:
+			if err != nil {
+				w.t.Errorf("node %s shutdown: %v", name, err)
+			}
+		case <-time.After(10 * time.Second):
+			w.t.Errorf("node %s did not finish shutdown", name)
+		}
+	}
 }
 
 func (w *world) node(name string, labels map[string]string) *node.Node {
@@ -184,10 +197,15 @@ func (w *world) nodeWith(name string, adjust func(*node.Options)) *node.Node {
 		w.t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(w.ctx)
+	done := make(chan error, 1)
 	w.mu.Lock()
 	w.nodeCancels[name] = cancel
+	w.nodeDone[name] = done
 	w.mu.Unlock()
-	go n.Run(ctx)
+	go func() {
+		done <- n.Run(ctx)
+		close(done)
+	}()
 	w.t.Cleanup(func() { w.stopNode(name) })
 	select {
 	case <-n.Online():
