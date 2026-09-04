@@ -1468,6 +1468,31 @@ func (b *Broker) packageProxy(w http.ResponseWriter, r *http.Request, host, requ
 		http.Error(w, "remount broker: "+rejected.public, rejected.status)
 		return
 	}
+	target := &url.URL{Scheme: proto.EgressProtocolHTTPS, Host: authority, Path: requestPath, RawQuery: query}
+	request := connector.ConnectorRequest{
+		Workspace: b.opts.WS, Tenant: b.opts.Tenant, Principal: b.opts.Principal,
+		Generation: b.opts.Generation, Rule: policy.rule, Method: strings.ToUpper(r.Method),
+		URL: target, Header: r.Header, ExpectedDigest: r.Header.Get(connector.ExpectedDigestHeader),
+	}
+	// The connector's side-effect-free authorization runs first so a request
+	// it can never execute consumes neither an approval nor a budget unit.
+	decision, err := managed.Authorize(r.Context(), request)
+	if err != nil {
+		audit.Decision, audit.Reason = DecisionDenied, "package connector authorization failed"
+		b.emit(audit)
+		http.Error(w, "remount broker: "+audit.Reason, http.StatusBadGateway)
+		return
+	}
+	if !decision.Allowed {
+		status := http.StatusForbidden
+		if decision.Code == "invalid_digest" {
+			status = http.StatusBadRequest
+		}
+		audit.Decision, audit.Reason = DecisionDenied, decision.Reason
+		b.emit(audit)
+		http.Error(w, "remount broker: "+audit.Reason, status)
+		return
+	}
 	requestTarget := requestPath
 	if query != "" {
 		requestTarget += "?" + query
@@ -1487,12 +1512,7 @@ func (b *Broker) packageProxy(w http.ResponseWriter, r *http.Request, host, requ
 		return
 	}
 	credUse := b.credentialUse(audit, used, "credential released to managed package connector")
-	target := &url.URL{Scheme: proto.EgressProtocolHTTPS, Host: authority, Path: requestPath, RawQuery: query}
-	response, err := managed.Execute(r.Context(), connector.ConnectorRequest{
-		Workspace: b.opts.WS, Tenant: b.opts.Tenant, Principal: b.opts.Principal,
-		Generation: b.opts.Generation, Rule: policy.rule, Method: strings.ToUpper(r.Method),
-		URL: target, Header: r.Header, ExpectedDigest: r.Header.Get(connector.ExpectedDigestHeader),
-	})
+	response, err := managed.Execute(r.Context(), request)
 	if err != nil {
 		status := http.StatusBadGateway
 		audit.Decision, audit.Reason = DecisionDenied, "package connector request failed"
