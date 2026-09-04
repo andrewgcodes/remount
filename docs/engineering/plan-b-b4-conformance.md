@@ -300,6 +300,16 @@ built `FROM scratch`, where `/bin/echo` does not exist: the run still reported
 a working program. An implementation whose exec silently produced nothing would
 have been called conformant in every category but two.
 
+The other categories were audited for the same weakness and do not share it,
+which is recorded here so the audit is not repeated. `CONF-SNAP-003` writes a
+seed file, snapshots, restores into a second workspace and byte-compares what
+that workspace serves, so an implementation that snapshots nothing fails it.
+`CONF-EVT-005` fails explicitly when a workspace that was created, claimed and
+written to produced no events, and `CONF-EVT-004` requires `ws.created`,
+`ws.claiming` and `ws.claimed` in that order rather than merely requiring that
+whatever arrived be well formed. Sessions were the outlier: they were the one
+category whose every row could be satisfied by silence.
+
 `CONF-SESS-009` asserts the bytes arrive, arrive verbatim, arrive tagged `st=1`,
 and arrive alongside the exit status of the program that produced them — so
 truncated, re-encoded, or wrongly-streamed output fails the same row as absent
