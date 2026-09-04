@@ -138,12 +138,44 @@ func (s *Session) Grant(ctx context.Context, ws string) (Grant, error) {
 // Fixture returns a claimed workspace shared by every check that only needs
 // "some workspace". Creating one per requirement would multiply the run's
 // cost by fifty for no additional coverage.
+// grantRefreshMargin is how much validity a shared grant must have left before
+// a check is allowed to start with it. A grant observed against a real
+// deployment had about twenty seconds of life, so the margin is most of that:
+// refreshing costs one round trip, and not refreshing costs a false failure.
+const grantRefreshMargin = 10 * time.Second
+
 func (s *Session) Fixture(ctx context.Context) (*fixture, error) {
 	s.sharedOne.Do(func() {
 		f, err := s.NewFixture(ctx, WorkspaceSpec{Name: "conformance-shared"})
 		s.sharedWS, s.sharedErr = f, err
 	})
-	return s.sharedWS, s.sharedErr
+	if s.sharedErr != nil {
+		return nil, s.sharedErr
+	}
+	// The shared fixture is created once and used by checks that run much
+	// later, so on any run slower than the grant's lifetime the last checks
+	// present an expired grant and fail with "unauthorized: grant expired" —
+	// reporting the suite's own bookkeeping as a defect in the implementation
+	// under test.
+	//
+	// That is not hypothetical and it is not a slow-machine edge case: judging
+	// a deployment over the public internet is what this suite is for, and it
+	// is exactly the case that takes long enough. Against a Modal deployment
+	// the run takes about 95 s and CONF-SNAP-004 failed every time, while the
+	// identical suite passed 53/53 against a local binary.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// ExpiresAt is milliseconds since the epoch, not seconds. Comparing it to
+	// Unix() makes every grant look like it expires in fifty thousand years,
+	// which is a bug that hides itself: the refresh simply never runs and the
+	// symptom is unchanged.
+	if expires := s.sharedWS.Grant.Claims.ExpiresAt; expires > 0 &&
+		time.Now().Add(grantRefreshMargin).UnixMilli() >= expires {
+		if err := s.Refresh(ctx, s.sharedWS); err != nil {
+			return nil, fmt.Errorf("conformance: refreshing the shared grant: %w", err)
+		}
+	}
+	return s.sharedWS, nil
 }
 
 // NewFixture creates, waits for and authorizes a fresh workspace.
