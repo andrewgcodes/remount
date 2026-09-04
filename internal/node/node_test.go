@@ -1223,6 +1223,35 @@ func TestRejectedRenewalFencesAndRetainsFilesystem(t *testing.T) {
 	}
 }
 
+func TestSessionLogAuthorityDoesNotReadMutableLeaseFields(t *testing.T) {
+	w := &ws{Workspace: proto.Workspace{
+		ID: "ws_log", Generation: 7, Tenant: "tenant", LeaseUntil: 1,
+	}}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				w.LeaseUntil++
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-done
+	}()
+	for i := 0; i < 10000; i++ {
+		authority := sessionLogAuthority(w)
+		if authority.ID != w.ID || authority.Generation != w.Generation || authority.Tenant != w.Tenant {
+			t.Fatalf("session log authority = %+v", authority)
+		}
+	}
+}
+
 func TestWorkspaceRegistryDescriptorsAreDerived(t *testing.T) {
 	process, err := workspace.NewProcess(t.TempDir())
 	if err != nil {
