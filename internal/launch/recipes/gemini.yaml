@@ -6,10 +6,13 @@ providers: [google]
 hosts:
   - registry.npmjs.org
 install: |
+  export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.local}"
+  export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
   command -v gemini >/dev/null 2>&1 || npm install -g @google/gemini-cli
 env:
   GEMINI_CLI_DISABLE_AUTOUPDATER: "1"
   GEMINI_MODEL: "{{.Model}}"
+  PATH: "${NPM_CONFIG_PREFIX:-$HOME/.local}/bin:$PATH"
 command: ["gemini", "-p", "{{.Task}}"]
 sandbox_flags:
   read-only: ["--approval-mode", "default"]
