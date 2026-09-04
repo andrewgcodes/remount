@@ -1,11 +1,23 @@
 # Linux-host handoff — 2026-09-03
 
-**Status:** open, with a named next proof for each item
+**Status:** mostly closed on 2026-09-04. Read this header before the sections.
 
-Everything here was blocked on this session's host (Darwin 25.3.0 arm64) by a
-missing kernel mechanism or a missing external resource, not by unfinished
-code. Each item names the exact prerequisite and the exact command, so a Linux
-agent can run it without re-deriving anything.
+This document was written on the belief that everything in it was blocked on a
+Darwin host by a missing kernel mechanism. **That belief was wrong**, and the
+two largest items — gVisor (§1) and Firecracker (§2) — have since been run to
+completion on this same Mac. Docker Desktop cannot host them because its daemon
+is a locked-down LinuxKit VM, but Colima provides a real Linux VM with its own
+daemon, and `--nested-virtualization` provides a real `/dev/kvm`. The recipe is
+in each section.
+
+Running them found eleven defects, one of them a security defect in gVisor
+egress enforcement. All are recorded in
+`docs/engineering/gvisor-egress-finding-2026-09-04.md`, and the ones that were
+fixed are fixed. **Nothing here should be deferred to "a Linux box" again
+without first trying the recipe.**
+
+The remaining sections (§3 onward) are still genuinely externally gated: they
+need credentials, a Kubernetes cluster, or a published release, not a kernel.
 
 Read first: `AGENTS.md`; `docs/engineering/plan-b-repository-executable-2026-09-03.md`;
 the `2026-09 build plan disposition` section of
