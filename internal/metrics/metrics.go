@@ -293,6 +293,7 @@ var (
 	EventSubscribersDropped    = Count("remount_event_subscribers_dropped_total", "events dropped for a subscriber that fell behind; the subscription stays open so the loss shows as a sequence gap")
 	EventTailQuotaRejected     = Count("remount_event_tail_quota_rejections_total", "follow subscriptions refused because one peer reached its concurrent tail limit")
 	SessionLogsPruned          = Count("remount_session_logs_pruned_total", "expired session log records removed by retention, each with a session.log.deleted event")
+	SessionLogQuotaRejected    = Count("remount_session_log_quota_rejections_total", "session log commits refused because the tenant retained-record limit was reached, counting reserved in-flight publications")
 	RecordGCRuns               = Count("remount_control_record_gc_runs_total", "completed control-record retention passes")
 	RecordGCErrors             = Count("remount_control_record_gc_errors_total", "control-record retention passes that failed")
 	ControllerFenced           = Count("remount_controller_fenced_total", "control decisions refused because the writer lease or epoch was stale")
