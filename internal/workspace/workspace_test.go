@@ -226,7 +226,14 @@ func TestDefaultImageTracksRelease(t *testing.T) {
 	if got := DefaultImage("v1.4.0"); got != DefaultImageRepository+":v1.4.0" {
 		t.Fatalf("release binary must pin its own image tag: %q", got)
 	}
-	for _, v := range []string{"dev", "", "v1.4.0-dirty", "abc123"} {
+	for _, v := range []string{
+		"dev",
+		"",
+		"v1.4.0-dirty",
+		"v0.0.0-20260904095559-f3fb13569f00",
+		"v0.0.0-20260904095559-f3fb13569f00+dirty",
+		"abc123",
+	} {
 		if got := DefaultImage(v); got != DefaultImageRepository+":latest" {
 			t.Fatalf("DefaultImage(%q) = %q", v, got)
 		}

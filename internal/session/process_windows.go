@@ -3,6 +3,7 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,7 +21,9 @@ var processJobs = struct {
 }{handles: make(map[int]windows.Handle)}
 
 func configureProcessGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NEW_PROCESS_GROUP}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_SUSPENDED,
+	}
 }
 
 func registerProcessGroup(cmd *exec.Cmd) error {
@@ -52,13 +55,6 @@ func registerProcessGroup(cmd *exec.Cmd) error {
 		return err
 	}
 	err = windows.AssignProcessToJobObject(job, process)
-	if err != nil {
-		if state, waitErr := windows.WaitForSingleObject(process, 1000); waitErr == nil && state == windows.WAIT_OBJECT_0 {
-			windows.CloseHandle(process)
-			windows.CloseHandle(job)
-			return nil
-		}
-	}
 	windows.CloseHandle(process)
 	if err != nil {
 		windows.CloseHandle(job)
@@ -67,7 +63,38 @@ func registerProcessGroup(cmd *exec.Cmd) error {
 	processJobs.Lock()
 	processJobs.handles[cmd.Process.Pid] = job
 	processJobs.Unlock()
+	if err := resumeProcess(uint32(cmd.Process.Pid)); err != nil {
+		releaseProcessGroup(cmd)
+		return err
+	}
 	return nil
+}
+
+func resumeProcess(pid uint32) error {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(snapshot)
+
+	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
+	err = windows.Thread32First(snapshot, &entry)
+	for err == nil {
+		if entry.OwnerProcessID == pid {
+			thread, openErr := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, entry.ThreadID)
+			if openErr != nil {
+				return openErr
+			}
+			_, resumeErr := windows.ResumeThread(thread)
+			windows.CloseHandle(thread)
+			return resumeErr
+		}
+		err = windows.Thread32Next(snapshot, &entry)
+	}
+	if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+		return fmt.Errorf("primary thread for process %d was not found", pid)
+	}
+	return err
 }
 
 func releaseProcessGroup(cmd *exec.Cmd) {

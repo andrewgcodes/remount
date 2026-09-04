@@ -10,7 +10,7 @@ import (
 
 func TestWindowsEchoProgramPreservesLiteral(t *testing.T) {
 	const want = "conf-sess-009: stdout must arrive verbatim."
-	program := echoProgram(want)
+	program := echoProgram("windows", want)
 	out, err := exec.Command(program[0], program[1:]...).Output()
 	if err != nil {
 		t.Fatal(err)
@@ -21,7 +21,8 @@ func TestWindowsEchoProgramPreservesLiteral(t *testing.T) {
 }
 
 func TestWindowsExitProgramReturnsRequestedCode(t *testing.T) {
-	err := exec.Command(exitProgram(7)[0], exitProgram(7)[1:]...).Run()
+	program := exitProgram("windows", 7)
+	err := exec.Command(program[0], program[1:]...).Run()
 	exit, ok := err.(*exec.ExitError)
 	if !ok || exit.ExitCode() != 7 {
 		t.Fatalf("exit program error = %v", err)

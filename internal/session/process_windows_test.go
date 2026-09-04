@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -15,6 +16,41 @@ import (
 	"golang.org/x/sys/windows"
 	"remount.dev/remount/internal/proto"
 )
+
+func TestWindowsProcessIsContainedBeforeItCanSpawn(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "child.pid")
+	quotedPIDFile := strings.ReplaceAll(pidFile, "'", "''")
+	parent := `$p = Start-Process ping -ArgumentList @('-n','60','127.0.0.1') -PassThru; ` +
+		`[IO.File]::WriteAllText('` + quotedPIDFile + `', [string]$p.Id); Wait-Process -Id $p.Id`
+	cmd := exec.Command("powershell", "-NoProfile", "-Command", parent)
+	configureProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = signalProcess(cmd, "KILL")
+		_ = cmd.Wait()
+		releaseProcessGroup(cmd)
+	})
+
+	time.Sleep(200 * time.Millisecond)
+	if _, err := os.Stat(pidFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("process executed before Job Object assignment: %v", err)
+	}
+	if err := registerProcessGroup(cmd); err != nil {
+		t.Fatal(err)
+	}
+	pid := waitForPID(t, pidFile)
+	if err := signalProcess(cmd, "KILL"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("terminated process exited successfully")
+	}
+	releaseProcessGroup(cmd)
+	assertProcessExited(t, pid)
+}
 
 func TestKillWorkspaceTerminatesWindowsDescendants(t *testing.T) {
 	dir := t.TempDir()
@@ -32,21 +68,7 @@ func TestKillWorkspaceTerminatesWindowsDescendants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var pid int
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		body, readErr := os.ReadFile(pidFile)
-		if readErr == nil && len(strings.TrimSpace(string(body))) > 0 {
-			pid, err = strconv.Atoi(strings.TrimSpace(string(body)))
-			if err == nil {
-				break
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if pid == 0 {
-		t.Fatalf("child pid was not reported: %v", err)
-	}
+	pid := waitForPID(t, pidFile)
 	if err := m.KillWorkspace("ws_windows_job"); err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +77,28 @@ func TestKillWorkspaceTerminatesWindowsDescendants(t *testing.T) {
 	if _, err := s.Wait(ctx); err != nil {
 		t.Fatal(err)
 	}
+	assertProcessExited(t, pid)
+}
+
+func waitForPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		body, err := os.ReadFile(path)
+		if err == nil && len(strings.TrimSpace(string(body))) > 0 {
+			pid, err := strconv.Atoi(strings.TrimSpace(string(body)))
+			if err == nil {
+				return pid
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("child pid was not reported")
+	return 0
+}
+
+func assertProcessExited(t *testing.T, pid int) {
+	t.Helper()
 	process, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(pid))
 	if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
 		return

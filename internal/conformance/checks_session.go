@@ -17,7 +17,7 @@ func checkSessInfoIsSeqZero(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	run, err := s.Exec(ctx, f, echoProgram("conformance")...)
+	run, err := s.Exec(ctx, f, echoProgram(s.Target.workspaceOS(), "conformance")...)
 	if err != nil {
 		return err
 	}
@@ -53,7 +53,7 @@ func checkSessExitIsLast(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	run, err := s.Exec(ctx, f, echoProgram("last")...)
+	run, err := s.Exec(ctx, f, echoProgram(s.Target.workspaceOS(), "last")...)
 	if err != nil {
 		return err
 	}
@@ -87,7 +87,7 @@ func checkSessSeqDense(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	run, err := s.Exec(ctx, f, echoProgram("dense")...)
+	run, err := s.Exec(ctx, f, echoProgram(s.Target.workspaceOS(), "dense")...)
 	if err != nil {
 		return err
 	}
@@ -105,7 +105,7 @@ func checkSessInputDeduplicated(ctx context.Context, s *Session) error {
 		return err
 	}
 	var res SOpenRes
-	open := SOpenReq{WS: f.WS.ID, Kind: "exec", Program: catProgram(), Stdin: true, Grant: &f.Grant, Idem: s.Idem("dedup")}
+	open := SOpenReq{WS: f.WS.ID, Kind: "exec", Program: catProgram(s.Target.workspaceOS()), Stdin: true, Grant: &f.Grant, Idem: s.Idem("dedup")}
 	if err := s.CallNode(ctx, f.Node, "s.open", open, &res); err != nil {
 		return err
 	}
@@ -153,7 +153,7 @@ func checkSessReplayIsByteIdentical(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	run, err := s.Exec(ctx, f, echoProgram("replay-me")...)
+	run, err := s.Exec(ctx, f, echoProgram(s.Target.workspaceOS(), "replay-me")...)
 	if err != nil {
 		return err
 	}
@@ -189,7 +189,7 @@ func checkSessWaitReportsExit(ctx context.Context, s *Session) error {
 		return err
 	}
 	var res SOpenRes
-	open := SOpenReq{WS: f.WS.ID, Kind: "exec", Program: exitProgram(7), Grant: &f.Grant, Idem: s.Idem("wait")}
+	open := SOpenReq{WS: f.WS.ID, Kind: "exec", Program: exitProgram(s.Target.workspaceOS(), 7), Grant: &f.Grant, Idem: s.Idem("wait")}
 	if err := s.CallNode(ctx, f.Node, "s.open", open, &res); err != nil {
 		return err
 	}
@@ -230,7 +230,7 @@ func checkSessAttachBeyondRange(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	run, err := s.Exec(ctx, f, echoProgram("beyond")...)
+	run, err := s.Exec(ctx, f, echoProgram(s.Target.workspaceOS(), "beyond")...)
 	if err != nil {
 		return err
 	}
@@ -540,7 +540,7 @@ func checkSessStdoutReachesTheClient(ctx context.Context, s *Session) error {
 	// Spaces and punctuation so that an implementation which splits, trims or
 	// re-quotes the payload fails here rather than in a caller's terminal.
 	const want = "conf-sess-009: stdout must arrive verbatim."
-	run, err := s.Exec(ctx, f, echoProgram(want)...)
+	run, err := s.Exec(ctx, f, echoProgram(s.Target.workspaceOS(), want)...)
 	if err != nil {
 		return err
 	}
