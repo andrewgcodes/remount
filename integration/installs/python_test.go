@@ -131,6 +131,10 @@ func TestB32ThePythonWheelInstallsIntoAFreshVenvAndDrivesTheInstalledServer(t *t
 	if !ok {
 		t.Fatalf("the smoke printed no output beyond %q", out)
 	}
+	// Windows Python ends lines with CRLF, so the cut above leaves a carriage
+	// return on the first line; as a path component it names a file that does
+	// not exist.
+	location = strings.TrimSpace(location)
 	// Canonicalise every side before comparing paths as strings. On Windows
 	// the interpreter can report an 8.3 short path — C:\Users\RUNNER~1\... for
 	// the directory the test knows as C:\Users\runneradmin\... — and the two

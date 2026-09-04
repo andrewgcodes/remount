@@ -153,6 +153,7 @@ func TestB32TheNpmTarballInstallsIntoAnEmptyDirAndDrivesTheInstalledServer(t *te
 	if !ok {
 		t.Fatalf("the smoke printed no output beyond %q", out)
 	}
+	resolved = strings.TrimSpace(resolved)
 	if strings.HasPrefix(realPath(t, resolved), root+string(os.PathSeparator)) {
 		t.Fatalf("the runtime resolved @remount/sdk to %s, inside the checkout", resolved)
 	}

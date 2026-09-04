@@ -167,6 +167,9 @@ func TestDockerBackendUnavailableIsClean(t *testing.T) {
 }
 
 func TestDockerBackendFailedRunRemovesPartialContainer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: the fake docker binary is a POSIX shell script")
+	}
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "docker")
 	marker := filepath.Join(dir, "container")
@@ -212,6 +215,9 @@ esac
 }
 
 func TestDockerBackendFailedRunRetainsRootWhenContainerCleanupIsUncertain(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: the fake docker binary is a POSIX shell script")
+	}
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "docker")
 	marker := filepath.Join(dir, "container")
