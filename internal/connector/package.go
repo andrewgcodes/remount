@@ -175,14 +175,28 @@ func (p *Package) Execute(ctx context.Context, in ConnectorRequest) (ConnectorRe
 		return ConnectorResponse{}, deny("unavailable", http.StatusServiceUnavailable, "package connector is unavailable")
 	}
 	method := strings.ToUpper(in.Method)
+	maximum := in.Rule.MaxResponseBytes
+	if maximum <= 0 || maximum > p.store.maxObjectBytes {
+		maximum = p.store.maxObjectBytes
+	}
 
 	expected := ""
 	if in.ExpectedDigest != "" {
 		expected, _ = normalizeDigest(in.ExpectedDigest)
-		cached, ok, err := p.store.lookup(in.Tenant, in.Workspace, expected)
-		if err != nil {
-			return ConnectorResponse{}, &Error{Code: "cache_integrity", HTTPStatus: http.StatusServiceUnavailable, Detail: err.Error(), Err: err}
+		// The ceiling governs delivered bytes: a HEAD releases none, on a
+		// cache hit exactly as on the fresh path below.
+		ceiling := maximum
+		if method == http.MethodHead {
+			ceiling = 0
 		}
+		cached, ok, err := p.store.lookup(in.Tenant, in.Workspace, expected, ceiling)
+		if errors.Is(err, errCachedObjectTooLarge) {
+			metrics.PackageFailures.Inc()
+			return ConnectorResponse{}, deny("response_too_large", http.StatusBadGateway, "package object exceeds the configured response limit")
+		}
+		// Any other lookup error means the scope's reference failed
+		// verification and was withdrawn; the request proceeds as a fresh,
+		// digest-checked fetch.
 		if ok {
 			metrics.PackageCacheHits.Inc()
 			if method == http.MethodHead {
@@ -226,10 +240,6 @@ func (p *Package) Execute(ctx context.Context, in ConnectorRequest) (ConnectorRe
 		}, nil
 	}
 
-	maximum := in.Rule.MaxResponseBytes
-	if maximum <= 0 || maximum > p.store.maxObjectBytes {
-		maximum = p.store.maxObjectBytes
-	}
 	if upstream.ContentLength > maximum {
 		_ = upstream.Body.Close()
 		metrics.PackageFailures.Inc()
