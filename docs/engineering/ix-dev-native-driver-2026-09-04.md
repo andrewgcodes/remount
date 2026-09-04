@@ -41,42 +41,59 @@ So a native driver is both possible and preferable: it removes a
 `remount-ix-helper` binary that is not shipped anywhere in this repo, which
 means the driver as it stands cannot actually provision anything.
 
-**The blocker is the response schema, not the design.** Verified live on
-2026-09-04 with a real account token:
+The schema is now known. Verified live on 2026-09-04 after updating the CLI
+(`ix 2026-06-28` was rejected by the server with `unsupported method:
+vm.build_commit_from_oci`; `curl https://ix.dev/install.sh | sh` brought it to
+`ix 2026-08-20 (a4ef7254bb)`, which works). One VM was created, observed, and
+destroyed:
 
+```json
+{
+  "id": "01a06e40-a390-7631-a0a9-0015cc458545",
+  "name": "remount-probe-1",
+  "owner_id": "01a02248-076a-7881-86ee-f8bcfb22d14e",
+  "owner": "andrewgao22-01a02248",
+  "region": "us-west-1",
+  "status": "running",
+  "image": "ix/base@blake3:b9842c21...",
+  "ipv6": "2604:2dc0:500:8400:72:372:ae1a:578a",
+  "ipv4": null,
+  "failure_reason": null, "failure_kind": null, "failure_retryable": null,
+  "node": "hil-compute-6",
+  "created_at": 1788556125071,
+  "disk_bytes_used": 0
+}
 ```
-$ ix ls --output json
-[]                                   # authenticates, lists, and returns nothing
 
-$ ix new ix/base:latest --name probe --no-shell --message-format json
-{"message":"server rejected RPC stream open for vm.build_commit_from_oci:
-  unsupported method: vm.build_commit_from_oci"}
-```
+Mapping onto `provision.Machine`:
 
-The account had no VMs, so `ls` never showed a machine object, and the create
-that would have produced one is refused: the installed CLI (`ix 2026-06-28`,
-`1a6382c0c7`) calls an RPC the current server no longer supports. Without one
-observed machine object there are no field names to map onto
-`provision.Machine`, and inventing them is exactly the guessing ADR 0062 exists
-to forbid.
+| `provision.Machine` | ix field | note |
+|---|---|---|
+| `ID` | `id` | UUID |
+| `Name` | `name` | what `--name` set |
+| `Region` | `region` | `us-west-1` was the default |
+| `State` | `status` | `running` |
+| `CreatedAt` | `created_at` | Unix **milliseconds**, not seconds |
+| `Tenant`, `Labels` | — | **no field exists** |
 
-## To finish it
+**The open design question is tenancy, not parsing.** ix.dev has no tags or
+labels on a VM, so there is nowhere to record the tenant and pool that
+`provision.ListOptions` filters on and that `Create` refuses to cross. Every
+other driver leans on provider-side metadata for this. The options are to
+encode tenant and pool into the VM `name` and parse them back in `List`, or to
+keep that mapping in Remount's own state. The name is the only provider-side
+string under Remount's control, so encoding it there is the likely answer, but
+it needs a delimiter that cannot collide with an operator-chosen node name and
+it makes the tenant visible to anyone who can list the account.
 
-1. Install an `ix` CLI new enough that `ix new` is accepted by the server. This
-   is a client-version problem, not an account problem — `ix ls` and auth both
-   work with the current token.
-2. Create one VM and capture `ix ls --output json` verbatim. Record the real
-   field names for id, name, state, region, and creation time.
-3. Replace the helper calls in `internal/provision/ix` with `providerutil`
-   `Command`s, following `fly.CLISecrets` for staging the enrollment token on
-   stdin and `fly` for the create/list/destroy shape.
-4. Keep the tenant/pool filter in `List`: it is a Remount invariant, not a
-   vendor one, and it is what stops one pool's reconciler from seeing another's
-   inventory.
-5. Unit-test with a fake `providerutil.Runner` asserting the enrollment token
-   never appears in argv, as the current test already does.
-6. Delete the helper fields once the native path is live, and update ADR 0062,
-   whose ix.dev entry records this same reasoning.
+Until that is settled the helper protocol keeps the mapping behind a versioned
+contract, which is what ADR 0062 asks for.
+
+Two operational details worth knowing, both learned the hard way here:
+
+- `ix rm` refuses to act without a TTY unless given `--force`
+  ("refusing to prompt without a TTY"). Any automation must pass it.
+- `ix new` prints a boot trace and opens a shell unless given `--no-shell`.
 
 ## Note for whoever runs the live lane
 
