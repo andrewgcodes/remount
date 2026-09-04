@@ -1,4 +1,4 @@
-# ADR 0083: pool scale-down fences the node before the provider destroy
+# ADR 0084: pool scale-down fences the node before the provider destroy
 
 ## Status
 
