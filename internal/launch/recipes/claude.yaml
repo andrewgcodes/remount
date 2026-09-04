@@ -8,6 +8,8 @@ hosts:
   - statsig.anthropic.com
   - platform.claude.com
 install: |
+  export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.local}"
+  export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
   command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code
 env:
   # No update checks, telemetry or error reporting from inside a workspace.
@@ -16,6 +18,7 @@ env:
   DISABLE_TELEMETRY: "1"
   DISABLE_ERROR_REPORTING: "1"
   ANTHROPIC_MODEL: "{{.Model}}"
+  PATH: "${NPM_CONFIG_PREFIX:-$HOME/.local}/bin:$PATH"
 command: ["claude", "-p", "{{.Task}}", "--output-format", "text"]
 resume_command: ["claude", "--continue", "-p", "{{.Task}}", "--output-format", "text"]
 sandbox_flags:

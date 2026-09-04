@@ -7,9 +7,12 @@ providers: [anthropic, openai, openrouter, google, xai, deepseek, mistral, groq]
 hosts:
   - registry.npmjs.org
 install: |
+  export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.local}"
+  export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
   command -v cline >/dev/null 2>&1 || npm install -g cline
 env:
   CLINE_MODEL: "{{.Model}}"
+  PATH: "${NPM_CONFIG_PREFIX:-$HOME/.local}/bin:$PATH"
 command: ["cline", "-y", "{{.Task}}"]
 state_dirs: [".cline"]
 path_keyed: true
