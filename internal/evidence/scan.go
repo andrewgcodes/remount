@@ -118,14 +118,24 @@ func ScanEnvValues(where, text string, extra []string, lookup Lookup) []Finding 
 
 // ScanSecrets refuses a record that carries a credential: the value of any
 // environment variable it names, or any credential-shaped string.
+//
+// The variable names are collected from the whole record before any field is
+// scanned. A record that names a variable in one field and carries that
+// variable's value in another still carries the value of a variable it names,
+// and collecting names per field would call exactly that record clean.
 func (r Record) ScanSecrets(lookup Lookup) []Finding {
+	fields := r.Strings()
+	named := append([]string(nil), r.RequiredEnv...)
+	for _, field := range fields {
+		named = append(named, envRefPattern.FindAllString(field, -1)...)
+	}
 	var out []Finding
-	for i, field := range r.Strings() {
+	for i, field := range fields {
 		if field == "" {
 			continue
 		}
 		where := fmt.Sprintf("%s field %d", r.Scenario, i)
-		out = append(out, ScanEnvValues(where, field, r.RequiredEnv, lookup)...)
+		out = append(out, ScanEnvValues(where, field, named, lookup)...)
 		out = append(out, ScanText(where, field)...)
 	}
 	return out

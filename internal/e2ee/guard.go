@@ -19,8 +19,10 @@ type Config struct {
 	// Bind returns this peer's e2ee identity once the peer id is known. A
 	// client's id is assigned at hello, so the identity cannot be built
 	// before the connection exists; in a deployment this is the call that
-	// asks the control plane to sign a binding. It is invoked at most once
-	// per connection and its result is reused.
+	// asks the control plane to sign a binding. Its result is reused for as
+	// long as the binding it returned can still authenticate a key
+	// agreement, and it is called again once that binding nears expiry: a
+	// node's uplink outlives a dated credential.
 	Bind func(ctx context.Context, self string) (*Identity, error)
 	// ControlKey verifies peer bindings. When it is nil the key the control
 	// plane returned in HelloOK is used, which is the same ed25519 key nodes
@@ -340,8 +342,17 @@ func (g *Guard) resolveOffer(offer *pendingOffer, session *Session, err error) {
 func (g *Guard) resolveIdentity(ctx context.Context) (*Identity, error) {
 	g.idMu.Lock()
 	defer g.idMu.Unlock()
-	if g.identity != nil || g.identityErr != nil {
-		return g.identity, g.identityErr
+	if g.identityErr != nil {
+		return nil, g.identityErr
+	}
+	// A binding is a dated credential and a node's uplink outlives one. The
+	// cached identity is reused only while its binding can still authenticate
+	// a key agreement; holding the first one forever would leave a long-lived
+	// connection permanently unable to negotiate, which a required policy
+	// turns into a total outage and a preferred policy turns into silent
+	// plaintext.
+	if g.identity != nil && bindingUsable(g.identity.Binding, g.cfg.now()) {
+		return g.identity, nil
 	}
 	if g.cfg.Bind == nil {
 		g.identityErr = proto.Err(proto.CodeUnsupported, "e2ee: no identity source configured")
@@ -360,8 +371,20 @@ func (g *Guard) resolveIdentity(ctx context.Context) (*Identity, error) {
 		g.identityErr = proto.Err(proto.CodeUnsupported, "e2ee: identity source returned no usable key")
 		return nil, g.identityErr
 	}
+	if !bindingUsable(identity.Binding, g.cfg.now()) {
+		// Not cached as permanent, for the same reason a failed binding is
+		// not: the next one may be fine. It is still refused now, because a
+		// binding this close to expiry cannot authenticate a handshake.
+		return nil, proto.Err(proto.CodeUnauthorized, "e2ee: the identity source returned a binding that expires too soon to complete a key agreement")
+	}
 	g.identity = identity
 	return identity, nil
+}
+
+// bindingUsable reports whether a binding will still verify at the far peer
+// when the key agreement it authenticates gets there.
+func bindingUsable(binding proto.PeerBinding, now time.Time) bool {
+	return binding.Exp != 0 && now.Add(identityRenewMargin).Unix() < binding.Exp
 }
 
 // waitHello blocks until the peer id is known, because every transcript and
@@ -431,7 +454,12 @@ func (g *Guard) inbound(ctx context.Context, f *proto.Frame) (*proto.Frame, bool
 	case f.Op == proto.OpE2EESealed:
 		return g.openSealed(ctx, f)
 	}
-	if f.T == proto.KindEvent && f.Op == proto.EvPeerGone {
+	if f.T == proto.KindEvent && f.Op == proto.EvPeerGone && !peerAddressed(f.From) {
+		// peer.gone is a statement about the fleet, and only the control plane
+		// makes it. One that arrives from a peer is refused below like any
+		// other plaintext peer payload: honouring it would let one peer
+		// destroy another peer's keys, and hand a forged fleet event to the
+		// layer above, without ever holding a key.
 		g.forgetGonePeer(f)
 		return f, true
 	}

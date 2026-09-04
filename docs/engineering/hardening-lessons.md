@@ -414,6 +414,78 @@ Do not turn an honest boundary into a bug-fix claim:
 The right response is to state these constraints, test the selected production
 backend, and add architecture only when the deployment requires it.
 
+## Lesson 11: a committed number is a claim, and claims decay
+
+A performance result is evidence about the commit it was taken on. Checked in,
+it stops being a measurement and becomes an assertion, and the code moves
+underneath it in silence. `bench/results/move-process-local.json` said 183 MB/s.
+The same benchmark, same host, same method, said 4.9 MB/s — because the file
+was recorded before a commit that made workspace movement roughly 90x slower,
+and nothing ever re-ran it.
+
+Correctness evidence in this repository already refuses that: `make plan-b`
+will not promote a recorded outcome into a pass, and re-earns every wired row on
+the candidate. Performance evidence deserves the same treatment. Re-earn it or
+delete it.
+
+**When a measurement contradicts a committed number, the contradiction is the
+finding.** Do not pick the number you trust. Believing the benchmark would have
+hidden a 41x regression; believing the fresh measurement without bisecting
+would have sent someone hunting an inherent cost that did not exist. Bisecting
+cost twenty minutes and turned "the artifact path is slow" into "one commit
+made it slow", which is a different and far more actionable sentence.
+
+Cheap falsification first, and expect to be wrong. Three hypotheses died before
+the bisect — gzip (1128 MB/s on incompressible data), fsync (1124 MB/s), and
+the network (the same slowness reproduced entirely on loopback). Each took
+minutes. Killing them is what made bisecting obviously worth doing, and it kept
+the eventual investigation from re-treading them.
+
+## Lesson 12: an instrument that cannot run is not a passing instrument
+
+The move benchmark was the one tool pointed at this regression, and it could not
+start. It refuses to put a credential on argv, so it requires `REMOUNT_TOKEN` in
+the environment — and the artifact endpoint answered a *presented* bearer with
+401 in standalone mode while accepting a request carrying no credential at all.
+Presenting a credential reduced authority.
+
+So a correctness bug in an auth path silently disabled a performance instrument,
+the evidence file froze at a commit before the regression, and the published
+number kept describing a build nobody ran. Two independent failures had to line
+up, and neither alone would have hidden it.
+
+This is the same rule the evidence model already states for jobs — a skipped
+secret-gated job is unavailable, never healthy — applied to tooling. A
+benchmark that fails to start looks exactly like a benchmark nobody scheduled.
+When a tool stops being run, find out whether it stopped being *runnable*.
+
+## Lesson 13: enumerate the other ways in
+
+An adversarial pass over `internal/e2ee`, `internal/fsops`, `internal/broker`,
+`internal/evidence` and the tenant diagnostics found seven defects that share
+one shape: the boundary holds against the attack it was designed for and leaks
+through an adjacent path.
+
+A second frame kind that skipped the policy check. A second lifetime, where a
+connection outlived the dated credential it had cached forever. A second
+encoding, where the ambiguous-path guard ran after decoding, so the two forms
+the specification names first were the two it could no longer see — while the
+two it could still see kept it looking healthy. A second error class, where
+containment was classified by matching a string that embeds the caller's own
+path, letting a workspace manufacture the audit signal that means exfiltration.
+Two code paths that ran *before* authentication and wrote the workspace's broker
+capability — a live bearer — into the durable event log.
+
+When reviewing a boundary, do not re-verify the case it already handles. Ask
+what else reaches the same place: another frame type, another caller, another
+encoding, another lifetime, another path that runs earlier than the check.
+
+Two corollaries worth stating separately. A credential's blast radius is every
+surface that *records* it, not only every surface that accepts it. And a signal
+that cannot tell "no" from "I could not look" is not a signal — an empty search
+result, a gauge zeroed on failure and a skipped job are all indistinguishable
+from good news until the code makes "unavailable" a distinct answer.
+
 ## Review checklist
 
 Before implementation:
@@ -447,3 +519,6 @@ Before handoff:
 - [ ] The final diff contains no secret material, debug instrumentation,
       unrelated edits, stale documentation, or inflated production claim.
 - [ ] Residual architectural and external gates remain explicit.
+- [ ] Any performance claim the change touches was re-measured on this
+      candidate, not carried forward from a checked-in file.
+- [ ] Every instrument the change would be judged by was confirmed able to run.

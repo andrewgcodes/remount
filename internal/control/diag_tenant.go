@@ -130,7 +130,13 @@ func (c *Control) retentionFindings(ctx context.Context) []proto.Finding {
 	}
 	tenants, err := c.opts.Tenants.List(ctx)
 	if err != nil {
-		metrics.TenantRetentionUnenforced.Set(0)
+		// The gauge is deliberately left alone. Setting it to zero would
+		// publish "every tenant's retention policy is enforced" at the one
+		// moment this check could not read a single policy, and a dashboard
+		// alerting on it would go green because the check broke. The failure
+		// counter is the honest machine-readable signal; the finding below is
+		// the human one.
+		metrics.TenantRetentionFailed.Inc()
 		return []proto.Finding{{
 			Severity: "warn", Check: "tenant.retention_unavailable",
 			Detail: "the tenant directory could not be listed (" + codeOfError(mapTenantError(err)) + ")",

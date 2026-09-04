@@ -38,9 +38,10 @@ func (j *PrefetchJob) Wait() error {
 }
 
 // StartPrefetch verifies the remote manifest, copies it and every hot-set
-// chunk into cache synchronously, then fetches remaining chunks in one bounded
-// background worker. A caller publishes or restores the full tree only after
-// Wait succeeds; no incomplete filesystem is presented as restored.
+// chunk into cache synchronously, then fetches the remaining chunks with a
+// bounded pool of background workers. A caller publishes or restores the full
+// tree only after Wait succeeds; no incomplete filesystem is presented as
+// restored.
 func StartPrefetch(ctx context.Context, remote, cache artifact.BlobStore, manifestID string, limits Limits) (*PrefetchJob, error) {
 	if remote == nil || cache == nil {
 		return nil, errors.New("chunked artifact: remote and cache stores are required")
@@ -114,13 +115,20 @@ func StartPrefetch(ctx context.Context, remote, cache artifact.BlobStore, manife
 	go func() {
 		defer close(job.done)
 		defer cancel()
-		var terminal error
+		// Cold chunks are independent objects, so they are fetched with
+		// bounded concurrency. Wait still joins every worker, so a caller that
+		// sees Wait return has evidence the cache is complete or the reason it
+		// is not.
+		pool := newTransferPool(background, limits.Concurrency)
+		defer pool.stop()
 		for _, chunk := range remaining {
-			if err := copyBlob(background, remote, cache, chunk); err != nil {
-				terminal = err
+			if err := pool.submit(func(ctx context.Context) error {
+				return copyBlob(ctx, remote, cache, chunk)
+			}); err != nil {
 				break
 			}
 		}
+		terminal := pool.wait()
 		job.mu.Lock()
 		job.err = terminal
 		job.mu.Unlock()

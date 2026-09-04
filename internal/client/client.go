@@ -20,11 +20,13 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/artifact/chunked"
 	"remount.dev/remount/internal/ids"
+	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/transport"
 )
@@ -774,7 +776,18 @@ type eventSubscription struct {
 	stop       chan struct{}
 	stopOnce   sync.Once
 	remoteOnce sync.Once
+	// dropped records that this subscription ended because the consumer could
+	// not keep up, rather than because it was cancelled. Without it the two are
+	// indistinguishable, and a consumer that silently lost events looks exactly
+	// like one that asked to stop.
+	dropped atomic.Bool
 }
+
+// Lagged reports whether this subscription was ended because its consumer fell
+// behind. Events are replayable, so the recovery is to re-tail from the last
+// sequence the consumer processed; what must never happen is that the loss is
+// invisible.
+func (s *eventSubscription) Lagged() bool { return s.dropped.Load() }
 
 func newEventSubscription(c *Client, id string, from uint64, ws string) *eventSubscription {
 	s := &eventSubscription{
@@ -821,10 +834,19 @@ func (s *eventSubscription) enqueue(event proto.Event) {
 		return
 	case s.in <- event:
 	default:
-		// Event delivery is replayable. Stop this subscriber explicitly rather
-		// than blocking the peer reader or risking a send on a closed channel.
-		s.close()
-		go s.c.stopEventSubscription(s)
+		// The consumer is behind. Blocking here would stall the peer reader for
+		// everyone, so this event is dropped — but the subscription stays open.
+		//
+		// Ending it instead was worse than the loss: a closed channel is exactly
+		// what a caller sees after cancelling, so a subscriber that silently
+		// lost 3,744 of 4,000 events could not tell that from its own clean
+		// shutdown. Staying open leaves the loss observable the way this system
+		// reports loss everywhere else — as a visible gap. Events carry a
+		// monotonic Seq, so a consumer sees the discontinuity, Lagged reports
+		// it directly, and the counter makes it visible to an operator who is
+		// not reading the stream at all.
+		s.dropped.Store(true)
+		metrics.EventSubscribersDropped.Inc()
 	}
 }
 

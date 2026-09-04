@@ -58,7 +58,14 @@ const (
 	MaxReadLimit     = 3 << 20 // leaves room for CBOR inside the 4 MiB frame
 	MaxSearchFile    = 8 << 20 // files larger than this are skipped by search
 	DefaultSearchMax = 500
-	MaxLineText      = 4096
+	// MaxSearchMax caps a caller-supplied result limit. The request field is
+	// wire-controlled, so without a ceiling one search can accumulate a reply
+	// that neither fits the transport frame nor the node's memory.
+	MaxSearchMax = 5000
+	// MaxSearchText bounds the total matched text in one reply so it always
+	// fits inside the frame alongside its envelope.
+	MaxSearchText = MaxReadLimit
+	MaxLineText   = 4096
 )
 
 var errEscape = proto.Err(proto.CodeDenied, "path escapes workspace")
@@ -116,6 +123,9 @@ func (f *FS) Read(p string, offset, limit int64) (*proto.FSReadRes, error) {
 	if err != nil {
 		return nil, err
 	}
+	if offset < 0 {
+		return nil, proto.Err(proto.CodeBadRequest, "offset must not be negative")
+	}
 	if limit <= 0 {
 		limit = DefaultReadLimit
 	}
@@ -161,6 +171,12 @@ func (f *FS) Write(p string, data []byte, mode uint32, appendMode, mkdirp bool) 
 	}
 	if name == "." {
 		return proto.Err(proto.CodeBadRequest, "is a directory")
+	}
+	if mode&^uint32(fs.ModePerm) != 0 {
+		// os.Root refuses type and setuid bits with an opaque error that would
+		// otherwise surface as `internal`. A caller's bad mode is its own fault
+		// and setuid is never something a workspace request may create.
+		return proto.Err(proto.CodeBadRequest, "mode %#o has bits outside 0777", mode)
 	}
 	parent := filepath.Dir(name)
 	if mkdirp {
@@ -342,7 +358,18 @@ func (f *FS) Search(p, pattern, glob string, max int) (*proto.FSSearchRes, error
 	if max <= 0 {
 		max = DefaultSearchMax
 	}
+	if max > MaxSearchMax {
+		max = MaxSearchMax
+	}
+	// A walk root that does not exist, is unreadable, or leaves the jail must
+	// be reported. WalkDir hands that failure to the callback, which skips
+	// unreadable entries by design, so an unusable root would otherwise return
+	// "no matches" -- a wrong answer that reads exactly like a real one.
+	if _, err := f.handle.Stat(name); err != nil {
+		return nil, mapErr(err)
+	}
 	res := &proto.FSSearchRes{}
+	textBytes := 0
 	walkErr := fs.WalkDir(f.handle.FS(), filepath.ToSlash(name), func(fp string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil // unreadable: skip
@@ -386,6 +413,11 @@ func (f *FS) Search(p, pattern, glob string, max int) (*proto.FSSearchRes, error
 				if len(text) > MaxLineText {
 					text = text[:MaxLineText]
 				}
+				if textBytes+len(text) > MaxSearchText {
+					res.Truncated = true
+					return errStop
+				}
+				textBytes += len(text)
 				res.Matches = append(res.Matches, proto.FSMatch{Path: rel, Line: line, Text: text})
 				if len(res.Matches) >= max {
 					res.Truncated = true
@@ -454,8 +486,7 @@ func (f *FS) Edit(p string, edits []proto.FSEdit) (int, error) {
 			return 0, proto.Err(proto.CodeResourceExhausted, "edited file exceeds limit of %d bytes", MaxReadLimit)
 		}
 	}
-	mode := uint32(0o644)
-	mode = uint32(st.Mode().Perm())
+	mode := uint32(st.Mode().Perm())
 	if err := f.Write(p, []byte(s), mode, false, false); err != nil {
 		return 0, err
 	}
@@ -489,6 +520,21 @@ func entry(name string, info os.FileInfo) proto.FSEntry {
 	}
 }
 
+// osReason is the innermost failure of a filesystem error, with the caller's
+// path stripped off. Every os.Root containment failure arrives as a PathError
+// or LinkError wrapping its own sentinel.
+func osReason(err error) string {
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) && pathErr.Err != nil {
+		return pathErr.Err.Error()
+	}
+	var linkErr *os.LinkError
+	if errors.As(err, &linkErr) && linkErr.Err != nil {
+		return linkErr.Err.Error()
+	}
+	return err.Error()
+}
+
 func mapErr(err error) error {
 	if err == nil {
 		return nil
@@ -497,12 +543,17 @@ func mapErr(err error) error {
 	if errors.As(err, &pe) {
 		return err
 	}
+	// Classify the operating system's own failure, never the formatted
+	// message: that message embeds a caller-chosen path, so matching it as a
+	// substring lets a file named "path escapes from parent" fabricate a
+	// jail-escape denial for any missing sibling.
+	reason := osReason(err)
 	switch {
-	case strings.Contains(err.Error(), "path escapes from parent"):
+	case reason == "path escapes from parent":
 		// os.Root intentionally keeps its sentinel private. Translate its
 		// containment failure into the protocol's stable denial code.
 		return errEscape
-	case errors.Is(err, os.ErrInvalid), strings.Contains(err.Error(), "file name too long"), strings.Contains(err.Error(), "not a directory"):
+	case errors.Is(err, os.ErrInvalid), reason == "file name too long", reason == "not a directory":
 		return proto.Err(proto.CodeBadRequest, "%v", err)
 	case errors.Is(err, fs.ErrNotExist):
 		return proto.Err(proto.CodeNotFound, "%v", err)

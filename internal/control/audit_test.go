@@ -249,3 +249,65 @@ func TestAuditExportRangeValidation(t *testing.T) {
 		}
 	}
 }
+
+// A denial is the record an auditor most wants, and it is written for every
+// refused export. That makes the request body a lever on the durable log: any
+// authenticated caller can name a tenant it does not own, as often as it
+// likes. What reaches the log must therefore be bounded by this control plane,
+// not by the size of the caller's request — the same reason a malformed range
+// is deliberately not recorded at all.
+func TestAuditDenialRecordDoesNotLetTheCallerSizeTheLog(t *testing.T) {
+	f := tenantControlFixture(t)
+	ctx := context.Background()
+	createRetentionTenants(t, f, map[string]proto.TenantPolicy{"tenant-a": {}})
+	alice := Subject{ID: "alice", Tenant: "tenant-a", Roles: []string{"operator", "admin"}}
+
+	oversized := strings.Repeat("z", 64<<10)
+	if _, err := f.c.AuditExport(ctx, alice, &proto.AuditExportReq{Tenant: oversized, From: 1, To: 2}); codeOf(err) != proto.CodeDenied {
+		t.Fatalf("an export naming another tenant=%v", err)
+	}
+	events, err := f.log.Read(ctx, 0, "", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	denials := 0
+	for _, event := range events {
+		if event.Type != proto.EvAuditExportDenied {
+			continue
+		}
+		denials++
+		if len(event.Payload) > 1024 {
+			t.Fatalf("one refused request appended %d durable bytes; a caller must not size the audit log", len(event.Payload))
+		}
+		if len(event.Stream) > 1024 {
+			t.Fatalf("the denial stream name is %d bytes", len(event.Stream))
+		}
+		// The refusal stays attributable: the record still says a tenant
+		// selector was named and how large it was.
+		if !bytes.Contains(event.Payload, []byte("65536")) {
+			t.Fatalf("the denial no longer describes what was requested: %s", event.Payload)
+		}
+	}
+	if denials != 1 {
+		t.Fatalf("recorded denials=%d", denials)
+	}
+
+	// A tenant id of ordinary length is still recorded verbatim, because that
+	// is the fact an auditor is looking for.
+	if _, err := f.c.AuditExport(ctx, alice, &proto.AuditExportReq{Tenant: "tenant-b", From: 1, To: 2}); codeOf(err) != proto.CodeDenied {
+		t.Fatalf("cross-tenant export=%v", err)
+	}
+	events, err = f.log.Read(ctx, 0, "", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	named := false
+	for _, event := range events {
+		if event.Type == proto.EvAuditExportDenied && bytes.Contains(event.Payload, []byte("tenant-b")) {
+			named = true
+		}
+	}
+	if !named {
+		t.Fatal("an ordinary cross-tenant denial no longer names the tenant that was requested")
+	}
+}

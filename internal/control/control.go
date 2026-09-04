@@ -225,6 +225,11 @@ type Options struct {
 	// per tenant and 100 per owning subject.
 	MaxWorkspacesPerTenant  int
 	MaxWorkspacesPerSubject int
+	// MaxEventTailsPerRequester bounds concurrent follow subscriptions from one
+	// connected peer. Each tail costs a goroutine and a buffered channel and is
+	// walked on every append, so an unbounded count is remotely reachable
+	// memory and per-event work.
+	MaxEventTailsPerRequester int
 	// Durable control-record quotas bound idempotency results and wake timers.
 	// Zero selects 100,000 total mutation records, 100,000 total timers, and
 	// 128 timers per workspace. Fired timers remain visible until retention GC.
@@ -339,7 +344,7 @@ type Control struct {
 	volumes               map[string]*proto.Volume
 	pools                 map[string]*proto.Pool // poolKey(tenant, name) -> desired node capacity
 	poolBusy              map[string]bool
-	poolIdle              map[string]time.Time
+	poolIdle              map[poolMachine]time.Time
 	poolWG                sync.WaitGroup
 	queues                map[string]*proto.Queue
 	agents                map[string]*proto.Agent
@@ -475,6 +480,9 @@ func New(opts Options) (*Control, error) {
 	if opts.MaxWorkspacesPerTenant <= 0 {
 		opts.MaxWorkspacesPerTenant = 1000
 	}
+	if opts.MaxEventTailsPerRequester <= 0 {
+		opts.MaxEventTailsPerRequester = 64
+	}
 	if opts.MaxWorkspacesPerSubject <= 0 {
 		opts.MaxWorkspacesPerSubject = 100
 	}
@@ -544,7 +552,7 @@ func New(opts Options) (*Control, error) {
 		volumes:               map[string]*proto.Volume{},
 		pools:                 map[string]*proto.Pool{},
 		poolBusy:              map[string]bool{},
-		poolIdle:              map[string]time.Time{},
+		poolIdle:              map[poolMachine]time.Time{},
 		queues:                map[string]*proto.Queue{},
 		agents:                map[string]*proto.Agent{},
 		approvals:             map[string]*proto.Approval{},
@@ -5538,6 +5546,15 @@ func (c *Control) eventsTail(ctx context.Context, from string, subject Subject, 
 	}
 	if previous := byID[subID]; previous != nil {
 		previous.cancel()
+	} else if len(byID) >= c.opts.MaxEventTailsPerRequester {
+		// Replacing an existing subscription is always allowed; adding a new one
+		// is what a peer can do without bound. Each tail holds a goroutine and a
+		// buffered channel and is visited on every append, so refusing here is
+		// the difference between a bounded resource and one remote peer sizing
+		// the control plane's memory and per-event cost.
+		c.mu.Unlock()
+		metrics.EventTailQuotaRejected.Inc()
+		return nil, proto.Err(proto.CodeResourceExhausted, "event tail subscription limit %d reached for this peer", c.opts.MaxEventTailsPerRequester)
 	}
 	tctx, cancel := context.WithCancel(context.Background())
 	tail := &tailState{cancel: cancel}

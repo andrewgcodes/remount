@@ -28,6 +28,9 @@ type Limits struct {
 	MaxTotalXattrBytes int64
 	MaxFileBytes       int64
 	MaxSnapshotBytes   int64
+	// Concurrency bounds how many chunk transfers a prefetch keeps in flight.
+	// Zero selects DefaultTransferConcurrency.
+	Concurrency int
 }
 
 // DefaultLimits bound manifest metadata while allowing multi-terabyte trees.
@@ -36,6 +39,7 @@ var DefaultLimits = Limits{
 	MaxManifestBytes: 512 << 20, MaxPathBytes: 4096,
 	MaxXattrsPerEntry: 128, MaxXattrBytes: 1 << 20, MaxTotalXattrBytes: 256 << 20,
 	MaxFileBytes: 1 << 40, MaxSnapshotBytes: 16 << 40,
+	Concurrency: DefaultTransferConcurrency,
 }
 
 // Manifest is the canonical plaintext snapshot descriptor.
@@ -108,6 +112,9 @@ func normalizedLimits(l Limits) Limits {
 	}
 	if l.MaxSnapshotBytes > 0 {
 		d.MaxSnapshotBytes = l.MaxSnapshotBytes
+	}
+	if l.Concurrency > 0 {
+		d.Concurrency = l.Concurrency
 	}
 	return d
 }

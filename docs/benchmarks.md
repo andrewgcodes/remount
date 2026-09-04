@@ -5,22 +5,41 @@ if a correctness test fails and labels every lane it could not exercise.
 
 ## Candidate and host
 
-- Commit: `0bb21377a1ae242ac482d7efe51a3ee95a8edc69` + uncommitted changes
-- Measured: 2026-09-03T19:31:01.260083+00:00
+- Commit: `acb3e427ef5b327d805f3434d1f82f69894bd6fd` + uncommitted changes
+- Measured: 2026-09-04T04:06:40.946856+00:00
 - Host: Darwin arm64 / arm / Python 3.14.5
 - Command: `python3 bench/run.py --count 3 --iterations 2 --output bench/results/latest.json --markdown docs/benchmarks.md`
 - Samples: 3 microbenchmark processes; 3 reconnect and 3 recovery runs
+
+## Open regression, measured 2026-09-03
+
+Two operations are slower on this candidate than on `21ef995`, bisected to
+`a3b5235 "feat(platform): converge hosted runtime handoff"`:
+
+| Operation | `21ef995` | this candidate | ratio |
+|---|---:|---:|---:|
+| Two-node move, 200 MiB | 0.85 s | 33–76 s | ~40–90x |
+| Client cut and lossless reattach | 0.855 s | 6.24 s | ~7x |
+
+The reattach row below therefore reports a regressed number, not a normal one.
+Both are under investigation; see `MISTAKES.md` #42 for why neither was caught
+for weeks — the checked-in evidence was recorded before the regression and the
+move benchmark could not run against a standalone server at all, so the one
+instrument pointed at this was itself broken.
+
+Numbers here are re-earned on the candidate. Do not carry a row forward from an
+earlier file: a committed performance number is a claim, and claims decay.
 
 ## Local results
 
 | Measurement | p50 / median | p99 | Evidence |
 |---|---:|---:|---|
-| Full 8 MiB chunked snapshot | 979.14 ms | not sampled | 8.01 MiB uploaded |
-| 4 KiB edit of an 8 MiB snapshot | 33.18 ms | not sampled | 82.5 KiB uploaded; 99.3× logical/upload ratio |
-| Direct loopback TLS request | 189.2 µs | not sampled | Go benchmark, warm connection |
-| Brokered allowed request | 256.4 µs | not sampled | 67.2 µs median incremental overhead |
-| Client cut mid-stream and lossless reattach | 0.520 s | 0.540 s | `TestReconnectMidStreamIsLossless`; bytes are asserted identical |
-| Graceful move, then node-loss recovery | 3.210 s | 3.230 s | `TestNodeDeathMovesWorkspaceFromSnapshot`; generation and bytes asserted |
+| Full 8 MiB chunked snapshot | 611.73 ms | not sampled | 8.01 MiB uploaded |
+| 4 KiB edit of an 8 MiB snapshot | 17.90 ms | not sampled | 82.5 KiB uploaded; 99.3× logical/upload ratio |
+| Direct loopback TLS request | 79.1 µs | not sampled | Go benchmark, warm connection |
+| Brokered allowed request | 161.8 µs | not sampled | 82.7 µs median incremental overhead |
+| Client cut mid-stream and lossless reattach | 6.240 s | 6.570 s | `TestReconnectMidStreamIsLossless`; bytes are asserted identical |
+| Graceful move, then node-loss recovery | 3.090 s | 3.090 s | `TestNodeDeathMovesWorkspaceFromSnapshot`; generation and bytes asserted |
 
 The chunk fixture is deterministic pseudo-random data. Baseline creation for
 the delta case is outside the timed interval. The HTTP comparison uses the
