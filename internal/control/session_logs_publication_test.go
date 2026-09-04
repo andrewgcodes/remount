@@ -458,3 +458,83 @@ func TestSessionLogAdmissionReconstructsAfterRestart(t *testing.T) {
 		t.Fatalf("replay of the durable record after restart = %v", err)
 	}
 }
+
+// TestSessionLogAdmissionRejectsCrossTenantSessionCollision keeps the reserved
+// slot tenant-owned: a second tenant publishing the same new session id while
+// the first tenant's publication is in flight must not reuse that slot, so a
+// tenant already at its limit cannot borrow another tenant's reservation.
+func TestSessionLogAdmissionRejectsCrossTenantSessionCollision(t *testing.T) {
+	store, dir := newBarrierArtifactStore(t)
+	now := time.Now()
+	sharedA := putAgedSegment(t, store.Store, dir, "tenant-a shared session", now)
+	sharedB := putAgedSegment(t, store.Store, dir, "tenant-b shared session", now)
+	f := newControlFixture(t, "", func(options *Options) {
+		options.Artifacts = store
+		options.MaxSessionLogsPerTenant = 1
+	})
+	putHeldSessionWorkspace(f.c, "ws-a", "tenant-a", "node-a", 7)
+	putHeldSessionWorkspace(f.c, "ws-b", "tenant-b", "node-b", 3)
+	request := func(session, workspace, node string, generation uint64, segments ...proto.SessionLogSegment) *proto.SessionLogCommitReq {
+		return &proto.SessionLogCommitReq{
+			Session: session, Workspace: workspace, Generation: generation, Principal: "p-" + node,
+			Kind: proto.SessionExec, MaxChunk: 32 << 10, Segments: segments,
+		}
+	}
+
+	// Tenant B is already at its limit; tenant A's publication of the shared
+	// session id is parked after verification with its slot reserved.
+	closed := make(chan struct{})
+	close(closed)
+	release := store.release
+	store.release = closed
+	if _, err := f.c.sessionLogCommit(context.Background(), "node-b", request("ses-b-full", "ws-b", "node-b", 3, sharedB)); err != nil {
+		t.Fatal(err)
+	}
+	<-store.verified
+	store.release = release
+
+	results := make(chan commitResult, 1)
+	go func() {
+		record, err := f.c.sessionLogCommit(context.Background(), "node-a", request("ses-shared", "ws-a", "node-a", 7, sharedA))
+		results <- commitResult{record, err}
+	}()
+	select {
+	case <-store.verified:
+	case <-time.After(30 * time.Second):
+		t.Fatal("tenant-a commit never verified its segment")
+	}
+	// Tenant B must be refused at admission. If it were admitted on A's slot it
+	// would proceed to verification and surface on the barrier instead.
+	collision := make(chan commitResult, 1)
+	go func() {
+		record, err := f.c.sessionLogCommit(context.Background(), "node-b", request("ses-shared", "ws-b", "node-b", 3, sharedB))
+		collision <- commitResult{record, err}
+	}()
+	select {
+	case result := <-collision:
+		if !errors.Is(result.err, &proto.Error{Code: proto.CodeConflict}) {
+			t.Fatalf("cross-tenant collision on a reserved session = %v, want conflict", result.err)
+		}
+	case id := <-store.verified:
+		close(store.release)
+		t.Fatalf("tenant-b was admitted on tenant-a's reservation and verified %s", id)
+	case <-time.After(30 * time.Second):
+		t.Fatal("cross-tenant collision neither rejected nor verified")
+	}
+	close(store.release)
+	if result := <-results; result.err != nil {
+		t.Fatalf("tenant-a commit = %v, want success", result.err)
+	}
+	if got := countSessionLogs(f.c, "tenant-b"); got != 1 {
+		t.Fatalf("tenant-b records = %d, want 1", got)
+	}
+	if _, err := f.c.sessionLogCommit(context.Background(), "node-b", request("ses-b-second", "ws-b", "node-b", 3, sharedB)); !errors.Is(err, &proto.Error{Code: proto.CodeResourceExhausted}) {
+		t.Fatalf("tenant-b at capacity = %v, want resource_exhausted", err)
+	}
+	f.c.mu.Lock()
+	admissions, pins := len(f.c.sessionLogAdmissions), len(f.c.sessionLogPins)
+	f.c.mu.Unlock()
+	if admissions != 0 || pins != 0 {
+		t.Fatalf("admissions=%d pins=%d after all commits settled, want 0/0", admissions, pins)
+	}
+}

@@ -124,11 +124,16 @@ type sessionLogPublication struct {
 // committed rows and other reserved slots, so two concurrent new sessions can
 // never both pass the check. It pins every not-yet-referenced segment so a
 // GC pass between verification and commit sees the artifact as a root. It
-// returns used and false when the tenant limit is reached.
-func (c *Control) sessionLogAdmitLocked(tenant, session string, isNew bool, artifacts []string) (*sessionLogPublication, int, bool) {
+// returns used and false when the tenant limit is reached, and an error when
+// another tenant is already publishing the same session id, since a session
+// belongs to exactly one tenant and must never share its slot across tenants.
+func (c *Control) sessionLogAdmitLocked(tenant, session string, isNew bool, artifacts []string) (*sessionLogPublication, int, bool, error) {
 	publication := &sessionLogPublication{tenant: tenant, session: session}
 	if isNew {
 		admission := c.sessionLogAdmissions[session]
+		if admission != nil && admission.tenant != tenant {
+			return nil, 0, false, proto.Err(proto.CodeConflict, "session log %s is being published by another tenant", session)
+		}
 		if admission == nil {
 			used := 0
 			for _, record := range c.sessionLogs {
@@ -142,7 +147,7 @@ func (c *Control) sessionLogAdmitLocked(tenant, session string, isNew bool, arti
 				}
 			}
 			if used >= c.opts.MaxSessionLogsPerTenant {
-				return nil, used, false
+				return nil, used, false, nil
 			}
 			admission = &sessionLogAdmission{tenant: tenant}
 			c.sessionLogAdmissions[session] = admission
@@ -159,7 +164,7 @@ func (c *Control) sessionLogAdmitLocked(tenant, session string, isNew bool, arti
 		pins[id]++
 	}
 	publication.artifacts = append([]string(nil), artifacts...)
-	return publication, 0, true
+	return publication, 0, true, nil
 }
 
 // sessionLogReleaseLocked ends a publication on every terminal path. On
@@ -260,7 +265,11 @@ func (c *Control) sessionLogCommit(ctx context.Context, node string, req *proto.
 	for _, segment := range pending {
 		artifacts = append(artifacts, segment.Artifact)
 	}
-	publication, used, admitted := c.sessionLogAdmitLocked(authority.Tenant, req.Session, existing == nil, artifacts)
+	publication, used, admitted, err := c.sessionLogAdmitLocked(authority.Tenant, req.Session, existing == nil, artifacts)
+	if err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
 	if !admitted {
 		limit := c.opts.MaxSessionLogsPerTenant
 		event := c.newEvent(proto.EvQuotaExceeded, req.Session, req.Principal, node, map[string]any{
