@@ -6,9 +6,12 @@ providers: [openai, azure-openai, openrouter]
 hosts:
   - registry.npmjs.org
 install: |
+  export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.local}"
+  export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
   command -v codex >/dev/null 2>&1 || npm install -g @openai/codex
 env:
   CODEX_MODEL: "{{.Model}}"
+  PATH: "${NPM_CONFIG_PREFIX:-$HOME/.local}/bin:$PATH"
 command: ["codex", "exec", "--skip-git-repo-check", "{{.Task}}"]
 resume_command: ["codex", "exec", "resume", "--last", "--skip-git-repo-check", "{{.Task}}"]
 sandbox_flags:

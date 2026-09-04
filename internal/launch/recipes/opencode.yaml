@@ -8,9 +8,12 @@ hosts:
   - models.dev
   - models.opencode.ai
 install: |
+  export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.local}"
+  export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
   command -v opencode >/dev/null 2>&1 || npm install -g opencode-ai
 env:
   OPENCODE_DISABLE_AUTOUPDATE: "1"
+  PATH: "${NPM_CONFIG_PREFIX:-$HOME/.local}/bin:$PATH"
   # Process locks are host-local coordination, not movable workspace state.
   XDG_STATE_HOME: "/tmp/remount-opencode-state-$REMOUNT_WORKSPACE"
   # Custom config sits between the global and the project opencode.json, so
