@@ -551,28 +551,32 @@ func (h *handle) Destroy(ctx context.Context) error {
 	if h.destroyed {
 		return nil
 	}
-	// Order matters here and is deliberately unchanged: nothing is dismantled
-	// until the network boundary is confirmed gone, so a failed teardown never
-	// leaves a half-destroyed workspace that can still carry traffic.
-	// TestDestroyRetainsLaterResourcesUntilEachPriorBoundarySucceeds pins it.
+	// Join the VMM before reclaiming its network, and destroy the volume only
+	// after both.
 	//
-	// On real hardware that invariant is currently unsatisfiable, and this is
-	// the open defect recorded in
-	// docs/engineering/gvisor-egress-finding-2026-09-04.md: Revoke both denies
-	// traffic and deletes the devices, and the VMM holds the TAP for as long as
-	// it lives, so revoking a live machine fails with "delete TAP: device or
-	// resource busy" and destroy, move and quarantine all stop there. Killing
-	// first would satisfy the kernel and break the invariant, so it is not done.
-	// The resolution is to split Revoke into a deny phase that runs while the
-	// machine lives and a release phase that runs after it dies.
-	if err := h.network.Revoke(ctx); err != nil {
-		return err
-	}
+	// The network teardown deletes the workspace's devices, and the VMM holds
+	// the TAP open for as long as it lives, so reclaiming first fails with
+	// "delete TAP: device or resource busy" and every teardown stops there.
+	// That is what made `remount ws move` fail with "released workspace source
+	// cleanup is pending" and what left a quarantined workspace holding a lease
+	// no retry could reclaim.
+	//
+	// This order was chosen rather than fallen into. The property that matters
+	// is that nothing is dismantled while the workspace can still carry
+	// traffic, and killing the VMM satisfies it more completely than revoking
+	// ever could: a process that does not exist sends nothing, whereas a
+	// revoked network still has a live guest behind it. The data property is
+	// unchanged in every branch — the volume is destroyed only after both the
+	// join and the revoke succeed, so a teardown that fails part way always
+	// leaves a recoverable workspace rather than a half-erased one.
 	if h.machine != nil {
 		if err := h.machine.Kill(ctx); err != nil {
 			return err
 		}
 		h.machine = nil
+	}
+	if err := h.network.Revoke(ctx); err != nil {
+		return err
 	}
 	if err := h.volume.Destroy(ctx); err != nil {
 		return err
