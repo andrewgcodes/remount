@@ -66,6 +66,18 @@ func TestInterpretCoversTheProgramsTheSuiteRuns(t *testing.T) {
 	if _, _, interactive := interpret([]string{"/bin/cat"}); !interactive {
 		t.Error("cat must stay open for input")
 	}
+	if out, code, interactive := interpret([]string{"cmd.exe", "/d", "/s", "/c", "echo", "hello"}); string(out) != "hello\n" || code != 0 || interactive {
+		t.Errorf("Windows echo interpreted as %q %d %v", out, code, interactive)
+	}
+	if out, code, interactive := interpret([]string{"cmd.exe", "/d", "/s", "/c", "echo hello world."}); string(out) != "hello world.\n" || code != 0 || interactive {
+		t.Errorf("Windows literal echo interpreted as %q %d %v", out, code, interactive)
+	}
+	if _, code, _ := interpret([]string{"cmd.exe", "/d", "/s", "/c", "exit", "7"}); code != 7 {
+		t.Errorf("Windows `exit 7` interpreted as code %d", code)
+	}
+	if _, _, interactive := interpret([]string{"powershell.exe", "-NoProfile", "-Command", "$input | ForEach-Object { $_ }"}); !interactive {
+		t.Error("Windows input command must stay open for input")
+	}
 }
 
 // The shim's canary is synthetic and must never look like a provider key,

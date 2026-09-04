@@ -61,6 +61,13 @@ func cleanEnv(t *testing.T, extra ...string) []string {
 		"TMPDIR=" + os.TempDir(),
 		"LANG=C",
 	}
+	if runtime.GOOS == "windows" {
+		for _, name := range []string{"APPDATA", "LOCALAPPDATA", "USERPROFILE", "SystemRoot", "ComSpec", "PATHEXT", "TEMP", "TMP"} {
+			if value := os.Getenv(name); value != "" {
+				env = append(env, name+"="+value)
+			}
+		}
+	}
 	env = append(env, extra...)
 	allowed := map[string]bool{}
 	for _, kv := range extra {
@@ -94,6 +101,26 @@ func TestCleanEnvDropsInheritedPaths(t *testing.T) {
 			if name == forbidden {
 				t.Fatalf("cleanEnv passed %s through", name)
 			}
+		}
+	}
+}
+
+func TestCleanEnvKeepsWindowsPackageManagerRoots(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows environment contract")
+	}
+	for _, name := range []string{"APPDATA", "LOCALAPPDATA", "USERPROFILE"} {
+		value := filepath.Join(t.TempDir(), name)
+		t.Setenv(name, value)
+		found := false
+		for _, kv := range cleanEnv(t) {
+			if kv == name+"="+value {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("cleanEnv omitted %s", name)
 		}
 	}
 }
@@ -206,6 +233,13 @@ func distName(goos, goarch string) string {
 	return name
 }
 
+func installedBinaryName(goos string) string {
+	if goos == "windows" {
+		return "remount.exe"
+	}
+	return "remount"
+}
+
 // installBinary copies one dist artifact into a prefix that looks like a
 // machine's own, far from the checkout. Copying rather than symlinking is the
 // point: a symlink into dist/ would keep the source tree load-bearing.
@@ -220,7 +254,7 @@ func installBinary(t *testing.T, prefix, goos, goarch string) string {
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	dst := filepath.Join(bin, "remount")
+	dst := filepath.Join(bin, installedBinaryName(goos))
 	if err := os.WriteFile(dst, body, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +273,12 @@ func containsSourceTree(t *testing.T, path, root string) bool {
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
-	return bytes.Contains(body, []byte(root))
+	for _, candidate := range []string{root, filepath.ToSlash(root)} {
+		if bytes.Contains(body, []byte(candidate)) {
+			return true
+		}
+	}
+	return false
 }
 
 func requireNoSourceTree(t *testing.T, path, root string) {

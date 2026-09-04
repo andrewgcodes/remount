@@ -99,10 +99,10 @@ func (s *Store) PutObject(ctx context.Context, key string, r io.Reader, size int
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-	defer resp.Body.Close()
 	if err := expectStatus(resp, http.StatusOK, http.StatusCreated); err != nil {
-		return ObjectInfo{}, err
+		return ObjectInfo{}, errors.Join(err, resp.Body.Close())
 	}
+	defer resp.Body.Close()
 	return ObjectInfo{Key: key, Size: size, ETag: trimETag(resp.Header.Get("ETag")), Metadata: cloneMap(opts.Metadata)}, nil
 }
 
@@ -551,6 +551,11 @@ func (s *Store) doStream(ctx context.Context, method, physical string, query url
 	}
 	if headers != nil {
 		req.Header = headers.Clone()
+	}
+	// Some S3-compatible endpoints close connections after precondition
+	// responses without keeping them out of the client's idle pool.
+	if req.Header.Get("If-Match") != "" || req.Header.Get("If-None-Match") != "" {
+		req.Close = true
 	}
 	if body != nil {
 		req.ContentLength = size

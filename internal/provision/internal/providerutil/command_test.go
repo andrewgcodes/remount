@@ -4,11 +4,36 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
 func TestOSRunnerUsesStdinOverridesEnvironmentAndSanitizesFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Setenv("PROVISION_TEST_ENV", "old")
+		out, err := (OSRunner{}).Run(context.Background(), Command{
+			Executable: "powershell.exe",
+			Args:       []string{"-NoProfile", "-Command", "$line = [Console]::In.ReadLine(); [Console]::Out.Write($line + '|' + $env:PROVISION_TEST_ENV)"},
+			Stdin:      []byte("stdin-value\n"),
+			Env:        map[string]string{"PROVISION_TEST_ENV": "new"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(out) != "stdin-value|new" {
+			t.Fatalf("output=%q", out)
+		}
+		const secret = "stderr-secret-canary"
+		_, err = (OSRunner{}).Run(context.Background(), Command{
+			Executable: "powershell.exe",
+			Args:       []string{"-NoProfile", "-Command", "[Console]::Error.Write('" + secret + "'); exit 1"},
+		})
+		if err == nil || strings.Contains(err.Error(), secret) {
+			t.Fatalf("failure leaked stderr: %v", err)
+		}
+		return
+	}
 	dir := t.TempDir()
 	helper := filepath.Join(dir, "helper")
 	script := "#!/bin/sh\nread line\nprintf '%s|%s' \"$line\" \"$PROVISION_TEST_ENV\"\n"
@@ -43,7 +68,11 @@ func TestOSRunnerBoundsStdout(t *testing.T) {
 	if !buffer.overflow || string(buffer.Bytes()) != "12345678" {
 		t.Fatalf("buffer=%q overflow=%t", buffer.Bytes(), buffer.overflow)
 	}
-	out, err := (OSRunner{}).Run(context.Background(), Command{Executable: "printf", Args: []string{"123456789"}, MaxOutput: 8})
+	command := Command{Executable: "printf", Args: []string{"123456789"}, MaxOutput: 8}
+	if runtime.GOOS == "windows" {
+		command = Command{Executable: "powershell.exe", Args: []string{"-NoProfile", "-Command", "[Console]::Out.Write('123456789')"}, MaxOutput: 8}
+	}
+	out, err := (OSRunner{}).Run(context.Background(), command)
 	if err == nil || !strings.Contains(err.Error(), "exceeded") {
 		t.Fatalf("expected command output bound, got output=%q err=%v", out, err)
 	}

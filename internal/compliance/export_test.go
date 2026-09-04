@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -280,7 +281,12 @@ func TestLargeExportUsesBoundedRangeAndVerifies(t *testing.T) {
 		t.Fatalf("large verify = %+v, %v", verified, err)
 	}
 	info, err := os.Stat(path)
-	if err != nil || info.Mode().Perm() != 0o600 {
+	if err != nil {
+		t.Fatalf("bundle mode = %v, %v", info.Mode(), err)
+	}
+	if runtime.GOOS == "windows" {
+		t.Log("unavailable: Go file modes do not expose Windows ACL confidentiality")
+	} else if info.Mode().Perm() != 0o600 {
 		t.Fatalf("bundle mode = %v, %v", info.Mode(), err)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -131,6 +132,10 @@ func TestEnvAndFileMasterKeys(t *testing.T) {
 	}
 	if _, err := NewFileMasterKey(path, "file-v1"); err != nil {
 		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		t.Log("unavailable: Go file modes do not expose Windows ACL confidentiality")
+		return
 	}
 	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatal(err)

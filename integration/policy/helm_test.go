@@ -44,26 +44,33 @@ func TestHelmGoldenTemplateIsCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Compare documents, not bytes.
+	// Compare documents, not bytes, and not line endings either.
 	//
-	// Helm's own formatting differs between major versions — 3 and 4 disagree
-	// about where a `---` separator goes and whether a trailing empty document
-	// is emitted — so a byte comparison is really a comparison against
-	// whichever helm the machine happens to ship. That is not a property of
-	// this chart, and it is what made this test fail in CI while passing
-	// locally: the golden was generated with helm 4 and the runner ships
-	// helm 3.
+	// Two different machine differences reach this comparison and neither is a
+	// property of the chart. Helm 3 and 4 disagree about where a `---`
+	// separator goes and whether a trailing empty document is emitted, so a
+	// byte comparison is really a comparison against whichever helm the runner
+	// ships. And a Windows checkout stores the golden with CRLF, which helm
+	// never emits.
 	//
-	// Everything this test exists to catch survives the normalisation. Chart
+	// Everything this test exists to catch survives both normalisations: chart
 	// drift changes a document's content, and any such change still shows up.
-	if sameDocuments(rendered, string(golden)) {
+	goldenText := strings.ReplaceAll(string(golden), "\r\n", "\n")
+	if sameDocuments(rendered, goldenText) {
 		return
 	}
 	t.Errorf("the chart no longer renders %s. Regenerate it and review the diff:\n"+
 		"  helm template %s %s --namespace %s -f %s > %s",
 		goldenPath, releaseName, chartPath, namespace, valuesPath, goldenPath)
-	for _, line := range firstDifference(strings.Join(documents(string(golden)), "\n---\n"), strings.Join(documents(rendered), "\n---\n")) {
+	for _, line := range firstDifference(strings.Join(documents(goldenText), "\n---\n"), strings.Join(documents(rendered), "\n---\n")) {
 		t.Log(line)
+	}
+}
+
+func TestHelmGoldenComparisonNormalizesWindowsCheckouts(t *testing.T) {
+	golden := strings.ReplaceAll("line one\r\nline two\r\n", "\r\n", "\n")
+	if diff := firstDifference(golden, "line one\nline two\n"); diff != nil {
+		t.Fatalf("line-ending-only difference = %v", diff)
 	}
 }
 

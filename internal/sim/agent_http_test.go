@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -373,46 +374,50 @@ func TestAgentHTTPAuthAndLifecycle(t *testing.T) {
 		t.Fatalf("deleted file = %d", res.status)
 	}
 
-	// Terminal: a PTY over WebSocket with binary I/O and JSON control.
-	termCtx, termCancel := context.WithTimeout(ctx, 30*time.Second)
-	term := api.wsDial(termCtx, "/v1/agents/"+a.ID+"/terminal?program=/bin/sh&rows=20&cols=80", true)
-	typ, open, err := term.Read(termCtx)
-	if err != nil || typ != websocket.MessageText || !bytes.Contains(open, []byte(`"type":"open"`)) {
-		t.Fatalf("terminal open = %v %v %s", typ, err, open)
-	}
-	if err := term.Write(termCtx, websocket.MessageBinary, []byte("echo term-$((20+22))\n")); err != nil {
-		t.Fatal(err)
-	}
-	var seen []byte
-	for !bytes.Contains(seen, []byte("term-42")) {
-		typ, msg, err := term.Read(termCtx)
-		if err != nil {
-			t.Fatalf("terminal read: %v (so far %q)", err, seen)
+	if runtime.GOOS == "windows" {
+		t.Log("unavailable: the session PTY backend uses Unix PTYs; ConPTY is not implemented")
+	} else {
+		// Terminal: a PTY over WebSocket with binary I/O and JSON control.
+		termCtx, termCancel := context.WithTimeout(ctx, 30*time.Second)
+		term := api.wsDial(termCtx, "/v1/agents/"+a.ID+"/terminal?program=/bin/sh&rows=20&cols=80", true)
+		typ, open, err := term.Read(termCtx)
+		if err != nil || typ != websocket.MessageText || !bytes.Contains(open, []byte(`"type":"open"`)) {
+			t.Fatalf("terminal open = %v %v %s", typ, err, open)
 		}
-		if typ == websocket.MessageBinary {
-			seen = append(seen, msg...)
+		if err := term.Write(termCtx, websocket.MessageBinary, []byte("echo term-$((20+22))\n")); err != nil {
+			t.Fatal(err)
 		}
-	}
-	if err := term.Write(termCtx, websocket.MessageText, []byte(`{"type":"resize","rows":40,"cols":120}`)); err != nil {
-		t.Fatal(err)
-	}
-	if err := term.Write(termCtx, websocket.MessageBinary, []byte("exit 3\n")); err != nil {
-		t.Fatal(err)
-	}
-	for {
-		typ, msg, err := term.Read(termCtx)
-		if err != nil {
-			t.Fatalf("terminal did not report exit: %v", err)
-		}
-		if typ == websocket.MessageText && bytes.Contains(msg, []byte(`"type":"exit"`)) {
-			if !bytes.Contains(msg, []byte(`"code":3`)) {
-				t.Fatalf("exit = %s", msg)
+		var seen []byte
+		for !bytes.Contains(seen, []byte("term-42")) {
+			typ, msg, err := term.Read(termCtx)
+			if err != nil {
+				t.Fatalf("terminal read: %v (so far %q)", err, seen)
 			}
-			break
+			if typ == websocket.MessageBinary {
+				seen = append(seen, msg...)
+			}
 		}
+		if err := term.Write(termCtx, websocket.MessageText, []byte(`{"type":"resize","rows":40,"cols":120}`)); err != nil {
+			t.Fatal(err)
+		}
+		if err := term.Write(termCtx, websocket.MessageBinary, []byte("exit 3\n")); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			typ, msg, err := term.Read(termCtx)
+			if err != nil {
+				t.Fatalf("terminal did not report exit: %v", err)
+			}
+			if typ == websocket.MessageText && bytes.Contains(msg, []byte(`"type":"exit"`)) {
+				if !bytes.Contains(msg, []byte(`"code":3`)) {
+					t.Fatalf("exit = %s", msg)
+				}
+				break
+			}
+		}
+		_ = term.Close(websocket.StatusNormalClosure, "")
+		termCancel()
 	}
-	_ = term.Close(websocket.StatusNormalClosure, "")
-	termCancel()
 
 	// A browser session cookie authenticates the preview proxy and the
 	// stable link only: preview content is same-origin and untrusted, so a

@@ -948,15 +948,6 @@ func erase32(key *[32]byte) {
 	}
 }
 
-func syncDirectory(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
-}
-
 func random32() ([32]byte, error) {
 	var out [32]byte
 	_, err := io.ReadFull(rand.Reader, out[:])

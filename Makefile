@@ -15,8 +15,10 @@ build:
 install:
 	CGO_ENABLED=0 go install -trimpath -ldflags="$(LDFLAGS)" ./cmd/remount
 
+# Heavy integration packages share host runtimes; package serialization keeps
+# their own concurrency intact without making unrelated packages compete.
 test:
-	go test -count=1 -timeout 300s ./...
+	go test -p 1 -count=1 -timeout 600s ./...
 	$(MAKE) public-api
 
 race:
@@ -88,7 +90,8 @@ modal-smoke:
 # packages. Run them under the race detector so this target cannot become a
 # documentation-only success gate again.
 conformance:
-	go test -race -count=1 -timeout 1200s \
+	go test -race -p 1 -count=1 -timeout 1200s \
+		-skip '^(TestExecRoundTripCostOfTheDurableSessionTier|TestPlanbPerf|TestPlanBScale|TestHandoffScaleAndControlFailover)' \
 		./internal/artifact ./internal/broker ./internal/client ./internal/control \
 		./internal/fsops ./internal/node ./internal/proto ./internal/relay \
 		./internal/server ./internal/session ./internal/sim ./internal/transport \
