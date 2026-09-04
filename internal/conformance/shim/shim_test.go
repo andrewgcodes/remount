@@ -69,6 +69,9 @@ func TestInterpretCoversTheProgramsTheSuiteRuns(t *testing.T) {
 	if out, code, interactive := interpret([]string{"cmd.exe", "/d", "/s", "/c", "echo", "hello"}); string(out) != "hello\n" || code != 0 || interactive {
 		t.Errorf("Windows echo interpreted as %q %d %v", out, code, interactive)
 	}
+	if out, code, interactive := interpret([]string{"cmd.exe", "/d", "/s", "/c", "echo hello world."}); string(out) != "hello world.\n" || code != 0 || interactive {
+		t.Errorf("Windows literal echo interpreted as %q %d %v", out, code, interactive)
+	}
 	if _, code, _ := interpret([]string{"cmd.exe", "/d", "/s", "/c", "exit", "7"}); code != 7 {
 		t.Errorf("Windows `exit 7` interpreted as code %d", code)
 	}

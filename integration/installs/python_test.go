@@ -75,7 +75,8 @@ async def main() -> None:
             if current["state"] in ("failed", "destroyed"):
                 raise SystemExit(f"workspace reached {current['state']}")
             await asyncio.sleep(0.1)
-        session = await client.exec(ws["id"], ["/bin/echo", "installed-from-the-wheel"])
+        program = ["cmd.exe", "/d", "/s", "/c", "echo installed-from-the-wheel"] if sys.platform == "win32" else ["/bin/echo", "installed-from-the-wheel"]
+        session = await client.exec(ws["id"], program)
         out = b""
         async for chunk in session:
             if chunk.stream == 1:

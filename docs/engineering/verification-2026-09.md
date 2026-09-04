@@ -17,12 +17,12 @@ in this file, and no run below printed one.
 
 ## 2026-09-04 - native Windows host verification
 
-**Status: required conformance verified; one performance gate remains known
-failing and is visible CI debt.**
+**Status: required conformance verified; one performance gate and two
+full-suite Docker OpenCode lanes remain known failing and are visible CI
+debt.**
 
 Host: Windows Server 2022 amd64. Go: 1.27.1. Race C toolchain: MinGW-w64
-16.1.0. The tested working tree was based on `533088b` after rebasing onto
-`origin/main` at `99e5adb`.
+16.1.0. Final verification integrated `origin/main` at `c47b4bb`.
 
 ### Final command results
 
@@ -30,23 +30,25 @@ Host: Windows Server 2022 amd64. Go: 1.27.1. Race C toolchain: MinGW-w64
 |---|---|
 | `go build ./...` | passed |
 | `go vet ./...` | passed |
-| `go test -count=1 -timeout 40m ./...` | failed only `remount.dev/remount/internal/sim.TestPlanbPerfMoveIncompressible` |
-| `go test -race -count=1 -timeout 60m ./...` | exposed the same performance failure plus two Windows handle/process races recorded below |
-| `go run ./cmd/conformance --build .` | 59 passed, 0 failed, 8 unavailable; all 52 required rows passed; cleanup verified |
-| `remount-windows-amd64.exe version` | `remount v0.0.0-20260904051749-533088b1506c+dirty` |
-| `go run ./cmd/conformance --binary .\remount-windows-amd64.exe` | 59 passed, 0 failed, 8 unavailable; all 52 required rows passed; cleanup verified |
+| `go test -count=1 -timeout 40m ./...` | failed `remount.dev/remount/internal/sim.TestPlanbPerfMoveIncompressible` at 9.2 MB/s versus 20 MB/s; a later run excluding only that gate also exposed the two full-suite Docker OpenCode failures recorded below |
+| `go test -race -count=1 -timeout 60m ./...` | timed out after one hour in `remount.dev/remount/internal/sim.TestPlanBOpenCodeDeterministicModelLane`; earlier race rounds also exposed the fixed handle/process races recorded below |
+| `go test -count=1 -timeout 40m -skip '^(TestPlanbPerfMoveIncompressible\|TestPlanBOpenCodeAgentTranscriptApprovalAndResume\|TestPlanBOpenCodeDeterministicModelLane)$' ./...` | passed |
+| `go test -race -count=1 -timeout 60m -skip '^(TestPlanbPerfMoveIncompressible\|TestPlanBOpenCodeAgentTranscriptApprovalAndResume\|TestPlanBOpenCodeDeterministicModelLane)$' ./...` | passed |
+| `go run ./cmd/conformance --build .` | 60 passed, 0 failed, 8 unavailable; all 53 required rows passed; cleanup verified |
+| `remount-windows-amd64.exe version` | `remount v0.0.0-20260904063639-9a7e70b0b7d5+dirty` |
+| `go run ./cmd/conformance --binary .\remount-windows-amd64.exe` | 60 passed, 0 failed, 8 unavailable; all 53 required rows passed; cleanup verified |
 | `./scripts/lint-locks.sh .` | passed |
 
 The raw ordinary-suite failure is retained exactly:
 
 ```text
 --- FAIL: TestPlanbPerfMoveIncompressible (8.45s)
-    planb_perf_move_test.go:114: incompressible: checkpoint phase 3.444s
-    planb_perf_move_test.go:114: incompressible: restore phase 3.251s
+    planb_perf_move_test.go:114: incompressible: checkpoint phase 3.537s
+    planb_perf_move_test.go:114: incompressible: restore phase 3.33s
     planb_perf_move_test.go:114: incompressible: chunks=0 uploaded_chunks=0 uploaded_bytes=0
-    planb_perf_move_test.go:114: incompressible: 64 MiB moved in 6.818s (9.4 MB/s), format=tar
-    planb_perf_move_test.go:116: incompressible move ran at 9.4 MB/s, want at least 20 MB/s
-FAIL remount.dev/remount/internal/sim 465.965s
+    planb_perf_move_test.go:114: incompressible: 64 MiB moved in 6.939s (9.2 MB/s), format=tar
+    planb_perf_move_test.go:116: incompressible move ran at 9.2 MB/s, want at least 20 MB/s
+FAIL remount.dev/remount/internal/sim 468.240s
 ```
 
 Classification: **confirmed Windows-host performance defect**, not a passed
@@ -59,6 +61,7 @@ names this exact exclusion in the workflow and job summary.
 |---|---|---|
 | Conformance launcher | `internal/conformance.TestLocalExecutableNameUsesWindowsSuffix` | temporary binaries were started without `.exe` |
 | Required session semantics | `CONF-SESS-004`, `CONF-SESS-006` | the runner attempted `/bin/cat` and `/bin/sh`, which do not exist on Windows |
+| Verbatim stdout conformance | `CONF-SESS-009` and `internal/conformance.TestWindowsEchoProgramPreservesLiteral` | after the manifest grew to 1.1.0, `cmd.exe` echoed `"conf-sess-009: stdout must arrive verbatim."` with literal quotes because the command and payload were passed as separate arguments |
 | Filesystem jail | `internal/fsops.TestWindowsHostilePathsAreRejectedBeforeFilesystemAccess` | drive, UNC, device, ADS, reserved-name, and trailing-dot/space inputs were not rejected as Windows path aliases before access |
 | Junction containment | `internal/fsops.TestWindowsJunctionParentCannotEscapeRoot` | no native regression proved a reparse-point parent could not escape the workspace |
 | Artifact namespace | `integration/storage.TestTenantArtifactPhysicalPath` and volume/encrypted-store tests | logical IDs containing `:` produced `The filename, directory name, or volume label syntax is incorrect.` |
@@ -71,6 +74,19 @@ names this exact exclusion in the workflow and job summary.
 | Conformance audit visibility | `CONF-BIND-002` | an immediate event-tail read could race the canonical audit append; the denied request was observed before its `leak_blocked` event |
 | Race cleanup | `internal/session.TestE11FastProducerReplaysEverySequenceAcrossTiers` | `TempDir RemoveAll cleanup: unlinkat ...\session.log: The process cannot access the file because it is being used by another process.` |
 | Race process registration | `internal/sim.TestHandoffScaleAndControlFailover/real-peers-and-durable-restart` | fast processes could exit while Job Object assignment returned `Access is denied`, surfacing as `contain process tree: Access is denied.` |
+| Job Object descendant test synchronization | `internal/session.TestKillWorkspaceTerminatesWindowsDescendants` | the PID file could be observed after creation but before `WriteAllText` stored the PID, producing `strconv.Atoi: parsing "": invalid syntax` |
+| Tiered session restart test synchronization | `internal/sim.TestE11TieredSessionRecordSurvivesNodeRestart` | collecting the terminal chunk did not prove the asynchronous `session.log.committed` completion event was durable before the simulated node death; 2 of 10 focused runs failed with `internal: session: incomplete archived record` |
+| Docker OpenCode installation in the full suite | `internal/sim.TestPlanBOpenCodeAgentTranscriptApprovalAndResume` | the Docker workspace fenced at its local lease safety deadline while installing pinned OpenCode; the install session returned `context deadline exceeded` after fifteen minutes, while a focused ordinary run passed in 77 seconds |
+| Docker session completion in the full suite | `internal/sim.TestPlanBOpenCodeDeterministicModelLane` | after a client cut, the Docker workspace fenced at its local lease safety deadline but the session chunk stream did not close; a full race command timed out after one hour with the test blocked for 56 minutes, and an ordinary full-suite rerun hit the bounded ten-minute context; focused ordinary and race runs passed in 58 and 44 seconds |
+| Install artifact source scan | `integration/installs.TestB32TheSourceTreeScanCatchesAnUntrimmedBinary` | Go recorded source paths with `/`, so a detector searching only for the host's `\` form missed an untrimmed binary |
+| Local Go module proxy | `integration/installs.TestB32AGoModuleConsumerBuildsFromTheArtifactAndDrivesTheInstalledServer` and `TestB32AReplaceIntoTheCheckoutIsCaught` | Windows paths produced invalid `file://C:%5C...` proxy URLs |
+| Linked npm control | `integration/installs.TestB32ALinkedNpmInstallIsCaught` | npm used a Windows junction, but the detector treated its installed path as an ordinary copied directory |
+
+The concurrent `c47b4bb` integration also exposed
+`integration/policy.TestInfrastructureDoesNotOwnRuntimeFacts` on every host:
+a Terraform validation error named the forbidden command as operator guidance.
+The message now describes the supported move command without looking like an
+imperative runtime invocation to the ownership scanner.
 
 The path-jail suite now covers both separators, `..`, drive-relative and
 drive-absolute paths, UNC and device paths, `CON`/`NUL`/`AUX`, ADS syntax,

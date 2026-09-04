@@ -357,16 +357,25 @@ func TestPlanBOpenCodeDeterministicModelLane(t *testing.T) {
 	// live stream, so it is driven by arriving bytes rather than by a timer.
 	var out bytes.Buffer
 	cuts := 0
-	for ch := range res.Session.Chunks() {
-		switch ch.Stream {
-		case proto.StreamStdout, proto.StreamStderr:
-			out.Write(ch.Data)
-		case proto.StreamGap:
-			t.Fatal("session reported a gap")
-		}
-		if out.Len() > 256*(cuts+1) && cuts < 3 {
-			cuts++
-			w.cut("c1")
+stream:
+	for {
+		select {
+		case ch, ok := <-res.Session.Chunks():
+			if !ok {
+				break stream
+			}
+			switch ch.Stream {
+			case proto.StreamStdout, proto.StreamStderr:
+				out.Write(ch.Data)
+			case proto.StreamGap:
+				t.Fatal("session reported a gap")
+			}
+			if out.Len() > 256*(cuts+1) && cuts < 3 {
+				cuts++
+				w.cut("c1")
+			}
+		case <-ctx.Done():
+			t.Fatalf("session stream did not close: %v\n%s", ctx.Err(), out.String())
 		}
 	}
 	if err := res.Session.Err(); err != nil {

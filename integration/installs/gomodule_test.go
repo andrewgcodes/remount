@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -137,7 +138,13 @@ func consumerEnv(t *testing.T, sandbox, proxy string) []string {
 	if err := os.WriteFile(goenv, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	fileURL := func(dir string) string { return (&url.URL{Scheme: "file", Path: dir}).String() }
+	fileURL := func(dir string) string {
+		slash := filepath.ToSlash(dir)
+		if runtime.GOOS == "windows" {
+			slash = "/" + slash
+		}
+		return (&url.URL{Scheme: "file", Path: slash}).String()
+	}
 	env := cleanEnv(t,
 		"GOENV="+goenv,
 		"GOMODCACHE="+filepath.Join(sandbox, "modcache"),
@@ -170,6 +177,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"time"
 
 	"remount.dev/remount/api"
@@ -203,7 +211,11 @@ func run() error {
 	if _, err := c.WaitClaimed(ctx, ws.ID); err != nil {
 		return err
 	}
-	stdout, _, exit, err := c.Run(ctx, ws.ID, "/bin/echo", "installed-from-the-module-artifact")
+	program := []string{"/bin/echo", "installed-from-the-module-artifact"}
+	if runtime.GOOS == "windows" {
+		program = []string{"cmd.exe", "/d", "/s", "/c", "echo installed-from-the-module-artifact"}
+	}
+	stdout, _, exit, err := c.Run(ctx, ws.ID, program...)
 	if err != nil {
 		return err
 	}

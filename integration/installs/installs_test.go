@@ -239,7 +239,12 @@ func containsSourceTree(t *testing.T, path, root string) bool {
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
-	return bytes.Contains(body, []byte(root))
+	for _, candidate := range []string{root, filepath.ToSlash(root)} {
+		if bytes.Contains(body, []byte(candidate)) {
+			return true
+		}
+	}
+	return false
 }
 
 func requireNoSourceTree(t *testing.T, path, root string) {
