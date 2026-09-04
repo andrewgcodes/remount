@@ -429,6 +429,20 @@ func New(opts Options) (*Node, error) {
 			volumeCapable = true
 		} else {
 			opts.Logger.Info("read-only volumes unavailable", "mount_probe", probeErr, "process_backend", processBackendErr)
+			// A node that cannot bind-mount never advertises read-only-volumes,
+			// so the control plane never places a volume-bearing workspace here
+			// and no attachment can succeed. Keeping the backend anyway meant
+			// every claim and every move still committed a workspace generation
+			// fence, and each commit rewrote the whole catalog: two JSON
+			// marshals, an unmarshal, a temp file and two fsyncs, under the
+			// node-wide volume lock. Claiming n workspaces cost O(n^2) to fence
+			// volumes that could not exist. Dropping the backend takes the
+			// existing n.volumes == nil path, which returns immediately for a
+			// workspace with no volumes and refuses one that asks for them.
+			_ = opts.Volumes.Close()
+			opts.Volumes = nil
+			_ = volumeRoot.Close()
+			volumeRoot = nil
 		}
 	}
 	if volumeCapable && !slices.Contains(opts.Caps, proto.CapabilityReadOnlyVolumes) {
