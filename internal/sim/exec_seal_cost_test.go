@@ -19,10 +19,12 @@ package sim
 // session replays byte-exactly after node loss.
 
 import (
+	"context"
 	"sort"
 	"testing"
 	"time"
 
+	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/node"
 	"remount.dev/remount/internal/proto"
 )
@@ -32,13 +34,12 @@ import (
 // rather than the seal.
 const execSealSamples = 24
 
-// measureExecRoundTrip runs execSealSamples sequential trivial execs against a
-// fresh world and returns their median. Sequential on purpose: concurrency
-// here would measure syscall.ForkLock, which Go takes process-wide around
-// fork/exec. That lock is why the 200-way lane cannot go below ~440 ms on this
-// host, and it is a property of running 200 nodes inside one test process
-// rather than a property of the product.
-func measureExecRoundTrip(t *testing.T, artifactTier bool) time.Duration {
+type execSealLane struct {
+	client    *client.Client
+	workspace string
+}
+
+func newExecSealLane(t *testing.T, artifactTier bool) execSealLane {
 	t.Helper()
 	w := newWorld(t)
 	name := "seal-off"
@@ -54,23 +55,21 @@ func measureExecRoundTrip(t *testing.T, artifactTier bool) time.Duration {
 	})
 	c := w.client("c-" + name)
 	ws := mustWS(t, c, proto.WorkspaceSpec{})
-	ctx := ctxT(t, 5*time.Minute)
+	return execSealLane{client: c, workspace: ws.ID}
+}
 
-	// One warm exec so image pull, node claim and process backend start-up are
-	// not attributed to the first sample.
-	if _, _, exit, err := c.Run(ctx, ws.ID, "sh", "-c", "printf warm"); err != nil || exit == nil || exit.Code != 0 {
-		t.Fatalf("warm exec: exit=%+v err=%v", exit, err)
+func (l execSealLane) sample(t *testing.T, ctx context.Context, output string, sample int) time.Duration {
+	t.Helper()
+	started := time.Now()
+	stdout, _, exit, err := l.client.Run(ctx, l.workspace, "sh", "-c", "printf '"+output+"'")
+	elapsed := time.Since(started)
+	if err != nil || exit == nil || exit.Code != 0 || string(stdout) != output {
+		t.Fatalf("exec %d: stdout=%q exit=%+v err=%v", sample, stdout, exit, err)
 	}
+	return elapsed
+}
 
-	lat := make([]time.Duration, execSealSamples)
-	for i := range lat {
-		started := time.Now()
-		stdout, _, exit, err := c.Run(ctx, ws.ID, "sh", "-c", "printf 'scale-exec'")
-		lat[i] = time.Since(started)
-		if err != nil || exit == nil || exit.Code != 0 || string(stdout) != "scale-exec" {
-			t.Fatalf("exec %d: stdout=%q exit=%+v err=%v", i, stdout, exit, err)
-		}
-	}
+func medianExecLatency(lat []time.Duration) time.Duration {
 	sort.Slice(lat, func(a, b int) bool { return lat[a] < lat[b] })
 	return lat[len(lat)/2]
 }
@@ -94,11 +93,27 @@ func TestExecRoundTripCostOfTheDurableSessionTier(t *testing.T) {
 		t.Skip("unavailable: this lane runs two full sim worlds and many execs; skipped under -short")
 	}
 	// Each configuration gets its own fresh world, so neither inherits the
-	// other's caches. Measuring the cheap one first biases against the finding
-	// rather than towards it, since a machine that gets busier during the run
-	// inflates the second number.
-	off := measureExecRoundTrip(t, false)
-	on := measureExecRoundTrip(t, true)
+	// other's caches. Samples alternate order so a host becoming busier or
+	// quieter while the package suite runs cannot make one arm inherit the
+	// whole trend.
+	offLane := newExecSealLane(t, false)
+	onLane := newExecSealLane(t, true)
+	ctx := ctxT(t, 5*time.Minute)
+	offLane.sample(t, ctx, "warm", -1)
+	onLane.sample(t, ctx, "warm", -1)
+	offLat := make([]time.Duration, execSealSamples)
+	onLat := make([]time.Duration, execSealSamples)
+	for i := range offLat {
+		if i%2 == 0 {
+			offLat[i] = offLane.sample(t, ctx, "scale-exec", i)
+			onLat[i] = onLane.sample(t, ctx, "scale-exec", i)
+		} else {
+			onLat[i] = onLane.sample(t, ctx, "scale-exec", i)
+			offLat[i] = offLane.sample(t, ctx, "scale-exec", i)
+		}
+	}
+	off := medianExecLatency(offLat)
+	on := medianExecLatency(onLat)
 
 	ratio := float64(on) / float64(off)
 	t.Logf("exec round trip p50: artifact tier off %v, on %v, ratio %.2fx (n=%d each)",
