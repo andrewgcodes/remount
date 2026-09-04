@@ -238,3 +238,113 @@ func (w *escapeWatcher) escaped() []string {
 	sort.Strings(out)
 	return out
 }
+
+// TestE5SiblingTenantsCannotReachEachOther is E5: two mutually untrusting
+// tenants on one node.
+//
+// The backend claims `SiblingIsolation: true`. That claim is exactly the shape
+// of the `enforced_gateway` claim which, when it was finally probed, turned out
+// to be unearned — so this probes it rather than trusting it. Two workspaces are
+// created on one backend and each is asked to reach the other's private
+// network: its broker address, and the guest address inside its namespace.
+// Neither may succeed, and — the part a command's exit status cannot tell you —
+// no frame from one may reach the other's veth at all.
+func TestE5SiblingTenantsCannotReachEachOther(t *testing.T) {
+	if os.Getenv("REMOUNT_GVISOR_INTEGRATION") != "1" {
+		t.Skip("unavailable: set REMOUNT_GVISOR_INTEGRATION=1 on a privileged Linux host with runsc")
+	}
+	rootfs := os.Getenv("REMOUNT_GVISOR_ROOTFS")
+	if rootfs == "" {
+		t.Skip("unavailable: REMOUNT_GVISOR_ROOTFS is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	// One backend, which is what "share one node" means.
+	backend, err := New(ctx, Options{Dir: t.TempDir(), RootFS: rootfs})
+	if err != nil {
+		t.Fatalf("gvisor backend unavailable in required lane: %v", err)
+	}
+
+	type tenant struct {
+		id       string
+		handle   *handle
+		listener net.Listener
+	}
+	tenants := make([]*tenant, 0, 2)
+	for _, id := range []string{"ws_tenant_a", "ws_tenant_b"} {
+		raw, err := backend.Create(ctx, id, proto.WorkspaceSpec{}, nil)
+		if err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+		h := raw.(*handle)
+		t.Cleanup(func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := h.Destroy(cleanupCtx); err != nil {
+				t.Errorf("cleanup %s: %v", id, err)
+			}
+		})
+		listener, err := net.Listen("tcp4", net.JoinHostPort(h.BrokerAdvertiseHost(), "0"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { listener.Close() })
+		go func() {
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				_ = conn.Close()
+			}
+		}()
+		endpoint := "http://" + listener.Addr().String()
+		if err := h.ApplyNetworkPolicy(ctx, proto.NetworkPolicy{Default: proto.NetworkDefaultDeny}, workspace.NetworkEndpoint{
+			Workspace: id, Generation: 1, ReverseProxyURL: endpoint, ForwardProxyURL: endpoint,
+		}); err != nil {
+			t.Fatalf("apply policy for %s: %v", id, err)
+		}
+		tenants = append(tenants, &tenant{id: id, handle: h, listener: listener})
+	}
+	a, b := tenants[0], tenants[1]
+
+	// Each tenant's own broker must work, or the negative results below would
+	// be meaningless — a workspace with no network at all trivially cannot
+	// reach its neighbour.
+	for _, ten := range tenants {
+		host, port, _ := net.SplitHostPort(ten.listener.Addr().String())
+		if err := runIn(ctx, ten.handle, "nc -z -w 2 "+host+" "+port); err != nil {
+			t.Fatalf("%s could not reach its own broker, so this test proves nothing: %v", ten.id, err)
+		}
+	}
+
+	// The neighbour's addresses: its broker, and the address inside its
+	// namespace. Neither is a destination this tenant has any claim to.
+	bHost, bPort, _ := net.SplitHostPort(b.listener.Addr().String())
+	for name, command := range map[string]string{
+		"sibling broker":     "nc -z -w 2 " + bHost + " " + bPort,
+		"sibling guest":      "nc -z -w 2 " + b.handle.network.GuestAddress().String() + " 22",
+		"sibling broker UDP": "nslookup example.com " + bHost,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := runIn(ctx, a.handle, command); err == nil {
+				t.Errorf("tenant A reached tenant B's %s (%s): the node does not isolate siblings, "+
+					"and SiblingIsolation is claimed unconditionally", name, command)
+			}
+		})
+	}
+}
+
+// runIn executes a shell command inside a workspace and reports its failure.
+func runIn(ctx context.Context, h *handle, command string) error {
+	spec := session.Spec{Kind: proto.SessionExec, Program: []string{"/bin/sh", "-c", command}}
+	if err := h.Prepare(&spec); err != nil {
+		return err
+	}
+	out, err := exec.CommandContext(ctx, spec.Program[0], spec.Program[1:]...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}

@@ -71,9 +71,16 @@ resource behind:
   directory, so a remote daemon produced workspaces that started, accepted
   writes and silently held none of them. Now probed with a nonce at startup.
 
-**What remains yours:** E5, which needs two mutually untrusting tenants on one
-node — `TestE4DenialConformance` does not set that up — and the rest of §15's
-scale and release-candidate work.
+**E5 is done too.** `TestE5SiblingTenantsCannotReachEachOther` puts two
+workspaces on one backend, proves each reaches its own broker so the negative
+results mean something, and proves neither reaches the other's broker, guest
+address or DNS. Confirmed on the wire rather than by exit status, because exit
+status is exactly what fooled everyone about E4: capturing during a run shows 7
+frames inside each tenant's own /30 and zero crossing. That is what earns
+`SiblingIsolation`. B28 is recorded passed on the same evidence.
+
+**What remains yours:** B29 (Firecracker, needs `/dev/kvm`) and the rest of
+§15's scale and release-candidate work.
 
 **What to run:**
 

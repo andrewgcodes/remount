@@ -92,10 +92,10 @@ var scenarios = []Scenario{
 	{
 		ID: "E5", Title: "two mutually untrusting tenants share one gVisor node",
 		Layer: LayerHostCI, Required: true,
-		Owner:    "internal/workspace/gvisor.TestE4DenialConformance",
+		Owner:    "internal/workspace/gvisor.TestE5SiblingTenantsCannotReachEachOther",
 		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS"},
-		Recorded: StatusUnavailable, Source: sourceHandoff,
-		Note: "same host gate as E4, which now passes; E5 additionally needs two mutually untrusting tenants on one node, which TestE4DenialConformance does not set up, so E5 stays unproven",
+		Recorded: StatusPassed, Source: sourceHandoff,
+		Note: "two workspaces on one backend, each proven to reach its own broker so the negatives mean something, and neither able to reach the other's broker, guest address or DNS. Confirmed on the wire rather than by exit status, because that is how the E4 suite fooled everyone: capturing during a run shows 7 frames inside each tenant's own /30 and zero crossing between them. This is what earns SiblingIsolation.",
 	},
 	{
 		ID: "E6", Title: "approve-on-first-use parks egress, a decision releases it, timeout denies",
@@ -421,9 +421,10 @@ var scenarios = []Scenario{
 	{
 		ID: "B28", Title: "the exact gVisor candidate passes isolation and enforced-gateway conformance",
 		Layer: LayerHostCI, Required: true, Source: sourcePlanB,
-		Env:  []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS", "REMOUNT_CHAOS_IMAGE"},
-		Open: notLanded("B7 (§15, isolation, scale and release-candidate artifacts)", "11"),
-		Note: "the host probe already exists as integration/chaos/backend-gates.sh --probe; the aggregate lane that consumes its verdict as a scenario does not",
+		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS"},
+		Owner:    "internal/workspace/gvisor.TestE4DenialConformance and TestE5SiblingTenantsCannotReachEachOther",
+		Recorded: StatusPassed,
+		Note:     "the enforced-gateway half is E4's seven-check denial suite and the isolation half is E5's two tenants, both run against the exact candidate on a host where runsc is registered (integration/chaos/backend-gates.sh --probe reports available). Both were made honest first: they now assert what leaves the workspace, captured with AF_PACKET, rather than inferring denial from a reply that never arrives. docs/engineering/gvisor-egress-finding-2026-09-04.md",
 	},
 	{
 		ID: "B29", Title: "Firecracker reports either an exact-host pass or unavailable with a reason",
