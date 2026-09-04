@@ -164,6 +164,19 @@ tests passed. The ordinary and race-conformance targets now serialize
 packages with `-p 1`, retaining all tests and concurrency within each package
 while removing competition between unrelated heavyweight packages.
 
+**Package serialization did not resolve the OpenCode snapshot failure.** The
+next Ubuntu conformance run failed at the same lock file. OpenCode stores
+durable session data under `.local/share/opencode`, which the recipe already
+declares as movable state, but derives process-coordination locks from
+`XDG_STATE_HOME`. With workspace `$HOME`, those transient locks landed inside
+the snapshot tree and could be replaced by container-root after the backend's
+ownership handoff. The recipe now keeps XDG state in a workspace-specific
+directory under `/tmp`; durable OpenCode state, the workspace tree, and the
+leak-scan assertions remain unchanged. A focused Docker run passed with an
+explicit assertion that `.local/state/opencode` never entered the workspace.
+A five-run stress attempt reproduced the separately recorded session-stream
+close failure before completing; it did not reproduce the lock-file failure.
+
 **A Windows-hosted Docker conformance run selected Windows commands for a
 Linux workspace.** Command selection was compiled from the runner's OS, so
 Docker sessions received `cmd.exe` even though they execute inside Linux. The

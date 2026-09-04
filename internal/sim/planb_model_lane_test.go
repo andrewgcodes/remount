@@ -387,6 +387,9 @@ stream:
 	if exit := res.Session.Exit(); exit == nil || exit.Code != 0 {
 		t.Fatalf("opencode exit = %+v\n%s\n%s", exit, out.String(), egressLog(t, c, ws.ID, planBUpstream))
 	}
+	if _, err := c.Stat(ctx, ws.ID, ".local/state/opencode"); err == nil || codeOf(err) != proto.CodeNotFound {
+		t.Fatalf("transient OpenCode state entered workspace: %v", err)
+	}
 	// B1: the harness did the work the script asked for, and said so.
 	greeting, err := c.ReadFile(ctx, ws.ID, "GREETING.txt")
 	if err != nil {
