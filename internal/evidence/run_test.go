@@ -118,6 +118,21 @@ func TestAnUnselectedGateIsUnavailableNotPassed(t *testing.T) {
 	t.Fatal("B0.lint is missing from the report")
 }
 
+func TestBaselineGateEnvironmentExcludesScenarioPrerequisites(t *testing.T) {
+	t.Setenv("REMOUNT_GVISOR_INTEGRATION", "1")
+	t.Setenv("REMOUNT_GVISOR_ROOTFS", "/rootfs")
+	t.Setenv("PATH", "/bin")
+	env := withoutEnv(os.Environ(), scenarioEnvNames())
+	if slices.ContainsFunc(env, func(entry string) bool {
+		return strings.HasPrefix(entry, "REMOUNT_GVISOR_")
+	}) {
+		t.Fatal("a host-gated scenario prerequisite leaked into the baseline gate")
+	}
+	if !slices.Contains(env, "PATH=/bin") {
+		t.Fatal("the baseline gate lost an unrelated environment variable")
+	}
+}
+
 func TestRunWritesAllThreeSummariesAndListsWhatItCouldNotProve(t *testing.T) {
 	dir := newRepo(t)
 	out := t.TempDir()

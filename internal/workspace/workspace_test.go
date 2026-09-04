@@ -180,6 +180,7 @@ esac
 		t.Fatal(err)
 	}
 	d.Binary = binary
+	d.checked = true
 	if _, err := d.Create(context.Background(), "ws_fail", proto.WorkspaceSpec{}, nil); err == nil {
 		t.Fatal("failed docker run succeeded")
 	}
@@ -220,6 +221,7 @@ esac
 		t.Fatal(err)
 	}
 	d.Binary = binary
+	d.checked = true
 	if _, err := d.Create(context.Background(), "ws_fail", proto.WorkspaceSpec{}, nil); err == nil || !strings.Contains(err.Error(), "cleanup: inspect") {
 		t.Fatalf("failed docker run error = %v", err)
 	}

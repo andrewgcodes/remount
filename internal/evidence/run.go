@@ -242,6 +242,7 @@ func runGate(ctx context.Context, opts Options, res Result, gate Gate) Record {
 	}
 	cmd := exec.CommandContext(runCtx, gate.Argv[0], gate.Argv[1:]...)
 	cmd.Dir = opts.Root
+	cmd.Env = withoutEnv(os.Environ(), scenarioEnvNames())
 	out, err := cmd.CombinedOutput()
 	rec.DurationMS = opts.Now().Sub(rec.StartedAt).Milliseconds()
 
@@ -290,6 +291,36 @@ func registryEnvNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func scenarioEnvNames() []string {
+	seen := map[string]bool{}
+	var names []string
+	for _, s := range Scenarios() {
+		for _, name := range s.Env {
+			if !seen[name] {
+				seen[name] = true
+				names = append(names, name)
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func withoutEnv(environ, names []string) []string {
+	blocked := make(map[string]bool, len(names))
+	for _, name := range names {
+		blocked[name] = true
+	}
+	out := make([]string, 0, len(environ))
+	for _, entry := range environ {
+		name, _, _ := strings.Cut(entry, "=")
+		if !blocked[name] {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 // scenarioRecords turns every registry row into a record. An unwired row is
