@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
 	"io"
@@ -1578,6 +1579,47 @@ func TestAuthzPushClosesRevokedPrincipalOnly(t *testing.T) {
 	n.closeRevokedSessions(r)
 	if exit := waitExit(t, kept); exit.Reason != proto.ExitReasonRevoked {
 		t.Fatalf("reset exit %+v", exit)
+	}
+}
+
+func TestAuthorizeClaimsDistinguishesControlAheadRevision(t *testing.T) {
+	n := newTestNode(t, nil)
+	public, private, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &ws{Workspace: proto.Workspace{
+		ID: "ws_authz_ahead", Node: n.id, Generation: 1, AuthzRevision: 3, Tenant: "team",
+	}}
+	n.mu.Lock()
+	n.ctrlPub = public
+	n.workspaces[w.ID] = w
+	n.mu.Unlock()
+	grant := func(revision uint64) *proto.Grant {
+		claims := proto.GrantClaims{
+			Client: "c_ahead", WS: w.ID, Node: n.id, Principal: "agent:bob", Tenant: w.Tenant,
+			AuthzRevision: revision, ExpiresAt: time.Now().Add(time.Minute).UnixMilli(), Gen: w.Generation,
+		}
+		return &proto.Grant{Claims: claims, Signature: ed25519.Sign(private, proto.MustMarshal(claims)), Node: n.id}
+	}
+
+	_, _, err = n.authorizeClaims("c_ahead", w.ID, grant(4))
+	var protocolErr *proto.Error
+	if !errors.As(err, &protocolErr) || protocolErr.Code != proto.CodeConflict {
+		t.Fatalf("control-ahead grant = %v", err)
+	}
+	n.mu.Lock()
+	r := n.applyAuthzLocked(w, proto.WSRenewResult{AuthzRevision: 4, Revoked: []string{"agent:alice"}})
+	n.mu.Unlock()
+	if r == nil {
+		t.Fatal("authorization push did not retain revocation work")
+	}
+	if _, claims, err := n.authorizeClaims("c_ahead", w.ID, grant(4)); err != nil || claims.AuthzRevision != 4 {
+		t.Fatalf("current grant claims=%+v err=%v", claims, err)
+	}
+	_, _, err = n.authorizeClaims("c_ahead", w.ID, grant(3))
+	if !errors.As(err, &protocolErr) || protocolErr.Code != proto.CodeUnauthorized {
+		t.Fatalf("stale grant = %v", err)
 	}
 }
 

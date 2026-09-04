@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -124,5 +125,52 @@ func TestSessionCloseWakesBlockedDelivery(t *testing.T) {
 	case <-s.Done():
 	case <-time.After(time.Second):
 		t.Fatal("Close did not wake blocked delivery")
+	}
+}
+
+func TestNodeCallWaitsForAuthorizationPush(t *testing.T) {
+	clientConn, serverConn := transport.Pipe(8)
+	clientPeer := transport.NewPeer(clientConn, nil)
+	var nodeCalls atomic.Int64
+	serverPeer := transport.NewPeer(serverConn, transport.HandlerFunc(func(ctx context.Context, peer *transport.Peer, frame *proto.Frame) {
+		switch frame.Op {
+		case proto.OpGrant:
+			_ = peer.Respond(ctx, frame, proto.Grant{
+				Node: "n_test",
+				Claims: proto.GrantClaims{
+					Client: "c_test", WS: "ws_test", Node: "n_test", AuthzRevision: 2,
+				},
+			})
+		case "test.authz":
+			if nodeCalls.Add(1) < 3 {
+				_ = peer.RespondErr(ctx, frame, proto.Err(proto.CodeConflict, "authorization push pending"))
+				return
+			}
+			_ = peer.Respond(ctx, frame, struct{}{})
+		default:
+			_ = peer.RespondErr(ctx, frame, proto.Err(proto.CodeUnsupported, "unexpected operation"))
+		}
+	}))
+	t.Cleanup(func() {
+		_ = clientPeer.Close()
+		_ = serverPeer.Close()
+	})
+	c := New(Options{Retries: 1})
+	c.mu.Lock()
+	c.peer = clientPeer
+	c.id = "c_test"
+	c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := c.nodeCall(ctx, "ws_test", "test.authz", func(grant *proto.Grant) any {
+		return struct {
+			Grant *proto.Grant `cbor:"grant"`
+		}{Grant: grant}
+	}, &struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if calls := nodeCalls.Load(); calls != 3 {
+		t.Fatalf("node calls = %d", calls)
 	}
 }
