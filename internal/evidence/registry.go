@@ -86,8 +86,8 @@ var scenarios = []Scenario{
 		Layer: LayerHostCI, Required: true,
 		Owner:    "internal/workspace/gvisor.TestE4DenialConformance",
 		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS"},
-		Recorded: StatusFailed, Source: sourceHandoff,
-		Note: "the suite now runs (a Colima VM hosts runsc; see handoff-linux-host-2026-09-03.md §1) and it FAILS: every forbidden destination reaches the host side of the veth, because gVisor injects frames below netfilter's IP hooks and the nftables output chain never sees them. Six of the seven checks passed only because the return path was blocked elsewhere. EgressMode enforced_gateway is advertised unconditionally and is unearned. docs/engineering/gvisor-egress-finding-2026-09-04.md",
+		Recorded: StatusPassed, Source: sourceHandoff,
+		Note: "runs on a Colima-hosted runsc (handoff-linux-host-2026-09-03.md §1) and passes, three consecutive runs, after the egress leak it exposed was fixed: gVisor injects frames below netfilter's IP hooks, so the nftables output chain never saw them and every forbidden destination crossed the veth. A netdev egress chain on the workspace veth now carries the policy, and the suite asserts it with an AF_PACKET watcher rather than inferring denial from a missing reply. docs/engineering/gvisor-egress-finding-2026-09-04.md",
 	},
 	{
 		ID: "E5", Title: "two mutually untrusting tenants share one gVisor node",
@@ -95,7 +95,7 @@ var scenarios = []Scenario{
 		Owner:    "internal/workspace/gvisor.TestE4DenialConformance",
 		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS"},
 		Recorded: StatusUnavailable, Source: sourceHandoff,
-		Note: "same host gate as E4, which now runs and fails; E5 is unproven for the same reason",
+		Note: "same host gate as E4, which now passes; E5 additionally needs two mutually untrusting tenants on one node, which TestE4DenialConformance does not set up, so E5 stays unproven",
 	},
 	{
 		ID: "E6", Title: "approve-on-first-use parks egress, a decision releases it, timeout denies",
