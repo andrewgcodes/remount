@@ -364,7 +364,75 @@ what a quarantined workspace *is*, and it wants deciding rather than patching.
 
 None of these are exotic. They are the first three things that happen when you
 create one workspace, and they were reachable the moment a host with `/dev/kvm`
-existed. `.github/workflows/kvm.yml` fails its last step on purpose "until the
-adapters are integrated" — but the adapters are integrated, in
-`cmd/remount/build_node.go`, and have been. What was missing was a host, and the
-host was available all along behind a flag nobody had tried.
+existed.
+
+`.github/workflows/kvm.yml` fails its last step on purpose "until the node-owned
+TAP, coherent CoW volume, jailed API, and guest-executor adapters are
+integrated". That instruction is stale, and the history says so precisely: the
+four adapters are constructed in `cmd/remount/build_node.go` —
+`NewJailerFactory`, `NewSystemNetworkProvider`, `NewReflinkStore` plus
+`NewCoWVolumeProvider`, and `NewGuestBridge` — and they were wired by `a3b5235`,
+while the workflow's deliberate failure was last touched by the earlier
+`5254695`. Nobody went back to it after the integration landed.
+
+So what was missing was never the adapters. It was a host, and the host was
+available the whole time behind a Colima flag nobody had tried.
+
+
+---
+
+# The Firecracker lane now boots, and one thing it does is still wrong
+
+After the three defects above, a workspace materializes on a real Firecracker
+microVM and works:
+
+```
+$ remount ws create --name fcvm --wait
+state=claimed node=n_06g6qjq6fcyd7zc90gp6k79ksc gen=1
+
+$ remount exec $WS -- /bin/sh -c 'uname -r; echo HELLO-FROM-MICROVM'
+5.10.223
+HELLO-FROM-MICROVM
+```
+
+The host is `6.8.0-117-generic`, so `5.10.223` is the guest, and jailed
+`firecracker --id rm-…` processes back it. A file written through the guest
+reads back. That is the first end-to-end microVM this repository has run.
+
+Two of the obstacles were mine rather than the code's, and are recorded so
+nobody loses the time twice. Alpine's `/sbin/init` is a symlink to
+`/bin/busybox`, so writing an init script "to" it overwrites busybox and the VM
+boots into a rootfs with no shell — remove the symlink first. And the guest
+agent's flag is `--workspace`, not `--root`; passing the wrong one makes init
+exit 1 and the kernel panics with "Attempted to kill init", which reads like a
+kernel problem and is not.
+
+## Open: explicit snapshots are rejected forever
+
+`remount ws snapshot` on that healthy workspace fails every time:
+
+```
+resource_exhausted: workspace snapshot interval 1s has not elapsed
+```
+
+Measured at 5, 10 and 15 seconds after the previous attempt, and after a fresh
+3-second wait. The interval is one second. The `SNAPSHOT` column stays empty, so
+nothing is being produced either.
+
+**The mechanism is not established, and it is deliberately not guessed at here.**
+The shape strongly suggests the failure this document keeps finding — a retry
+colliding with its own predecessor. `Client.nodeCall` retries once on conflict,
+unreachable or unauthorized; `acquireSnapshot` sets `w.lastSnapshot` when the
+gate *passes* and rejects anything within the interval after that; so a first
+attempt that passes the gate, sets the timestamp and then fails would leave its
+own retry to be refused by the interval it just created. That is a hypothesis.
+It is not confirmed, `runMutation` already keys snapshots by idempotency key in
+a way that should make the retry a cache hit, and the node log records no
+snapshot attempt at all — which the hypothesis does not explain.
+
+MISTAKES.md #47 is about exactly this temptation: a recognisable shape is not a
+diagnosis. **The next measurement**, for whoever picks this up: log or count
+entries to `acquireSnapshot` with the value of `w.lastSnapshot` and whether
+`explicit` is set, and confirm how many requests the node actually receives for
+one CLI invocation. If it is one, the retry hypothesis is dead and the timestamp
+is being set by something not yet identified.
