@@ -7,7 +7,8 @@
 #
 # Mirrors the ci.yml jobs, in the order they are cheapest to fail:
 #
-#   test            gofmt, vet, lint-locks, the suite, the race lane
+#   test            gofmt, vet, lint-locks, the suite (both Go modules), the
+#                   race lane
 #   build           make dist, which cross-compiles every platform
 #   static-analysis go mod verify/tidy, staticcheck, govulncheck, seeded fuzz
 #   conformance     make conformance, bounded fuzzing
@@ -16,14 +17,27 @@
 # through the windows-test job. That job has caught real defects a
 # darwin-only vet does not see.
 #
+# Only ci.yml is mirrored. The SDK, web, isolation, KVM, vendor, MinIO, MCP
+# and release workflows have their own triggers and prerequisites and are not
+# part of this verdict.
+#
 # Usage:
 #   scripts/verify-local.sh              everything
 #   scripts/verify-local.sh fast         skip the race lane and conformance
 #   scripts/verify-local.sh <name>...    run only the named gates
 #
-# Exit status is the number of failed gates, so `if scripts/verify-local.sh`
-# is a usable precondition. Every gate runs even when an earlier one fails:
-# one full report beats a bisect through six pushes.
+# Exit status:
+#   0  every selected gate ran and passed
+#   1  at least one gate failed
+#   2  no gate failed, but a gate could not run (an analyzer is not
+#      installed) so the verdict is incomplete; a check that cannot run is
+#      unavailable, never passed
+#   64 usage error
+#
+# so `if scripts/verify-local.sh` is a usable precondition. Every gate runs
+# even when an earlier one fails: one full report beats a bisect through six
+# pushes. Only the complete gate set, with every gate executed, is reported
+# as safe to push; `fast` and named gates say which subset they covered.
 set -uo pipefail
 
 cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -36,7 +50,9 @@ SUITE_TIMEOUT="${SUITE_TIMEOUT:-900s}"
 RACE_TIMEOUT="${RACE_TIMEOUT:-1800s}"
 
 failed=0
+unavailable=0
 declare -a results=()
+declare -a unavailable_names=()
 
 bold=$(tput bold 2>/dev/null || true)
 red=$(tput setaf 1 2>/dev/null || true)
@@ -64,6 +80,20 @@ gate() { # gate <name> <command...>
   rm -f "$log"
 }
 
+# A gate whose tool is absent did not run. It is neither a pass nor a
+# failure, and the aggregate verdict must say so rather than fold it into
+# "all gates passed": CI installs these tools, so a local run that lacks them
+# has not earned the checks CI will make.
+unavailable_gate() { # unavailable_gate <name> <reason> <how to install>
+  local name="$1" reason="$2" install="$3"
+  printf '%s==> %s%s\n' "$bold" "$name" "$reset"
+  printf '%s    UNAVAILABLE%s %s(%s)%s\n' "$red" "$reset" "$dim" "$reason" "$reset"
+  printf '      %s\n' "$install"
+  results+=("UNAV $name ($reason)")
+  unavailable_names+=("$name")
+  unavailable=$((unavailable + 1))
+}
+
 # --- individual gates, each mirroring one ci.yml step -----------------------
 
 gate_gofmt() { gate "gofmt" bash -c 'test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }'; }
@@ -77,8 +107,17 @@ gate_crossvet() {
 
 gate_locks() { gate "lock discipline" ./scripts/lint-locks.sh .; }
 
+# `make test` is the in-module suite plus `make public-api`, which compiles
+# and tests the exported SDK from the separate integration/publicsdk module.
+# Only an external module can prove the public packages avoid Go `internal`
+# imports, so parity with the test gate needs both.
+publicsdk_test() {
+  ( cd integration/publicsdk && go test -count=1 -timeout "$SUITE_TIMEOUT" ./... )
+}
+
 gate_suite() {
   gate "suite" go test -p 1 -count=1 -timeout "$SUITE_TIMEOUT" ./...
+  gate "suite (integration/publicsdk)" publicsdk_test
 }
 
 gate_race() {
@@ -93,16 +132,12 @@ gate_static() {
   if command -v staticcheck >/dev/null; then
     gate "staticcheck" staticcheck ./...
   else
-    printf '%s==> staticcheck%s\n%s    skipped: not installed%s\n' "$bold" "$reset" "$dim" "$reset"
-    printf '      go install honnef.co/go/tools/cmd/staticcheck@v0.8.1\n'
-    results+=("skip staticcheck (not installed)")
+    unavailable_gate "staticcheck" "not installed" "go install honnef.co/go/tools/cmd/staticcheck@v0.8.1"
   fi
   if command -v govulncheck >/dev/null; then
     gate "govulncheck" govulncheck ./...
   else
-    printf '%s==> govulncheck%s\n%s    skipped: not installed%s\n' "$bold" "$reset" "$dim" "$reset"
-    printf '      go install golang.org/x/vuln/cmd/govulncheck@v1.7.0\n'
-    results+=("skip govulncheck (not installed)")
+    unavailable_gate "govulncheck" "not installed" "go install golang.org/x/vuln/cmd/govulncheck@v1.7.0"
   fi
   gate "seeded fuzz corpus" go test ./... -run '^Fuzz'
 }
@@ -124,19 +159,22 @@ run_fast() {
   gate_suite; gate_build; gate_static
 }
 
-case "${1:-all}" in
+# Which set ran decides what the verdict may claim. Only `all` is the full
+# ci.yml gate set; the others are named as the subset they are.
+gate_set="${1:-all}"
+case "$gate_set" in
   all)  run_all ;;
   fast) run_fast ;;
   *)
+    gate_set="selected"
     for name in "$@"; do
-      if declare -F "gate_$name" >/dev/null; then
-        "gate_$name"
-      else
+      if ! declare -F "gate_$name" >/dev/null; then
         echo "unknown gate: $name" >&2
         echo "available: gofmt vet crossvet locks suite race build static conformance" >&2
-        exit 2
+        exit 64
       fi
     done
+    for name in "$@"; do "gate_$name"; done
     ;;
 esac
 
@@ -146,15 +184,30 @@ echo
 printf '%s--- summary ---%s\n' "$bold" "$reset"
 for line in "${results[@]}"; do
   case "$line" in
-    FAIL*) printf '%s%s%s\n' "$red" "$line" "$reset" ;;
-    skip*) printf '%s%s%s\n' "$dim" "$line" "$reset" ;;
-    *)     printf '%s%s%s\n' "$green" "$line" "$reset" ;;
+    FAIL*|UNAV*) printf '%s%s%s\n' "$red" "$line" "$reset" ;;
+    *)           printf '%s%s%s\n' "$green" "$line" "$reset" ;;
   esac
 done
 
-if [ "$failed" -eq 0 ]; then
-  printf '\n%sall gates passed — safe to push%s\n' "$green" "$reset"
-else
-  printf '\n%s%d gate(s) failed — do not push%s\n' "$red" "$failed" "$reset"
+case "$gate_set" in
+  all)      set_desc="the full ci.yml gate set" ;;
+  fast)     set_desc="the fast gate set (race lane and conformance did not run)" ;;
+  selected) set_desc="selected gates: $*" ;;
+esac
+ran=${#results[@]}
+
+if [ "$failed" -gt 0 ]; then
+  printf '\n%s%d of %d gate(s) failed in %s — do not push%s\n' "$red" "$failed" "$ran" "$set_desc" "$reset"
+  exit 1
 fi
-exit "$failed"
+if [ "$unavailable" -gt 0 ]; then
+  printf '\n%s%d of %d gate(s) could not run in %s: %s — verification incomplete, not a pass%s\n' \
+    "$red" "$unavailable" "$ran" "$set_desc" "${unavailable_names[*]}" "$reset"
+  exit 2
+fi
+case "$gate_set" in
+  all) printf '\n%sall %d ci.yml gates passed — safe to push%s\n' "$green" "$ran" "$reset" ;;
+  *)   printf '\n%s%d gate(s) passed in %s — not the full ci.yml gate set; run without arguments before pushing%s\n' \
+         "$green" "$ran" "$set_desc" "$reset" ;;
+esac
+exit 0
