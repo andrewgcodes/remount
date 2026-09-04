@@ -255,9 +255,12 @@ func (s *Store) refPath(scope, digest string) string {
 // only after the blob's bytes have been hashed and found to match digest, so
 // the returned body is verified content, not a file that merely has the right
 // name and size. maxBytes > 0 is the ceiling the current rule permits for a
-// delivered body; a larger object returns errCachedObjectTooLarge without
-// touching the blob. Any other error means the reference existed but could not
-// be verified: it has been invalidated and the caller should fetch afresh.
+// delivered body; a verified object larger than that returns
+// errCachedObjectTooLarge. The ceiling is applied to the verified size, never
+// to reference metadata alone, so corrupt metadata cannot pin a policy
+// rejection onto an object that fits. Any other error means the reference
+// existed but could not be verified: it has been invalidated and the caller
+// should fetch afresh.
 func (s *Store) lookup(tenant, workspace, digest string, maxBytes int64) (ConnectorResponse, bool, error) {
 	scope := s.scope(tenant, workspace)
 	s.mu.Lock()
@@ -275,9 +278,6 @@ func (s *Store) lookup(tenant, workspace, digest string, maxBytes int64) (Connec
 		s.invalidate(scope, digest, nil)
 		return ConnectorResponse{}, false, errors.New("connector cache metadata is corrupt")
 	}
-	if maxBytes > 0 && ref.Size > maxBytes {
-		return ConnectorResponse{}, false, errCachedObjectTooLarge
-	}
 	f, err := os.Open(s.blobPath(digest))
 	if err != nil {
 		s.invalidate(scope, digest, nil)
@@ -293,6 +293,10 @@ func (s *Store) lookup(tenant, workspace, digest string, maxBytes int64) (Connec
 		_ = f.Close()
 		s.invalidate(scope, digest, nil)
 		return ConnectorResponse{}, false, errors.New("connector cache metadata disagrees with verified content")
+	}
+	if maxBytes > 0 && info.Size() > maxBytes {
+		_ = f.Close()
+		return ConnectorResponse{}, false, errCachedObjectTooLarge
 	}
 	return ConnectorResponse{
 		StatusCode: ref.StatusCode, Header: cloneHeader(ref.Header), Body: f,
