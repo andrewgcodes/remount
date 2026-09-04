@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"time"
 
+	"remount.dev/remount/internal/broker"
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/workspace"
@@ -71,10 +72,27 @@ func (n *Node) Diag(ctx context.Context) *proto.NodeDiag {
 		d.VolumeSourceMaxEntries = n.opts.MaxVolumeSourceEntries
 	}
 
+	// Snapshot each workspace's mutable fields under the lock rather than
+	// carrying live *ws pointers past the unlock. The renew loop writes
+	// LeaseUntil and the authorization fields on exactly these rows, so
+	// reading them afterwards is a data race — the "live pointer escaping the
+	// mutex" shape AGENTS.md records as one of the three bugs only the race
+	// detector found. The handle and broker are set once at claim time and are
+	// carried deliberately, because the work below them does I/O and must not
+	// hold the lock.
 	n.mu.Lock()
-	held := make([]*ws, 0, len(n.workspaces))
+	held := make([]wsDiagView, 0, len(n.workspaces))
 	for _, w := range n.workspaces {
-		held = append(held, w)
+		held = append(held, wsDiagView{
+			ID:         w.ID,
+			Generation: w.Generation,
+			Tenant:     w.Tenant,
+			LeaseUntil: w.LeaseUntil,
+			Volumes:    append([]proto.VolumeMount(nil), w.Spec.Volumes...),
+			leases:     append([]proto.BindingLease(nil), w.leases...),
+			handle:     w.handle,
+			broker:     w.broker,
+		})
 	}
 	materializing := make([]string, 0, len(n.materializing))
 	for id := range n.materializing {
@@ -91,9 +109,9 @@ func (n *Node) Diag(ctx context.Context) *proto.NodeDiag {
 			Backend:   w.handle.Backend(),
 			Root:      workspace.MountPathOf(w.handle),
 			LeaseEnds: w.LeaseUntil,
-			Volumes:   append([]proto.VolumeMount(nil), w.Spec.Volumes...),
+			Volumes:   append([]proto.VolumeMount(nil), w.Volumes...),
 		}
-		for _, mount := range w.Spec.Volumes {
+		for _, mount := range w.Volumes {
 			if n.volumes == nil {
 				d.Findings = append(d.Findings, proto.Finding{Severity: "error", Check: "node.diag_unavailable", Subject: w.ID, Detail: "volume mount verification is unavailable"})
 				continue
@@ -225,4 +243,19 @@ func humanBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// wsDiagView is one workspace's diagnostic state, copied while the node lock is
+// held. It exists so the reporting below — which does filesystem and volume
+// I/O and therefore must run unlocked — reads a consistent snapshot instead of
+// fields another goroutine is still writing.
+type wsDiagView struct {
+	ID         string
+	Generation uint64
+	Tenant     string
+	LeaseUntil int64
+	Volumes    []proto.VolumeMount
+	leases     []proto.BindingLease
+	handle     workspace.Handle
+	broker     *broker.Broker
 }
