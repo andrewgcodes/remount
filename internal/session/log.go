@@ -181,7 +181,11 @@ type Log struct {
 	first  uint64
 	next   uint64
 	closed bool
-	wake   chan struct{}
+	// The terminal append is retained but hidden until close commits the
+	// durable record. Otherwise a live subscriber can observe exit first.
+	terminalFirst   uint64
+	terminalPending bool
+	wake            chan struct{}
 
 	spill      *os.File
 	spillFirst uint64
@@ -277,7 +281,10 @@ func (l *Log) Append(stream uint8, data []byte) (uint64, error) {
 func (l *Log) appendTerminal(stream uint8, data []byte) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.appendLocked(stream, data, true)
+	first, err := l.appendLocked(stream, data, true)
+	l.terminalFirst = first
+	l.terminalPending = true
+	return first, err
 }
 
 func (l *Log) appendLocked(stream uint8, data []byte, terminal bool) (uint64, error) {
@@ -316,13 +323,13 @@ func (l *Log) appendLocked(stream uint8, data []byte, terminal bool) (uint64, er
 // leaves the lower and memory tiers intact and is returned after joining the
 // synchronous BlobStore producer.
 func (l *Log) Close() error {
-	return l.closeWithPublish(nil)
+	return l.closeWithPublish(nil, nil)
 }
 
-// closeWithPublish runs publish after every archival producer has joined and
-// while readers are still excluded from observing EOF. Session uses it to
-// commit capacity and publish its exited channel as one ordered handoff.
-func (l *Log) closeWithPublish(publish func()) error {
+// closeWithPublish runs finalCommit and publish after every archival producer
+// has joined and while readers are still excluded from observing EOF. Session
+// uses it to commit durability, capacity, and exit as one ordered handoff.
+func (l *Log) closeWithPublish(finalCommit func(LogRecord) error, publish func()) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
@@ -332,7 +339,15 @@ func (l *Log) closeWithPublish(publish func()) error {
 	if l.opts.BlobStore != nil {
 		err = l.evictLocked(true)
 		if err == nil {
-			err = l.sealSpillLocked()
+			if finalCommit != nil && l.spillBytes > 0 {
+				err = l.sealSpillWithCommitLocked(finalCommit)
+				finalCommit = nil
+			} else {
+				err = l.sealSpillLocked()
+			}
+		}
+		if err == nil && finalCommit != nil {
+			err = finalCommit(l.recordLocked(l.segments))
 		}
 		if err == nil {
 			l.appendErr = nil
@@ -401,8 +416,12 @@ func (l *Log) Stats() LogStats {
 	}
 }
 
-// Next returns the next append sequence.
-func (l *Log) Next() uint64 { l.mu.Lock(); defer l.mu.Unlock(); return l.next }
+// Next returns the next sequence visible to readers.
+func (l *Log) Next() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.visibleNextLocked()
+}
 
 // Oldest returns the oldest replayable sequence.
 func (l *Log) Oldest() uint64 { l.mu.Lock(); defer l.mu.Unlock(); return l.oldestLocked() }
@@ -500,6 +519,10 @@ func (l *Log) spillLocked(c Chunk) error {
 }
 
 func (l *Log) sealSpillLocked() error {
+	return l.sealSpillWithCommitLocked(l.opts.CommitRecord)
+}
+
+func (l *Log) sealSpillWithCommitLocked(commit func(LogRecord) error) error {
 	if l.spillBytes == 0 {
 		return nil
 	}
@@ -537,7 +560,7 @@ func (l *Log) sealSpillLocked() error {
 	if len(l.segments) > 0 && l.segments[len(l.segments)-1].Next != first {
 		return errors.New("session: refusing non-contiguous artifact segment")
 	}
-	if err := l.opts.CommitRecord(l.recordLocked(candidate)); err != nil {
+	if err := commit(l.recordLocked(candidate)); err != nil {
 		return l.tierErrorLocked(TierBlob, first, next, fmt.Errorf("commit segment reference: %w", err))
 	}
 	// The durable reference is the commit point. Only now may disk be reclaimed.
@@ -649,7 +672,8 @@ func (l *Log) Read(from uint64, max int) ([]Chunk, error) {
 	var out []Chunk
 	for max <= 0 || len(out) < max {
 		l.mu.Lock()
-		if from >= l.next {
+		visibleNext := l.visibleNextLocked()
+		if from >= visibleNext {
 			l.mu.Unlock()
 			return out, nil
 		}
@@ -657,10 +681,7 @@ func (l *Log) Read(from uint64, max int) ([]Chunk, error) {
 		store, maxChunk := l.opts.BlobStore, l.opts.MaxChunk
 		if found {
 			l.mu.Unlock()
-			remaining := 0
-			if max > 0 {
-				remaining = max - len(out)
-			}
+			remaining := readLimit(max, len(out), visibleNext-from)
 			chunks, err := readBlobSegment(store, segment, from, remaining, maxChunk)
 			if err != nil {
 				l.markUnavailable(TierBlob)
@@ -682,10 +703,7 @@ func (l *Log) Read(from uint64, max int) ([]Chunk, error) {
 			l.mu.Unlock()
 			return nil, tierError(tier, from, oldest, nil)
 		}
-		remaining := 0
-		if max > 0 {
-			remaining = max - len(out)
-		}
+		remaining := readLimit(max, len(out), visibleNext-from)
 		if from < l.first {
 			chunks, err := l.readSpillLocked(from, remaining)
 			if err != nil {
@@ -703,7 +721,7 @@ func (l *Log) Read(from uint64, max int) ([]Chunk, error) {
 			continue
 		}
 		i := int(from - l.first)
-		for i < len(l.chunks) && (max <= 0 || len(out) < max) {
+		for i < len(l.chunks) && l.chunks[i].Seq < visibleNext && (max <= 0 || len(out) < max) {
 			chunk := l.chunks[i]
 			chunk.Data = append([]byte(nil), chunk.Data...)
 			out = append(out, chunk)
@@ -713,6 +731,25 @@ func (l *Log) Read(from uint64, max int) ([]Chunk, error) {
 		return out, nil
 	}
 	return out, nil
+}
+
+func (l *Log) visibleNextLocked() uint64 {
+	if l.terminalPending && !l.closed {
+		return l.terminalFirst
+	}
+	return l.next
+}
+
+func readLimit(max, have int, visible uint64) int {
+	maxInt := int(^uint(0) >> 1)
+	remaining := maxInt
+	if visible <= uint64(maxInt) {
+		remaining = int(visible)
+	}
+	if max > 0 && max-have < remaining {
+		remaining = max - have
+	}
+	return remaining
 }
 
 func (l *Log) segmentForLocked(seq uint64) (SegmentRef, bool) {
@@ -807,7 +844,7 @@ func (c *Cursor) Next(ctx context.Context, max int) ([]Chunk, error) {
 			return out, nil
 		}
 		c.log.mu.Lock()
-		if c.seq < c.log.next {
+		if c.seq < c.log.visibleNextLocked() {
 			c.log.mu.Unlock()
 			continue
 		}
