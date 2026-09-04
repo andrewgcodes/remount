@@ -400,7 +400,7 @@ func TestPoolRetirementFenceBlocksClaimsAcrossTheProviderDestroy(t *testing.T) {
 // that returns a definite error has not destroyed anything, so the node goes
 // back into service and a claim on it succeeds.
 func TestPoolRetirementFenceIsReleasedWhenTheProviderDefinitelyFails(t *testing.T) {
-	driver := &retireDriver{machine: retireMachine(), destroyErr: errors.New("provider: quota exceeded")}
+	driver := &retireDriver{machine: retireMachine(), destroyErr: provision.MarkDestroyNotApplied(errors.New("provider: quota exceeded"))}
 	rf := newRetireFixture(t, "", driver, nodepool.Options{})
 	rf.reconcileParked(t)
 	close(rf.parked.release)
