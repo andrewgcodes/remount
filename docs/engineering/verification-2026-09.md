@@ -257,6 +257,23 @@ seal-cost signal. Hosted ordinary and race lanes now also exclude that exact
 measurement and publish both exclusions in the job summary. The assertion and
 test remain unchanged in developer package targets.
 
+## Current-main compatibility recheck
+
+The final branch contains `origin/main` at
+`7d1bc8ddbc055be9f57e157bac1915c0cadbe876`; no mainline commit was missing.
+On that combined history, native Windows passed build, vet, the complete
+serialized ordinary package lane with the five documented Windows exclusions,
+the nested public-SDK module, and the complete serialized race package lane
+with its four documented exclusions. Built-binary conformance remained:
+
+```text
+60 passed, 0 failed, 8 unavailable of 68 requirements
+required         53 passed, 0 failed, 0 unavailable
+capability-gated 7 passed, 0 failed, 7 unavailable
+extension        0 passed, 0 failed, 1 unavailable
+cleanup: verified
+```
+
 **A Windows-hosted Docker conformance run selected Windows commands for a
 Linux workspace.** Command selection was compiled from the runner's OS, so
 Docker sessions received `cmd.exe` even though they execute inside Linux. The
