@@ -97,6 +97,7 @@ func TestPackageCacheHitVerifiesBytesAgainstAdvertisedDigest(t *testing.T) {
 		name    string
 		damage  func(t *testing.T, f *cachedPackageFixture)
 		sibling bool
+		maximum int64
 	}{
 		{name: "same size corruption", damage: func(t *testing.T, f *cachedPackageFixture) {
 			rewriteBlob(t, f.store.blobPath(f.digest), []byte(corrupt))
@@ -137,12 +138,30 @@ func TestPackageCacheHitVerifiesBytesAgainstAdvertisedDigest(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
+		// The rule permits 64 bytes; the intact blob has 24; the reference
+		// claims 100. Metadata alone must not turn a fitting object into a
+		// permanent response_too_large.
+		{name: "inflated reference size above current rule", maximum: 64, damage: func(t *testing.T, f *cachedPackageFixture) {
+			ref := f.store.refPath(f.store.scope("tenant-private", "ws_a"), f.digest)
+			data, err := os.ReadFile(ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data = []byte(strings.Replace(string(data), `"size":`+strconv.Itoa(len(payload)), `"size":100`, 1))
+			if err := os.WriteFile(ref, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			before := metrics.PackageCacheIntegrityFailures.Value()
+			maximum := tc.maximum
+			if maximum == 0 {
+				maximum = 256
+			}
 			f := newCachedPackageFixture(t, opts, payload)
-			first := f.mustFetchVerified(t, "ws_a", 256)
+			first := f.mustFetchVerified(t, "ws_a", maximum)
 			if first.Provenance.Cached || f.calls.Load() != 1 {
 				t.Fatalf("first fetch cached=%v calls=%d", first.Provenance.Cached, f.calls.Load())
 			}
@@ -154,7 +173,7 @@ func TestPackageCacheHitVerifiesBytesAgainstAdvertisedDigest(t *testing.T) {
 			}
 			// The damaged object must never be released under the advertised
 			// digest, whichever way the connector chooses to recover.
-			response, err := f.fetch(t, workspace, 256)
+			response, err := f.fetch(t, workspace, maximum)
 			if err == nil {
 				body := readConnectorResponse(t, response)
 				if body != payload {
@@ -166,9 +185,9 @@ func TestPackageCacheHitVerifiesBytesAgainstAdvertisedDigest(t *testing.T) {
 			}
 			// Recovery: a later fetch by the same workspace delivers verified
 			// bytes and is served from the repaired reference afterwards.
-			f.mustFetchVerified(t, workspace, 256)
+			f.mustFetchVerified(t, workspace, maximum)
 			calls := f.calls.Load()
-			later := f.mustFetchVerified(t, workspace, 256)
+			later := f.mustFetchVerified(t, workspace, maximum)
 			if !later.Provenance.Cached || f.calls.Load() != calls {
 				t.Fatalf("repaired reference not reused: cached=%v calls=%d->%d", later.Provenance.Cached, calls, f.calls.Load())
 			}
