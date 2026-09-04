@@ -54,6 +54,26 @@ func (c *Control) loadPools() error {
 	return rows.Err()
 }
 
+// loadPoolRetirements restores scale-down fences committed before a restart.
+// A fenced node stays unclaimable until provider inventory shows whether its
+// destroy took effect; the in-flight goroutine that held it died with the
+// process, but the provider call it made may not have.
+func (c *Control) loadPoolRetirements() error {
+	rows, err := c.db.Query(`SELECT node, tenant, pool, machine FROM pool_retirements`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var node, tenant, pool, machine string
+		if err := rows.Scan(&node, &tenant, &pool, &machine); err != nil {
+			return err
+		}
+		c.poolRetiring[node] = poolRetirement{Pool: poolKey(tenant, pool), Machine: machine, Node: node}
+	}
+	return rows.Err()
+}
+
 func (c *Control) poolCreate(ctx context.Context, subject Subject, req *proto.PoolCreateReq) (*proto.Pool, error) {
 	if err := proto.ValidatePoolSpec(req.Spec); err != nil {
 		return nil, err
@@ -168,12 +188,20 @@ func (c *Control) poolRemove(ctx context.Context, subject Subject, req *proto.Po
 		if _, err := tx.Exec(`DELETE FROM pools WHERE tenant=? AND name=?`, pool.Tenant, pool.Spec.Name); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(`DELETE FROM pool_retirements WHERE tenant=? AND pool=?`, pool.Tenant, pool.Spec.Name); err != nil {
+			return err
+		}
 		return c.insertMutationTx(tx.Tx, scope, req.IdempotencyKey, proto.OpPoolRemove, req, struct{}{})
 	}, []*proto.Event{c.poolEvent(proto.EvPoolRemoved, pool, subject.ID, map[string]any{"pool": pool.Spec.Name})}); err != nil {
 		c.mu.Unlock()
 		return err
 	}
 	delete(c.pools, key)
+	for node, fence := range c.poolRetiring {
+		if fence.Pool == key {
+			delete(c.poolRetiring, node)
+		}
+	}
 	c.mu.Unlock()
 	if c.opts.PoolReconciler != nil {
 		c.opts.PoolReconciler.Forget(c.poolSpec(pool))

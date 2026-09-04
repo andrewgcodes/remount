@@ -345,6 +345,7 @@ type Control struct {
 	pools                 map[string]*proto.Pool // poolKey(tenant, name) -> desired node capacity
 	poolBusy              map[string]bool
 	poolIdle              map[poolMachine]time.Time
+	poolRetiring          map[string]poolRetirement // node -> durable scale-down fence; no new claims
 	poolWG                sync.WaitGroup
 	queues                map[string]*proto.Queue
 	agents                map[string]*proto.Agent
@@ -553,6 +554,7 @@ func New(opts Options) (*Control, error) {
 		pools:                 map[string]*proto.Pool{},
 		poolBusy:              map[string]bool{},
 		poolIdle:              map[poolMachine]time.Time{},
+		poolRetiring:          map[string]poolRetirement{},
 		queues:                map[string]*proto.Queue{},
 		agents:                map[string]*proto.Agent{},
 		approvals:             map[string]*proto.Approval{},
@@ -704,6 +706,7 @@ CREATE TABLE IF NOT EXISTS session_logs (id TEXT PRIMARY KEY, tenant TEXT NOT NU
 CREATE INDEX IF NOT EXISTS session_logs_expiry ON session_logs(expires_at);
 CREATE TABLE IF NOT EXISTS volumes (tenant TEXT NOT NULL, id TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(tenant, id));
 CREATE TABLE IF NOT EXISTS pools (tenant TEXT NOT NULL, name TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(tenant, name));
+CREATE TABLE IF NOT EXISTS pool_retirements (node TEXT PRIMARY KEY, tenant TEXT NOT NULL, pool TEXT NOT NULL, machine TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS queues (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, data BLOB NOT NULL);
@@ -983,6 +986,9 @@ func (c *Control) load() error {
 		return err
 	}
 	if err := c.loadPools(); err != nil {
+		return err
+	}
+	if err := c.loadPoolRetirements(); err != nil {
 		return err
 	}
 	rows, err = c.db.Query(`SELECT data FROM queues`)
@@ -4648,6 +4654,11 @@ func (c *Control) eligibleLocked(ws *proto.Workspace, n *nodeState) bool {
 // a stronger backend registered on the same node.
 func (c *Control) eligibleBackendLocked(ws *proto.Workspace, n *nodeState) (string, bool) {
 	if n == nil || !n.Status.Online {
+		return "", false
+	}
+	// A node fenced for pool scale-down is on its way to the provider's
+	// destroy call; it takes no new work until inventory proves the outcome.
+	if _, retiring := c.poolRetiring[n.Status.ID]; retiring {
 		return "", false
 	}
 	// Dynamically enrolled machines are one-tenant authorities. The label is
