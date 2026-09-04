@@ -87,6 +87,17 @@ func TestCacheExpiryBoundAndConcurrentSingleflight(t *testing.T) {
 		}()
 	}
 	<-started
+	// Wait until the other workers have coalesced onto the in-flight
+	// resolution. Releasing as soon as the first request lands lets a worker
+	// that has not reached the join yet start a second one once this flight is
+	// deleted, which is a race in the test rather than in the resolver.
+	deadline := time.Now().Add(30 * time.Second)
+	for resolver.coalescedOn(source) < workers-1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of %d workers coalesced", resolver.coalescedOn(source), workers-1)
+		}
+		time.Sleep(time.Millisecond)
+	}
 	close(release)
 	for range workers {
 		if err := <-results; err != nil {
