@@ -179,10 +179,25 @@ func (c *Control) markApprovalDirty(ap *proto.Approval) {
 type approvalStage struct {
 	c       *Control
 	touched map[string]*proto.Approval
+	// counters are the metric increments the change earns; they land with
+	// the publish so a failed commit counts nothing.
+	counters []*metrics.Counter
 }
 
 func (c *Control) stageApprovals() *approvalStage {
 	return &approvalStage{c: c, touched: map[string]*proto.Approval{}}
+}
+
+// count defers one increment of ctr to the publish.
+func (s *approvalStage) count(ctr *metrics.Counter) {
+	s.counters = append(s.counters, ctr)
+}
+
+func (s *approvalStage) flushCounters() {
+	for _, ctr := range s.counters {
+		ctr.Inc()
+	}
+	s.counters = nil
 }
 
 // lookup is the staged copy when there is one, else the live approval.
@@ -263,6 +278,7 @@ func (s *approvalStage) publishLocked() {
 		delete(s.c.dirtyApprovals, id)
 	}
 	s.touched = map[string]*proto.Approval{}
+	s.flushCounters()
 }
 
 // publishDirtyLocked applies the copies to the live map now and leaves them
@@ -279,6 +295,7 @@ func (s *approvalStage) publishDirtyLocked() {
 		s.c.dirtyApprovals[id] = live
 	}
 	s.touched = map[string]*proto.Approval{}
+	s.flushCounters()
 }
 
 // park records a permission or elicitation request the node parked for a
@@ -319,7 +336,7 @@ func (s *approvalStage) park(a *proto.Agent, run *proto.AgentRun, ws *proto.Work
 	}
 	s.add(ap)
 	a.PendingApprovals = pending + 1
-	metrics.ApprovalsPending.Inc()
+	s.count(metrics.ApprovalsPending)
 	return []*proto.Event{c.approvalEvent(proto.EvApprovalPending, ap, ws, "", node, map[string]any{
 		"run": run.ID, "title": ap.Title, "tool_call": ap.ToolCall, "tool_kind": ap.ToolKind, "options": len(ap.Options),
 	})}, nil
@@ -346,7 +363,7 @@ func (s *approvalStage) expire(a *proto.Agent, run *proto.AgentRun, principal st
 		ap := s.edit(id)
 		ap.Status = proto.ApprovalExpired
 		ap.UpdatedAt = c.now().UnixMilli()
-		metrics.ApprovalsExpired.Inc()
+		s.count(metrics.ApprovalsExpired)
 		events = append(events, c.approvalEvent(proto.EvApprovalExpired, ap, ws, principal, "", map[string]any{"run": ap.Run}))
 	}
 	a.PendingApprovals = s.pending(a.ID)
