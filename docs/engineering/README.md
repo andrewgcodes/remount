@@ -6,6 +6,14 @@ statements that the described controls already exist.
 
 ## Documents
 
+### [Codebase review and remediation handoff — 2026-09-04](./review-handoff-2026-09-04.md)
+
+Report-only review with eleven reproduced failing invariants, a local-verification
+coverage concern, exact source locations, self-contained diagnostic reproducers,
+and remediation requirements. It distinguishes current findings from inherited
+PR #7 issues and historical evidence. No bugs are fixed by this document; read
+its finding register alongside the earlier implementation closure.
+
 ### [Hardening implementation closure — 2026-09-03](./implementation-closure-2026-09-03.md) — current status
 
 **Start here.** Its `2026-09 build plan disposition` section is the current
