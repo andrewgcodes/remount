@@ -517,3 +517,29 @@ performance patch. It is recorded here so the next person to profile this does
 not spend the evening rediscovering it. The number to watch is whether any
 *single* operation's share grows, which would indicate new work added under the
 lock rather than the expected cost of the lock existing.
+
+### Candidates found by shape, deliberately not acted on
+
+A scan for the "lock held across I/O" shape across `internal/` produced 30 hits,
+most of them false positives (`sync.Once.Do`, `http.StatusNotFound` matching a
+crude pattern). Two are genuine instances of the shape:
+
+| Site | Shape |
+|---|---|
+| `connector.(*Store).lookup` | holds the store-wide `s.mu` across `os.ReadFile`, `os.Open` and `Stat` |
+| `artifact/encrypted.(*FileStore)` and `keys.go` | hold a lock across `os.Open` / `os.Remove` |
+
+**Neither is being changed, and the reason is the point.** Lesson 14 of
+`docs/engineering/hardening-lessons.md` exists because this exact reasoning —
+"here is a lock held across I/O, that must be the slow thing" — produced a wrong
+diagnosis earlier the same night, and nearly produced a risky restructure of a
+durable-commit boundary to buy 1.4% of a profile. A shape is a hypothesis, not a
+finding.
+
+What would settle each: a benchmark driving concurrent `lookup` calls at a
+realistic cache-hit rate, with `-mutexprofile`, and `go tool pprof -peek` on the
+symbol by name. If the delay is material, the remedy is the same one available
+to `artifact.publish` — the cached blobs are content-addressed and immutable, so
+reading them needs no lock at all, and the mutex only has to guard the
+accounting. Until someone runs that, this table is a list of places to look, not
+a list of defects.
