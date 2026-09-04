@@ -518,7 +518,7 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case b.requestSlots <- struct{}{}:
 		defer func() { <-b.requestSlots }()
 	default:
-		audit := b.auditFor(r, "", r.Host, r.URL.Path)
+		audit := b.auditFor(r, "", r.Host, redactCapability(r.URL.Path))
 		audit.Decision, audit.Reason = DecisionLimitExceeded, "concurrent request limit exhausted"
 		b.emit(audit)
 		http.Error(w, "remount broker: concurrent request limit exhausted", http.StatusTooManyRequests)
@@ -528,7 +528,7 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	suspended := b.suspended
 	b.mu.RUnlock()
 	if suspended {
-		audit := b.auditFor(r, "", r.Host, r.URL.Path)
+		audit := b.auditFor(r, "", r.Host, redactCapability(r.URL.Path))
 		audit.Decision, audit.Reason = DecisionDenied, "workspace is quiesced"
 		b.emit(audit)
 		http.Error(w, "remount broker: workspace is quiesced", http.StatusServiceUnavailable)
@@ -643,10 +643,15 @@ func (b *Broker) authenticateRequest(r *http.Request, proxyRequest bool) bool {
 		token = proxyAuthorizationToken(r.Header.Get("Proxy-Authorization"))
 	} else {
 		const prefix = "/c/"
-		if !strings.HasPrefix(r.URL.Path, prefix) {
+		// Split the *escaped* path. Splitting the decoded one and clearing
+		// RawPath destroys the request's original encoding, which is what the
+		// typed-policy ambiguity guard downstream is there to inspect: %2f and
+		// %2e would already have become a separator and a dot by then.
+		escaped := r.URL.EscapedPath()
+		if !strings.HasPrefix(escaped, prefix) {
 			return false
 		}
-		remainder := strings.TrimPrefix(r.URL.Path, prefix)
+		remainder := strings.TrimPrefix(escaped, prefix)
 		cut := strings.IndexByte(remainder, '/')
 		if cut < 0 {
 			token, remainder = remainder, ""
@@ -664,7 +669,11 @@ func (b *Broker) authenticateRequest(r *http.Request, proxyRequest bool) bool {
 		if remainder == "" {
 			remainder = "/"
 		}
-		r.URL.Path, r.URL.RawPath = remainder, ""
+		decodedRemainder, err := url.PathUnescape(remainder)
+		if err != nil {
+			return false
+		}
+		r.URL.Path, r.URL.RawPath = decodedRemainder, remainder
 	}
 	principal := b.opts.Principal
 	if subtle.ConstantTimeCompare([]byte(token), []byte(b.token)) != 1 {
@@ -701,7 +710,7 @@ func (b *Broker) validProxyAuthorization(value string) bool {
 }
 
 func (b *Broker) rejectUnauthenticated(w http.ResponseWriter, r *http.Request, proxyRequest bool) {
-	audit := b.auditFor(r, "", r.Host, r.URL.Path)
+	audit := b.auditFor(r, "", r.Host, redactCapability(r.URL.Path))
 	audit.Decision = DecisionUnauthenticated
 	audit.Reason = "workspace broker capability missing or invalid"
 	b.emit(audit)
@@ -711,6 +720,21 @@ func (b *Broker) rejectUnauthenticated(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 	http.Error(w, "remount broker: invalid workspace capability", http.StatusForbidden)
+}
+
+// redactCapability removes the workspace bearer from a path recorded before
+// authentication stripped it. Audits reach the node's durable event log and
+// are exported, and this token authorizes every egress this workspace has.
+func redactCapability(p string) string {
+	const prefix = "/c/"
+	if !strings.HasPrefix(p, prefix) {
+		return p
+	}
+	rest := p[len(prefix):]
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return prefix + "[redacted]" + rest[i:]
+	}
+	return prefix + "[redacted]"
 }
 
 func splitDest(p string) (host, rest string) {

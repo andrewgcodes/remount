@@ -1302,12 +1302,22 @@ func writeArtifactReadError(w http.ResponseWriter, err error) {
 
 func (s *Server) artifactSubject(r *http.Request) (control.Subject, bool, bool) {
 	token, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if !bearer || token == "" {
-		if s.opts.Mode != ModeStandalone || s.opts.Token != "" || s.opts.Authenticator != nil {
-			return control.Subject{}, false, false
-		}
+	// A standalone server with no shared token and no authenticator has nothing
+	// to check a credential against, and every other surface — the relay hello
+	// and the console — already admits any bearer in that configuration. This
+	// endpoint used to admit only the *absence* of one, so presenting a
+	// credential made a caller less authorized than presenting none: an
+	// operator with REMOUNT_TOKEN exported saw `remount push` fail with 401
+	// against their own laptop, and the repository's own move benchmark could
+	// not run against a standalone server at all. Deciding the mode before
+	// reading the header keeps the two answers the same.
+	unauthenticated := s.opts.Mode == ModeStandalone && s.opts.Token == "" && s.opts.Authenticator == nil
+	if unauthenticated {
 		subject := control.Subject{ID: "local-user", Tenant: "local", Roles: []string{"admin"}}
 		return subject, true, subject.Tenant != ""
+	}
+	if !bearer || token == "" {
+		return control.Subject{}, false, false
 	}
 	if s.opts.Token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.opts.Token)) == 1 {
 		return control.Subject{ID: "legacy-node", Tenant: "local", Roles: []string{identity.RoleNode}}, true, true

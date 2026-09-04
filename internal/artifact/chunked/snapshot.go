@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 
 	"remount.dev/remount/internal/artifact"
 )
@@ -25,7 +26,37 @@ type SnapshotOptions struct {
 	// and tar representations of one directory hold the same files; the
 	// selection rules live in one place rather than being restated per format.
 	Skip func(rel string, isDir bool) bool
+	// Concurrency bounds how many chunk transfers are in flight. Zero selects
+	// DefaultTransferConcurrency; one restores strictly serial transfer.
+	Concurrency int
+	// MaxUnsharedBytes is the number of new bytes past which this snapshot has
+	// to earn chunking rather than be given it. A chunked snapshot pays a whole
+	// content-addressed publish, an HTTP request and an authorization per
+	// chunk, which costs roughly an order of magnitude more per byte than
+	// sending the tree once; it wins only while the bytes the tree does not
+	// share with the store are a small fraction of the tree. Past this many
+	// unshared bytes, a tree whose unshared share is above
+	// one-in-UnsharedShareDivisor is abandoned with ErrNotDeduplicating,
+	// before anything is uploaded, so the caller can fall back to a whole-tree
+	// format.
+	//
+	// Zero or negative means no limit, which keeps every chunk transfer
+	// immediate and holds no chunk bodies in memory.
+	MaxUnsharedBytes int64
 }
+
+// UnsharedShareDivisor is the largest share of a tree that may be new before
+// chunk-by-chunk transfer stops being cheaper than sending the tree once.
+// Measured against this repository's own artifact store, publishing one 64 KiB
+// chunk costs about 5 ms even with transfers overlapped, while a whole-tree
+// snapshot moves about 150 MB/s, which puts the crossover near one part in
+// twelve; one in eight keeps a margin on slower storage.
+const UnsharedShareDivisor = 8
+
+// ErrNotDeduplicating reports that a chunked snapshot was abandoned because
+// too little of the tree was already stored for chunking to pay for itself.
+// No blob was uploaded and no manifest was published.
+var ErrNotDeduplicating = errors.New("chunked artifact: snapshot does not deduplicate")
 
 // SnapshotResult reports logical identity and physical deduplication work.
 // The tags are load-bearing: `remount push --chunked --json` reports these
@@ -92,6 +123,15 @@ func Snapshot(ctx context.Context, store artifact.BlobStore, root string, opts S
 		return result, errors.New("chunked artifact: hot-set entry limit exceeded")
 	}
 	seenChunks := make(map[string]struct{})
+	// Chunk objects are independent and immutable, so they are published
+	// concurrently. Nothing downstream may observe the snapshot before every
+	// one of them is durable, which is why the manifest is published only
+	// after the pool has been joined below.
+	publisher := &chunkPublisher{
+		pool: newTransferPool(ctx, opts.Concurrency), store: store,
+		unsharedLimit: opts.MaxUnsharedBytes,
+	}
+	defer publisher.pool.stop()
 	var totalXattrBytes int64
 	for _, rel := range paths {
 		if err := ctx.Err(); err != nil {
@@ -142,7 +182,7 @@ func Snapshot(ctx context.Context, store artifact.BlobStore, root string, opts S
 			}
 			entry.Xattrs, err = readXattrs(file, limits)
 			if err == nil {
-				entry.Chunks, err = snapshotFile(ctx, store, io.LimitReader(file, entry.Size), entry.Size, limits, seenChunks, &result)
+				entry.Chunks, err = snapshotFile(ctx, publisher, io.LimitReader(file, entry.Size), entry.Size, limits, seenChunks, &result)
 			}
 			closeErr := file.Close()
 			if err != nil || closeErr != nil {
@@ -160,6 +200,18 @@ func Snapshot(ctx context.Context, store artifact.BlobStore, root string, opts S
 		}
 		manifest.Entries = append(manifest.Entries, entry)
 	}
+	// Join every chunk transfer before the manifest exists anywhere. A
+	// manifest is a promise that its chunks are fetchable; publishing it while
+	// a transfer is outstanding would make that promise ahead of the fact.
+	if err := publisher.pool.wait(); err != nil {
+		return result, err
+	}
+	if err := publisher.uploadDeferred(ctx, opts.Concurrency); err != nil {
+		return result, err
+	}
+	// The workers are joined, so their counters are now this goroutine's to
+	// read. Nothing before this point may copy them out of the publisher.
+	result.ChunksUploaded, result.BytesUploaded = publisher.uploaded()
 	manifest.Chunks = result.Chunks
 	hot := make(map[string]struct{}, len(opts.HotPaths))
 	entryTypes := make(map[string]string, len(manifest.Entries))
@@ -194,7 +246,131 @@ func Snapshot(ctx context.Context, store artifact.BlobStore, root string, opts S
 	return result, nil
 }
 
-func snapshotFile(ctx context.Context, store artifact.BlobStore, r io.Reader, expected int64, limits Limits, seen map[string]struct{}, result *SnapshotResult) ([]ChunkRef, error) {
+// chunkPublisher hands one chunk body to the bounded transfer pool and folds
+// each worker's deduplication result back into the shared counters.
+type chunkPublisher struct {
+	pool          *transferPool
+	store         artifact.BlobStore
+	unsharedLimit int64
+
+	mu             sync.Mutex
+	deferred       []deferredChunk
+	unsharedSeen   int64
+	plaintextSeen  int64
+	uploadedChunks int
+	uploadedBytes  int64
+}
+
+// observe records one chunk's bytes against the tree total, including chunks
+// this snapshot has already seen. The unshared share is judged against the
+// tree walked so far, so it is the producer that reports it.
+func (p *chunkPublisher) observe(n int) {
+	p.mu.Lock()
+	p.plaintextSeen += int64(n)
+	p.mu.Unlock()
+}
+
+// deferredChunk is a chunk the store does not have yet, held until the whole
+// tree has been probed. Holding it costs at most unsharedLimit bytes, which is
+// the same budget that decides whether this snapshot stays chunked at all.
+type deferredChunk struct {
+	id   string
+	body []byte
+}
+
+func (p *chunkPublisher) publish(id string, body []byte) error {
+	return p.pool.submit(func(context.Context) error {
+		if p.unsharedLimit <= 0 {
+			uploaded, err := putMissing(p.store, id, body)
+			if err != nil {
+				return err
+			}
+			if uploaded {
+				p.record(int64(len(body)))
+			}
+			return nil
+		}
+		present, err := blobPresent(p.store, id, len(body))
+		if err != nil || present {
+			return err
+		}
+		p.mu.Lock()
+		p.unsharedSeen += int64(len(body))
+		over := p.unsharedSeen > p.unsharedLimit &&
+			p.unsharedSeen*UnsharedShareDivisor > p.plaintextSeen
+		if !over {
+			p.deferred = append(p.deferred, deferredChunk{id: id, body: body})
+		}
+		p.mu.Unlock()
+		if over {
+			return ErrNotDeduplicating
+		}
+		return nil
+	})
+}
+
+func (p *chunkPublisher) record(n int64) {
+	p.mu.Lock()
+	p.uploadedChunks++
+	p.uploadedBytes += n
+	p.mu.Unlock()
+}
+
+// uploaded reports what the workers published. Call it only after joining
+// them: a snapshot that returns early must not copy counters a worker may
+// still be writing.
+func (p *chunkPublisher) uploaded() (int, int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.uploadedChunks, p.uploadedBytes
+}
+
+// uploadDeferred publishes the chunks this tree does not share with the store,
+// once the whole tree has been probed and the snapshot is known to be worth
+// storing as chunks. It must be joined before the manifest is published.
+func (p *chunkPublisher) uploadDeferred(ctx context.Context, concurrency int) error {
+	p.mu.Lock()
+	pending := p.deferred
+	p.deferred = nil
+	p.mu.Unlock()
+	if len(pending) == 0 {
+		return nil
+	}
+	pool := newTransferPool(ctx, concurrency)
+	defer pool.stop()
+	for _, chunk := range pending {
+		if err := pool.submit(func(context.Context) error {
+			uploaded, err := putMissing(p.store, chunk.id, chunk.body)
+			if err != nil {
+				return err
+			}
+			if uploaded {
+				p.record(int64(len(chunk.body)))
+			}
+			return nil
+		}); err != nil {
+			break
+		}
+	}
+	return pool.wait()
+}
+
+// blobPresent reports whether the store already holds this exact object.
+func blobPresent(store artifact.BlobStore, id string, size int) (bool, error) {
+	stored, err := store.Head(id)
+	if err == nil {
+		if stored != int64(size) {
+			return false, errors.New("chunked artifact: existing blob has wrong size")
+		}
+		return true, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return false, err
+	}
+	return false, nil
+}
+
+func snapshotFile(ctx context.Context, publisher *chunkPublisher, r io.Reader, expected int64, limits Limits, seen map[string]struct{}, result *SnapshotResult) ([]ChunkRef, error) {
 	chunker := NewChunker(r)
 	var refs []ChunkRef
 	var total int64
@@ -215,17 +391,15 @@ func snapshotFile(ctx context.Context, store artifact.BlobStore, r io.Reader, ex
 		}
 		id := digestID(chunk)
 		refs = append(refs, ChunkRef{ID: id, Size: len(chunk)})
+		publisher.observe(len(chunk))
 		result.Chunks++
 		total += int64(len(chunk))
 		if _, ok := seen[id]; !ok {
-			uploaded, err := putMissing(store, id, chunk)
-			if err != nil {
-				return nil, err
-			}
 			seen[id] = struct{}{}
-			if uploaded {
-				result.ChunksUploaded++
-				result.BytesUploaded += int64(len(chunk))
+			// The chunker already returned a private copy, so the worker owns
+			// these bytes for as long as the transfer runs.
+			if err := publisher.publish(id, chunk); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -236,14 +410,8 @@ func snapshotFile(ctx context.Context, store artifact.BlobStore, r io.Reader, ex
 }
 
 func putMissing(store artifact.BlobStore, id string, body []byte) (bool, error) {
-	size, err := store.Head(id)
-	if err == nil {
-		if size != int64(len(body)) {
-			return false, errors.New("chunked artifact: existing blob has wrong size")
-		}
-		return false, nil
-	}
-	if !errors.Is(err, fs.ErrNotExist) {
+	present, err := blobPresent(store, id, len(body))
+	if err != nil || present {
 		return false, err
 	}
 	got, size, err := store.Put(bytes.NewReader(body))

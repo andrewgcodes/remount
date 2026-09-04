@@ -166,23 +166,41 @@ func (c *Control) enrichPoolInventory(work poolWork, machines []provision.Machin
 					node.Workspaces++
 				}
 			}
+			key := poolMachine{pool: work.key, machine: machine.ID}
 			if node.Workspaces == 0 {
-				if c.poolIdle[machine.ID].IsZero() {
-					c.poolIdle[machine.ID] = now
+				if c.poolIdle[key].IsZero() {
+					c.poolIdle[key] = now
 				}
-				node.IdleSince = c.poolIdle[machine.ID]
+				node.IdleSince = c.poolIdle[key]
 			} else {
-				delete(c.poolIdle, machine.ID)
+				delete(c.poolIdle, key)
 			}
 		}
 		out = append(out, node)
 	}
-	for machine := range c.poolIdle {
-		if _, ok := visible[machine]; !ok {
-			delete(c.poolIdle, machine)
+	// Prune only this pool's own entries. The map is control-wide, and
+	// reconcilePoolsAsync starts every pool on the same tick, so a prune keyed
+	// on machine id alone made pool A erase pool B's idle clocks: no machine in
+	// a multi-pool fleet ever survived from "marked idle" to "old enough to
+	// scale down", and idle provider inventory ran indefinitely. Retained
+	// inventory costs money, so this is a billing bug, not a tidiness one.
+	for key := range c.poolIdle {
+		if key.pool != work.key {
+			continue
+		}
+		if _, ok := visible[key.machine]; !ok {
+			delete(c.poolIdle, key)
 		}
 	}
 	return out
+}
+
+// poolMachine scopes an idle clock to the pool that observed it. Two pools may
+// legitimately see the same provider machine id, and neither may speak for the
+// other's inventory.
+type poolMachine struct {
+	pool    string
+	machine string
 }
 
 func (c *Control) commitPoolFailure(work poolWork, reason string, cause error) {

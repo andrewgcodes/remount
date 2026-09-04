@@ -92,6 +92,11 @@ const (
 	// maxPeerIDBytes bounds an identifier before it is length-prefixed into a
 	// signature transcript or an AAD, where a 16-bit length is used.
 	maxPeerIDBytes = 256
+	// identityRenewMargin is how long a binding must still be valid for to
+	// authenticate a key agreement. A binding closer to expiry than this is
+	// rebound rather than used, so it cannot expire between this peer signing
+	// an offer and the far peer verifying it.
+	identityRenewMargin = 30 * time.Second
 )
 
 // EventKind classifies what the guard observed. Observation is for tests,

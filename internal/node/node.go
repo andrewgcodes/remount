@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"remount.dev/remount/internal/artifact"
+	"remount.dev/remount/internal/artifact/chunked"
 	"remount.dev/remount/internal/broker"
 	"remount.dev/remount/internal/connector"
 	"remount.dev/remount/internal/control"
@@ -60,6 +61,11 @@ type Options struct {
 	// Empty disables uploads (snapshots stay local).
 	ArtifactURL string
 	HTTPClient  *http.Client
+	// MaxChunkedUnsharedBytes bounds how many new bytes a chunked snapshot may
+	// transfer before the node decides chunking is not paying for itself and
+	// stores the whole tree in one object instead. Zero selects
+	// DefaultMaxChunkedUnsharedBytes; negative disables the fallback.
+	MaxChunkedUnsharedBytes int64
 	// MaxArtifactBytes bounds compressed snapshots and remote downloads.
 	// Zero selects 8 GiB.
 	MaxArtifactBytes int64
@@ -4351,26 +4357,36 @@ func (n *Node) snapshotRaw(ctx context.Context, w *ws, upload bool, consistency 
 	}
 	if n.chunkedSnapshotEnabled(w) {
 		result, err := n.snapshotChunked(ctx, w, upload, excludes)
-		if err != nil {
+		switch {
+		case err == nil:
+			metrics.SnapshotsTaken.Inc()
+			metrics.SnapshotBytes.Add(uint64(result.PlaintextBytes))
+			metrics.SnapshotBytesUploaded.Add(uint64(result.BytesUploaded))
+			metrics.SnapshotLogicalBytes.Add(uint64(result.PlaintextBytes))
+			authoritative := consistency == proto.SnapshotConsistencyQuiesced && upload
+			n.emit(proto.EvWSSnapshot, w.ID, w.Spec.Principal, map[string]any{
+				"artifact": result.ManifestID, "format": proto.ArtifactFormatChunkedV1,
+				"bytes": result.PlaintextBytes, "manifest_bytes": result.ManifestBytes,
+				"uploaded_bytes": result.BytesUploaded, "chunks": result.Chunks,
+				"uploaded_chunks": result.ChunksUploaded, "uploaded": upload,
+				"consistency": consistency, "authoritative": authoritative,
+			})
+			return proto.WSSnapshotRes{
+				Artifact: result.ManifestID, Bytes: result.PlaintextBytes, Consistency: consistency,
+				Authoritative: authoritative, Format: proto.ArtifactFormatChunkedV1,
+				UploadedBytes: result.BytesUploaded, Chunks: result.Chunks, UploadedChunks: result.ChunksUploaded,
+			}, nil
+		case errors.Is(err, chunked.ErrNotDeduplicating):
+			// A tree that shares almost nothing with the artifact store is far
+			// cheaper to send once than to publish, authorize and transfer one
+			// object per 64 KiB chunk. Nothing was uploaded and no manifest
+			// was published, so the whole-tree path below is the whole
+			// snapshot rather than a second attempt at the same one.
+			n.logger.Info("chunked snapshot deduplicates too little; using whole-tree format",
+				"ws", w.ID, "gen", w.Generation)
+		default:
 			return proto.WSSnapshotRes{}, err
 		}
-		metrics.SnapshotsTaken.Inc()
-		metrics.SnapshotBytes.Add(uint64(result.PlaintextBytes))
-		metrics.SnapshotBytesUploaded.Add(uint64(result.BytesUploaded))
-		metrics.SnapshotLogicalBytes.Add(uint64(result.PlaintextBytes))
-		authoritative := consistency == proto.SnapshotConsistencyQuiesced && upload
-		n.emit(proto.EvWSSnapshot, w.ID, w.Spec.Principal, map[string]any{
-			"artifact": result.ManifestID, "format": proto.ArtifactFormatChunkedV1,
-			"bytes": result.PlaintextBytes, "manifest_bytes": result.ManifestBytes,
-			"uploaded_bytes": result.BytesUploaded, "chunks": result.Chunks,
-			"uploaded_chunks": result.ChunksUploaded, "uploaded": upload,
-			"consistency": consistency, "authoritative": authoritative,
-		})
-		return proto.WSSnapshotRes{
-			Artifact: result.ManifestID, Bytes: result.PlaintextBytes, Consistency: consistency,
-			Authoritative: authoritative, Format: proto.ArtifactFormatChunkedV1,
-			UploadedBytes: result.BytesUploaded, Chunks: result.Chunks, UploadedChunks: result.ChunksUploaded,
-		}, nil
 	}
 	pr, pw := io.Pipe()
 	producerDone := make(chan error, 1)

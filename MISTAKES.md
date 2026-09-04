@@ -868,6 +868,125 @@ browser credential's reach is the set of routes that accept it; add a route
 that returns data and you have widened the credential, whether or not that was
 the intent.
 
+## 42. A 41x performance regression nobody could see, because the tool that would have seen it was broken
+
+**Symptom.** Moving a 200 MB workspace between two local nodes took 33 s. The
+checked-in benchmark evidence claimed 183 MB/s for a larger payload. Both were
+honest measurements; they were taken at different commits, and nothing ever
+compared them. `git bisect` over 23 commits put the whole regression inside
+one:
+
+    21ef995  test(sim): record fleet-scale failover evidence     0.85s  (235 MB/s)
+    a3b5235  feat(platform): converge hosted runtime handoff     75.79s (2.6 MB/s)
+
+`a3b5235` is 12,504 insertions across 66 files, and its own handoff document
+had already written the warning: "Three subagents shared the integration
+worktree, so the final commit groups a large convergence diff. Review by
+subsystem and behavior, not merely by commit size." It was reviewed by
+subsystem. It was not reviewed by behavior, and workspace movement — the
+product's central operation — got roughly 90x slower without a single test
+noticing.
+
+**Why nothing caught it.** The move benchmark was the one instrument pointed at
+this, and it could not run. `bench/move_matrix.py` refuses to put a credential
+on argv, so it requires `REMOUNT_TOKEN` in the environment; the artifact
+endpoint answered a *presented* bearer with 401 in standalone mode while
+accepting a request with no credential at all. So the benchmark failed against
+the simplest possible server, the evidence file went stale at a commit before
+the regression, and the number in `docs/benchmarks.md` kept describing a build
+nobody was running.
+
+Two independent failures had to line up: a correctness bug in an auth path made
+the instrument unusable, and a performance claim was carried forward as a
+committed fact rather than re-earned. Neither alone would have hidden this.
+
+**Fix.** `internal/server/server.go`: a standalone server with no shared token
+and no authenticator now resolves the same subject whether or not a bearer is
+presented, because it has nothing to check one against and every other surface
+already admits any bearer in that configuration. Presenting a credential must
+never reduce authority. Regression tests
+`TestStandaloneArtifactsAcceptABearerTheSameAsNone` and
+`TestConfiguredTokenStillRejectsAWrongBearer` — the second exists because the
+first would also pass if the fix had opened every mode.
+
+**Lesson.** A performance number is evidence about a commit, not about a
+program. Once it is checked in it stops being a measurement and becomes a
+claim, and a claim decays silently while the code moves underneath it. Re-earn
+it on the candidate or delete it — the same rule this repository already
+applies to correctness evidence, which is why `make plan-b` refuses to promote a
+recorded outcome into a pass.
+
+The second half is sharper: **when a measurement contradicts a committed
+number, do not pick a side — find out why they differ.** The contradiction was
+the finding. Believing the benchmark would have hidden a 41x regression;
+believing my own measurement without bisecting would have sent someone hunting
+an inherent cost that did not exist. Three hypotheses died on the way there
+(gzip, fsync, the network), each cheap to test and each wrong, and testing them
+is what made the bisect obviously worth doing.
+
+And an instrument that cannot run is not a passing instrument. A benchmark that
+fails to start looks exactly like a benchmark nobody scheduled.
+
+## 44. Three ceilings that were never ceilings
+
+**Symptom.** A load pass that measured growth across repeated cycles — rather
+than checking a single absolute number — found three places where a bound was
+assumed and never enforced.
+
+`Control.tails` had no limit of any kind. One authenticated peer, on **one
+connection**, opened **2,000 follow subscriptions with zero refusals**: 2,000
+control-plane goroutines and 150 MiB, about 75 KiB each, growing linearly with
+no rejection code and no metric. Each subscription also takes a slot that
+`Log.fanOutLocked` walks on every append under the log mutex, so the cost is
+per-event as well as per-subscriber. A remote peer sized the control plane's
+memory and its per-event work.
+
+`eventSubscription.enqueue` dropped a slow consumer by closing its channel. A
+consumer that stopped reading during 4,000 events received 256 of them and then
+saw a closed channel — which is exactly what it sees after cancelling itself.
+The loss was both uncounted and indistinguishable from a clean shutdown.
+
+`Control.poolIdle` was one control-wide map keyed by machine id, but
+`enrichPoolInventory` pruned every entry not visible to *the pool it was
+currently reconciling*. Since `reconcilePoolsAsync` starts every pool on the
+same tick, reconciling pool A erased the idle clocks of pools B through Z. A
+single pool drained in 870 ms; six pools left 4 of 6 machines running after
+30 s, and an eight-pool run left machines up after 3 minutes 21 seconds with
+every node online, assignment-free and correctly labelled. The wider the fleet,
+the less likely any machine survived from "marked idle" to "old enough to
+destroy". Idle provider inventory is billed by the hour, so this was a spend
+bug wearing a tidiness bug's clothes.
+
+**Fix.** `MaxEventTailsPerRequester` (default 64) refuses a new subscription
+with `resource_exhausted` and `remount_event_tail_quota_rejections_total`;
+replacing an existing subscription id is still always allowed, because that is
+not the unbounded direction. `enqueue` now drops the event and **keeps the
+subscription open**, setting `Lagged()` and moving
+`remount_event_subscribers_dropped_total`; events carry a monotonic `Seq`, so
+the consumer sees the discontinuity the same way a session sees a `gap` chunk.
+`poolIdle` is keyed by `{pool, machine}` and each reconcile prunes only its own
+pool's entries.
+
+**Lesson.** A ceiling nobody measured is a hypothesis. All three of these were
+believed to be bounded; none were, and the code read as though they were.
+
+Measure a bound by **slope, not level**: run to steady state, run again, and
+compare a later cycle to an earlier one. An absolute number tells you what a
+workload costs; only the second cycle tells you whether anything was released.
+That method is what separated the real leaks from ordinary cost here — 400
+reconnecting cursors peak at 2,429 goroutines and settle to 29 every single
+cycle, which looks alarming and is completely fine.
+
+Two of these are the same mistake as #38 and #43 again, in a third costume: a
+silent drop and a green gauge are both "I could not tell" rendered as good
+news. **Every rejected or dropped unit needs a counter and an explicit result**
+— if the only evidence of loss is that a number is smaller than expected, the
+loss is invisible to everyone who was not counting.
+
+And shared mutable state must be keyed by the scope that owns it. `poolIdle`
+was correct for one pool and silently wrong for two, which is the kind of bug
+that ships because the test fixture had one of everything.
+
 ---
 
 The smaller fixes from the same hardening pass—error shadowing in persistence
@@ -877,6 +996,59 @@ indexed in the [implementation
 closure](docs/engineering/implementation-closure-2026-09-03.md#additional-defects-found-during-implementation-review).
 Their reusable implications are folded into the [hardening
 playbook](docs/engineering/hardening-lessons.md).
+
+## 43. Six ways to hold a boundary and one way to hand it away
+
+**Symptom.** An adversarial pass over the newest subsystems and over the two
+oldest security boundaries found bugs that share one shape: the code defended
+the property it was written to defend and did not notice a second path to the
+same place.
+
+- `internal/e2ee`: `peer.gone` was handled before the required-policy plaintext
+  check and without asking who sent it, so any peer could forge a plaintext
+  fleet event and destroy another peer's keys. Only the control plane speaks
+  for the fleet.
+- `internal/e2ee`: a connection cached its binding identity forever. A node
+  uplink outlives a dated credential, so once the binding expired the peer
+  could never encrypt again — a permanent outage under a required policy, and a
+  permanent silent downgrade under a preferred one.
+- `internal/fsops`: containment failures were classified by matching
+  `"path escapes from parent"` against an error string that embeds the caller's
+  own path. A workspace could create a directory with that name and manufacture
+  the exact audit signal an operator reads as an exfiltration attempt. The
+  error mapper was matching on message text, which is the thing this protocol
+  tells every other caller never to do.
+- `internal/fsops`: a search whose root could not be walked returned "no
+  matches" rather than an error, so a jail denial rendered as a clean empty
+  result.
+- `internal/broker`: the ambiguous-encoded-path guard ran after the path had
+  already been decoded, so `%2f` and `%2e` — the two forms the specification
+  names first — were exactly the two it could no longer see. `%25` and `%5c`
+  still tripped it, which is why it looked like it worked.
+- `internal/broker`: the workspace's broker capability, a bearer that
+  authorizes that workspace's entire egress surface, was written into audit
+  records by two pre-authentication paths and from there into the durable,
+  exportable event log.
+- `internal/control`: a retention gauge was set to zero when the check could not
+  run, so the number an operator alerts on went green at the moment the check
+  broke.
+
+**Lesson.** Every one of these is a boundary that holds against the attack it
+was designed for and leaks through an adjacent path: a second frame kind, a
+second lifetime, a second encoding, a second error class, a second code path
+that runs before authentication. When reviewing a boundary, do not re-verify
+the case it already handles — enumerate the other ways in.
+
+Two of these are also the same mistake as #38 wearing different clothes: a
+signal that reports healthy when it is merely uninformed. An empty search
+result, a zeroed gauge, and a skipped job are all indistinguishable from good
+news unless the code makes "I could not tell" a distinct answer.
+
+And a credential's blast radius is every surface that records it, not just
+every surface that accepts it. The broker capability was never *checked* in an
+audit record; it was only *written* there, and that was enough.
+
+---
 
 That playbook is also the cross-cutting pattern analysis for mistakes 23-41:
 truth must survive asynchronous boundaries, authorization must be revalidated

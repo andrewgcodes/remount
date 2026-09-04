@@ -10,7 +10,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 
 	"remount.dev/remount/internal/compliance"
 	"remount.dev/remount/internal/eventlog"
@@ -216,6 +218,7 @@ func (c *Control) AuditExport(ctx context.Context, actor Subject, req *proto.Aud
 // recording it would let any authenticated caller grow the log at will.
 func (c *Control) recordAuditDenial(actor Subject, requested string, req *proto.AuditExportReq, reason error) {
 	metrics.AuditExportDenied.Inc()
+	requested = recordedTenantSelector(requested)
 	stream := actor.Tenant
 	if stream == "" {
 		stream = requested
@@ -229,6 +232,29 @@ func (c *Control) recordAuditDenial(actor Subject, requested string, req *proto.
 	if err := c.transact(func(*eventlog.Tx) error { return nil }, []*proto.Event{event}); err != nil {
 		c.logger.Warn("audit export denial was not recorded", "err", err, "principal", actor.ID)
 	}
+}
+
+// maxRecordedTenantSelector bounds how much of a caller-supplied tenant
+// selector may reach the durable log. A tenant id is a short identifier;
+// anything longer than this is not one, and only its size is a fact worth
+// keeping.
+const maxRecordedTenantSelector = 128
+
+// recordedTenantSelector keeps a denial attributable without letting the
+// request body decide how many bytes the canonical event log grows by.
+//
+// The denial itself is the record an auditor wants, and it is written for
+// every refused export. Copying an unbounded request field into it verbatim
+// would let any authenticated caller append its own request to the durable log
+// once per refusal, for as long as it cared to — the same amplification the
+// malformed-range case is deliberately not recorded to avoid. The prefix is
+// trimmed to valid UTF-8 so a cut multi-byte rune cannot leave a broken string
+// in a durable event.
+func recordedTenantSelector(requested string) string {
+	if len(requested) <= maxRecordedTenantSelector {
+		return requested
+	}
+	return fmt.Sprintf("%s… (%d bytes)", strings.ToValidUTF8(requested[:maxRecordedTenantSelector], ""), len(requested))
 }
 
 // auditExportError turns a compliance failure into a stable protocol code. A
