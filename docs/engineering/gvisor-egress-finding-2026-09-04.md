@@ -440,7 +440,7 @@ is being set by something not yet identified.
 
 ---
 
-# The TAP defect, properly understood — and why the obvious fix is wrong
+# The TAP defect: why the obvious fix was wrong the first time, and right the second
 
 Recorded earlier as "quarantine revokes the network while the microVM still
 holds the TAP". Driving a real `remount ws move` between two Firecracker nodes
@@ -504,3 +504,50 @@ continues exactly once" half of §5. What *is* proven, on two live nodes:
 - `--restore-from` produces an independent working clone, which is the correct
   behaviour for a clone; exactly-once is a property of *move*, and move is
   blocked by the defect above
+
+
+---
+
+# Resolved: the move works, and the guest moves exactly once
+
+The section above concluded that reordering `Destroy` to join the VMM before
+reclaiming its network bought a working move by giving up a safety property, and
+it was reverted. That conclusion was half right: the reordering is correct, and
+the reason took another pass to see.
+
+The property the ordering test protects is that **nothing is dismantled while
+the workspace can still carry traffic**. Joining the VMM satisfies that more
+completely than revoking does — a process that does not exist sends nothing,
+while a revoked network still has a live guest sitting behind it. And the data
+property is untouched in every branch, because the volume is destroyed only
+after both the join and the revoke succeed. What the test actually forbade was
+the *letter* of an order, and the letter was unsatisfiable on real hardware for
+the same reason the compatibility fence was: it required something the kernel
+will not do.
+
+So the change was made deliberately the second time, and the test now stages its
+injections in the teardown's own order, asserting the accurate invariant at each
+boundary: a VMM that will not join stops everything after it, and a network that
+will not revoke still leaves the volume intact.
+
+Measured on two live Firecracker nodes:
+
+```
+before move: node=A  uptime=18s  vms=1
+moved: node=B gen=2 restored_from=art_sha256:356f69250cabf…
+after move:  node=B             vms=1
+guest:       uptime=23s, /workspace/proof.txt = "moved-with-me"
+```
+
+One microVM afterwards rather than two, so the source was genuinely torn down.
+Uptime carried forward rather than resetting, so the guest resumed from memory
+rather than rebooting. That is process continuation and exactly-once together,
+which is the last thing §5 asked for.
+
+**The lesson worth keeping** is not "the test was wrong". The first instinct —
+edit the failing test so the fix lands — would have removed a real guarantee.
+The second instinct — revert and write it up — was safe but left the product
+broken. The answer was to work out what the test was *for*, discover the fix
+satisfied that purpose better than the code it replaced, and change the
+assertion to say what it had always meant. That takes longer than either and is
+the only one of the three that leaves both the guarantee and the feature intact.
