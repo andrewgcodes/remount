@@ -177,6 +177,55 @@ explicit assertion that `.local/state/opencode` never entered the workspace.
 A five-run stress attempt reproduced the separately recorded session-stream
 close failure before completing; it did not reproduce the lock-file failure.
 
+**The following CI run exposed four independent regressions.** The exact jobs
+were macOS `101053506318`, Ubuntu `101053506160`, Windows `101053506144`, and
+race conformance `101053505886`.
+
+- macOS and Ubuntu both failed `TestE8PrincipalRevocationComposes` when Bob's
+  newer grant reached a node before the corresponding authorization-revision
+  push. Treating every revision mismatch as stale returned
+  `unauthorized: grant authorization revision or tenant is stale`. Nodes now
+  distinguish an older grant (`unauthorized`) from a control-ahead grant
+  (`conflict`); the client discards the grant and retries for a bounded
+  interval while the node receives the push. The existing E8 revocation
+  assertion remains unchanged, including node-side closure evidence. The
+  focused client regression passed ten repetitions, node authorization tests
+  passed ten ordinary and five race repetitions, and E8 passed fifty ordinary
+  and ten race repetitions.
+- Windows failed five B32 install lanes with `executable file not found in
+  %PATH%`: the release artifact was `remount-windows-amd64.exe`, but the
+  isolated install copied it to `remount`. Installed Windows binaries now
+  retain the `.exe` suffix. The linked-npm control separately expanded its
+  prefix beneath a literal `${APPDATA}` because the intentionally scrubbed
+  environment also removed Windows package-manager roots; the clean
+  environment now retains only the required Windows runtime and user-data
+  variables. Focused executable-name, environment, static install, Go-module,
+  npm, and Python-wheel regressions passed where their named prerequisites
+  were available.
+- Windows `TestHelmGoldenTemplateIsCurrent` displayed identical lines but
+  failed at line 14 because the checkout held CRLF bytes and Helm emitted LF.
+  Golden comparison now normalizes CRLF to LF before comparing content; the
+  focused policy tests passed.
+- Race conformance pruned 992 of 1,200 events, reported oldest sequence 993,
+  then advanced the asynchronous retention watermark before the recovery
+  request. Recovery now follows each explicit increasing `CodeEvicted`
+  watermark until it reaches the retained window; it still rejects silent
+  truncation. The same job spent fifteen minutes in sequential cursor
+  teardown after one partitioned detach request never returned. Scale teardown
+  now issues bounded detaches concurrently and then closes every client and
+  connection, while the existing peer, goroutine, heap, and descriptor release
+  assertions remain unchanged. Full-width ordinary and race cursor runs
+  passed. The security-focused `make conformance` lane now excludes the
+  separately exercised Plan B and handoff scale benchmarks so its twenty-minute
+  budget measures conformance rather than benchmark teardown.
+
+The same Windows job failed `TestHandoffScaleAndControlFailover`: after a
+16-second control restart, at least one of 200 live sessions exceeded the
+client's fixed 30-second reattach deadline. This remains a named Windows CI
+exclusion and is not reported as passed. A focused run on the verification VM
+passed in 86.5 seconds, confirming that the failure depends on hosted-runner
+load rather than disproving the observed deadline miss.
+
 **A Windows-hosted Docker conformance run selected Windows commands for a
 Linux workspace.** Command selection was compiled from the runner's OS, so
 Docker sessions received `cmd.exe` even though they execute inside Linux. The

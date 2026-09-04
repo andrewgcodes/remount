@@ -2296,8 +2296,12 @@ func (n *Node) authorizeClaims(client, wsID string, g *proto.Grant) (*ws, proto.
 	if g.Claims.Gen != w.Generation {
 		return nil, proto.GrantClaims{}, proto.Err(proto.CodeConflict, "grant generation %d != workspace generation %d (workspace moved?)", g.Claims.Gen, w.Generation)
 	}
-	if g.Claims.Tenant != w.Tenant || g.Claims.AuthzRevision != w.AuthzRevision {
+	if g.Claims.Tenant != w.Tenant || g.Claims.AuthzRevision < w.AuthzRevision {
 		return nil, proto.GrantClaims{}, proto.Err(proto.CodeUnauthorized, "grant authorization revision or tenant is stale")
+	}
+	if g.Claims.AuthzRevision > w.AuthzRevision {
+		return nil, proto.GrantClaims{}, proto.Err(proto.CodeConflict,
+			"node authorization revision %d is behind grant revision %d", w.AuthzRevision, g.Claims.AuthzRevision)
 	}
 	if proto.HasCapability(n.protocol, proto.CapabilityControllerEpoch) && g.Claims.ControllerEpoch != n.currentControllerEpoch() {
 		return nil, proto.GrantClaims{}, proto.Err(proto.CodeUnauthorized, "grant controller epoch is stale")

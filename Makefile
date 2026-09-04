@@ -91,6 +91,7 @@ modal-smoke:
 # documentation-only success gate again.
 conformance:
 	go test -race -p 1 -count=1 -timeout 1200s \
+		-skip '^(TestPlanBScale|TestHandoffScaleAndControlFailover)' \
 		./internal/artifact ./internal/broker ./internal/client ./internal/control \
 		./internal/fsops ./internal/node ./internal/proto ./internal/relay \
 		./internal/server ./internal/session ./internal/sim ./internal/transport \

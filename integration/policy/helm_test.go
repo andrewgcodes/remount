@@ -44,14 +44,22 @@ func TestHelmGoldenTemplateIsCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rendered == string(golden) {
+	goldenText := strings.ReplaceAll(string(golden), "\r\n", "\n")
+	if rendered == goldenText {
 		return
 	}
 	t.Errorf("the chart no longer renders %s. Regenerate it and review the diff:\n"+
 		"  helm template %s %s --namespace %s -f %s > %s",
 		goldenPath, releaseName, chartPath, namespace, valuesPath, goldenPath)
-	for _, line := range firstDifference(string(golden), rendered) {
+	for _, line := range firstDifference(goldenText, rendered) {
 		t.Log(line)
+	}
+}
+
+func TestHelmGoldenComparisonNormalizesWindowsCheckouts(t *testing.T) {
+	golden := strings.ReplaceAll("line one\r\nline two\r\n", "\r\n", "\n")
+	if diff := firstDifference(golden, "line one\nline two\n"); diff != nil {
+		t.Fatalf("line-ending-only difference = %v", diff)
 	}
 }
 
