@@ -1116,3 +1116,55 @@ unavailable of 68 requirements in 6.793 seconds. All 53 required requirements
 passed; the unavailable capability-gated and extension checks retained their
 named prerequisites. Cleanup was verified. The fuzz gate completed every
 registered target without a failure. No artifact was published.
+
+### Post-rebase aggregate and canonical-event observation, 2026-09-04
+
+The Linux branch was rebased onto `origin/main`
+`0f19959fef6403d0e4f75b09758c4babe6019f7e`, preserving the upstream Modal
+startup fix, conformance grant refresh, gVisor crash reclamation and E5 proof.
+The first aggregate run on candidate
+`e2668ffcfa919f4db099c29f3e1ae63b67449c9b` completed in 1,864,017 ms:
+
+```text
+39 passed, 0 failed, 28 unavailable
+required: 39 of 55 passed, 0 failed, 16 unavailable
+external resources: 1 created, 1 cleanup verified, 0 cleanup failed
+```
+
+The exact command supplied the pinned gVisor and Firecracker candidates and
+ran `go run ./cmd/evidence run`. B28, B29, B30, B31 and B32 passed. Every
+unavailable row retained its named missing prerequisite or explicit release
+decision. The baseline gates passed because their subprocess environment now
+removes scenario-only host switches rather than accidentally activating
+privileged integration tests inside ordinary `make test` and `make race`.
+Post-run inspection found zero `rmh*` links, Remount nftables tables,
+Remount namespace mounts, runsc sandboxes or gofers. **Status: verified.**
+
+The subsequent exact built-binary command exposed a separate intermittent
+conformance-runner race:
+
+```sh
+go run ./cmd/conformance --build .
+```
+
+The denied broker request returned 403, but `CONF-BIND-002` immediately read
+the control-plane event stream before the node's durable event outbox had
+forwarded its `egress.denied` audit. One of five focused repetitions reproduced
+the false failure; the other four observed the same canonical event and
+passed. The checker now polls the canonical log for at most five seconds,
+within the requirement's existing context, and still fails with the original
+diagnostic if the event never arrives. `CONF-BIND-003` uses the same boundary,
+and `CONF-BIND-005` waits until both refused requests are observable before
+asserting that neither audit contains the secret.
+
+Verification:
+
+```text
+go test -count=20 ./internal/conformance
+10 focused built-binary CONF-BIND-002 runs
+go run ./cmd/conformance --build .
+```
+
+All focused repetitions passed. The complete built-binary run reported 60
+passed, 0 failed and 8 unavailable of 68 requirements in 6.838 seconds; all 53
+required requirements passed and cleanup was verified. **Status: verified.**
