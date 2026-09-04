@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"remount.dev/remount/internal/metrics"
 )
 
 const (
@@ -23,7 +25,14 @@ const (
 	defaultMaxObjects      int64 = 100_000
 	defaultMaxScopeObjects int64 = 4_096
 	connectorKeyBytes            = 32
+
+	stagingBodyPrefix     = "body-"
+	stagingMetadataPrefix = ".metadata-"
 )
+
+// errCachedObjectTooLarge reports a verified-scope reference whose object is
+// larger than the ceiling the current rule permits. No bytes were released.
+var errCachedObjectTooLarge = errors.New("connector cache object exceeds the current response limit")
 
 // StoreOptions bound both physical shared storage and the logical amount one
 // workspace may pin. Limits are enforced before an upstream body is staged.
@@ -105,12 +114,65 @@ func NewStore(root string, opts StoreOptions) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := reconcileStaging(filepath.Join(root, "scopes")); err != nil {
+		return nil, err
+	}
 	return &Store{
 		root: root, key: key, maxBytes: opts.MaxBytes,
 		maxBytesPerScope: opts.MaxBytesPerScope, maxObjectBytes: opts.MaxObjectBytes,
 		maxObjects: opts.MaxObjects, maxObjectsPerScope: opts.MaxObjectsPerScope,
 		byScope: map[string]int64{}, objectsByScope: map[string]int64{},
 	}, nil
+}
+
+// reconcileStaging removes staging files a previous process abandoned before
+// commit or abort. In-memory reservations do not survive restart, so any file
+// left in a scope's tmp directory would otherwise occupy bytes and inodes that
+// no admission decision accounts for. Only regular files carrying the store's
+// own staging prefixes are removed; anything else in a tmp directory fails
+// closed because that directory belongs entirely to this store.
+func reconcileStaging(scopesDir string) error {
+	scopes, err := os.ReadDir(scopesDir)
+	if err != nil {
+		return fmt.Errorf("connector store: read scopes: %w", err)
+	}
+	for _, scope := range scopes {
+		if !scope.IsDir() {
+			continue
+		}
+		scopeRoot := filepath.Join(scopesDir, scope.Name())
+		if err := removeOwnedStaging(filepath.Join(scopeRoot, "tmp"), stagingBodyPrefix, true); err != nil {
+			return err
+		}
+		if err := removeOwnedStaging(filepath.Join(scopeRoot, "refs"), stagingMetadataPrefix, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeOwnedStaging(dir, prefix string, exclusive bool) error {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("connector store: read staging: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) || !entry.Type().IsRegular() {
+			if exclusive {
+				return fmt.Errorf("connector store: unexpected staging entry %q", filepath.Join(dir, name))
+			}
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("connector store: remove abandoned staging: %w", err)
+		}
+		metrics.PackageStagingReclaimed.Inc()
+	}
+	return nil
 }
 
 func loadOrCreateKey(path string) ([]byte, error) {
@@ -189,34 +251,109 @@ func (s *Store) refPath(scope, digest string) string {
 	return filepath.Join(s.scopeRoot(scope), "refs", digest+".json")
 }
 
-func (s *Store) lookup(tenant, workspace, digest string) (ConnectorResponse, bool, error) {
+// lookup resolves the scope's own reference for digest. A hit is returned
+// only after the blob's bytes have been hashed and found to match digest, so
+// the returned body is verified content, not a file that merely has the right
+// name and size. maxBytes > 0 is the ceiling the current rule permits for a
+// delivered body; a larger object returns errCachedObjectTooLarge without
+// touching the blob. Any other error means the reference existed but could not
+// be verified: it has been invalidated and the caller should fetch afresh.
+func (s *Store) lookup(tenant, workspace, digest string, maxBytes int64) (ConnectorResponse, bool, error) {
 	scope := s.scope(tenant, workspace)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	data, err := os.ReadFile(s.refPath(scope, digest))
+	s.mu.Unlock()
 	if errors.Is(err, os.ErrNotExist) {
 		return ConnectorResponse{}, false, nil
 	}
 	if err != nil {
+		s.invalidate(scope, digest, nil)
 		return ConnectorResponse{}, false, fmt.Errorf("connector cache metadata unavailable: %w", err)
 	}
 	var ref cacheReference
-	if err := json.Unmarshal(data, &ref); err != nil || ref.Digest != digest || ref.Size < 0 {
+	if err := json.Unmarshal(data, &ref); err != nil || ref.Digest != digest || ref.Size < 0 || ref.Size > s.maxObjectBytes {
+		s.invalidate(scope, digest, nil)
 		return ConnectorResponse{}, false, errors.New("connector cache metadata is corrupt")
+	}
+	if maxBytes > 0 && ref.Size > maxBytes {
+		return ConnectorResponse{}, false, errCachedObjectTooLarge
 	}
 	f, err := os.Open(s.blobPath(digest))
 	if err != nil {
+		s.invalidate(scope, digest, nil)
 		return ConnectorResponse{}, false, errors.New("connector cache content is unavailable")
 	}
-	st, err := f.Stat()
-	if err != nil || !st.Mode().IsRegular() || st.Size() != ref.Size {
+	info, err := s.verifyBlob(f, digest)
+	if err != nil {
 		_ = f.Close()
-		return ConnectorResponse{}, false, errors.New("connector cache content failed integrity metadata checks")
+		s.invalidate(scope, digest, info)
+		return ConnectorResponse{}, false, err
+	}
+	if info.Size() != ref.Size {
+		_ = f.Close()
+		s.invalidate(scope, digest, nil)
+		return ConnectorResponse{}, false, errors.New("connector cache metadata disagrees with verified content")
 	}
 	return ConnectorResponse{
 		StatusCode: ref.StatusCode, Header: cloneHeader(ref.Header), Body: f,
 		ContentLength: ref.Size,
 	}, true, nil
+}
+
+// verifyBlob hashes the open file and reports whether it is a regular file no
+// larger than the object ceiling whose bytes hash to digest. On success the
+// file is rewound to offset 0. Blobs are only ever linked and removed, never
+// written in place, so hashing does not need the store lock.
+func (s *Store) verifyBlob(f *os.File, digest string) (os.FileInfo, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("connector cache content unavailable: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return info, errors.New("connector cache content is not a regular file")
+	}
+	if info.Size() > s.maxObjectBytes {
+		return info, errors.New("connector cache content exceeds the object ceiling")
+	}
+	hash := sha256.New()
+	n, err := io.Copy(hash, io.LimitReader(f, info.Size()+1))
+	if err != nil {
+		return info, fmt.Errorf("connector cache content unreadable: %w", err)
+	}
+	if n != info.Size() {
+		return info, errors.New("connector cache content changed during verification")
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != digest {
+		return info, errors.New("connector cache content does not match its digest")
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return info, fmt.Errorf("connector cache content unavailable: %w", err)
+	}
+	return info, nil
+}
+
+// invalidate withdraws the scope's reference so the next request fetches
+// afresh. When failed names the blob that failed verification, that blob is
+// discarded too, but only while the digest path still refers to the very file
+// that was examined: a concurrent commit may already have replaced it with
+// verified bytes.
+func (s *Store) invalidate(scope, digest string, failed os.FileInfo) {
+	metrics.PackageCacheIntegrityFailures.Inc()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = os.Remove(s.refPath(scope, digest))
+	if failed != nil {
+		s.discardBlobLocked(digest, failed)
+	}
+}
+
+func (s *Store) discardBlobLocked(digest string, failed os.FileInfo) {
+	path := s.blobPath(digest)
+	current, err := os.Lstat(path)
+	if err != nil || !os.SameFile(current, failed) {
+		return
+	}
+	_ = os.Remove(path)
 }
 
 func (s *Store) begin(tenant, workspace string, maximum int64) (*reservation, *os.File, error) {
@@ -257,7 +394,7 @@ func (s *Store) begin(tenant, workspace string, maximum int64) (*reservation, *o
 		s.release(scope, maximum)
 		return nil, nil, fmt.Errorf("connector cache staging unavailable: %w", err)
 	}
-	f, err := os.CreateTemp(tmpDir, "body-*")
+	f, err := os.CreateTemp(tmpDir, stagingBodyPrefix+"*")
 	if err != nil {
 		s.release(scope, maximum)
 		return nil, nil, fmt.Errorf("connector cache staging unavailable: %w", err)
@@ -337,25 +474,14 @@ func (r *reservation) commit(digest string, size int64, status int, header httpH
 		return "", errors.New("connector cache object exceeded its reservation")
 	}
 	s := r.store
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	blob := s.blobPath(digest)
-	if err := ensurePrivateDir(filepath.Dir(blob)); err != nil {
+	if err := s.publishBlob(r.path, blob, digest); err != nil {
 		_ = os.Remove(r.path)
 		return "", err
 	}
-	if err := os.Link(r.path, blob); err != nil {
-		if !errors.Is(err, os.ErrExist) {
-			_ = os.Remove(r.path)
-			return "", fmt.Errorf("connector cache commit: %w", err)
-		}
-		info, statErr := os.Stat(blob)
-		if statErr != nil || !info.Mode().IsRegular() || info.Size() != size {
-			_ = os.Remove(r.path)
-			return "", errors.New("connector cache existing blob failed integrity metadata checks")
-		}
-	}
 	_ = os.Remove(r.path)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := os.Chmod(blob, 0o444); err != nil {
 		return "", fmt.Errorf("connector cache protect blob: %w", err)
 	}
@@ -364,6 +490,48 @@ func (r *reservation) commit(digest string, size int64, status int, header httpH
 		return "", err
 	}
 	return blob, nil
+}
+
+// publishBlob links the verified staged file at the digest path. When a blob
+// already exists there it is reused only after its own bytes hash to digest;
+// an existing file that fails verification is discarded and replaced by the
+// staged bytes, so a same-named object that does not match its digest can
+// never be reached through a committed reference. Hashing runs outside the
+// store lock, so the replacement is guarded by an identity check on the file
+// that was examined and by a single retry.
+func (s *Store) publishBlob(staged, blob, digest string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ensurePrivateDir(filepath.Dir(blob)); err != nil {
+		return err
+	}
+	for attempt := 0; ; attempt++ {
+		err := os.Link(staged, blob)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("connector cache commit: %w", err)
+		}
+		existing, openErr := os.Open(blob)
+		var failed os.FileInfo
+		verifyErr := openErr
+		if openErr == nil {
+			s.mu.Unlock()
+			failed, verifyErr = s.verifyBlob(existing, digest)
+			_ = existing.Close()
+			s.mu.Lock()
+		}
+		if verifyErr == nil {
+			return nil
+		}
+		if attempt > 0 {
+			return fmt.Errorf("connector cache commit could not replace unverified blob: %w", verifyErr)
+		}
+		if failed != nil {
+			s.discardBlobLocked(digest, failed)
+		}
+	}
 }
 
 // httpHeader avoids importing net/http in the storage layer while retaining

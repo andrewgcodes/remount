@@ -148,6 +148,8 @@ Every counter is exported at `/metrics` in Prometheus text format, and through
 | `remount_connector_package_response_bytes_total` | registry bytes staged and hashed before release |
 | `remount_connector_package_failures_total` | connector execution, integrity, or policy failures |
 | `remount_connector_package_quota_rejections_total` | package staging rejected before disk limits could be exceeded |
+| `remount_connector_package_cache_integrity_failures_total` | a workspace cache reference failed digest verification and was withdrawn before any byte was released |
+| `remount_connector_package_staging_reclaimed_total` | abandoned package staging files removed when the connector store restarted |
 | `remount_workspace_quota_rejections_total` | workspace creation rejected at tenant/subject capacity |
 | `remount_session_quota_rejections_total` | session open rejected at node/workspace/principal capacity |
 | `remount_control_requests_rejected_total` / `remount_node_requests_rejected_total` | bounded request admission rejected overload |
