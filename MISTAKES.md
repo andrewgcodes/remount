@@ -987,6 +987,83 @@ And shared mutable state must be keyed by the scope that owns it. `poolIdle`
 was correct for one pool and silently wrong for two, which is the kind of bug
 that ships because the test fixture had one of everything.
 
+## 45. One fsync per unit, in two streaming paths
+
+**Symptom.** The two regressions in #42 had one shared shape, and it was not
+what I guessed. `a3b5235` put **per-unit durable-sync work inside streaming
+paths**, turning one publish into thousands.
+
+Move: the commit routed every filesystem-backed move through chunked-v1, so
+200 MB became ~3,200 objects of 64 KiB, each content-addressed and published —
+staging file, `F_FULLFSYNC`, rename, directory `F_FULLFSYNC` — **three times**
+over, at the source cache, the control-plane store and the destination cache.
+
+Reattach: the commit gave the node a `BlobStoreForSession`, which made
+`l.opts.BlobStore != nil` true and switched on a path where `spillLocked` calls
+`l.spill.Sync()` **per chunk, while holding `l.mu`**. Every reader blocked
+behind hundreds of `F_FULLFSYNC`s. `log.go` itself did not change; the node
+turned the path on.
+
+**What I got wrong, twice.** I predicted round trips, because "large factor
+with fast primitives" usually means round trips. A proof plus an HTTP HEAD
+measured **0.17 ms** — negligible. I had also excluded fsync, because I
+measured 200 MB as four 50 MB files with `Sync()` on each at 1124 MB/s. That
+measurement was correct and the inference was wrong: the real path does not do
+4 fsyncs, it does ~5,000. Isolated, an object costs 0.98 ms with no sync and
+8.04 ms with file and directory sync.
+
+**Fix.** Bounded-concurrency chunk transfer, and chunk only when chunking pays
+— past a byte budget, a tree whose unshared share is too large abandons the
+chunked attempt before uploading anything. For the session log, drop the
+per-record spill sync entirely: `spec/PROTOCOL.md` §8.2 already says "the ring
+and spill of §8 are node-local, so they do not survive node loss", and the
+durable commit point is `sealSpillLocked`, which syncs before publishing the
+segment. The per-record sync was buying a guarantee the protocol disclaims.
+Move went 64.8 s to 0.727 s for 200 MB; reattach went 6.75 s to 0.84 s, back to
+its pre-regression 0.855 s.
+
+**Lesson.** A measurement of the primitive is not a measurement of the path.
+Four fsyncs and five thousand fsyncs have the same per-call cost and completely
+different consequences, and the number of calls was the entire story. When a
+micro-benchmark exonerates a suspect, check the count before you clear it.
+
+Durability has a scope, and syncing outside that scope is pure cost. The spill
+file is a cache in front of a durable tier; the seal is the commit. Anything
+that fsyncs *before* the commit point is buying nothing and charging the reader
+for it, because it was doing it under the lock.
+
+## 46. NoSubscribe subscribed anyway
+
+**Symptom.** Removing the spill sync made session output fast enough to overrun
+a client's 1024-deep delivery queue, which failed the session with
+`resource_exhausted`. The session under test had been opened with
+`NoSubscribe: true` and should have had no chunk stream at all.
+
+`Client.Exec` sends `NoSubscribe`, the node honours it and does not subscribe —
+and then the client unconditionally runs `go registered.reattach(...)`, which
+subscribes. The caller's explicit request was satisfied on the wire and undone
+one line later. `internal/server/api_console.go` opens **every console exec**
+this way, so every one of them streamed output nobody read.
+
+It survived because `Session.Wait` blocks on the exit chunk, so the reattach
+was load-bearing: removing it alone would have hung every `NoSubscribe` caller.
+The protocol has had an `s.wait` operation the whole time, implemented by the
+node and never called by the client.
+
+**Fix.** `Exec` skips the reattach when the caller asked for no subscription,
+and `Wait` falls back to `s.wait`. Regression coverage comes from the load test
+that exposed it.
+
+**Lesson.** An option that is honoured by one side and reversed by the other is
+worse than an option that does not exist: it reads as supported, tests as
+supported, and silently costs what it claimed to save. When adding a flag that
+suppresses work, check what else the same call path starts unconditionally.
+
+This also only surfaced because something *else* got faster. Accidental
+throttling hides real defects, and every performance fix is a chance to find
+the bug that slowness was concealing — worth expecting rather than being
+surprised by.
+
 ---
 
 The smaller fixes from the same hardening pass—error shadowing in persistence

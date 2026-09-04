@@ -1355,6 +1355,9 @@ type Session struct {
 	pending      map[uint64]*proto.Frame
 	pendingBytes int
 	out          chan Chunk
+	// unsubscribed records that this session was opened with NoSubscribe, so
+	// no chunk stream will arrive and Wait must ask the node directly.
+	unsubscribed bool
 	in           chan *proto.Frame
 	stop         chan struct{}
 	stopOnce     sync.Once
@@ -1396,6 +1399,18 @@ func (c *Client) Exec(ctx context.Context, req proto.SOpenReq) (*Session, error)
 	s.mu.Unlock()
 	s.seedInputSeq(res.LastInputSeq)
 	registered := c.register(res.S, s)
+	if req.NoSubscribe {
+		// The caller asked not to receive output and the node honoured it, so
+		// reattaching here would subscribe anyway and quietly undo the request.
+		// It also fills this session's delivery queue with chunks nobody reads,
+		// which fails the session outright once the producer is fast enough.
+		// Wait falls back to the s.wait operation, which is what that operation
+		// exists for.
+		registered.mu.Lock()
+		registered.unsubscribed = true
+		registered.mu.Unlock()
+		return registered, nil
+	}
 	go registered.reattach(context.Background(), c.generation())
 	return registered, nil
 }
@@ -1799,7 +1814,49 @@ func (s *Session) Close(ctx context.Context, kill bool) error {
 }
 
 // Wait blocks until exit (server-side wait plus local delivery).
+// waitRemote asks the node for the exit status instead of waiting for an exit
+// chunk. A session opened with NoSubscribe has no chunk stream, so the stream
+// is not a place its exit can arrive.
+func (s *Session) waitRemote(ctx context.Context) (*proto.ExitInfo, error) {
+	for {
+		var res proto.SWaitRes
+		err := s.c.nodeCall(ctx, s.WS, proto.OpSWait, func(g *proto.Grant) any {
+			return proto.SWaitReq{S: s.ID, TimeoutSec: 30, Grant: g}
+		}, &res)
+		if err != nil {
+			return nil, err
+		}
+		if res.Exited {
+			if res.Exit == nil {
+				return nil, proto.Err(proto.CodeClosed, "session closed without exit")
+			}
+			s.mu.Lock()
+			if s.exit == nil {
+				s.exit = res.Exit
+			}
+			s.closed = true
+			exit := s.exit
+			s.mu.Unlock()
+			s.stopOnce.Do(func() { close(s.stop) })
+			return exit, nil
+		}
+		// The node's own wait timed out rather than the session ending. Respect
+		// the caller's deadline and ask again.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+	}
+}
+
 func (s *Session) Wait(ctx context.Context) (*proto.ExitInfo, error) {
+	s.mu.Lock()
+	unsubscribed := s.unsubscribed
+	s.mu.Unlock()
+	if unsubscribed {
+		return s.waitRemote(ctx)
+	}
 	select {
 	case <-s.exited:
 		if exit := s.Exit(); exit != nil {

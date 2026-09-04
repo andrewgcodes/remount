@@ -475,10 +475,16 @@ func (l *Log) spillLocked(c Chunk) error {
 		l.invalidateSpillLocked()
 		return l.tierErrorLocked(TierDisk, c.Seq, c.Seq+1, fmt.Errorf("write data: %w", err))
 	}
-	if err := l.spill.Sync(); err != nil {
-		l.invalidateSpillLocked()
-		return l.tierErrorLocked(TierDisk, c.Seq, c.Seq+1, fmt.Errorf("sync: %w", err))
-	}
+	// No fsync per record. The spill is a node-local cache, not a durability
+	// tier: spec/PROTOCOL.md §8.2 states plainly that "the ring and spill of §8
+	// are node-local, so they do not survive node loss", and the durable commit
+	// point is sealSpillLocked, which syncs before publishing the segment to the
+	// blob store. Syncing every record bought a guarantee the protocol
+	// disclaims, and cost one F_FULLFSYNC per chunk while holding l.mu — every
+	// reader blocked behind it, which is how session reattach became ~8x
+	// slower when the node started supplying a BlobStore and switched this
+	// path on. Output lost to a node crash is already reported as an explicit
+	// gap, never as a complete replay.
 	if off == 0 {
 		l.spillFirst = first
 	}
