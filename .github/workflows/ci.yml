@@ -75,8 +75,7 @@ jobs:
           # cross-compilation and artifact installation for host resources.
           go test -p 1 -count=1 -timeout 2400s -skip '^(TestExecRoundTripCostOfTheDurableSessionTier|TestPlanbPerfMoveIncompressible|TestPlanBOpenCodeAgentTranscriptApprovalAndResume|TestPlanBOpenCodeDeterministicModelLane|TestHandoffScaleAndControlFailover)$' ./...
           Push-Location integration/publicsdk
-          npm ci
-          npm test
+          go test -count=1 ./...
       - name: race
         run: |
           # Under the race detector the Docker OpenCode lane can fence the
