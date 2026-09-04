@@ -343,7 +343,19 @@ func (s *Session) finish(info proto.ExitInfo) {
 			return s.onComplete(finalInfo, record)
 		}
 	}
-	_ = s.Log.closeWithPublish(finalCommit, func() {
+	_ = s.Log.closeWithPublish(finalCommit, func(commitErr error) {
+		if commitErr != nil {
+			s.mu.Lock()
+			failed := *s.exit
+			message := "session log completion: " + commitErr.Error()
+			if failed.Error == "" {
+				failed.Error = message
+			} else {
+				failed.Error += "; " + message
+			}
+			s.exit = &failed
+			s.mu.Unlock()
+		}
 		if onFinish != nil {
 			onFinish()
 		}

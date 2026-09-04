@@ -18,17 +18,12 @@ const (
 	defaultPartSize           = int64(16 << 20)
 	defaultMaxObjectBytes     = int64(8 << 30)
 	defaultRequestTimeout     = 2 * time.Minute
-	// idleConnTimeout is shorter than the 60 s that AWS ELB, MinIO and most
-	// reverse proxies use, and much shorter than net/http's 90 s default,
-	// which is longer than the servers it talks to and so guarantees this race
-	// eventually happens.
-	idleConnTimeout       = 25 * time.Second
-	defaultStagingTTL     = 24 * time.Hour
-	minimumPartSize       = int64(5 << 20)
-	maximumPartSize       = int64(5 << 30)
-	maximumObjectSize     = int64(5 << 40)
-	maximumSingleCopySize = int64(5 << 30)
-	maximumParts          = 10_000
+	defaultStagingTTL         = 24 * time.Hour
+	minimumPartSize           = int64(5 << 20)
+	maximumPartSize           = int64(5 << 30)
+	maximumObjectSize         = int64(5 << 40)
+	maximumSingleCopySize     = int64(5 << 30)
+	maximumParts              = 10_000
 )
 
 var (
@@ -140,25 +135,11 @@ func New(cfg Config) (*Store, error) {
 	if cfg.HTTPClient != nil {
 		*client = *cfg.HTTPClient
 	} else {
-		// Keep-alive connections are the one place where a correct request
-		// fails for a reason that has nothing to do with the request. If the
-		// endpoint closes an idle connection and this client then picks that
-		// connection to carry the next request, net/http reports "server
-		// closed idle connection" — and it will not retry, because
-		// Request.isReplayable only replays GET, HEAD, OPTIONS and TRACE. A
-		// PUT therefore fails outright. That is not hypothetical: it is how
-		// TestMinIOIntegration failed in CI on the first upload after a ~36 s
-		// idle gap.
-		//
-		// Retrying is the wrong remedy. A conditional PUT that is retried
-		// after its response was lost can come back 412 and be read as a
-		// conflict that never happened, turning a transient into a false
-		// negative — the ambiguous-outcome trap AGENTS.md names. So the fix is
-		// to stop offering the connection instead: expire idle connections
-		// well inside the shortest idle timeout a reasonable endpoint or load
-		// balancer uses, so this client closes them before the server does.
+		// A conditional write cannot be retried after an ambiguous transport
+		// failure. Fresh connections avoid handing it a socket the endpoint
+		// has already closed without introducing an unsafe retry.
 		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.IdleConnTimeout = idleConnTimeout
+		transport.DisableKeepAlives = true
 		client.Transport = transport
 	}
 	// A redirect can copy the session-token header to a host outside the

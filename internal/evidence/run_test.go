@@ -428,6 +428,48 @@ func TestNeedsTool(t *testing.T) {
 	t.Fatalf("%s is missing from the report", wired.ID)
 }
 
+func TestAWiredShellScenarioExit77IsUnavailableOnlyWithAReason(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		output string
+		status Status
+		reason string
+	}{
+		{name: "missing socat", output: "unavailable: socat is required", status: StatusUnavailable, reason: "socat is required"},
+		{name: "missing setsid", output: "UNAVAILABLE: setsid is required", status: StatusUnavailable, reason: "setsid is required"},
+		{name: "unexplained", output: "host proof could not start", status: StatusFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := newRepo(t)
+			wired := Scenario{
+				ID: "B8", Title: "wired host proof", Layer: LayerHostCI, Required: true,
+				Owner: "scripts/gvisor-conformance.sh",
+				Argv:  []string{"sh", "-c", "printf '%s\\n' \"$1\" >&2; exit 77", "gvisor-conformance", tc.output},
+			}
+			res, err := Run(context.Background(), Options{
+				Root: dir, Out: t.TempDir(), Gates: noGates, Lookup: fakeEnv(nil),
+				Scenarios: []string{wired.ID}, overrideScenario: &wired,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, rec := range res.Records {
+				if rec.Scenario != wired.ID {
+					continue
+				}
+				if rec.Status != tc.status {
+					t.Fatalf("status = %s, want %s (%s)", rec.Status, tc.status, rec.Reason)
+				}
+				if tc.reason != "" && rec.Reason != tc.reason {
+					t.Fatalf("reason = %q, want %q", rec.Reason, tc.reason)
+				}
+				return
+			}
+			t.Fatalf("%s is missing from the report", wired.ID)
+		})
+	}
+}
+
 // TestAnUnselectedWiredScenarioIsUnavailableNotPassed keeps the selector on the
 // same honesty terms as the gate list: leaving a row out of an invocation is a
 // reason, never a silent omission and never a pass.

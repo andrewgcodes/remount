@@ -251,6 +251,89 @@ func TestWaitBlocksUntilDurableCompletionRecordCommits(t *testing.T) {
 	}
 }
 
+func TestDurableCompletionFailureIsObservableAndReplayStaysIncomplete(t *testing.T) {
+	store, err := artifact.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitErr := errors.New("complete record rejected")
+	recordErrors := make(chan error, 1)
+	var partial LogRecord
+	var partialMu sync.Mutex
+	m := NewManager(ManagerOptions{
+		SpillDir: t.TempDir(), MemBytes: 1, SpillBytes: 1 << 20, MaxChunk: 16, SegmentBytes: 64,
+		Retention:          time.Hour,
+		BlobStoreForTenant: func(string) (artifact.BlobStore, error) { return store, nil },
+		CommitSessionLogRecord: func(_ string, _ Spec, record LogRecord) error {
+			partialMu.Lock()
+			partial = record
+			partialMu.Unlock()
+			return nil
+		},
+		CompleteSessionLogRecord: func(string, Spec, proto.SessionInfo, proto.ExitInfo, LogRecord) error {
+			return commitErr
+		},
+		OnRecordError: func(_ string, err error) {
+			recordErrors <- err
+		},
+	})
+	t.Cleanup(m.Close)
+	s, err := m.Open(Spec{
+		WS: "ws_durable_failure", Tenant: "tenant", Principal: "principal",
+		Kind: proto.SessionExec, Program: []string{"sh", "-c", "head -c 1024 /dev/zero | tr '\\0' x"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	exit, err := s.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exit == nil || !strings.Contains(exit.Error, commitErr.Error()) {
+		t.Fatalf("exit = %+v, want durable completion failure", exit)
+	}
+	select {
+	case err := <-recordErrors:
+		if !errors.Is(err, commitErr) {
+			t.Fatalf("record error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnRecordError did not receive the completion failure")
+	}
+	cursor := s.Log.CursorAt(0)
+	for {
+		_, err := cursor.Next(ctx, 0)
+		if err == nil {
+			continue
+		}
+		var incomplete *ErrIncompleteLog
+		if !errors.As(err, &incomplete) || !strings.Contains(err.Error(), commitErr.Error()) {
+			t.Fatalf("cursor error = %v, want incomplete durable log", err)
+		}
+		break
+	}
+	partialMu.Lock()
+	record := partial
+	partialMu.Unlock()
+	if len(record.Segments) == 0 {
+		t.Fatal("lower-tier durable segments were not preserved")
+	}
+	archived := proto.SessionLogRecord{
+		Session: s.ID, Workspace: s.WS, Tenant: s.Tenant, Principal: s.Principal,
+		Kind: s.Kind, Info: s.Info, Exit: *exit, MaxChunk: record.MaxChunk,
+	}
+	for _, segment := range record.Segments {
+		archived.Segments = append(archived.Segments, proto.SessionLogSegment{
+			First: segment.First, Next: segment.Next, Artifact: segment.Artifact, Bytes: segment.Bytes,
+		})
+	}
+	if _, err := m.RestoreArchived(archived, store); err == nil || !strings.Contains(err.Error(), "incomplete archived record") {
+		t.Fatalf("incomplete replay restore = %v", err)
+	}
+}
+
 func TestImmediateOutputStillFollowsInfo(t *testing.T) {
 	m := newMgr(t)
 	for i := 0; i < 100; i++ {

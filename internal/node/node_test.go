@@ -136,6 +136,64 @@ func TestStaleSessionDetachDoesNotCancelReplacementCursor(t *testing.T) {
 	close(conn.releaseSend)
 }
 
+func TestSubscriptionReportsDurableCompletionFailure(t *testing.T) {
+	n := newTestNode(t, nil)
+	n.sessions.Close()
+	store, err := artifact.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitErr := errors.New("complete record rejected")
+	n.sessions = session.NewManager(session.ManagerOptions{
+		SpillDir: t.TempDir(), MemBytes: 1, SpillBytes: 1 << 20, MaxChunk: 16, SegmentBytes: 64,
+		Retention:          time.Hour,
+		BlobStoreForTenant: func(string) (artifact.BlobStore, error) { return store, nil },
+		CommitSessionLogRecord: func(string, session.Spec, session.LogRecord) error {
+			return nil
+		},
+		CompleteSessionLogRecord: func(string, session.Spec, proto.SessionInfo, proto.ExitInfo, session.LogRecord) error {
+			return commitErr
+		},
+	})
+	s, err := n.sessions.Open(session.Spec{
+		WS: "ws_completion_failure", Tenant: "tenant", Principal: "principal",
+		Kind: proto.SessionExec, Program: []string{"sh", "-c", "printf output"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeConn, clientConn := transport.Pipe(16)
+	p := transport.NewPeer(nodeConn, nil)
+	t.Cleanup(func() {
+		_ = p.Close()
+		_ = clientConn.Close()
+	})
+	n.subscribe(p, "c_completion_failure", s, 0, "")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for {
+		frame, err := clientConn.Recv(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body proto.ChunkBody
+		if err := proto.Unmarshal(frame.Body, &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Stream != proto.StreamExit {
+			continue
+		}
+		var exit proto.ExitInfo
+		if err := proto.Unmarshal(body.Data, &exit); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(exit.Error, commitErr.Error()) {
+			t.Fatalf("exit = %+v, want durable completion failure", exit)
+		}
+		return
+	}
+}
+
 func nodeDigest(body string) string {
 	sum := sha256.Sum256([]byte(body))
 	return artifact.ID(sum[:])

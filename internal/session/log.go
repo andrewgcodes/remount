@@ -66,6 +66,20 @@ func (e *ErrTierUnavailable) Unwrap() error {
 	return &ErrEvicted{Requested: e.Requested, Oldest: e.Oldest}
 }
 
+// ErrIncompleteLog reports that the terminal chunk is unavailable because the
+// complete durable session record did not commit.
+type ErrIncompleteLog struct {
+	Cause error
+}
+
+func (e *ErrIncompleteLog) Error() string {
+	return fmt.Sprintf("session: durable log completion failed: %v", e.Cause)
+}
+
+func (e *ErrIncompleteLog) Unwrap() error {
+	return e.Cause
+}
+
 // SegmentRef is one immutable encoded range in a BlobStore.
 type SegmentRef struct {
 	First    uint64 `json:"first"`
@@ -186,6 +200,7 @@ type Log struct {
 	terminalFirst   uint64
 	terminalPending bool
 	wake            chan struct{}
+	completionErr   error
 
 	spill      *os.File
 	spillFirst uint64
@@ -329,7 +344,7 @@ func (l *Log) Close() error {
 // closeWithPublish runs finalCommit and publish after every archival producer
 // has joined and while readers are still excluded from observing EOF. Session
 // uses it to commit durability, capacity, and exit as one ordered handoff.
-func (l *Log) closeWithPublish(finalCommit func(LogRecord) error, publish func()) error {
+func (l *Log) closeWithPublish(finalCommit func(LogRecord) error, publish func(error)) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
@@ -353,9 +368,10 @@ func (l *Log) closeWithPublish(finalCommit func(LogRecord) error, publish func()
 			l.appendErr = nil
 		}
 	}
+	l.completionErr = err
 	l.closed = true
 	if publish != nil {
-		publish()
+		publish(err)
 	}
 	l.broadcastLocked()
 	return err
@@ -734,7 +750,7 @@ func (l *Log) Read(from uint64, max int) ([]Chunk, error) {
 }
 
 func (l *Log) visibleNextLocked() uint64 {
-	if l.terminalPending && !l.closed {
+	if l.terminalPending && (!l.closed || l.completionErr != nil) {
 		return l.terminalFirst
 	}
 	return l.next
@@ -849,7 +865,11 @@ func (c *Cursor) Next(ctx context.Context, max int) ([]Chunk, error) {
 			continue
 		}
 		if c.log.closed {
+			err := c.log.completionErr
 			c.log.mu.Unlock()
+			if err != nil {
+				return nil, &ErrIncompleteLog{Cause: err}
+			}
 			return nil, io.EOF
 		}
 		wake := c.log.wake

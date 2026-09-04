@@ -2,6 +2,7 @@ package evidence
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -394,6 +395,11 @@ func runScenario(ctx context.Context, opts Options, rec Record, s Scenario) Reco
 		rec.Artifacts = []string{log}
 	}
 	if err != nil {
+		if reason, ok := scenarioUnavailableReason(err, string(output)); ok {
+			rec.Status = StatusUnavailable
+			rec.Reason = reason
+			return rec
+		}
 		rec.Status = StatusFailed
 		rec.Reason = fmt.Sprintf("%s: %v (see %s)", rec.Command, err, log)
 		return rec
@@ -410,6 +416,22 @@ func runScenario(ctx context.Context, opts Options, rec Record, s Scenario) Reco
 	}
 	rec.Status = StatusPassed
 	return rec
+}
+
+func scenarioUnavailableReason(err error, output string) (string, bool) {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 77 {
+		return "", false
+	}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		for _, prefix := range []string{"UNAVAILABLE:", "unavailable:"} {
+			if reason, ok := strings.CutPrefix(line, prefix); ok && strings.TrimSpace(reason) != "" {
+				return strings.TrimSpace(reason), true
+			}
+		}
+	}
+	return "", false
 }
 
 func scenarioArgv(argv []string) []string {

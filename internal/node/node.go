@@ -3315,6 +3315,21 @@ func (n *Node) subscribe(p *transport.Peer, client string, s *session.Session, f
 		for {
 			chunks, err := cur.Next(ctx, 64)
 			if err != nil {
+				var incomplete *session.ErrIncompleteLog
+				if errors.As(err, &incomplete) {
+					info := s.ExitInfo()
+					if info == nil {
+						return
+					}
+					f := &proto.Frame{
+						V: proto.Version, T: proto.KindChunk, To: client, S: s.ID, WS: s.WS, Seq: cur.Seq(),
+						Body: proto.MustMarshal(proto.ChunkBody{Stream: proto.StreamExit, Data: proto.MustMarshal(*info)}),
+					}
+					if ctx.Err() != nil || p.Send(context.WithoutCancel(ctx), f) != nil {
+						return
+					}
+					return
+				}
 				var unavailable *session.ErrTierUnavailable
 				var ev *session.ErrEvicted
 				if errors.As(err, &ev) {
