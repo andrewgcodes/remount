@@ -44,6 +44,34 @@ image = (
 app = modal.App(APP_NAME, image=image)
 control_secret = modal.Secret.from_name(SECRET_NAME, required_keys=["REMOUNT_TOKEN"])
 
+# Optional. With it the deployment can broker a model credential instead of
+# merely allowing egress to the provider: the workspace holds `ref:b_openai`
+# and the node substitutes the real value at the network edge. Without it the
+# demo can reach api.openai.com and has nothing to send, so no harness can
+# actually run there.
+MODEL_SECRET_NAME = os.environ.get("REMOUNT_MODAL_MODEL_SECRET", "remount-openai")
+
+
+def _optional_model_secret() -> list[modal.Secret]:
+    """The model secret is optional, so its absence must not fail a deploy.
+
+    from_name is lazy, so a missing secret surfaces at hydration rather than
+    here; resolving it now is what makes "optional" true rather than merely
+    documented. A deployment without it still runs — it simply has no binding
+    to broker, which the control function reports at startup.
+    """
+    try:
+        secret = modal.Secret.from_name(MODEL_SECRET_NAME, required_keys=["OPENAI_API_KEY"])
+        secret.hydrate()
+        return [secret]
+    except Exception as err:  # noqa: BLE001 - any resolution failure means absent
+        print(f"remount: model secret {MODEL_SECRET_NAME!r} unavailable ({err.__class__.__name__}); "
+              "the deployment will allow egress to the provider but broker no credential")
+        return []
+
+
+model_secrets = _optional_model_secret() if modal.is_local() else []
+
 # The control plane is a single stateful process, so it must be exactly one
 # container with a durable volume. A web endpoint that scales out would give
 # you N independent control planes behind one URL, each with its own database.
@@ -102,7 +130,7 @@ atexit.register(_shutdown)
     min_containers=1,
     max_containers=1,
     volumes={"/data": volume},
-    secrets=[control_secret],
+    secrets=[control_secret, *model_secrets],
 )
 @modal.concurrent(max_inputs=200)
 @modal.web_server(7443, startup_timeout=180)
@@ -116,13 +144,27 @@ def control():
     subprocess.run(["/usr/local/bin/remount", "help"], check=True, stdout=subprocess.DEVNULL)
     os.makedirs("/data/server", exist_ok=True)
     os.makedirs("/data/node", exist_ok=True)
-    server = _spawn(
-        ["/usr/local/bin/remount", "server",
-         "--listen", "0.0.0.0:7443",
-         "--data", "/data/server",
-         "--lease", "20"],
-        "/data/server.log",
-    )
+    argv = ["/usr/local/bin/remount", "server",
+            "--listen", "0.0.0.0:7443",
+            "--data", "/data/server",
+            "--lease", "20"]
+    # The secret's value never enters the bindings file: it names the
+    # environment variable the node resolves at lease time, the same contract
+    # docs/operations.md documents for a production deployment.
+    if os.environ.get("OPENAI_API_KEY"):
+        bindings = Path("/data/bindings.json")
+        bindings.write_text(json.dumps([{
+            "id": "b_openai",
+            "secret": "$OPENAI_API_KEY",
+            "destinations": ["api.openai.com"],
+            "placeholder": "sk-proj-REMOUNT-PLACEHOLDER-NOT-A-REAL-KEY",
+            "ttl_sec": 900,
+        }]))
+        argv += ["--bindings", str(bindings)]
+        print("remount: brokering b_openai for api.openai.com", flush=True)
+    else:
+        print("remount: no OPENAI_API_KEY; no binding configured", flush=True)
+    server = _spawn(argv, "/data/server.log")
     # Wait for the control plane to answer before enrolling the local node.
     for _ in range(60):
         if server.poll() is not None:
