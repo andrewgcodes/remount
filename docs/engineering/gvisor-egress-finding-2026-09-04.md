@@ -284,3 +284,87 @@ docker filesystem probe: the daemon could not read this node's data directory
 
 where the same configuration previously produced a workspace that started,
 accepted writes and silently contained none of them.
+
+---
+
+# Booting a real microVM: what the Firecracker lane found
+
+Once nested virtualization gave the machine a real `/dev/kvm`, the Firecracker
+backend could be run for the first time — not its unit tests, the backend, with
+a node attached to a control plane. Getting there needed a btrfs pool, because
+the CoW volume provider requires `FICLONE` and refuses ext4, and a jailer base
+that is not group- or world-writable. Both refusals were correct and both said
+exactly what was wrong.
+
+The node then registered with `BACKENDS=firecracker` and all four probes green:
+KVM/jailer/snapshot, node-owned network, CoW volume, guest executor. Creating a
+workspace produced three defects in a row, each hidden behind the one before it.
+
+## 1. `remount ws create --wait` segfaults when the workspace is not claimed
+
+```
+panic: runtime error: invalid memory address or nil pointer dereference
+main.cmdWS(...) cmd/remount/main.go:943
+```
+
+`ws, err = cl.WaitClaimed(...)` assigns a nil workspace on the error path and the
+error message then reads `ws.ID`. So the command dies with SIGSEGV precisely
+when it has something useful to say — an unclaimed workspace is the normal
+outcome when no node matches, and "is a matching node online?" is the message
+the user needed. Fixed by not assigning through `ws` until the call succeeds.
+The two other `WaitClaimed` call sites were checked and do not dereference the
+result on their error paths.
+
+## 2. A quarantined workspace could never be claimed again, by anyone
+
+The first materialization failed for an honest reason. Every retry after it
+failed for a dishonest one:
+
+```
+err="write workspace environment: unreachable: guest vsock handshake failed: EOF"
+err="conflict: firecracker workspace ws_… is already active"
+err="conflict: firecracker workspace ws_… is already active"       (forever)
+```
+
+`quarantineMaterialization` deliberately retains the filesystem — the tree may
+hold bytes nothing else has, and that instinct is right. But it let go of the
+handle without telling the backend, and the Firecracker backend keeps a registry
+of live workspaces. So `reserve` refused the next `Create` *and* the next
+`Adopt`, while the node — correctly — retried with `adopt=true` because the
+workspace was quarantined. The node deadlocked against a conflict it had caused
+itself, reporting the wrong problem forever.
+
+Fixed with `workspace.Detacher`, an optional interface meaning "I am no longer
+holding this" as distinct from "destroy it". The Firecracker handle already
+carried a `release` callback, so implementing it was three lines; the node calls
+it on the quarantine path where it has already closed the filesystem.
+
+## 3. The same shape again, one layer down (open)
+
+With the registry released, the retry gets further and hits:
+
+```
+err="delete TAP: device or resource busy"
+err="firecracker: network for ws_… is already reserved"   (x6)
+```
+
+The quarantine path revokes the network while the microVM is still running, so
+the TAP cannot be deleted, so the network lease is never released, so every
+retry conflicts on the reservation. It is defect 2 wearing different clothes: a
+failure path that gives up one resource without giving up the ones underneath
+it.
+
+The fix is not simply "delete the TAP harder". The VM has to be stopped before
+its network can be reclaimed, and quarantine currently keeps it alive, so the
+question is what quarantine is supposed to retain: the filesystem, certainly;
+the running machine, almost certainly not. That is a lifecycle decision about
+what a quarantined workspace *is*, and it wants deciding rather than patching.
+
+## What this says about the lane
+
+None of these are exotic. They are the first three things that happen when you
+create one workspace, and they were reachable the moment a host with `/dev/kvm`
+existed. `.github/workflows/kvm.yml` fails its last step on purpose "until the
+adapters are integrated" — but the adapters are integrated, in
+`cmd/remount/build_node.go`, and have been. What was missing was a host, and the
+host was available all along behind a flag nobody had tried.

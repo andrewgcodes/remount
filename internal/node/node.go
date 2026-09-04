@@ -2098,6 +2098,16 @@ func (n *Node) quarantineMaterialization(id string, handle workspace.Handle, b *
 	}
 	if handle != nil {
 		_ = handle.FS().Close()
+		// Tell the backend we are done holding this, without destroying it. A
+		// backend that keeps a registry of live workspaces would otherwise
+		// refuse both Create and Adopt for this id forever, and the retry below
+		// — which correctly sets adopt=true for a quarantined workspace — would
+		// fail on a conflict this node caused itself. Observed on the
+		// Firecracker backend: every retry reported "workspace is already
+		// active" while the real failure had been a guest vsock handshake.
+		if detacher, ok := handle.(workspace.Detacher); ok {
+			detacher.Detach()
+		}
 	}
 	n.mu.Lock()
 	n.quarantined[id] = struct{}{}
