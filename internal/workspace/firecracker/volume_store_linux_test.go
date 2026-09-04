@@ -15,7 +15,7 @@ import (
 
 func TestDiskFullRestoreStagingFailsClosedAndCleansUp(t *testing.T) {
 	if os.Getenv("REMOUNT_FIRECRACKER_INTEGRATION") != "1" {
-		t.Skip("set REMOUNT_FIRECRACKER_INTEGRATION=1 for the privileged disk-full staging proof")
+		t.Skip("unavailable: set REMOUNT_FIRECRACKER_INTEGRATION=1 for the privileged disk-full staging proof")
 	}
 	if os.Geteuid() != 0 {
 		t.Skip("unavailable: disk-full staging proof requires root to mount a bounded tmpfs")

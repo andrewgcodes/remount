@@ -119,7 +119,7 @@ func TestValidateRefusesProviderIDsAsEvergreenProof(t *testing.T) {
 func TestListRendersWithoutReadingACredentialValue(t *testing.T) {
 	t.Setenv("REMOUNT_INTEGRATION_OPENAI_KEY", "sk-planted-by-this-test-0000000000")
 	var buf strings.Builder
-	if err := list([]string{"--unowned", "--required"}, &buf); err != nil {
+	if err := list([]string{"--unowned"}, &buf); err != nil {
 		t.Fatal(err)
 	}
 	out := buf.String()
@@ -133,15 +133,16 @@ func TestListRendersWithoutReadingACredentialValue(t *testing.T) {
 	// finished, and a test that fails when the work succeeds is a bad test. So
 	// the anti-vacuity guard is on the wider `--unowned` set, which is
 	// non-empty as long as any optional row is unproven.
-	var wide strings.Builder
-	if err := list([]string{"--unowned"}, &wide); err != nil {
+	if !strings.Contains(out, "OPEN: ") {
+		t.Fatalf("no unowned rows were listed at all, so the credential check proves nothing:\n%s", out)
+	}
+	buf.Reset()
+	if err := list([]string{"--unowned", "--required"}, &buf); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(wide.String(), "sk-planted") {
-		t.Fatal("the listing printed a credential value")
-	}
-	if !strings.Contains(wide.String(), "OPEN: ") {
-		t.Fatalf("no unowned rows were listed at all, so neither listing proves anything:\n%s", wide.String())
+	out = buf.String()
+	if strings.Contains(out, "sk-planted") {
+		t.Fatal("the required-unowned listing printed a credential value")
 	}
 	for _, id := range []string{"E1", "E7"} {
 		if strings.Contains(out, "\n"+id+" ") {

@@ -941,6 +941,9 @@ func (c *Client) nodeCall(ctx context.Context, wsID, op string, body func(g *pro
 				continue
 			}
 		case proto.CodeUnauthorized:
+			if !staleGrantAuthority(pe) {
+				return err
+			}
 			c.forgetGrant(wsID)
 			if attempt == 0 {
 				continue
@@ -961,6 +964,12 @@ func (c *Client) nodeCall(ctx context.Context, wsID, op string, body func(g *pro
 		}
 		return err
 	}
+}
+
+func staleGrantAuthority(err *proto.Error) bool {
+	return err.Msg == "grant authorization revision or tenant is stale" ||
+		err.Msg == "grant authorization revision is stale" ||
+		err.Msg == "grant controller epoch is stale"
 }
 
 // ---------------------------------------------------------------------------

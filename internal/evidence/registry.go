@@ -459,14 +459,15 @@ var scenarios = []Scenario{
 	},
 	{
 		ID: "B30", Title: "reconnect and pool bursts stay within declared resource ceilings",
-		Layer: LayerCode, Required: true, Source: sourcePlanB,
-		Owner: "internal/sim.TestPlanBScale*, scripts/planb-resource-ceilings.sh",
-		Argv:  []string{"./scripts/planb-resource-ceilings.sh"},
-		Note:  "deterministic reconnect, pool, spill, artifact, event, subscription and quota workloads assert bounded resources, counted rejection or loss, and explicit caller outcomes; the host gate uses 10,000 simultaneous reconnecting cursors",
+		Layer: LayerCode, Required: true, Source: sourceLinux,
+		Owner:    "internal/sim.TestPlanBScale*, scripts/planb-resource-ceilings.sh",
+		Argv:     []string{"./scripts/planb-resource-ceilings.sh"},
+		Recorded: StatusPassed,
+		Note:     "three cycles of 10,000 simultaneous reconnecting cursors returned to the resource floor; pool, spill, artifact, event, subscription and quota workloads remained bounded and counted every rejection or loss",
 	},
 	{
 		ID: "B31", Title: "two clean builds produce the declared reproducible artifacts",
-		Layer: LayerArtifact, Required: true, Source: sourcePlanB,
+		Layer: LayerArtifact, Required: true, Source: sourceLinux,
 		Owner:    "integration/reproducible.TestB31BinariesAreAFunctionOfTheSourceAlone, scripts/reproducible-container-builds.sh",
 		Argv:     []string{"./scripts/reproducible-container-builds.sh"},
 		Recorded: StatusPassed,
@@ -474,10 +475,11 @@ var scenarios = []Scenario{
 	},
 	{
 		ID: "B32", Title: "clean installs pass the black-box smoke without source-tree imports",
-		Layer: LayerArtifact, Required: true, Source: sourcePlanB,
-		Owner: "integration/installs.TestB32*",
-		Argv:  []string{"go", "test", "-count=1", "-timeout=20m", "./integration/installs/"},
-		Note:  "the dist binary and the two release images install into temporary prefixes and pass the black-box smoke with 0 required failures; the wheel, the npm tarball and a Go module resolved from a local proxy drive an installed server with no replace, editable install or link back into the checkout. Every source-tree detector has a control that reintroduces the dependency and requires the detector to catch it. Bounded: the SPDX SBOM needs syft and the Homebrew formula needs a published release, so both stay unavailable with a reason.",
+		Layer: LayerArtifact, Required: true, Source: sourceLinux,
+		Owner:    "integration/installs.TestB32*",
+		Argv:     []string{"go", "test", "-count=1", "-timeout=20m", "./integration/installs/"},
+		Recorded: StatusPassed,
+		Note:     "the dist binary and both release images passed manifest 1.1.0 black-box conformance; the wheel, npm tarball and external Go module drove an installed server without a source-tree dependency, and the checksums, static-link, inventory and SPDX SBOM lanes passed",
 	},
 }
 

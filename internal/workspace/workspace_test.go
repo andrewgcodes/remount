@@ -154,6 +154,83 @@ func TestDockerBackendUnavailableIsClean(t *testing.T) {
 	}
 }
 
+func TestDockerBackendFailedRunRemovesPartialContainer(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "docker")
+	marker := filepath.Join(dir, "container")
+	commands := filepath.Join(dir, "commands")
+	root := filepath.Join(dir, "data", "ws_fail")
+	script := `#!/bin/sh
+case "$1" in
+	info) echo 27.4.1 ;;
+	run) touch "$REMOUNT_DOCKER_MARKER"; exit 1 ;;
+	inspect) echo "$REMOUNT_DOCKER_ROOT" ;;
+	rm) printf '%s\n' "$*" >> "$REMOUNT_DOCKER_COMMANDS"; rm -f "$REMOUNT_DOCKER_MARKER" ;;
+esac
+`
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REMOUNT_DOCKER_MARKER", marker)
+	t.Setenv("REMOUNT_DOCKER_COMMANDS", commands)
+	t.Setenv("REMOUNT_DOCKER_ROOT", root)
+
+	d, err := NewDocker(filepath.Join(dir, "data"), "alpine:3.20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Binary = binary
+	if _, err := d.Create(context.Background(), "ws_fail", proto.WorkspaceSpec{}, nil); err == nil {
+		t.Fatal("failed docker run succeeded")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("partial container marker remains: %v", err)
+	}
+	body, err := os.ReadFile(commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(body)); got != "rm -f remount-ws-fail" {
+		t.Fatalf("cleanup command = %q", got)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("failed workspace root remains: %v", err)
+	}
+}
+
+func TestDockerBackendFailedRunRetainsRootWhenContainerCleanupIsUncertain(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "docker")
+	marker := filepath.Join(dir, "container")
+	root := filepath.Join(dir, "data", "ws_fail")
+	script := `#!/bin/sh
+case "$1" in
+	info) echo 27.4.1 ;;
+	run) touch "$REMOUNT_DOCKER_MARKER"; exit 1 ;;
+	inspect) echo "daemon unavailable" >&2; exit 1 ;;
+esac
+`
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REMOUNT_DOCKER_MARKER", marker)
+
+	d, err := NewDocker(filepath.Join(dir, "data"), "alpine:3.20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Binary = binary
+	if _, err := d.Create(context.Background(), "ws_fail", proto.WorkspaceSpec{}, nil); err == nil || !strings.Contains(err.Error(), "cleanup: inspect") {
+		t.Fatalf("failed docker run error = %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("partial container marker was lost: %v", err)
+	}
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("workspace root was removed before container cleanup was proven: %v", err)
+	}
+}
+
 // TestDockerBackendReal runs only when a docker daemon is reachable.
 func TestDockerBackendReal(t *testing.T) {
 	d, _ := NewDocker(filepath.Join(t.TempDir(), "d"), "alpine:3.20")

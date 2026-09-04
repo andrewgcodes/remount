@@ -21,10 +21,84 @@ import (
 	"testing"
 	"time"
 
+	"remount.dev/remount/internal/eventlog"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/server"
 	"remount.dev/remount/internal/transport"
 )
+
+type planbScaleExportSink struct {
+	maxBatch int
+	rejectAt int
+	calls    int
+	accepted int
+	rejected int
+	oversize int
+}
+
+func (s *planbScaleExportSink) Send(_ context.Context, events []proto.Event) error {
+	s.calls++
+	if len(events) > s.maxBatch {
+		s.oversize++
+	}
+	if s.calls == s.rejectAt {
+		s.rejected += len(events)
+		return errors.New("destination backpressure")
+	}
+	s.accepted += len(events)
+	return nil
+}
+
+func TestPlanBScaleExportBackpressureKeepsBoundedBatchAndCursor(t *testing.T) {
+	events := planbScaleSize(t, 1200, 400)
+	const batchEvents = 64
+
+	log := eventlog.New(eventlog.NewMemory(0))
+	defer log.Close()
+	for i := 0; i < events; i++ {
+		if err := log.Append(context.Background(), &proto.Event{
+			Type: "planb.scale.export", Payload: proto.MustMarshal(map[string]int{"i": i}),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cursors, err := eventlog.NewMemoryCursorStore(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := &planbScaleExportSink{maxBatch: batchEvents, rejectAt: 4}
+	last, err := eventlog.RunExport(context.Background(), log, blocked, cursors, eventlog.RunOptions{
+		Name: "planb-scale", From: 1, BatchEvents: batchEvents, BatchBytes: 64 << 10,
+	})
+	if err == nil || err.Error() != "destination backpressure" {
+		t.Fatalf("backpressured export error = %v", err)
+	}
+	if last != 3*batchEvents || blocked.accepted != 3*batchEvents || blocked.rejected != batchEvents || blocked.oversize != 0 {
+		t.Fatalf("backpressured export last=%d accepted=%d rejected=%d oversize=%d",
+			last, blocked.accepted, blocked.rejected, blocked.oversize)
+	}
+	cursor, err := cursors.Load(context.Background(), "planb-scale")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.Next != last+1 {
+		t.Fatalf("cursor advanced past rejected batch: %+v after last=%d", cursor, last)
+	}
+
+	recovered := &planbScaleExportSink{maxBatch: batchEvents}
+	last, err = eventlog.RunExport(context.Background(), log, recovered, cursors, eventlog.RunOptions{
+		Name: "planb-scale", From: 1, BatchEvents: batchEvents, BatchBytes: 64 << 10,
+	})
+	if err != nil || last != uint64(events) {
+		t.Fatalf("recovered export = (%d, %v), want (%d, nil)", last, err, events)
+	}
+	if recovered.accepted != events-3*batchEvents || recovered.rejected != 0 || recovered.oversize != 0 {
+		t.Fatalf("recovered export accepted=%d rejected=%d oversize=%d",
+			recovered.accepted, recovered.rejected, recovered.oversize)
+	}
+	t.Logf("%d events exported in batches of at most %d; %d rejected events were explicit and retried from cursor %d",
+		events, batchEvents, blocked.rejected, cursor.Next)
+}
 
 // TestPlanBScaleEventLogRetentionCeilingIsCountedAndExplicit drives the
 // canonical log past its retained-event ceiling and requires the eviction to
@@ -56,11 +130,11 @@ func TestPlanBScaleEventLogRetentionCeilingIsCountedAndExplicit(t *testing.T) {
 	var pruned float64
 	for {
 		pruned = planbScaleDelta(before, planbScaleMetrics(), "remount_events_pruned_total")
-		if pruned > 0 {
+		if pruned >= float64(posts-ceiling) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("posted %d events under a %d-event ceiling and nothing was pruned or counted", posts, ceiling)
+			t.Fatalf("posted %d events under a %d-event ceiling and only %g were pruned and counted", posts, ceiling, pruned)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}

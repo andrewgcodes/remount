@@ -4,4 +4,5 @@ set -eu
 : "${REMOUNT_SCALE_CURSORS:=10000}"
 export REMOUNT_SCALE_CURSORS
 
-go test -race -count=1 -run '^TestPlanBScale' -v -timeout 30m ./internal/sim
+# Keep resource measurements representative; make race remains a separate gate.
+go test -count=1 -run '^TestPlanBScale' -v -timeout 30m ./internal/sim

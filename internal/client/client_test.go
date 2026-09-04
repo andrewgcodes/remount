@@ -28,6 +28,23 @@ func TestCallerSuppliedIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestOnlyGrantAuthorityStalenessIsRetryable(t *testing.T) {
+	for _, test := range []struct {
+		message string
+		want    bool
+	}{
+		{message: "grant authorization revision or tenant is stale", want: true},
+		{message: "grant authorization revision is stale", want: true},
+		{message: "grant controller epoch is stale", want: true},
+		{message: "grant is for a different client, workspace or node"},
+		{message: "bad grant signature"},
+	} {
+		if got := staleGrantAuthority(&proto.Error{Code: proto.CodeUnauthorized, Msg: test.message}); got != test.want {
+			t.Fatalf("staleGrantAuthority(%q) = %v, want %v", test.message, got, test.want)
+		}
+	}
+}
+
 func TestAppendWithinLimit(t *testing.T) {
 	destination := []byte("ab")
 	if !appendWithinLimit(&destination, []byte("cd"), 2, 4) || string(destination) != "abcd" {

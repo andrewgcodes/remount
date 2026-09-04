@@ -833,3 +833,219 @@ still be rotated as a precaution. The 2026-09-03 run recorded above did **not**
 repeat that pattern: its canary was synthetic and generated at run time, and
 the scans above confirm the real key appeared in no workspace path, no host
 data directory, and no log.
+
+---
+
+## 2026-09-04 — B30, B31, B32 and the isolation scale matrix
+
+Host: `devin-box`, Linux x86_64, kernel 5.15.200, 8 CPUs, 31 GiB RAM and
+no swap. The checkout was based on `origin/main`
+`0f77dad628811737ab2aa1e5c9cd91bfdd41e150`. Nothing was published, pushed to
+an image registry, tagged or signed.
+
+### B30 resource ceilings
+
+Command:
+
+```sh
+./scripts/planb-resource-ceilings.sh
+```
+
+The script used its default `REMOUNT_SCALE_CURSORS=10000` and ran the
+measurement without race instrumentation; `make race` remains a separate
+gate. `TestPlanBScale*` passed in 81.884 seconds after rebasing onto the
+candidate above.
+
+| Proof | Observed result | Status |
+|---|---|---|
+| event retention | 1,200 posts under a 200-event ceiling; all 1,000 pruned events were counted before the retained range was read | verified |
+| slow subscriber and bounded tails | dropped/rejected work was explicit; no silent sequence gap | verified |
+| export backpressure | 1,200 events in batches of at most 64; one rejected 64-event batch left the cursor at 193, and retry exported the complete range without loss | verified |
+| reconnecting cursors | three cycles of 10,000 cursors; 7,500 connections severed per cycle; peak 60,028 goroutines and 922.8 MiB heap-in-use; every cycle settled to 28 goroutines, 17 descriptors and two relay peers | verified |
+| cursor loss accounting | dropped-frame deltas `+250122`, `+264531`, `+250584`; gap delta zero in every cycle | verified |
+| provider burst/drain | four burst cycles returned to zero provider machines; a six-machine wide burst drained in 1.969 seconds; zero provision failures | verified |
+| quota rejection/recovery | 24 workspace rejections in each of two cycles were counted and capacity recovered; session quota rejection also recovered | verified |
+| session-log spill | four sessions emitted about 1.25 MB; 13,441 chunks were evicted explicitly; four spill files totaled 303.0 KiB and replay reported a gap rather than silent loss | verified |
+| snapshot deduplication | four unchanged 20 MiB snapshots: 80 MiB logical, 1.3 MiB uploaded, deduplication ratio 0.9843 | verified |
+
+Two defects were found while earning this result. Cursor teardown had used
+10,000 serialized detach RPCs and could stall indefinitely; teardown now cuts
+the clients and connections directly, including connections racing with
+shutdown, and a 400-cursor control returned to two peers in all three cycles.
+Event retention had accepted the first asynchronous prune before reading the
+range; it now waits for the complete `posts - ceiling` count. Ten focused race
+repetitions of each corrected boundary passed.
+
+### B31 reproducible clean-container builds
+
+Command:
+
+```sh
+./scripts/reproducible-container-builds.sh
+```
+
+The digest-pinned Go image
+`golang@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b`
+built every supported OS/architecture pair twice in clean containers with
+cold caches and different `TMPDIR` values. The two checksum manifests were
+identical:
+
+```text
+verified: two clean containers produced byte-identical static binaries
+```
+
+All containers and output directories were removed. **Status: verified.**
+
+### B32 clean installs and SBOM
+
+Command:
+
+```sh
+PATH=/home/ubuntu/.local/bin:$PATH \
+  go test -count=1 -v -timeout 30m ./integration/installs
+```
+
+The full lane passed in 56.490 seconds. It built and installed the static
+binary, both OCI candidates, Python wheel, npm tarball and external Go module
+consumer in disposable environments; both black-box image checks reported
+manifest 1.1.0 `CONFORMANT`, required 53 passed, 0 failed, 0 unavailable, with
+cleanup verified. Checksums, static-link checks and the installed component
+inventory passed. The SPDX lane used Syft 1.32.0 obtained from
+`anchore/syft@sha256:b6a6da626d98f5cb92e28934176709003cce6cdcf674816959c7d84845d94045`
+and passed. No artifact was published. **Status: verified.**
+
+The aggregate evidence runner executes direct `go test` proofs verbosely and
+treats a selected proof that exits zero with a Go `--- SKIP` as `unavailable`
+when the test names its prerequisite, and as a failure when the skip has no
+`unavailable` reason. B32 therefore cannot become green merely because Syft is
+absent.
+
+### Docker 200-node / 2,000-workspace scale lane
+
+Command:
+
+```sh
+REMOUNT_HANDOFF_SCALE_BACKEND=docker \
+REMOUNT_HANDOFF_SCALE_IMAGE=alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1 \
+  go test -count=1 -run '^TestHandoffScaleAndControlFailover$' \
+  -v -timeout 30m ./internal/sim
+```
+
+Candidate: Docker Server 27.4.1 and the exact Alpine digest above. The host
+reached 1,023 running workspaces and 200 partially created containers before
+Docker failed additional bridge endpoint creation:
+
+```text
+failed to add the host (veth...) <=> sandbox (...) pair interfaces:
+exchange full
+```
+
+The run was terminated rather than misreported as a pass. It produced no
+complete claim, exec, move or reattach distribution, so no Docker benchmark
+number was added to `docs/benchmarks.md`. This named host cannot supply the
+required bridge/veth capacity. **Status: unavailable on `devin-box`.**
+
+The failure also exposed a real cleanup defect: `docker run` can leave a
+container in `Created` after endpoint setup fails, while `Docker.Create`
+removed only the host workspace root. The failure path now inspects the
+container mount, removes only a container proven to own that exact root under
+an independent bounded cleanup context, and reports cleanup failure. Ten race
+repetitions of the regression test passed. After the attempted scale run,
+1,223 containers selected by the `remount.workspace` label were removed;
+zero labeled or `remount-ws-*` containers remained, and the temporary scale
+tree was removed.
+
+### gVisor 200-node / 2,000-workspace scale lane
+
+Command:
+
+```sh
+sudo env \
+  REMOUNT_HANDOFF_SCALE_BACKEND=gvisor \
+  REMOUNT_GVISOR_ROOTFS=/home/ubuntu/firecracker-artifacts/rootfs-tree \
+  REMOUNT_RUNSC=/usr/bin/runsc \
+  PATH="$PATH" \
+  go test -count=1 -run '^TestHandoffScaleAndControlFailover$' \
+  -v -timeout 30m ./internal/sim
+```
+
+Candidate: `runsc release-20260817.0` and the root filesystem tree previously
+used by the successful gVisor cleanup proof. The host used about 1.5 GiB before
+the lane. At 813 live sandboxes it used 14 GiB with 15 GiB available; while
+the test process was being stopped it reached 1,060 sandboxes and 18 GiB used
+with 11 GiB available. The measured slope cannot reach 2,000 sandboxes within
+31 GiB and no swap without risking an OOM kill, so the lane was terminated
+before host exhaustion. It produced no complete claim, exec, move or reattach
+distribution, and no gVisor benchmark number was added. **Status: unavailable
+on `devin-box` because the named host lacks RAM for 2,000 runsc sandboxes.**
+
+Cleanup deleted all 1,060 runsc containers, verified no sandbox or gofer
+process remained, unmounted 197 backend `null-netns` mountpoints, verified no
+mount below the test root remained, and removed the temporary scale tree.
+
+### B32 reconnect race and final repository gates
+
+Repeated B32 external Go consumer runs exposed an intermittent loss of the
+installed node uplink while the consumer replaced a session cursor. The same
+failure reproduced from an exact detached `origin/main`
+`0f77dad628811737ab2aa1e5c9cd91bfdd41e150` worktree, so the lane was not
+reported green merely because the defect predated this branch. Replacing a
+cursor cancelled the old subscriber while it could be inside a WebSocket
+write; that cancellation could close the shared peer carrying the node
+uplink. Subscriber cancellation now prevents the next write but does not
+cancel a write already active on the shared transport.
+
+Commands:
+
+```sh
+go test -race -count=10 \
+  -run '^TestReplacingSessionCursorDoesNotCancelSharedPeerWrite$' \
+  -timeout 300s ./internal/node
+
+go test -count=10 \
+  -run '^TestB32AGoModuleConsumerBuildsFromTheArtifactAndDrivesTheInstalledServer$' \
+  -timeout 15m ./integration/installs
+
+go test -race -count=5 \
+  -run '^TestB32AGoModuleConsumerBuildsFromTheArtifactAndDrivesTheInstalledServer$' \
+  -timeout 20m ./integration/installs
+```
+
+All repetitions passed. The deterministic node regression models a
+cancellation-sensitive transport write and proves that replacing one cursor
+does not close the shared peer. The ten clean-install repetitions passed in
+66.148 seconds, and the five race-instrumented repetitions passed in 45.410
+seconds. **Status: verified.**
+
+The complete final race gate then passed:
+
+```sh
+make race
+```
+
+The B32 installation package passed under race in 62.340 seconds; the node
+package passed in 45.702 seconds; the simulation package passed in 365.470
+seconds; every package completed successfully. **Status: verified.**
+
+The remaining final-tree gates also passed:
+
+```sh
+make
+make lint
+make test
+make conformance
+go run ./cmd/conformance --build .
+go mod verify
+go mod tidy -diff
+make dist
+go run ./cmd/protogen --check
+make public-api
+scripts/lint-locks.sh
+make fuzz FUZZTIME=5s
+```
+
+The built-binary conformance run reported 60 passed, 0 failed and 8
+unavailable of 68 requirements in 6.793 seconds. All 53 required requirements
+passed; the unavailable capability-gated and extension checks retained their
+named prerequisites. Cleanup was verified. The fuzz gate completed every
+registered target without a failure. No artifact was published.
