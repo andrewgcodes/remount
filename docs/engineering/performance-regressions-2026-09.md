@@ -469,10 +469,25 @@ A narrower version is available and also unstarted: the node's *local* artifact
 store fsyncs twice (`tmp.Sync`, then `syncDir` after the rename) for a copy
 that is only a cache, because the durable authority is the remote store plus
 the committed record. A node that dies after the local put and before the
-upload leaves a segment no record references — garbage, not data. Making that
-write non-durable would remove about half the seal cost, but `artifact.Store`
-is also the authority in standalone mode, so it needs an explicit cache-put
+upload leaves a segment no record references — garbage, not data. `artifact.Store`
+is also the authority in standalone mode, so this needs an explicit cache-put
 path rather than a global change.
+
+**It is worth the work, and here is the number rather than a guess.** Gating
+both fsyncs behind an environment variable and re-running the lane:
+
+| Configuration | exec ratio (tier on ÷ tier off) |
+|---|---|
+| today: both stores durable | 2.47-2.66x |
+| node-local store as a cache, control plane still durable | **1.48-1.79x** |
+| neither store fsyncs (not a legal configuration; upper bound only) | 1.11x |
+
+So the node-local fsyncs are roughly half the durable tier's cost on an exec —
+about +17 ms today against about +7 ms with the cache-put path — and the control
+plane's fsyncs, which must stay, are most of the remainder. The third row is
+included only to show that after both are gone almost nothing is left: the HTTP
+upload, the HEAD and the control commit together are worth about 2 ms. The
+experiment was reverted; nothing in the tree is gated on that variable.
 
 **`artifact.(*Store).publish` holds the store-wide lock across filesystem
 syscalls** (9.7% of mutex delay). The work inside the lock is cheap — `-peek`
