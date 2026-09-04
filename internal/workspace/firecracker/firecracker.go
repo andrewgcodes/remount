@@ -551,14 +551,32 @@ func (h *handle) Destroy(ctx context.Context) error {
 	if h.destroyed {
 		return nil
 	}
-	if err := h.network.Revoke(ctx); err != nil {
-		return err
-	}
+	// Join the VMM before reclaiming its network, and destroy the volume only
+	// after both.
+	//
+	// The network teardown deletes the workspace's devices, and the VMM holds
+	// the TAP open for as long as it lives, so reclaiming first fails with
+	// "delete TAP: device or resource busy" and every teardown stops there.
+	// That is what made `remount ws move` fail with "released workspace source
+	// cleanup is pending" and what left a quarantined workspace holding a lease
+	// no retry could reclaim.
+	//
+	// This order was chosen rather than fallen into. The property that matters
+	// is that nothing is dismantled while the workspace can still carry
+	// traffic, and killing the VMM satisfies it more completely than revoking
+	// ever could: a process that does not exist sends nothing, whereas a
+	// revoked network still has a live guest behind it. The data property is
+	// unchanged in every branch — the volume is destroyed only after both the
+	// join and the revoke succeed, so a teardown that fails part way always
+	// leaves a recoverable workspace rather than a half-erased one.
 	if h.machine != nil {
 		if err := h.machine.Kill(ctx); err != nil {
 			return err
 		}
 		h.machine = nil
+	}
+	if err := h.network.Revoke(ctx); err != nil {
+		return err
 	}
 	if err := h.volume.Destroy(ctx); err != nil {
 		return err

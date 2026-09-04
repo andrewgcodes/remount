@@ -215,7 +215,7 @@ func TestFreshLifecycleOrdering(t *testing.T) {
 	if err := h.Destroy(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	want := "probe-machine,probe-network,probe-volume,probe-guest,volume-create,reserve-network,net-prepare,new-machine,configure,start,net-activate,pause,snapshot,archive,resume,net-revoke,kill,volume-destroy"
+	want := "probe-machine,probe-network,probe-volume,probe-guest,volume-create,reserve-network,net-prepare,new-machine,configure,start,net-activate,pause,snapshot,archive,resume,kill,net-revoke,volume-destroy"
 	if got := log.joined(); got != want {
 		t.Fatalf("calls=%s\nwant=%s", got, want)
 	}
@@ -414,22 +414,32 @@ func TestDestroyRetainsLaterResourcesUntilEachPriorBoundarySucceeds(t *testing.T
 	network := h.network.(*fakeNetwork)
 	machine := h.machine.(*fakeMachine)
 	volume := h.volume.(*fakeVolume)
-	network.revokeErr = errors.New("network still live")
-	if err := h.Destroy(context.Background()); err == nil {
-		t.Fatal("destroy succeeded while network revoke failed")
-	}
-	if strings.Contains(log.joined(), "volume-destroy") || strings.Contains(log.joined(), "kill") {
-		t.Fatalf("later resources destroyed before network postcondition: %s", log.joined())
-	}
-	network.revokeErr = nil
+	// The stages follow the teardown order: join the VMM, reclaim the network,
+	// then destroy the volume. Each one must gate everything after it, and the
+	// volume — the only thing here that is data — must survive every partial
+	// failure.
+	//
+	// The VMM is joined first because the network cannot be reclaimed while it
+	// holds its TAP, and because a joined VMM is a stronger guarantee that
+	// nothing is still carrying traffic than a revoked network with a live
+	// guest behind it.
 	machine.killErr = errors.New("VMM not joined")
 	if err := h.Destroy(context.Background()); err == nil {
 		t.Fatal("destroy succeeded while VMM join failed")
 	}
-	if strings.Contains(log.joined(), "volume-destroy") {
-		t.Fatalf("volume destroyed before VMM join: %s", log.joined())
+	if strings.Contains(log.joined(), "net-revoke") || strings.Contains(log.joined(), "volume-destroy") {
+		t.Fatalf("teardown continued past a VMM that would not join: %s", log.joined())
 	}
 	machine.killErr = nil
+
+	network.revokeErr = errors.New("network still live")
+	if err := h.Destroy(context.Background()); err == nil {
+		t.Fatal("destroy succeeded while network revoke failed")
+	}
+	if strings.Contains(log.joined(), "volume-destroy") {
+		t.Fatalf("the volume was destroyed before the network postcondition: %s", log.joined())
+	}
+	network.revokeErr = nil
 	volume.destroyErr = errors.New("disk busy")
 	if err := h.Destroy(context.Background()); err == nil {
 		t.Fatal("destroy succeeded while volume removal failed")
