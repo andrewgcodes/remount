@@ -26,6 +26,13 @@ on:
 permissions:
   contents: read
 
+# One run per workflow per ref. A newer push makes an older run's result
+# irrelevant, and on a private repo that superseded run is still being
+# billed - macOS minutes at 10x and Windows at 2x.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
     runs-on: ubuntu-latest
