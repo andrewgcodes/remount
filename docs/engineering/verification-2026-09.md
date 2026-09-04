@@ -1918,6 +1918,14 @@ This result is deliberately **incomplete**, not passed: all 20 required rows
 that did not execute remain unavailable with named missing prerequisites or
 unwired owning proofs. B32 passed and no required row failed.
 
+After `main` advanced to `069a17d3acf63bcd6050acf4bbadd4ef3d90ad61`
+with four Windows-lane test corrections, that commit was merged without
+overwriting the follow-up changes. On committed candidate
+`ff23e7e29c3c96dd676de4e516b9d317da93f380`, the direct B32 proof passed again
+in 49.368 seconds, the affected workspace packages passed under the race
+detector, and the aggregate repeated the same 35 passed, 0 failed, 32
+unavailable result with verified cleanup.
+
 Built-binary conformance on the same candidate:
 
 ```sh
