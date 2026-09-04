@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 )
 
@@ -32,6 +33,17 @@ type agentReportState struct {
 	retryAt          bool     // agentRetry holds the agent
 	events           []string // every event type in the log, in order
 	transcripts      int
+	counters         map[string]uint64 // the lifecycle counters a report can move
+}
+
+// reportCounters are the process-wide counters agentReport increments; the
+// package's tests do not run in parallel, so their deltas are the report's.
+var reportCounters = map[string]*metrics.Counter{
+	"runs_finished":     metrics.AgentRunsFinished,
+	"agents_finished":   metrics.AgentsFinished,
+	"agents_failed":     metrics.AgentsFailed,
+	"approvals_pending": metrics.ApprovalsPending,
+	"approvals_expired": metrics.ApprovalsExpired,
 }
 
 // canonicalJSON renders v the way the database would hand it back, so a
@@ -134,7 +146,23 @@ func snapshotAgentReportState(t *testing.T, f *controlFixture, id string) agentR
 	for _, ev := range all {
 		s.events = append(s.events, ev.Type)
 	}
+	s.counters = map[string]uint64{}
+	for name, ctr := range reportCounters {
+		s.counters[name] = ctr.Value()
+	}
 	return s
+}
+
+// counterDeltas is what each counter moved between two snapshots, omitting
+// the ones that did not.
+func counterDeltas(before, after agentReportState) map[string]uint64 {
+	out := map[string]uint64{}
+	for name, v := range after.counters {
+		if d := v - before.counters[name]; d != 0 {
+			out[name] = d
+		}
+	}
+	return out
 }
 
 // failAgentWrites makes the next agents-row write fail inside its
@@ -171,6 +199,8 @@ type reportPublishCase struct {
 	name  string
 	prep  func(t *testing.T, af *agentFixture) (*proto.Agent, proto.AgentRunReq, proto.AgentReport)
 	check func(t *testing.T, af *agentFixture, got *proto.Agent, run *proto.AgentRun)
+	// counts is what one committed report adds to reportCounters.
+	counts map[string]uint64
 }
 
 func reportPublishCases() []reportPublishCase {
@@ -260,6 +290,7 @@ func reportPublishCases() []reportPublishCase {
 				af.report(t, run, 2, proto.AgentReport{Kind: proto.AgentReportTurnStarted, Message: msg})
 				return a, run, proto.AgentReport{Seq: 3, Kind: proto.AgentReportTurnFinished, Message: msg, StopReason: "end_turn"}
 			},
+			counts: map[string]uint64{"agents_finished": 1},
 			check: func(t *testing.T, af *agentFixture, got *proto.Agent, run *proto.AgentRun) {
 				if got.Status != proto.AgentFinished || len(got.Inbox) != 0 || got.Turns != 1 {
 					t.Fatalf("max_turns: %+v", got)
@@ -293,7 +324,8 @@ func reportPublishCases() []reportPublishCase {
 				af.report(t, run, 2, proto.AgentReport{Kind: proto.AgentReportTurnStarted, Message: msg})
 				return a, run, proto.AgentReport{Seq: 3, Kind: proto.AgentReportPermission, Approval: toolCallApproval("ap_1", proto.ApprovalToolCall)}
 			},
-			check: checkParked("ap_1", proto.ApprovalToolCall),
+			counts: map[string]uint64{"approvals_pending": 1},
+			check:  checkParked("ap_1", proto.ApprovalToolCall),
 		},
 		{
 			name: "elicitation",
@@ -302,7 +334,8 @@ func reportPublishCases() []reportPublishCase {
 				af.report(t, run, 2, proto.AgentReport{Kind: proto.AgentReportTurnStarted, Message: msg})
 				return a, run, proto.AgentReport{Seq: 3, Kind: proto.AgentReportElicitation, Approval: toolCallApproval("ap_2", proto.ApprovalElicitation)}
 			},
-			check: checkParked("ap_2", proto.ApprovalElicitation),
+			counts: map[string]uint64{"approvals_pending": 1},
+			check:  checkParked("ap_2", proto.ApprovalElicitation),
 		},
 		{
 			name: "finished_expires_approvals",
@@ -312,6 +345,7 @@ func reportPublishCases() []reportPublishCase {
 				af.report(t, run, 3, proto.AgentReport{Kind: proto.AgentReportPermission, Approval: toolCallApproval("ap_1", proto.ApprovalToolCall)})
 				return a, run, proto.AgentReport{Seq: 4, Kind: proto.AgentReportFinished, StopReason: "exit"}
 			},
+			counts: map[string]uint64{"runs_finished": 1, "approvals_expired": 1},
 			check: func(t *testing.T, af *agentFixture, got *proto.Agent, run *proto.AgentRun) {
 				if run.State != proto.AgentRunDone || run.StopReason != "exit" || got.PendingApprovals != 0 || len(got.Inbox) != 1 || got.Status != proto.AgentRunning {
 					t.Fatalf("finished: run=%+v agent=%+v", run, got)
@@ -337,6 +371,7 @@ func reportPublishCases() []reportPublishCase {
 				af.report(t, run, 2, proto.AgentReport{Kind: proto.AgentReportTurnStarted, Message: msg})
 				return a, run, proto.AgentReport{Seq: 3, Kind: proto.AgentReportFinished, ExitCode: 1}
 			},
+			counts: map[string]uint64{"runs_finished": 1},
 			check: func(t *testing.T, af *agentFixture, got *proto.Agent, run *proto.AgentRun) {
 				if run.State != proto.AgentRunDone || run.Error != "harness exited 1" || got.Failures != 1 || len(got.Inbox) != 1 || got.Status != proto.AgentRunning {
 					t.Fatalf("crash: run=%+v agent=%+v", run, got)
@@ -364,6 +399,7 @@ func reportPublishCases() []reportPublishCase {
 				af.report(t, retry, 1, proto.AgentReport{Kind: proto.AgentReportStarted, Transcript: "s_acp_2"})
 				return a, retry, proto.AgentReport{Seq: 2, Kind: proto.AgentReportFinished, Error: "session/load: no such session"}
 			},
+			counts: map[string]uint64{"runs_finished": 1, "agents_failed": 1},
 			check: func(t *testing.T, af *agentFixture, got *proto.Agent, run *proto.AgentRun) {
 				if got.Status != proto.AgentFailed || got.Failures != 2 || len(got.Inbox) != 0 || run.State != proto.AgentRunDone {
 					t.Fatalf("second failure: agent=%+v run=%+v", got, run)
@@ -455,6 +491,13 @@ func TestAgentReportPublishesOnlyAfterDurableCommit(t *testing.T) {
 				t.Fatalf("retry of the same report: %v", err)
 			}
 			committed := snapshotAgentReportState(t, af.controlFixture, a.ID)
+			want := tc.counts
+			if want == nil {
+				want = map[string]uint64{}
+			}
+			if got := counterDeltas(before, committed); !reflect.DeepEqual(got, want) {
+				t.Fatalf("one committed report moved counters %v, want %v", got, want)
+			}
 			if committed.agent != committed.durableAgent {
 				t.Fatalf("after the retry memory and the agents row disagree\nmemory:  %s\ndurable: %s", committed.agent, committed.durableAgent)
 			}
