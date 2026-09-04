@@ -939,9 +939,16 @@ func cmdWS(ctx context.Context, args []string) error {
 		if *wait {
 			wctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
-			if ws, err = cl.WaitClaimed(wctx, ws.ID); err != nil {
-				return fmt.Errorf("%s created but not claimed: %w (is a matching node online?)", ws.ID, err)
+			// Do not assign through ws here. WaitClaimed returns a nil
+			// workspace with its error, so overwriting ws first makes the
+			// error path dereference nil and the command dies with SIGSEGV —
+			// exactly when the user most needs the message, because an
+			// unclaimed workspace is the normal outcome when no node matches.
+			claimed, waitErr := cl.WaitClaimed(wctx, ws.ID)
+			if waitErr != nil {
+				return fmt.Errorf("%s created but not claimed: %w (is a matching node online?)", ws.ID, waitErr)
 			}
+			ws = claimed
 		}
 		if c.json {
 			printJSON(ws)

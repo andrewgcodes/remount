@@ -36,6 +36,52 @@ gvisor status=unavailable reason=runsc is not registered with Docker
 **What you need:** a Linux host with Docker and `runsc` registered as a
 runtime.
 
+**This is no longer blocked on macOS, and the lane has now been run.** Docker
+Desktop cannot host `runsc` because its daemon lives in a locked-down LinuxKit
+VM, but that is a property of Docker Desktop, not of the machine. Colima
+provides a real Ubuntu VM with its own daemon, and gVisor's `systrap` platform
+needs no KVM:
+
+```sh
+brew install colima && colima start --arch aarch64 --cpu 4 --memory 6 --disk 20
+colima ssh -- sudo sh -c 'cd /tmp && \
+  curl -fsSLO https://storage.googleapis.com/gvisor/releases/release/latest/$(uname -m)/runsc && \
+  chmod 755 runsc && mv runsc /usr/local/bin/ && runsc install && systemctl restart docker'
+sh integration/chaos/backend-gates.sh --probe   # REMOUNT_CHAOS_IMAGE=alpine:3.20
+```
+
+Running it found four defects, all recorded with reproduction steps in
+`docs/engineering/gvisor-egress-finding-2026-09-04.md`. **Two are fixed and
+`TestE4DenialConformance` now passes**, three consecutive runs, leaving no
+resource behind:
+
+- the deny-first egress policy was not enforced at all — gVisor injects frames
+  below netfilter's IP hooks, so the output chain never saw them and every
+  forbidden destination crossed the veth. Containment came only from Docker's
+  default `FORWARD policy drop`; with `FORWARD ACCEPT` a sandbox reached 8.8.8.8
+  and was answered. Now carried by a netdev egress chain on the workspace veth.
+- an `nsfs` mount leaked per workspace on the successful path. Now released in
+  `execRuntime.destroy`.
+
+- a killed run leaked its netns, veth and runsc sandboxes, and because the
+  slot is derived from the workspace rather than the PID, a restarted node
+  collided with its own leftovers deterministically. Now reaped at startup,
+  sandboxes first so the namespaces read as uninhabited.
+- the docker backend did not verify its daemon could see the node's data
+  directory, so a remote daemon produced workspaces that started, accepted
+  writes and silently held none of them. Now probed with a nonce at startup.
+
+**E5 is done too.** `TestE5SiblingTenantsCannotReachEachOther` puts two
+workspaces on one backend, proves each reaches its own broker so the negative
+results mean something, and proves neither reaches the other's broker, guest
+address or DNS. Confirmed on the wire rather than by exit status, because exit
+status is exactly what fooled everyone about E4: capturing during a run shows 7
+frames inside each tenant's own /30 and zero crossing. That is what earns
+`SiblingIsolation`. B28 is recorded passed on the same evidence.
+
+**What remains yours:** B29 (Firecracker, needs `/dev/kvm`) and the rest of
+§15's scale and release-candidate work.
+
 **What to run:**
 
 ```sh
@@ -71,6 +117,29 @@ firecracker status=unavailable reason=Firecracker requires Linux
 **What you need:** Linux x86_64 or arm64 with KVM, a matching static
 `firecracker` and `jailer`, a trusted guest kernel and rootfs, and a cgroup
 parent.
+
+**A Mac can now be that host, which changes who should do this.** Apple Silicon
+M3 and later with macOS 15+ support nested virtualization, and Colima exposes it
+with one flag. Verified on an M5 Pro / macOS 26.3:
+
+```sh
+colima delete --force
+colima start --nested-virtualization --arch aarch64 --cpu 4 --memory 6 --disk 20
+colima ssh -- ls -la /dev/kvm        # crw-rw---- 1 root kvm 10, 232
+```
+
+With real firecracker + jailer v1.16.1, the Firecracker CI kernel
+(`vmlinux-5.10.223`, aarch64) and a 256 MiB ext4 rootfs built from `alpine:3.20`,
+`integration/firecracker/host-gate.sh` reports **AVAILABLE** rather than
+"Firecracker requires Linux", and `go test -race -count=10
+./internal/workspace/firecracker` is green.
+
+**That is a host, not a pass.** Those 31 tests are deterministic ordering proofs
+that finish in 0.00 s and boot no microVM. The gap this section describes is
+unchanged: `.github/workflows/kvm.yml` still fails its last step on purpose
+until the node-owned TAP, the coherent CoW volume, the jailed API and the
+guest-executor adapters are integrated. The value of the above is only that you
+no longer need to find a Linux box to do that work on.
 
 **The full required-proof list is in `handoff-2026-09-03-codex-wrap.md` §5**
 ("P1 — finish the Firecracker production proof"). In summary: build the guest

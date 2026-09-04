@@ -70,7 +70,15 @@ def _optional_model_secret() -> list[modal.Secret]:
         return []
 
 
-model_secrets = _optional_model_secret() if modal.is_local() else []
+# Resolved the same way in both environments, deliberately. Gating this on
+# modal.is_local() looks like an optimisation — why re-resolve a secret inside
+# the container — and it breaks the deployment outright: the decorator below
+# would attach one secret at deploy time and declare none at run time, and Modal
+# refuses to start a container whose dependency count disagrees with the
+# function it is running ("Function has 3 dependencies but container got 4
+# object ids"). Whatever this expression does, it has to do it identically on
+# both sides.
+model_secrets = _optional_model_secret()
 
 # The control plane is a single stateful process, so it must be exactly one
 # container with a durable volume. A web endpoint that scales out would give

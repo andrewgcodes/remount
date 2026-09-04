@@ -82,6 +82,24 @@ func New(ctx context.Context, opts Options) (*Backend, error) {
 	if err := runtime.probe(ctx); err != nil {
 		return nil, err
 	}
+	// Reclaim what a previous process left, before allocating anything.
+	//
+	// The slot allocator lives in memory, so a fresh backend asks the kernel for
+	// the same slots the last one used — which are exactly the slots whose
+	// leftovers are still there. A node that was killed therefore collides with
+	// itself on its very next start and reports "create veth: file exists", an
+	// error naming a file rather than the cause.
+	//
+	// Order matters: a leftover sandbox still inhabits the namespace it was
+	// started in, so the namespaces only look uninhabited once the sandboxes
+	// are gone. Nothing this process created can exist yet, so everything found
+	// here is a leftover by construction.
+	if _, err := runtime.reapStateRoot(ctx); err != nil {
+		return nil, fmt.Errorf("gvisor: sandboxes from a previous run could not be reaped: %w", err)
+	}
+	if _, err := netns.ReclaimOrphans(ctx); err != nil {
+		return nil, fmt.Errorf("gvisor: orphaned network state from a previous run could not be reclaimed: %w", err)
+	}
 	if err := network.Probe(ctx); err != nil {
 		return nil, fmt.Errorf("gvisor: enforced network unavailable: %w", err)
 	}
