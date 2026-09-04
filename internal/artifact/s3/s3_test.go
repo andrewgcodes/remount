@@ -855,7 +855,6 @@ func TestACallerSuppliedHTTPClientIsNotRewritten(t *testing.T) {
 type staleOnceTransport struct {
 	inner  http.RoundTripper
 	failed bool
-	bodies []int64 // bytes the server received per attempt
 }
 
 func (t *staleOnceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
