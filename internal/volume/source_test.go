@@ -13,7 +13,7 @@ import (
 func TestDirectoryResolverRejectsEverySymlinkComponent(t *testing.T) {
 	root := t.TempDir()
 	id := artifactID('a')
-	regular := filepath.Join(root, "regular", id)
+	regular := filepath.Join(root, SourceRelativePath("regular", id))
 	if err := os.MkdirAll(regular, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -28,25 +28,29 @@ func TestDirectoryResolverRejectsEverySymlinkComponent(t *testing.T) {
 	}
 	f.Close()
 
-	if err := os.Symlink("regular", filepath.Join(root, "tenant-link")); err != nil {
+	tenantLink, _ := sourcePathComponents("tenant-link", id)
+	regularTenant, _ := sourcePathComponents("regular", id)
+	if err := os.Symlink(regularTenant, filepath.Join(root, tenantLink)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := resolver.OpenArtifact(context.Background(), "tenant-link", id); !errors.Is(err, ErrUnsafePath) {
 		t.Fatalf("tenant symlink = %v, want unsafe path", err)
 	}
-	if err := os.MkdirAll(filepath.Join(root, "same-tenant", "real"), 0o700); err != nil {
+	sameTenant, sameArtifact := sourcePathComponents("same-tenant", id)
+	if err := os.MkdirAll(filepath.Join(root, sameTenant, "real"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink("real", filepath.Join(root, "same-tenant", id)); err != nil {
+	if err := os.Symlink("real", filepath.Join(root, sameTenant, sameArtifact)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := resolver.OpenArtifact(context.Background(), "same-tenant", id); !errors.Is(err, ErrUnsafePath) {
 		t.Fatalf("internal artifact symlink = %v, want unsafe path", err)
 	}
-	if err := os.Mkdir(filepath.Join(root, "other-tenant"), 0o700); err != nil {
+	otherTenant, otherArtifact := sourcePathComponents("other-tenant", id)
+	if err := os.Mkdir(filepath.Join(root, otherTenant), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(filepath.Join("..", "regular", id), filepath.Join(root, "other-tenant", id)); err != nil {
+	if err := os.Symlink(filepath.Join("..", regularTenant, sameArtifact), filepath.Join(root, otherTenant, otherArtifact)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := resolver.OpenArtifact(context.Background(), "other-tenant", id); !errors.Is(err, ErrUnsafePath) {
@@ -57,7 +61,7 @@ func TestDirectoryResolverRejectsEverySymlinkComponent(t *testing.T) {
 func TestDirectoryResolverAcceptsTenantIdentityGrammar(t *testing.T) {
 	root := t.TempDir()
 	tenant, id := "org:team@example.com", artifactID('b')
-	if err := os.MkdirAll(filepath.Join(root, tenant, id), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(root, SourceRelativePath(tenant, id)), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	resolver, err := OpenDirectoryResolver(root)

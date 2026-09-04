@@ -248,13 +248,4 @@ func (r *ctxReader) Read(p []byte) (int, error) {
 	return r.r.Read(p)
 }
 
-func syncDir(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
-}
-
 func sha256Writer() hash.Hash { return sha256.New() }

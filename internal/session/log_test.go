@@ -553,6 +553,7 @@ func TestE11FastProducerReplaysEverySequenceAcrossTiers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = l.closeLocal() })
 	// E11's six hours/2 GiB are a duration and volume, not a distinct code
 	// path. Small segment thresholds force the same transitions quickly.
 	const chunks = 512

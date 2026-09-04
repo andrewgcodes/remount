@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/sys/windows"
+
 	"remount.dev/remount/internal/proto"
 )
 
@@ -78,6 +80,39 @@ func TestWindowsCaseAliasesStayInsideRoot(t *testing.T) {
 	rel, err := filepath.Rel(root, resolved)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		t.Fatalf("case alias escaped root: %q, %v", resolved, err)
+	}
+}
+
+func TestWindowsShortNameAliasStaysInsideRoot(t *testing.T) {
+	f, root := newFS(t)
+	longDir := "LongDirectoryNameForShortAlias"
+	if err := f.Write(longDir+`\file.txt`, []byte("safe"), 0, false, true); err != nil {
+		t.Fatal(err)
+	}
+	longPath, err := windows.UTF16PtrFromString(filepath.Join(root, longDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]uint16, windows.MAX_PATH)
+	n, err := windows.GetShortPathName(longPath, &buffer[0], uint32(len(buffer)))
+	if err != nil {
+		t.Skipf("unavailable: Windows short-name lookup failed: %v", err)
+	}
+	shortDir := filepath.Base(windows.UTF16ToString(buffer[:n]))
+	if !strings.Contains(shortDir, "~") {
+		t.Skip("unavailable: NTFS 8.3 short-name generation is disabled")
+	}
+	got, err := f.Read(shortDir+`\file.txt`, 0, 0)
+	if err != nil || string(got.Data) != "safe" {
+		t.Fatalf("short-name read = %q, %v", got.Data, err)
+	}
+	resolved, err := f.Resolve(shortDir + `\file.txt`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := filepath.Rel(root, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, `..\`) {
+		t.Fatalf("short-name alias escaped root: %q, %v", resolved, err)
 	}
 }
 

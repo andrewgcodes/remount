@@ -907,6 +907,7 @@ func SnapshotTrees(trees []Tree, w io.Writer) (SnapshotStats, error) {
 			if err := validateSymlinkTarget(rel, link); err != nil {
 				return writeErr(err)
 			}
+			link = filepath.ToSlash(link)
 		}
 		var file *os.File
 		if info.Mode().IsRegular() {

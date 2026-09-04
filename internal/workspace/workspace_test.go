@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +47,7 @@ func TestProcessBackendLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer h.Destroy(ctx)
 	if _, err := be.Create(ctx, "ws_1", proto.WorkspaceSpec{}, nil); err == nil {
 		t.Fatal("duplicate create allowed")
 	}
@@ -57,19 +59,26 @@ func TestProcessBackendLifecycle(t *testing.T) {
 	}
 
 	// Prepare resolves cwd inside the root and merges env.
-	spec := session.Spec{Kind: proto.SessionExec, Program: []string{"sh", "-c", "pwd; echo $HOME; echo $FOO"}, Cwd: "sub", Env: []string{"FOO=bar"}}
+	program := []string{"sh", "-c", "pwd; echo $HOME; echo $FOO"}
+	if runtime.GOOS == "windows" {
+		program = []string{"cmd.exe", "/d", "/s", "/c", "cd & echo %HOME% & echo %FOO%"}
+	}
+	spec := session.Spec{Kind: proto.SessionExec, Program: program, Cwd: "sub", Env: []string{"FOO=bar"}}
 	if err := h.Prepare(&spec); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(spec.Cwd, "/ws_1/sub") {
+	if !strings.HasSuffix(spec.Cwd, filepath.Join("ws_1", "sub")) {
 		t.Fatal(spec.Cwd)
 	}
 	m := session.NewManager(session.ManagerOptions{})
 	defer m.Close()
 	s, _ := m.Open(spec)
 	out := drain(t, s)
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 3 || !strings.HasSuffix(lines[0], "/ws_1/sub") || !strings.HasSuffix(lines[1], "/ws_1") || lines[2] != "bar" {
+	lines := strings.Split(strings.ReplaceAll(strings.TrimSpace(out), "\r\n", "\n"), "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSpace(lines[i])
+	}
+	if len(lines) != 3 || !strings.HasSuffix(lines[0], filepath.Join("ws_1", "sub")) || !strings.HasSuffix(lines[1], "ws_1") || lines[2] != "bar" {
 		t.Fatalf("%q", out)
 	}
 	bad := session.Spec{Cwd: "../../etc"}
@@ -102,6 +111,9 @@ func TestProcessBackendLifecycle(t *testing.T) {
 	// Adopt after "restart".
 	h3, err := be2.Adopt(ctx, "ws_1")
 	if err != nil || h3.ID() != "ws_1" {
+		t.Fatal(err)
+	}
+	if err := h3.FS().Close(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := be2.Adopt(ctx, "ws_missing"); err == nil {
@@ -179,7 +191,11 @@ func TestDockerBackendReal(t *testing.T) {
 	if !strings.Contains(out, "from host") || !strings.Contains(out, "ws_dk") || !strings.Contains(out, "/work") {
 		t.Fatalf("%q", out)
 	}
-	if _, err := d.Adopt(ctx, "ws_dk"); err != nil {
+	adopted, err := d.Adopt(ctx, "ws_dk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adopted.FS().Close(); err != nil {
 		t.Fatal(err)
 	}
 }

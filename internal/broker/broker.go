@@ -1931,9 +1931,9 @@ func classifyUpstreamError(err error) string {
 		return ErrorClassTimeout
 	case errors.As(err, &dnsErr):
 		return ErrorClassDNS
-	case errors.Is(err, syscall.ECONNREFUSED):
+	case errors.Is(err, syscall.ECONNREFUSED), isPlatformConnectionRefused(err):
 		return ErrorClassRefused
-	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE):
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE), isPlatformConnectionReset(err):
 		return ErrorClassReset
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 		return ErrorClassEOF
