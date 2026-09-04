@@ -28,6 +28,9 @@ func TestE4DenialConformance(t *testing.T) {
 	if os.Getenv("REMOUNT_GVISOR_INTEGRATION") != "1" {
 		t.Skip("unavailable: set REMOUNT_GVISOR_INTEGRATION=1 on a privileged Linux host with runsc")
 	}
+	if os.Geteuid() != 0 {
+		t.Skip("unavailable: gVisor integration requires root for runsc, netns and nftables")
+	}
 	rootfs := os.Getenv("REMOUNT_GVISOR_ROOTFS")
 	if rootfs == "" {
 		t.Skip("unavailable: REMOUNT_GVISOR_ROOTFS is not set")
@@ -427,6 +430,9 @@ func runIn(ctx context.Context, h *handle, command string) error {
 func TestE4FailedSetupCleanupConformance(t *testing.T) {
 	if os.Getenv("REMOUNT_GVISOR_INTEGRATION") != "1" {
 		t.Skip("unavailable: set REMOUNT_GVISOR_INTEGRATION=1 on a privileged Linux host with runsc")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("unavailable: gVisor integration requires root for runsc, netns and nftables")
 	}
 	rootfs := os.Getenv("REMOUNT_GVISOR_ROOTFS")
 	if rootfs == "" {

@@ -201,7 +201,7 @@ func git(ctx context.Context, root string, args ...string) (string, error) {
 func credentials(lookup Lookup) []Credential {
 	names := map[string]bool{}
 	for _, s := range Scenarios() {
-		for _, name := range s.Env {
+		for _, name := range credentialEnv(s.Env) {
 			names[name] = true
 		}
 	}
@@ -281,7 +281,7 @@ func registryEnvNames() []string {
 	seen := map[string]bool{}
 	var names []string
 	for _, s := range Scenarios() {
-		for _, name := range s.Env {
+		for _, name := range credentialEnv(s.Env) {
 			if !seen[name] {
 				seen[name] = true
 				names = append(names, name)
