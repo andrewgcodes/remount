@@ -249,6 +249,14 @@ that does not invalidate the Ubuntu result. The hosted ordinary and race lanes
 now exclude that exact scale test and name the debt in the job summary; it
 remains in `make test`, `make race`, and focused developer runs.
 
+The next ordinary macOS package run, job `101101072814`, exposed the other
+already identified hosted timing boundary:
+`TestExecRoundTripCostOfTheDurableSessionTier` measured 12 ms with the artifact
+tier disabled and 13 ms enabled (1.06x), so process-start overhead masked the
+seal-cost signal. Hosted ordinary and race lanes now also exclude that exact
+measurement and publish both exclusions in the job summary. The assertion and
+test remain unchanged in developer package targets.
+
 **A Windows-hosted Docker conformance run selected Windows commands for a
 Linux workspace.** Command selection was compiled from the runner's OS, so
 Docker sessions received `cmd.exe` even though they execute inside Linux. The
