@@ -709,3 +709,46 @@ down from 4.8x, and what remains is the control plane's own durable write plus
 the HTTP upload — the part that must stay. Move is the one operation these
 changes did not help and it is still 2.7x its baseline; it is the next thing to
 profile, and nothing in this document has yet attributed it.
+
+---
+
+## Move, attributed at last, 2026-09-04
+
+Move was the one fleet operation left unexplained: p50 4.8-5.1 s against a
+1.88 s baseline, after every other row had been fixed or improved. Re-profiling
+after the artifact changes attributes it, and the answer is not a defect on the
+move path.
+
+**The artifact fix worked, and the numbers say so in absolute terms rather than
+as a share.** Total mutex delay across the scenario fell from 3384 s to 2575 s,
+down 24%. Within that, `artifact.(*Store).PutExpected` fell from 10.70% of 3384 s
+to 0.92% of 2575 s — about 362 s to 24 s, a fifteenfold reduction — and
+`artifact.(*Store).publish` no longer appears in the profile at all.
+
+**The pressure moved rather than vanished.** `control.(*Control).dispatch` went
+from 26.48% to 40.33%, which looks alarming until it is read in absolute terms:
+896 s to 1039 s. It genuinely rose. Removing the artifact bottleneck let more
+requests arrive at the control plane concurrently, so they queue on the next
+serialisation point instead. That is what fixing a bottleneck looks like when
+another one is behind it, and it is worth stating plainly so nobody reads the
+percentage as a regression.
+
+**Where move actually waits.** `wsMove` itself is only 1.78% of mutex delay, so
+the move handler is not the problem. A move also drives `wsClaim` on the
+destination (8.65%) and `wsReady` (10.56%), and it does real work in between:
+quiesce, snapshot, artifact transfer, restore. The CPU profile is 38%
+`syscall.rawsyscalln` — filesystem and network syscalls, not lock spinning — so
+the remainder is the transfer itself, which is the work the operation exists to
+do.
+
+**What would move it, and why that is not done here.** The remaining lock cost
+is the control plane's single state machine lock, and `wsReady`, `wsClaim` and
+`wsMove` serialise on it because generations, leases, placement and
+authorization revisions must stay consistent. Reducing it means sharding that
+lock per tenant or per workspace, which changes fencing semantics and is an
+architectural decision with correctness consequences, not a performance patch.
+It is recorded here with its measurement so the decision can be made on
+evidence.
+
+No further optimisation is proposed for move. It is the one operation whose
+remaining cost is dominated by work it must actually perform.
