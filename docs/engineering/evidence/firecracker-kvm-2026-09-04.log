@@ -1,4 +1,4 @@
-candidate=acb3e427ef5b327d805f3434d1f82f69894bd6fd
+candidate=8d27d6d036e246e837d685bc6e4e74c007e96908
 host=Linux 5.15.200 x86_64 GNU/Linux
 Firecracker v1.16.1
 Jailer v1.16.1
@@ -11,11 +11,11 @@ guest_binary_sha256=f9ad7fd58b39d4b66213c910e6b36459b34adf79aac205624ccedd9d92a1
 guest_protocol=1
 guest_vsock_port=10789
 
-ok  	remount.dev/remount/internal/workspace/firecracker	0.038s
+ok  	remount.dev/remount/internal/workspace/firecracker	0.036s
 === RUN   TestB29FirecrackerHostSmoke
---- PASS: TestB29FirecrackerHostSmoke (4.75s)
+--- PASS: TestB29FirecrackerHostSmoke (4.70s)
 === RUN   TestB29FirecrackerCheckpointMoveRestore
---- PASS: TestB29FirecrackerCheckpointMoveRestore (22.98s)
+--- PASS: TestB29FirecrackerCheckpointMoveRestore (23.84s)
 === RUN   TestDiskFullRestoreStagingFailsClosedAndCleansUp
 --- PASS: TestDiskFullRestoreStagingFailsClosedAndCleansUp (0.00s)
 PASS

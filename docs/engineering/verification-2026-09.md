@@ -456,7 +456,7 @@ findmnt | rg 'remount-gvisor|runsc' || true
 ## 2026-09-04 — Firecracker 2.3 and B29 on Linux/KVM
 
 **Status: verified on the exact candidate.** Candidate
-`acb3e427ef5b327d805f3434d1f82f69894bd6fd` ran on Linux x86_64, kernel
+`8d27d6d036e246e837d685bc6e4e74c007e96908` ran on Linux x86_64, kernel
 `5.15.200`, with KVM and nested virtualization available. The static
 Firecracker and jailer were both v1.16.1. Their SHA-256 digests were
 `2fd0171309af7e24cf8dafc8a6f921c1434c49b5f9349bb996b7ed0a4deb8aa7`
