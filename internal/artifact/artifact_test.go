@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -595,5 +596,154 @@ func TestStoreHeadMatchesOpenAndIsNotExistForUnknown(t *testing.T) {
 	}
 	if _, err := bs.Head("not-a-digest"); err == nil {
 		t.Fatal("Head must reject malformed ids")
+	}
+}
+
+// TestConcurrentPublishersOfOneDigestCreateItExactlyOnce is the correctness
+// property the store-wide lock used to provide and the per-digest lock has to
+// keep providing.
+//
+// publish decides "did I create this object?" by looking at the filesystem and
+// then updating the store's counters. If two goroutines uploading identical
+// content can both observe "absent" and both count a creation, the store's
+// object and byte totals drift upward forever, and a store with a quota
+// eventually refuses writes it has room for. Content addressing makes the
+// racing renames harmless — both write the same bytes to the same path — so
+// the accounting is the only thing at risk, and the only thing this asserts.
+func TestConcurrentPublishersOfOneDigestCreateItExactlyOnce(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("same-content-every-time"), 512)
+
+	const racers = 24
+	var wg sync.WaitGroup
+	created := make([]bool, racers)
+	errs := make([]error, racers)
+	start := make(chan struct{})
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			// put reports creation through the store's counters, so compare
+			// those rather than a return value the API does not expose.
+			_, _, err := store.PutLimit(bytes.NewReader(payload), 0)
+			errs[i] = err
+			created[i] = err == nil
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("racer %d: %v", i, err)
+		}
+	}
+	store.mu.Lock()
+	objects, storedBytes, reservedObjects, reservedBytes := store.objects, store.bytes, store.reservedObjects, store.reservedBytes
+	store.mu.Unlock()
+
+	if objects != 1 {
+		t.Errorf("%d concurrent uploads of one digest left the store counting %d objects; identical content is one object", racers, objects)
+	}
+	if storedBytes != int64(len(payload)) {
+		t.Errorf("store counts %d bytes for one %d-byte object", storedBytes, len(payload))
+	}
+	// Every reservation must be settled, whether its publisher created the
+	// object or found it already there. A leaked reservation is a quota the
+	// store can never reclaim.
+	if reservedObjects != 0 || reservedBytes != 0 {
+		t.Errorf("reservations leaked: %d objects, %d bytes still reserved", reservedObjects, reservedBytes)
+	}
+}
+
+// TestConcurrentPublishersOfDistinctDigestsAllLand covers the other side: the
+// per-digest lock must not make two different objects exclude each other.
+func TestConcurrentPublishersOfDistinctDigestsAllLand(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const racers = 24
+	var wg sync.WaitGroup
+	ids := make([]string, racers)
+	errs := make([]error, racers)
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ids[i], _, errs[i] = store.PutLimit(bytes.NewReader([]byte(fmt.Sprintf("distinct-%03d", i))), 0)
+		}(i)
+	}
+	wg.Wait()
+
+	unique := map[string]struct{}{}
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("racer %d: %v", i, err)
+		}
+		unique[ids[i]] = struct{}{}
+	}
+	if len(unique) != racers {
+		t.Fatalf("%d distinct payloads produced %d distinct ids", racers, len(unique))
+	}
+	store.mu.Lock()
+	objects := store.objects
+	store.mu.Unlock()
+	if objects != racers {
+		t.Errorf("store counts %d objects after %d distinct uploads", objects, racers)
+	}
+	for _, id := range ids {
+		if _, err := store.Head(id); err != nil {
+			t.Errorf("Head(%s): %v", id, err)
+		}
+	}
+}
+
+// TestACachedPutIsTheSameObjectAsADurableOne pins that PutLimitCached differs
+// from PutLimit only in durability. If it ever produced different bytes, a
+// different digest, or an object the store could not serve, a node would
+// upload something the control plane did not expect.
+func TestACachedPutIsTheSameObjectAsADurableOne(t *testing.T) {
+	durable, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cached, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("cache-put-parity"), 1000)
+
+	wantID, wantSize, err := durable.PutLimit(bytes.NewReader(payload), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotID, gotSize, err := cached.PutLimitCached(bytes.NewReader(payload), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotID != wantID || gotSize != wantSize {
+		t.Fatalf("cached put produced %s/%d, durable put produced %s/%d", gotID, gotSize, wantID, wantSize)
+	}
+	// Readable immediately, which is the property the node depends on: it
+	// reopens the object to upload it in the very next statement.
+	r, size, err := cached.Open(gotID)
+	if err != nil {
+		t.Fatalf("a cached object could not be reopened: %v", err)
+	}
+	defer r.Close()
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != int64(len(payload)) || !bytes.Equal(got, payload) {
+		t.Fatalf("cached object served %d bytes, want %d", len(got), len(payload))
+	}
+	if err := cached.Verify(gotID); err != nil {
+		t.Fatalf("a cached object failed its own digest verification: %v", err)
 	}
 }

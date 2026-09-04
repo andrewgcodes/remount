@@ -154,6 +154,43 @@ type Store struct {
 	reservedBytes   int64
 	reservedObjects int
 	pins            map[string]int // digest -> active idempotent readers
+
+	// digestLocks serialise publishers of the same digest without serialising
+	// the whole store. Blobs are content addressed, so two puts of different
+	// digests write different paths and cannot interfere; only same-digest
+	// publishers need to agree on who created the object. Holding s.mu across
+	// the Lstat, verify, Chmod and Rename made every concurrent upload queue
+	// behind unrelated filesystem calls, which showed up as 9.7% of all mutex
+	// delay in the 2026-09 profile of 200 concurrent uploads.
+	digestLocks [digestLockShards]sync.Mutex
+}
+
+// digestLockShards is a power of two so the shard is a mask of the digest's
+// leading bits. 64 is far more than the number of cores that could publish at
+// once, and the array costs 64 words.
+const digestLockShards = 64
+
+// lockDigest serialises same-digest publishers and returns the unlock.
+func (s *Store) lockDigest(digest string) func() {
+	var shard uint16
+	for i := 0; i < 4 && i < len(digest); i++ {
+		shard = shard<<4 | uint16(unhex(digest[i]))
+	}
+	m := &s.digestLocks[shard%digestLockShards]
+	m.Lock()
+	return m.Unlock
+}
+
+func unhex(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10
+	}
+	return 0
 }
 
 // NewStore creates the directory if needed.
@@ -265,7 +302,27 @@ func (s *Store) Put(r io.Reader) (string, int64, error) {
 // PutLimit is Put with a compressed-byte limit. A non-positive limit means
 // unlimited. Rejected bytes remain private temporary files and are removed.
 func (s *Store) PutLimit(r io.Reader, maxBytes int64) (string, int64, error) {
-	return s.put(r, "", maxBytes)
+	return s.putObject(r, "", maxBytes, true)
+}
+
+// PutLimitCached stores r without waiting for the bytes to reach the platter.
+//
+// It exists for the one caller whose local copy is a cache rather than the
+// authority: a node writes a session-log segment or a snapshot chunk into its
+// own store and immediately uploads it to the control plane's store, which is
+// durable, and only then commits the record that references it. A node that
+// dies between the local write and that commit leaves an object no record
+// names — garbage the store's own collector removes, not data anyone can
+// lose. Paying two fsyncs to make that intermediate copy survive a crash it
+// has no meaning after was about half the per-exec cost of the durable
+// session-log tier (docs/engineering/performance-regressions-2026-09.md).
+//
+// The bytes are still fully written and immediately readable through this
+// store; only the promise that they survive power loss is dropped. Callers for
+// whom this store *is* the authority — standalone mode, anything committing a
+// record that points here and nowhere else — must use PutLimit.
+func (s *Store) PutLimitCached(r io.Reader, maxBytes int64) (string, int64, error) {
+	return s.putObject(r, "", maxBytes, false)
 }
 
 // PutExpected stores r only if its digest is expected. This is the safe path
@@ -329,6 +386,12 @@ func verifyExpectedReader(expected string, r io.Reader, maxBytes int64) (int64, 
 }
 
 func (s *Store) put(r io.Reader, expected string, maxBytes int64) (string, int64, error) {
+	return s.putObject(r, expected, maxBytes, true)
+}
+
+// putObject stores r. When durable is false the object is written and made
+// visible but not synced; see PutLimitCached for the only caller that may.
+func (s *Store) putObject(r io.Reader, expected string, maxBytes int64, durable bool) (string, int64, error) {
 	reservation, err := s.reserveObject()
 	if err != nil {
 		metrics.ArtifactQuotaRejected.Inc()
@@ -362,9 +425,11 @@ func (s *Store) put(r io.Reader, expected string, maxBytes int64) (string, int64
 		_ = tmp.Close()
 		return "", n, fmt.Errorf("%w: body is %s", ErrDigestMismatch, got)
 	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return "", 0, err
+	if durable {
+		if err := tmp.Sync(); err != nil {
+			_ = tmp.Close()
+			return "", 0, err
+		}
 	}
 	if err := tmp.Close(); err != nil {
 		return "", 0, err
@@ -374,11 +439,11 @@ func (s *Store) put(r io.Reader, expected string, maxBytes int64) (string, int64
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return "", 0, err
 	}
-	created, err := s.publish(tmpName, dst, n, reservation)
+	created, err := s.publish(tmpName, dst, digest, n, reservation)
 	if err != nil {
 		return "", 0, err
 	}
-	if created {
+	if created && durable {
 		if err := syncDir(filepath.Dir(dst)); err != nil {
 			// The rename is already visible and accounted for. Returning an error
 			// makes the caller retry safely without pretending durability.
@@ -472,43 +537,72 @@ func (w *reservationWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (s *Store) publish(tmpName, dst string, size int64, reservation *storeReservation) (bool, error) {
+func (s *Store) publish(tmpName, dst, digest string, size int64, reservation *storeReservation) (bool, error) {
+	// Only same-digest publishers need to agree, and they are the only ones
+	// that share a destination path. s.mu is taken twice below, briefly, and
+	// never across a filesystem call.
+	unlock := s.lockDigest(digest)
+	defer unlock()
+
+	// The reservation's fields are guarded by s.mu, so read them under it
+	// rather than assuming this goroutine is the only one that can see them.
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if reservation.done || !reservation.object || reservation.bytes != size {
+	invalid := reservation.done || !reservation.object || reservation.bytes != size
+	s.mu.Unlock()
+	if invalid {
 		return false, errors.New("artifact: invalid staging reservation")
 	}
+
+	// Publish no longer holds s.mu across the filesystem, so Delete and Collect
+	// can now run while this is deciding whether the blob is already here. They
+	// both refuse a pinned digest, and Collect additionally skips ".put-" temp
+	// files by name, so pinning for the length of that decision closes the one
+	// window this restructure would otherwise open: a blob verified as present
+	// and then removed before the caller is told it is present. pin reports
+	// false when the blob does not exist, which is the create path below, and
+	// there is nothing to protect until the rename lands.
+	if s.pin(digest) {
+		defer s.unpin(digest)
+	}
+
+	existing := false
 	if st, err := os.Lstat(dst); err == nil {
 		if !st.Mode().IsRegular() || st.Size() != size {
 			return false, fmt.Errorf("artifact: existing blob %q is not the expected immutable object", filepath.Base(dst))
 		}
+		// A published blob is mode 0444 and named by its own content, so
+		// nothing mutates it and verifying it needs no lock at all. This is the
+		// call that made a large artifact's re-hash block every other upload.
 		if err := verifyBlobPath(dst, filepath.Base(dst)); err != nil {
 			metrics.ArtifactMiss.Inc()
 			return false, err
 		}
-		s.reservedBytes -= reservation.bytes
-		s.reservedObjects--
-		reservation.bytes = 0
-		reservation.object = false
-		reservation.done = true
-		return false, nil
+		existing = true
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return false, err
 	}
-	if err := os.Chmod(tmpName, 0o444); err != nil {
-		return false, err
+
+	if !existing {
+		if err := os.Chmod(tmpName, 0o444); err != nil {
+			return false, err
+		}
+		if err := os.Rename(tmpName, dst); err != nil {
+			return false, err
+		}
 	}
-	if err := os.Rename(tmpName, dst); err != nil {
-		return false, err
+
+	s.mu.Lock()
+	if !existing {
+		s.bytes += size
+		s.objects++
 	}
-	s.bytes += size
-	s.objects++
 	s.reservedBytes -= reservation.bytes
 	s.reservedObjects--
 	reservation.bytes = 0
 	reservation.object = false
 	reservation.done = true
-	return true, nil
+	s.mu.Unlock()
+	return !existing, nil
 }
 
 // Open returns a reader for id.
