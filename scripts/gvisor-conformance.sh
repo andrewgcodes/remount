@@ -26,6 +26,11 @@ case "${1:-all}" in
 esac
 case "${1:-all}" in
   e5|all)
+    if [ ! -x "$tmp/gvisor.test" ]; then
+      go test -c -o "$tmp/gvisor.test" ./internal/workspace/gvisor
+    fi
+    sudo -n env REMOUNT_GVISOR_INTEGRATION=1 REMOUNT_GVISOR_ROOTFS="$REMOUNT_GVISOR_ROOTFS" \
+      "$tmp/gvisor.test" -test.run '^TestE5SiblingTenantsCannotReachEachOther$' -test.v -test.timeout=3m
     go test -c -o "$tmp/node.test" ./internal/node
     sudo -n env REMOUNT_GVISOR_INTEGRATION=1 REMOUNT_GVISOR_ROOTFS="$REMOUNT_GVISOR_ROOTFS" \
       "$tmp/node.test" -test.run '^TestE5TenantIsolationConformance$' -test.v -test.timeout=2m
