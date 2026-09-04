@@ -584,3 +584,54 @@ to `artifact.publish` — the cached blobs are content-addressed and immutable, 
 reading them needs no lock at all, and the mutex only has to guard the
 accounting. Until someone runs that, this table is a list of places to look, not
 a list of defects.
+
+---
+
+## The MinIO CI lane: what is fixed, what is not, 2026-09-04
+
+**Do not re-run this to make it pass.** It is a real defect and it is only
+partly addressed.
+
+`net/http` reuses keep-alive connections, and `Request.isReplayable` replays
+only GET, HEAD, OPTIONS and TRACE. So when an endpoint closes a pooled
+connection and the transport then hands that connection the next request, an S3
+PUT fails with `http: server closed idle connection` and is not retried.
+`net/http`'s default `IdleConnTimeout` is 90 s — longer than the 60 s AWS ELB,
+MinIO and most reverse proxies use — which makes this inevitable rather than
+unlucky.
+
+**Fixed:** the store now owns a transport with a 25 s idle timeout when the
+caller supplies no client of its own (`internal/artifact/s3/config.go`). The
+`S3 REST and multipart compatibility` step had failed four CI runs in a row and
+passed on the first run after this change.
+
+**One green run is not proof, and this is stated plainly rather than claimed as
+a fix.** The change is defensible on its own terms — an idle timeout longer than
+the server's is simply wrong — but a single pass does not establish causation
+for a race.
+
+**Not fixed:** `warm-standby failover core (E10)` still fails the same way, in
+`Store.CheckConditionalWrites`, on the first conditional PUT. It does **not**
+reproduce locally: running the two CI steps in their CI order against the same
+pinned MinIO image, with the same environment, both pass.
+
+**Why retrying is not the obvious remedy.** A conditional PUT retried after its
+response was lost can return 412 and be read as a conflict that never happened,
+turning a transient into a false negative on the path that gates failover.
+
+**The remedy that is available, and why it was not taken here.** `net/http`
+already retries safely when it knows the request was never written; it just
+declines to for a PUT because `isReplayable` is false. Setting an
+`Idempotency-Key` header, with a rewindable body, makes the request replayable
+and lets the standard library's own guarantee do the work — it retries only on a
+reused connection that was closed before the request went out, so there is no
+double write, and it would leave streaming uploads unretried, correctly, because
+they cannot be rewound. `signedHeaderBlock` signs every header present, so the
+header is signed consistently and remains valid SigV4.
+
+That change puts a new header on **every** S3 request this codebase makes, to
+every endpoint, for a failure that reproduces only in CI. It wants a reviewer
+and a run against more than one S3 implementation, not a 3 a.m. commit. Whoever
+picks it up: the disambiguation for the probe specifically is that its staging
+key is freshly random and private, so a 412 on a retry proves our own earlier
+attempt landed rather than indicating a real conflict.
