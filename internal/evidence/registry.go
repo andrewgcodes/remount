@@ -86,8 +86,8 @@ var scenarios = []Scenario{
 		Layer: LayerHostCI, Required: true,
 		Owner:    "internal/workspace/gvisor.TestE4DenialConformance",
 		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS"},
-		Recorded: StatusUnavailable, Source: sourceHandoff,
-		Note: "runsc is not registered with Docker on the recorded host, so the seven-check denial suite cannot run; the backend advertises enforced_gateway only after it passes",
+		Recorded: StatusFailed, Source: sourceHandoff,
+		Note: "the suite now runs (a Colima VM hosts runsc; see handoff-linux-host-2026-09-03.md §1) and it FAILS: every forbidden destination reaches the host side of the veth, because gVisor injects frames below netfilter's IP hooks and the nftables output chain never sees them. Six of the seven checks passed only because the return path was blocked elsewhere. EgressMode enforced_gateway is advertised unconditionally and is unearned. docs/engineering/gvisor-egress-finding-2026-09-04.md",
 	},
 	{
 		ID: "E5", Title: "two mutually untrusting tenants share one gVisor node",
@@ -95,7 +95,7 @@ var scenarios = []Scenario{
 		Owner:    "internal/workspace/gvisor.TestE4DenialConformance",
 		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS"},
 		Recorded: StatusUnavailable, Source: sourceHandoff,
-		Note: "same host gate as E4",
+		Note: "same host gate as E4, which now runs and fails; E5 is unproven for the same reason",
 	},
 	{
 		ID: "E6", Title: "approve-on-first-use parks egress, a decision releases it, timeout denies",
