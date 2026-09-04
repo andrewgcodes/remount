@@ -168,7 +168,7 @@ func TestDockerBackendReal(t *testing.T) {
 	}
 	defer h.Destroy(ctx)
 	h.FS().Write("f.txt", []byte("from host"), 0, false, false)
-	spec := session.Spec{Kind: proto.SessionExec, Program: []string{"sh", "-c", "cat f.txt; echo $REMOUNT_WORKSPACE; pwd"}}
+	spec := session.Spec{Kind: proto.SessionExec, Program: []string{"sh", "-c", "cat f.txt; echo $REMOUNT_WORKSPACE; pwd; mkdir -p .config/opencode; chmod 700 .config/opencode"}}
 	if err := h.Prepare(&spec); err != nil {
 		t.Fatal(err)
 	}
@@ -178,6 +178,12 @@ func TestDockerBackendReal(t *testing.T) {
 	out := drain(t, s)
 	if !strings.Contains(out, "from host") || !strings.Contains(out, "ws_dk") || !strings.Contains(out, "/work") {
 		t.Fatalf("%q", out)
+	}
+	if err := h.(FilesystemAccessPreparer).PrepareFilesystemAccess(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.FS().Write(".config/opencode/config.json", []byte("{}"), 0, false, false); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := d.Adopt(ctx, "ws_dk"); err != nil {
 		t.Fatal(err)

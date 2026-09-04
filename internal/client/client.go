@@ -919,22 +919,48 @@ func (c *Client) forgetGrant(wsID string) {
 }
 
 // nodeCall performs a request against the node holding wsID, attaching a
-// grant. A stale grant (workspace moved) is refreshed once.
+// grant. A stale grant is refreshed, and a node that has not yet adopted the
+// grant's authorization revision gets a bounded interval to converge.
 func (c *Client) nodeCall(ctx context.Context, wsID, op string, body func(g *proto.Grant) any, out any) error {
-	for attempt := 0; attempt < 2; attempt++ {
+	deadline := time.Now().Add(15 * time.Second)
+	backoff := 25 * time.Millisecond
+	for attempt := 0; ; attempt++ {
 		g, err := c.grant(ctx, wsID)
 		if err != nil {
 			return err
 		}
 		err = c.call(ctx, g.Node, op, body(g), out)
 		var pe *proto.Error
-		if errors.As(err, &pe) && (pe.Code == proto.CodeConflict || pe.Code == proto.CodeUnreachable || pe.Code == proto.CodeUnauthorized) && attempt == 0 {
+		if !errors.As(err, &pe) {
+			return err
+		}
+		switch pe.Code {
+		case proto.CodeConflict, proto.CodeUnreachable:
+			if attempt == 0 {
+				c.forgetGrant(wsID)
+				continue
+			}
+		case proto.CodeUnauthorized:
 			c.forgetGrant(wsID)
-			continue
+			if attempt == 0 {
+				continue
+			}
+			if time.Now().Before(deadline) {
+				timer := time.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return ctx.Err()
+				case <-timer.C:
+				}
+				if backoff < 500*time.Millisecond {
+					backoff *= 2
+				}
+				continue
+			}
 		}
 		return err
 	}
-	return nil
 }
 
 // ---------------------------------------------------------------------------

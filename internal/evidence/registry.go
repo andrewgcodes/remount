@@ -460,16 +460,17 @@ var scenarios = []Scenario{
 	{
 		ID: "B30", Title: "reconnect and pool bursts stay within declared resource ceilings",
 		Layer: LayerCode, Required: true, Source: sourcePlanB,
-		Owner: "internal/sim.TestPlanBScale*",
-		Argv:  []string{"go", "test", "-count=1", "-timeout=40m", "-run", "^TestPlanBScale", "./internal/sim/"},
-		Note:  "eleven scenarios measuring slope across repeated cycles rather than a single level, because a leak is a slope and not a level. It found three paths that were unbounded or uncounted — event-tail subscriptions, slow-subscriber drops and per-pool idle clocks — all now bounded and counted.",
+		Owner: "internal/sim.TestPlanBScale*, scripts/planb-resource-ceilings.sh",
+		Argv:  []string{"./scripts/planb-resource-ceilings.sh"},
+		Note:  "deterministic reconnect, pool, spill, artifact, event, subscription and quota workloads assert bounded resources, counted rejection or loss, and explicit caller outcomes; the host gate uses 10,000 simultaneous reconnecting cursors",
 	},
 	{
 		ID: "B31", Title: "two clean builds produce the declared reproducible artifacts",
 		Layer: LayerArtifact, Required: true, Source: sourcePlanB,
-		Owner: "integration/reproducible.TestB31BinariesAreAFunctionOfTheSourceAlone",
-		Argv:  []string{"go", "test", "-count=1", "-timeout=20m", "./integration/reproducible/"},
-		Note:  "proves environment independence, not mere repetition: a cold build cache and a different TMPDIR produce byte-identical binaries, with a positive control that two version stamps do differ. The two-clean-containers half belongs to a Linux CI host.",
+		Owner:    "integration/reproducible.TestB31BinariesAreAFunctionOfTheSourceAlone, scripts/reproducible-container-builds.sh",
+		Argv:     []string{"./scripts/reproducible-container-builds.sh"},
+		Recorded: StatusPassed,
+		Note:     "two clean digest-pinned Go containers with cold caches and different TMPDIR values produce byte-identical binaries for every supported platform",
 	},
 	{
 		ID: "B32", Title: "clean installs pass the black-box smoke without source-tree imports",

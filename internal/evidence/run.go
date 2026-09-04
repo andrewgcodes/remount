@@ -403,6 +403,8 @@ var hostProbeFor = map[string]string{
 	"E5":  "gvisor",
 	"B28": "gvisor",
 	"B29": "firecracker",
+	"B31": "docker",
+	"B32": "docker",
 }
 
 func missingEnv(names []string, lookup Lookup) []string {

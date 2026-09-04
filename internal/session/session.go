@@ -191,16 +191,16 @@ func (s *Session) Input(iseq uint64, data []byte, eof bool) error {
 	}
 	if eof {
 		if running != nil {
-			if err := running.CloseWrite(); err != nil {
+			if err := running.CloseWrite(); err != nil && !errors.Is(err, os.ErrClosed) {
 				return proto.Err(proto.CodeClosed, "stdin close: %v", err)
 			}
 		} else if kind == proto.SessionExec {
-			if err := stdin.Close(); err != nil {
+			if err := stdin.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 				return proto.Err(proto.CodeClosed, "stdin close: %v", err)
 			}
 		} else if kind == proto.SessionPort {
 			if cw, ok := conn.(interface{ CloseWrite() error }); ok {
-				if err := cw.CloseWrite(); err != nil {
+				if err := cw.CloseWrite(); err != nil && !errors.Is(err, os.ErrClosed) {
 					return proto.Err(proto.CodeClosed, "stdin close: %v", err)
 				}
 			}

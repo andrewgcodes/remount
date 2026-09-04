@@ -41,6 +41,7 @@ import (
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/node"
 	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/server"
 	"remount.dev/remount/internal/transport"
 )
 
@@ -134,10 +135,12 @@ func TestPlanBScaleReconnectingCursorsReleaseTheirState(t *testing.T) {
 	if testing.Short() {
 		t.Skip("simultaneous-cursor scale evidence is not a short test")
 	}
-	cursors := planbScaleSize(t, 400, 40)
+	cursors := planbScaleSizeFromEnv(t, "REMOUNT_SCALE_CURSORS", 400, 40)
 	rng := planbScaleRand(t)
 
-	w := newWorld(t)
+	w := newWorldWith(t, func(o *server.Options) {
+		o.LeaseSec = 300
+	})
 	w.nodeWith("n1", func(o *node.Options) {
 		o.MaxSessions = 64
 		o.MaxActiveSessions = 16

@@ -75,7 +75,7 @@ var wiredScenarios = map[string]string{
 	"B27": "required encryption refuses before any mutation",
 	"B28": "the aggregate exact-candidate gVisor isolation and enforced-gateway host lane",
 	"B29": "the aggregate exact-candidate Firecracker KVM lifecycle, isolation, failure and cleanup lane",
-	"B30": "resource ceilings measured by slope across repeated cycles",
+	"B30": "10,000 reconnecting cursors and the remaining bounded resource workloads settle within declared ceilings",
 	"B31": "reproducible builds across a cold cache and a different TMPDIR",
 	"B32": "clean installs of the binary, images, wheel, tarball and module, each with a source-tree control",
 	"B8":  "internal/provision/e2b contract tests against fixtures captured from the real api.e2b.app",
@@ -140,14 +140,17 @@ func TestScenariosAreCopiesNotLiveRegistryRows(t *testing.T) {
 	}
 }
 
-func TestGvisorAndFirecrackerRowsAreBoundToTheirHostProbe(t *testing.T) {
+func TestHostBoundRowsUseACompatibleEvidenceLayer(t *testing.T) {
 	for id, probe := range hostProbeFor {
 		s, ok := ScenarioByID(id)
 		if !ok {
 			t.Fatalf("%s is probed but not registered", id)
 		}
+		if probe == "docker" && s.Layer == LayerArtifact {
+			continue
+		}
 		if s.Layer != LayerHostCI {
-			t.Fatalf("%s is bound to the %s probe but is not a host-ci row", id, probe)
+			t.Fatalf("%s is bound to the %s probe but has incompatible layer %s", id, probe, s.Layer)
 		}
 	}
 }
