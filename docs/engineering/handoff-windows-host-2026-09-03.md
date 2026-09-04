@@ -78,7 +78,7 @@ go run ./cmd/conformance --build .
 ```
 
 It has 67 requirements across nine semantic categories, imports no Remount
-implementation package, and reports `CONFORMANT` with 52/52 required rows on
+implementation package, and reports `CONFORMANT` with 53/53 required rows on
 darwin/arm64. **Any required row that fails on Windows is a genuine defect**,
 because the manifest asserts protocol semantics, not platform behavior. See
 `docs/engineering/plan-b-b4-conformance.md`.

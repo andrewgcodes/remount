@@ -9,7 +9,7 @@ import (
 // ManifestVersion is the version of the whole manifest document. It changes
 // when a requirement is added, retired or has its tier changed, so a report
 // names exactly which contract an implementation was judged against.
-const ManifestVersion = "1.0.0"
+const ManifestVersion = "1.1.0"
 
 // ProtocolVersion is the wire version this manifest describes. A target that
 // declares any other version is not judged by it (§13).
@@ -298,6 +298,12 @@ func (r Requirement) Gates() string {
 
 const v1 = "1.0.0"
 
+// v11 is the manifest version that added CONF-SESS-009. Every pre-existing row
+// keeps Version v1: none of their assertions changed meaning, and a report must
+// still be able to say an implementation passed a row at the version it was
+// judged against.
+const v11 = "1.1.0"
+
 // requirements is the manifest itself. Each row is a sentence from
 // spec/PROTOCOL.md turned into an obligation, cited back to the section that
 // says it, and classified by §12.5.
@@ -497,6 +503,12 @@ var requirements = []Requirement{
 		Category: CategorySession, Tier: TierRequired,
 		Title: "an attach past the produced range never fabricates output: the node reports where live begins and emits nothing before it",
 		Spec:  "PROTOCOL.md §8 guarantee 3",
+	},
+	{
+		ID: "CONF-SESS-009", Version: v11, Since: v11,
+		Category: CategorySession, Tier: TierRequired,
+		Title: "the bytes a process writes to stdout reach the client verbatim, on the stdout stream, with the exit status that ran them",
+		Spec:  "PROTOCOL.md §8, ChunkBody st=1",
 	},
 
 	// ---- snapshot identity, restore, move and source retention -----------
