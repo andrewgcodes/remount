@@ -1125,6 +1125,58 @@ And a credential's blast radius is every surface that records it, not just
 every surface that accepts it. The broker capability was never *checked* in an
 audit record; it was only *written* there, and that was enough.
 
+## 47. I read a mutex profile from the top and named the wrong culprit
+
+After fixing five regressions from `a3b5235`, one stayed open: exec round trip,
+0.645 s baseline against 2.54 s. I wrote in the commit message, in
+`docs/engineering/performance-regressions-2026-09.md`, and in my report to the
+user that the cause was `Log.closeWithPublish` holding `l.mu` across an fsync,
+a `BlobStore.Put`, a `BlobStore.Head` and a `CommitRecord` — "the mutex profile
+attributes 47% of all delay to it."
+
+It does not. Re-profiling the same scenario and using `-peek` on the specific
+paths instead of reading the top of the profile:
+
+| Path | Share of mutex delay |
+|---|---:|
+| `control.(*Control).dispatch` | 26.5% |
+| `artifact.(*Store).publish` | 9.7% |
+| `syscall.forkExec` (Go's process-wide `ForkLock`) | 9.4% |
+| `control.(*Control).sessionLogCommit` | **1.4%** |
+
+The path I had named was the fourth-largest thing on the list, at a twenty-fifth
+of the weight I gave it. Worse, I had a remedy ready — restructure the seal so
+the upload and the control commit happen outside `l.mu` — and that remedy would
+have restructured a durable-commit boundary, at some risk, to buy 1.4% of one
+profile.
+
+What actually costs the time, measured by instrumenting each phase of a seal:
+
+```
+SEALTRACE bytes=195 sync=3.4ms put=14.5ms head=0.12ms commit=0.6ms total=19ms
+PUTTRACE  n=195 copy=0.14ms tmpsync=3-8ms mkdir=0.18ms publish=0.2ms dirsync=3.1ms
+```
+
+Closing a session that printed ten bytes writes a 195-byte segment to the
+node's own artifact store (two fsyncs), uploads it to the control plane's store
+(two more fsyncs, plus HTTP), and commits a record. Five fsyncs and two round
+trips, on the caller's critical path, to durably archive ten bytes of output.
+`Head`, which I had listed as a cost, is 0.12 ms — 0.6% of the seal. Had I
+"optimised" by removing it, as I briefly considered, I would have weakened a
+durability check to buy nothing.
+
+**Lesson.** A mutex profile's top rows are `sync.(*Mutex).Unlock` and the
+callers that happen to sit above the most samples; they are not an attribution.
+`-peek` on the specific symbol is. And the first move on a latency question is
+to instrument the phases of the slow operation and read the numbers, not to
+find a lock held across I/O and assume it must be the one — "a lock held across
+I/O" is a shape I had already fixed three times that night, and I pattern
+matched on the shape instead of measuring the instance.
+
+This is #45's lesson ("a measurement of the primitive is not a measurement of
+the path") turned around: a measurement of the *path* is not an attribution to
+a *component* either. Both directions need the actual number.
+
 ---
 
 That playbook is also the cross-cutting pattern analysis for mistakes 23-41:

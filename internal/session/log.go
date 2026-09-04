@@ -507,9 +507,18 @@ func (l *Log) sealSpillLocked() error {
 	if len(l.segments) >= l.opts.MaxSegments {
 		return l.tierErrorLocked(TierBlob, first, next, errors.New("session segment reference limit reached"))
 	}
-	if err := l.spill.Sync(); err != nil {
-		return l.tierErrorLocked(TierDisk, first, next, fmt.Errorf("sync before seal: %w", err))
-	}
+	// No fsync of the spill before uploading it. The bytes handed to the blob
+	// store are read back through this same descriptor, so they are the bytes
+	// that were written whether or not they have reached the platter, and the
+	// spill is explicitly not a durability tier: spec/PROTOCOL.md §8.2 says the
+	// ring and spill "are node-local, so they do not survive node loss". The
+	// durable commit point is the blob store's own durable write followed by
+	// CommitRecord below. Syncing here made the non-durable tier durable
+	// immediately before copying it into the tier that actually provides
+	// durability, and cost one F_FULLFSYNC on the critical path of every
+	// session close. A node lost mid-seal commits no record, so the segment is
+	// legitimately absent rather than silently short — which is the outcome
+	// §8.2 already allows for.
 	id, n, err := l.opts.BlobStore.Put(io.NewSectionReader(l.spill, 0, size))
 	if err != nil {
 		return l.tierErrorLocked(TierBlob, first, next, fmt.Errorf("put segment: %w", err))

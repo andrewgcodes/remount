@@ -486,6 +486,36 @@ that cannot tell "no" from "I could not look" is not a signal — an empty searc
 result, a gauge zeroed on failure and a skipped job are all indistinguishable
 from good news until the code makes "unavailable" a distinct answer.
 
+## Lesson 14: a profile's top rows are not an attribution
+
+A latency question invites a shortcut: find a lock held across I/O, recognise a
+shape you have fixed before, and name it the cause. That shortcut produced a
+wrong answer this month. `Log.closeWithPublish` does hold a mutex across an
+fsync, two HTTP requests and a control round trip — a genuinely bad shape — and
+it was named as the cause of a 4x exec regression on the strength of a mutex
+profile read from the top. `-peek` on the actual symbol put it at 1.4% of
+delay. The real cost was five fsyncs spread across two artifact stores, which
+no amount of staring at lock shapes would have revealed.
+
+Two habits follow.
+
+**Read profiles with `-peek`, not `-top`.** A mutex profile's leading rows are
+`sync.(*Mutex).Unlock` and whichever callers sit above the most samples. That
+is a ranking of sample counts, not an attribution to a component. Ask about the
+symbol you suspect, by name, and let it answer.
+
+**Instrument the phases before choosing a remedy.** Timing each step of the
+slow operation takes a few minutes and is not optional. Here it showed that
+`BlobStore.Head`, which had been listed among the costs and was a candidate for
+removal, was 0.6% of the seal — deleting it would have weakened a durability
+check to buy nothing measurable.
+
+The corollary to Lesson 11: a number decays, but a *diagnosis* decays faster,
+because it was an inference from a number and inherits every weakness of the
+measurement plus the ones the reasoning added. Re-measure a diagnosis before
+you act on it, especially your own, and especially when it flatters a fix you
+already know how to write.
+
 ## Review checklist
 
 Before implementation:
@@ -510,6 +540,8 @@ During implementation:
 
 Before handoff:
 
+- [ ] A performance claim names the symbol it blames, measured with `-peek`
+      and phase timings, not inferred from a profile's top rows.
 - [ ] Focused regression and the appropriate race/fault/restart test pass.
 - [ ] Repository gates appropriate to the change pass from a clean candidate.
 - [ ] Public API, fuzz, distribution, and cloud layers were run when relevant,

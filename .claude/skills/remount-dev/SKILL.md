@@ -149,6 +149,31 @@ postcondition. `gofmt` realigns const blocks, so a patch matching
 Grep for the intended result after every scripted edit, or match on a pattern
 tolerant of whitespace. Exit status zero is not evidence the edit happened.
 
+**An operation is slow and a lock is held across I/O.** Do not stop there. That
+shape is real and this codebase has had it three times, which is exactly why it
+is the wrong thing to trust: it is the first pattern you will recognise and it
+will feel like an answer. Measure before you name a cause.
+
+```sh
+go test ./internal/sim -run '^TestX$' -count=1 -mutexprofile=mutex.out -blockprofile=block.out
+go tool pprof -peek 'YourSuspect$' internal/sim.test mutex.out   # not -top
+```
+
+`-top` on a mutex profile ranks `sync.(*Mutex).Unlock` and whichever callers sit
+above the most samples; it is a sample count, not an attribution. Ask about your
+suspect by name. Then instrument the phases of the slow operation with
+`time.Now()` deltas behind an env var and read the actual numbers — in
+`MISTAKES.md` #47 the suspect was 1.4% of delay and the real cost was five
+fsyncs spread across two artifact stores, which no amount of reading lock shapes
+would have shown.
+
+Two things that are **not** product defects, so recognise them before filing
+one: `syscall.forkExec` contention is Go's process-wide `ForkLock`, and the sim
+runs every node in one process (200 concurrent `sh -c printf` spawns cost 436 ms
+here against 5 ms unloaded); and `control.(*Control).dispatch` contention is the
+control plane's single state machine lock, which `wsReady`, `wsCreate` and
+`wsClaim` legitimately serialise on.
+
 **A workspace sits pending.** `remount ws get WS` and compare
 `spec.requires` and `spec.placement` against `remount nodes`. Eligibility is
 the intersection of every constraint.

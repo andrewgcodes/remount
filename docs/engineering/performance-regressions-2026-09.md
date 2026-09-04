@@ -335,7 +335,7 @@ The lanes that would have caught them:
 | 5 | Reattach after control restart | **improved** — 4.90 s → 4.17 s |
 | 6 | Volume fence write per claim/move | **fixed** for volume-incapable nodes |
 | 7 | Whole fleet-scale scenario | **improved** — 35.1 s → 22.4 s |
-| 3 | Exec round trip p50 at 200-way concurrency | **OPEN** — 0.645 s baseline, 2.54 s now |
+| 3 | Exec round trip p50 at 200-way concurrency | **diagnosed and partly reduced** — see "Regression 3, re-diagnosed" below. The first diagnosis in this document was wrong. |
 
 Also fixed separately: the 200 MiB two-node move, 33–76 s → 0.88 s (228 MB/s
 against a 235 MB/s baseline), by bounding chunk-transfer concurrency and
@@ -388,3 +388,132 @@ visible. It was deliberately not attempted unreviewed.
 Skipping the seal for short sessions is **not** a valid shortcut: sealing is
 what makes a completed session survive node loss, which is the whole promise of
 `tiered-session-logs` and what E11 asserts.
+
+---
+
+## Regression 3, re-diagnosed (2026-09-03, later the same night)
+
+An earlier revision of this document, and the commit message for `c89e413`,
+said regression 3 was `Log.closeWithPublish` holding `l.mu` across an fsync,
+a `BlobStore.Put`, a `BlobStore.Head` and a `CommitRecord`, "47% of all mutex
+delay". **That attribution was wrong**, and MISTAKES.md #47 records how it was
+arrived at. Re-profiling the same scenario and using `go tool pprof -peek` on
+each symbol rather than reading the top of the profile:
+
+| Path | Share of mutex delay |
+|---|---:|
+| `control.(*Control).dispatch` | 26.5% |
+| `artifact.(*Store).publish` | 9.7% |
+| `syscall.forkExec` (Go's process-wide `ForkLock`) | 9.4% |
+| `control.(*Control).sessionLogCommit` | 1.4% |
+
+### What the cost actually is
+
+The mechanism was found by building the lane this document had already said
+was missing — "a single-session exec round trip with an artifact URL
+configured, which is what makes the session-log upload path live". That lane is
+now `internal/sim.TestExecRoundTripCostOfTheDurableSessionTier`, and it holds
+everything equal except whether the node advertises a durable tier:
+
+```
+exec round trip p50: artifact tier off 11ms, on 29ms, ratio 2.66x (n=24 each)
+```
+
+Instrumenting each phase of a seal of a session that printed ten bytes:
+
+| Phase | Cost |
+|---|---:|
+| spill fsync before upload | 3.4 ms |
+| `BlobStore.Put` (node-local store: 2 fsyncs, then HTTP upload to control: 2 more) | 14.5 ms |
+| `BlobStore.Head` | 0.12 ms |
+| `CommitRecord` | 0.6 ms |
+| **total** | **~19 ms** |
+
+The two-stores-two-fsyncs-each claim is measured, not inferred: tagging every
+`artifact.Store.put` with its store directory shows exactly two puts per seal,
+one under the node's own `.../<node>/artifacts` and one under the control
+plane's `.../server/artifacts`, both `created=true` and both taking the full
+`tmp.Sync()` plus `syncDir()` path.
+
+So closing a trivial session costs five fsyncs and two round trips to durably
+archive a 195-byte segment, all on the caller's critical path. That is what
+spec §8.2 buys — an exited session replays byte-exactly after node loss — and
+it is a real guarantee, not waste. But it is paid synchronously by every exec.
+
+### What was fixed
+
+The spill fsync before the upload was redundant and is removed. The bytes
+handed to the blob store are read back through the same descriptor, so they are
+the bytes that were written regardless of whether they reached the platter, and
+§8.2 states plainly that the ring and spill "are node-local, so they do not
+survive node loss". It made the non-durable tier durable immediately before
+copying it into the tier that provides durability. A node lost mid-seal commits
+no record, so the segment is legitimately absent rather than silently short.
+
+Measured: seal 19 ms → 15.8 ms; exec ratio 2.81x → 2.47–2.66x across three runs.
+
+This is the same defect as MISTAKES.md #45 one layer down: #45 removed an fsync
+per *record* in `spillLocked`; this removes an fsync per *seal* in
+`sealSpillLocked`. Both were syncing a tier the protocol declares non-durable.
+
+### What is still open, and deliberately not changed
+
+**The seal is on the exec's critical path.** Roughly 15 ms of the remaining
+cost is the genuine price of §8.2 durability: two fsyncs in the node's artifact
+store, two in the control plane's, an HTTP upload, and a control commit.
+Removing it from the caller's critical path would change an observable
+guarantee — that an exited session is immediately durably replayable — and so
+is a design decision needing an ADR, not a performance patch.
+
+A narrower version is available and also unstarted: the node's *local* artifact
+store fsyncs twice (`tmp.Sync`, then `syncDir` after the rename) for a copy
+that is only a cache, because the durable authority is the remote store plus
+the committed record. A node that dies after the local put and before the
+upload leaves a segment no record references — garbage, not data. Making that
+write non-durable would remove about half the seal cost, but `artifact.Store`
+is also the authority in standalone mode, so it needs an explicit cache-put
+path rather than a global change.
+
+**`artifact.(*Store).publish` holds the store-wide lock across filesystem
+syscalls** (9.7% of mutex delay). The work inside the lock is cheap — `-peek`
+shows `os.Chmod` at 4.6 ms and `os.Rename` at 1.6 ms across the entire run, and
+`verifyBlobPath` never executes in this workload — so the delay is pure
+queueing: every upload to the shared control-plane store serialises on one
+mutex. The fix is to stop deriving "did I create this blob?" from a lock and
+start deriving it from the filesystem: `os.Link(tmp, dst)` fails with `EEXIST`
+if the blob is already there, which is an atomic create-if-absent, leaving the
+mutex to guard only the accounting counters. That is deliberately **not** done
+here: hardlink semantics differ on Windows, which
+`docs/engineering/handoff-windows-host-2026-09-03.md` identifies as the least
+verified platform in the repository, and this is a durable-artifact path. It
+wants a reviewer and a Windows run, not a 3 a.m. commit.
+
+**`syscall.forkExec` at 9.4% is a simulation artifact, not a product defect.**
+Go serialises `fork`/`exec` process-wide behind `ForkLock`. The sim runs 200
+nodes inside one test process, so all 200 execs queue there; in production each
+node is its own process. Measured directly: 200 concurrent `sh -c printf`
+spawns from one Go process take 436 ms wall (p50 247 ms), against 5 ms
+unloaded. That is a floor the 200-way lane cannot go below and it should not be
+attributed to Remount.
+
+**`control.(*Control).dispatch` at 26.5% is the control plane's single state
+machine lock, and is a design property rather than a defect.** Breaking it down
+by the operation holding it:
+
+| Operation | Share of dispatch delay |
+|---|---:|
+| `wsReady` | 34.4% |
+| `wsCreate` | 31.5% |
+| `wsClaim` | 17.2% |
+| `sessionLogCommit` | 5.2% |
+| `wsMove` | 3.8% |
+
+These are workspace lifecycle transitions, and they serialise against shared
+state — generations, leases, placement, authorization revisions — that the
+whole system's correctness depends on being consistent. Removing the
+serialisation would mean sharding the control lock per tenant or per workspace,
+which is an architectural change with real fencing consequences, not a
+performance patch. It is recorded here so the next person to profile this does
+not spend the evening rediscovering it. The number to watch is whether any
+*single* operation's share grows, which would indicate new work added under the
+lock rather than the expected cost of the lock existing.
