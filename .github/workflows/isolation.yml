@@ -34,6 +34,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y runsc
           runsc --version
+          sudo runsc install --runtime=runsc
+          sudo systemctl restart docker
+          for attempt in $(seq 1 30); do
+            docker info >/dev/null 2>&1 && break
+            if [ "$attempt" -eq 30 ]; then
+              echo "Docker did not recover after runsc registration" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          docker info --format '{{json .Runtimes}}' | grep -q '"runsc"'
       - name: Build disposable Alpine rootfs
         shell: bash
         run: |
