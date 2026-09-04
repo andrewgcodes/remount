@@ -107,6 +107,9 @@ type cacheEntry struct {
 type resolveCall struct {
 	done chan struct{}
 	err  error
+	// joined counts callers that coalesced onto this resolution instead of
+	// starting their own. It is written under CachedResolver.mu.
+	joined int
 }
 
 // New returns a bounded external-source resolver.
@@ -159,6 +162,19 @@ func New(cfg Config) (*CachedResolver, error) {
 	return &CachedResolver{cfg: cfg, entries: make(map[string]*cacheEntry), inflight: make(map[string]*resolveCall)}, nil
 }
 
+// coalescedOn reports how many callers have joined the in-flight resolution
+// for source. It exists so a test can wait until every concurrent caller has
+// actually coalesced before letting the provider respond; releasing earlier
+// lets a straggler start a second resolution and makes the assertion racy.
+func (r *CachedResolver) coalescedOn(source string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if call := r.inflight[source]; call != nil {
+		return call.joined
+	}
+	return 0
+}
+
 // ValidateSource rejects literal values and malformed or unsupported schemes.
 func ValidateSource(source string) error {
 	if len(source) == 0 || len(source) > maximumSourceBytes {
@@ -209,6 +225,7 @@ func (r *CachedResolver) Resolve(ctx context.Context, source string) (string, er
 		}
 		r.removeExpiredLocked(now)
 		if call := r.inflight[source]; call != nil {
+			call.joined++
 			done := call.done
 			r.mu.Unlock()
 			select {
@@ -267,6 +284,7 @@ func (r *CachedResolver) Probe(ctx context.Context, source string) error {
 	}
 	r.mu.Lock()
 	if call := r.inflight[source]; call != nil {
+		call.joined++
 		done := call.done
 		r.mu.Unlock()
 		select {
