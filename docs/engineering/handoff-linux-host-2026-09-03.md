@@ -200,7 +200,7 @@ disposable environments, which a Linux CI host does properly.
   `go run ./cmd/conformance --endpoint URL --external`.
 
 The conformance runner exists and reports **CONFORMANT** against a freshly
-built binary here: 52/52 required rows, 0 failed. It imports no Remount
+built binary here: 53/53 required rows, 0 failed. It imports no Remount
 implementation package, so it can judge an install without a source tree.
 
 **Nothing is published.** Plan B §18 explicitly cuts "a public release, tag,

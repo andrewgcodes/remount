@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "protocol_version": "1",
   "requirements": [
     {
@@ -287,6 +287,15 @@
       "tier": "required",
       "title": "an attach past the produced range never fabricates output: the node reports where live begins and emits nothing before it",
       "spec": "PROTOCOL.md §8 guarantee 3"
+    },
+    {
+      "id": "CONF-SESS-009",
+      "version": "1.1.0",
+      "since": "1.1.0",
+      "category": "session",
+      "tier": "required",
+      "title": "the bytes a process writes to stdout reach the client verbatim, on the stdout stream, with the exit status that ran them",
+      "spec": "PROTOCOL.md §8, ChunkBody st=1"
     },
     {
       "id": "CONF-SNAP-001",

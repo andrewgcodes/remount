@@ -1,8 +1,8 @@
 {
   "_comment": [
-    "Deterministic failure seeds for Plan B §12.4, scenario B21.",
+    "Deterministic failure seeds for Plan B \u00a712.4, scenario B21.",
     "Each seed names one defect the internal/conformance/shim implementation can be built with,",
-    "the semantic category §12.1 places it in, and the exact requirements the suite must fail",
+    "the semantic category \u00a712.1 places it in, and the exact requirements the suite must fail",
     "when judging that implementation. A seed whose must_fail list stops being failed means the",
     "suite has stopped asserting something it used to assert, which is the regression this file",
     "exists to catch. must_not_fail names rows that must keep passing, so a defect cannot be",
@@ -10,85 +10,236 @@
     "The seeds are sanitized: the shim holds no credential and the canary secret in it is",
     "synthetic and exists only inside a test process."
   ],
-  "manifest_version": "1.0.0",
+  "manifest_version": "1.1.0",
   "protocol_version": "1",
   "seeds": [
     {
       "defect": "negotiation",
       "category": "negotiation",
       "violation": "echoes capability identifiers it does not implement, and accepts a hello that never offered the v1 baseline",
-      "must_fail": ["CONF-NEG-002", "CONF-NEG-003"],
-      "must_not_fail": ["CONF-WS-002", "CONF-AUTH-003", "CONF-SESS-004", "CONF-SNAP-001", "CONF-BIND-002", "CONF-APP-002", "CONF-AGT-003", "CONF-EVT-001"]
+      "must_fail": [
+        "CONF-NEG-002",
+        "CONF-NEG-003"
+      ],
+      "must_not_fail": [
+        "CONF-WS-002",
+        "CONF-AUTH-003",
+        "CONF-SESS-004",
+        "CONF-SNAP-001",
+        "CONF-BIND-002",
+        "CONF-APP-002",
+        "CONF-AGT-003",
+        "CONF-EVT-001"
+      ]
     },
     {
       "defect": "workspace",
       "category": "workspace",
       "violation": "ignores the idempotency key, so a retry after a dropped connection creates a second workspace",
-      "must_fail": ["CONF-WS-002"],
-      "must_not_fail": ["CONF-NEG-002", "CONF-AUTH-003", "CONF-SESS-004", "CONF-SNAP-001", "CONF-BIND-002", "CONF-APP-002", "CONF-AGT-003", "CONF-EVT-001"]
+      "must_fail": [
+        "CONF-WS-002"
+      ],
+      "must_not_fail": [
+        "CONF-NEG-002",
+        "CONF-AUTH-003",
+        "CONF-SESS-004",
+        "CONF-SNAP-001",
+        "CONF-BIND-002",
+        "CONF-APP-002",
+        "CONF-AGT-003",
+        "CONF-EVT-001"
+      ]
     },
     {
       "defect": "authority",
       "category": "authority",
       "violation": "accepts a grant bound to a generation the workspace no longer has",
-      "must_fail": ["CONF-AUTH-003", "CONF-AUTH-004", "CONF-AUTH-006"],
-      "must_not_fail": ["CONF-NEG-002", "CONF-WS-002", "CONF-SESS-004", "CONF-SNAP-001", "CONF-BIND-002", "CONF-APP-002", "CONF-AGT-003", "CONF-EVT-001"]
+      "must_fail": [
+        "CONF-AUTH-003",
+        "CONF-AUTH-004",
+        "CONF-AUTH-006"
+      ],
+      "must_not_fail": [
+        "CONF-NEG-002",
+        "CONF-WS-002",
+        "CONF-SESS-004",
+        "CONF-SNAP-001",
+        "CONF-BIND-002",
+        "CONF-APP-002",
+        "CONF-AGT-003",
+        "CONF-EVT-001"
+      ]
     },
     {
       "defect": "session",
       "category": "session",
       "violation": "applies an input whose iseq was already applied, so a retried keystroke is typed twice",
-      "must_fail": ["CONF-SESS-004"],
-      "must_not_fail": ["CONF-NEG-002", "CONF-WS-002", "CONF-AUTH-003", "CONF-SNAP-001", "CONF-BIND-002", "CONF-APP-002", "CONF-AGT-003", "CONF-EVT-001"]
+      "must_fail": [
+        "CONF-SESS-004"
+      ],
+      "must_not_fail": [
+        "CONF-NEG-002",
+        "CONF-WS-002",
+        "CONF-AUTH-003",
+        "CONF-SNAP-001",
+        "CONF-BIND-002",
+        "CONF-APP-002",
+        "CONF-AGT-003",
+        "CONF-EVT-001"
+      ]
+    },
+    {
+      "defect": "stdout",
+      "category": "session",
+      "violation": "emits a structurally perfect log that never carries what the process wrote, so every shape assertion holds vacuously",
+      "must_fail": [
+        "CONF-SESS-009"
+      ],
+      "must_not_fail": [
+        "CONF-SESS-001",
+        "CONF-SESS-002",
+        "CONF-SESS-003",
+        "CONF-SESS-005",
+        "CONF-SESS-008",
+        "CONF-NEG-002",
+        "CONF-WS-002",
+        "CONF-AUTH-003",
+        "CONF-SNAP-001",
+        "CONF-BIND-002",
+        "CONF-APP-002",
+        "CONF-AGT-003",
+        "CONF-EVT-001"
+      ]
     },
     {
       "defect": "snapshot",
       "category": "snapshot",
       "violation": "returns a fresh artifact id for an unchanged tree, so the id identifies the moment rather than the contents",
-      "must_fail": ["CONF-SNAP-001"],
-      "must_not_fail": ["CONF-NEG-002", "CONF-WS-002", "CONF-AUTH-003", "CONF-SESS-004", "CONF-BIND-002", "CONF-APP-002", "CONF-AGT-003", "CONF-EVT-001"]
+      "must_fail": [
+        "CONF-SNAP-001"
+      ],
+      "must_not_fail": [
+        "CONF-NEG-002",
+        "CONF-WS-002",
+        "CONF-AUTH-003",
+        "CONF-SESS-004",
+        "CONF-BIND-002",
+        "CONF-APP-002",
+        "CONF-AGT-003",
+        "CONF-EVT-001"
+      ]
     },
     {
       "defect": "binding",
       "category": "binding",
       "violation": "forwards a placeholder aimed at a host its binding does not cover instead of blocking the request",
-      "must_fail": ["CONF-BIND-002"],
-      "must_not_fail": ["CONF-NEG-002", "CONF-WS-002", "CONF-AUTH-003", "CONF-SESS-004", "CONF-SNAP-001", "CONF-APP-002", "CONF-AGT-003", "CONF-EVT-001"]
+      "must_fail": [
+        "CONF-BIND-002"
+      ],
+      "must_not_fail": [
+        "CONF-NEG-002",
+        "CONF-WS-002",
+        "CONF-AUTH-003",
+        "CONF-SESS-004",
+        "CONF-SNAP-001",
+        "CONF-APP-002",
+        "CONF-AGT-003",
+        "CONF-EVT-001"
+      ]
     },
     {
       "defect": "approval",
       "category": "approval",
       "violation": "reports settled approvals as pending, so a caller polling for work sees decided rows as outstanding",
-      "must_fail": ["CONF-APP-002"],
-      "must_not_fail": ["CONF-NEG-002", "CONF-WS-002", "CONF-AUTH-003", "CONF-SESS-004", "CONF-SNAP-001", "CONF-BIND-002", "CONF-AGT-003", "CONF-EVT-001"]
+      "must_fail": [
+        "CONF-APP-002"
+      ],
+      "must_not_fail": [
+        "CONF-NEG-002",
+        "CONF-WS-002",
+        "CONF-AUTH-003",
+        "CONF-SESS-004",
+        "CONF-SNAP-001",
+        "CONF-BIND-002",
+        "CONF-AGT-003",
+        "CONF-EVT-001"
+      ]
     },
     {
       "defect": "agent",
       "category": "agent",
       "violation": "lets the inbox grow without limit instead of refusing the excess with resource_exhausted",
-      "must_fail": ["CONF-AGT-003"],
-      "must_not_fail": ["CONF-NEG-002", "CONF-WS-002", "CONF-AUTH-003", "CONF-SESS-004", "CONF-SNAP-001", "CONF-BIND-002", "CONF-APP-002", "CONF-EVT-001"]
+      "must_fail": [
+        "CONF-AGT-003"
+      ],
+      "must_not_fail": [
+        "CONF-NEG-002",
+        "CONF-WS-002",
+        "CONF-AUTH-003",
+        "CONF-SESS-004",
+        "CONF-SNAP-001",
+        "CONF-BIND-002",
+        "CONF-APP-002",
+        "CONF-EVT-001"
+      ]
     },
     {
       "defect": "event",
       "category": "event",
       "violation": "assigns a sequence that goes backwards, so seq is not a total order",
-      "must_fail": ["CONF-EVT-001", "CONF-EVT-002"],
-      "must_not_fail": ["CONF-NEG-002", "CONF-WS-002", "CONF-AUTH-003", "CONF-SESS-004", "CONF-SNAP-001", "CONF-APP-002", "CONF-AGT-003"]
+      "must_fail": [
+        "CONF-EVT-001",
+        "CONF-EVT-002"
+      ],
+      "must_not_fail": [
+        "CONF-NEG-002",
+        "CONF-WS-002",
+        "CONF-AUTH-003",
+        "CONF-SESS-004",
+        "CONF-SNAP-001",
+        "CONF-APP-002",
+        "CONF-AGT-003"
+      ]
     },
     {
       "defect": "version",
       "category": "negotiation",
       "violation": "accepts a frame carrying a version it never negotiated",
-      "must_fail": ["CONF-NEG-004"],
-      "must_not_fail": ["CONF-NEG-002", "CONF-NEG-003", "CONF-WS-002", "CONF-AUTH-003", "CONF-SESS-004", "CONF-SNAP-001", "CONF-BIND-002", "CONF-APP-002", "CONF-AGT-003", "CONF-EVT-001"]
+      "must_fail": [
+        "CONF-NEG-004"
+      ],
+      "must_not_fail": [
+        "CONF-NEG-002",
+        "CONF-NEG-003",
+        "CONF-WS-002",
+        "CONF-AUTH-003",
+        "CONF-SESS-004",
+        "CONF-SNAP-001",
+        "CONF-BIND-002",
+        "CONF-APP-002",
+        "CONF-AGT-003",
+        "CONF-EVT-001"
+      ]
     },
     {
       "defect": "version-mutates",
       "category": "negotiation",
       "violation": "refuses the unnegotiated version, but only after it has already created a workspace and appended an event",
-      "must_fail": ["CONF-NEG-004"],
-      "must_not_fail": ["CONF-NEG-002", "CONF-NEG-003", "CONF-WS-002", "CONF-AUTH-003", "CONF-SESS-004", "CONF-SNAP-001", "CONF-BIND-002", "CONF-APP-002", "CONF-AGT-003", "CONF-EVT-001"]
+      "must_fail": [
+        "CONF-NEG-004"
+      ],
+      "must_not_fail": [
+        "CONF-NEG-002",
+        "CONF-NEG-003",
+        "CONF-WS-002",
+        "CONF-AUTH-003",
+        "CONF-SESS-004",
+        "CONF-SNAP-001",
+        "CONF-BIND-002",
+        "CONF-APP-002",
+        "CONF-AGT-003",
+        "CONF-EVT-001"
+      ]
     }
   ]
 }

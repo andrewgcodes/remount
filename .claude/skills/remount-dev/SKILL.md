@@ -116,6 +116,21 @@ user-owned, make narrow patches, and never reset or check out work you did not
 create. Fetch again before integration, inspect the complete diff, and rerun
 affected tests after resolving an upstream change.
 
+**Staging by name is not the same as staging what you wrote.** `git add <path>`
+stages the file's *current* contents, including edits a concurrently running
+agent made to it since you last looked. Avoiding `git commit -a` does not
+protect you. This has already produced a broken `main`: `b26492d` staged
+`internal/evidence/registry.go` by name and swept in another agent's B32 wiring,
+so the pushed registry named `integration/installs.TestB32*` while that package
+existed only as an uncommitted directory — a fresh clone had a wired scenario
+pointing at nothing. `ed46694` repaired it.
+
+Before every commit made while another agent is working in the tree, run
+`git diff --cached` and read it in full. If it contains work you did not write,
+either commit it deliberately with a message that describes it and verify it
+first, or unstage it. A commit message that describes less than the commit
+contains is a false record, and here it also shipped a dangling reference.
+
 Before changing a boundary, identify the authoritative state, resource at risk,
 generation or operation fence, irreversible action, durable commit, spawned
 workers, capacity rule and observable postcondition. Authorization before a

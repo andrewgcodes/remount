@@ -51,6 +51,7 @@ var checks = map[string]CheckFunc{
 	"CONF-SESS-006": checkSessWaitReportsExit,
 	"CONF-SESS-007": checkSessEvictedReplayGaps,
 	"CONF-SESS-008": checkSessAttachBeyondRange,
+	"CONF-SESS-009": checkSessStdoutReachesTheClient,
 
 	"CONF-SNAP-001": checkSnapDeterministicID,
 	"CONF-SNAP-002": checkSnapDigestIsIdentity,

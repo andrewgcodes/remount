@@ -53,6 +53,11 @@ const (
 	DefectAuthority Defect = "authority"
 	// DefectSession applies an input whose iseq was already applied.
 	DefectSession Defect = "session"
+	// DefectStdout produces a structurally perfect log that carries nothing the
+	// process wrote: seq 0 is the info chunk, sequences are dense, the exit
+	// chunk is last, and a replay is byte-identical to the live tail because
+	// both are empty. Every session row except CONF-SESS-009 holds for it.
+	DefectStdout Defect = "stdout"
 	// DefectSnapshot returns a fresh artifact id for an unchanged tree.
 	DefectSnapshot Defect = "snapshot"
 	// DefectBinding forwards a placeholder aimed at a host its binding does
@@ -75,8 +80,8 @@ const (
 // Defects lists every defect a caller may install, excluding DefectNone.
 var Defects = []Defect{
 	DefectNegotiation, DefectWorkspace, DefectAuthority, DefectSession,
-	DefectSnapshot, DefectBinding, DefectApproval, DefectAgent, DefectEvent,
-	DefectVersion, DefectVersionMutates,
+	DefectStdout, DefectSnapshot, DefectBinding, DefectApproval, DefectAgent,
+	DefectEvent, DefectVersion, DefectVersionMutates,
 }
 
 // CategoryOf names the semantic category each defect breaks, as the string
@@ -86,6 +91,8 @@ func CategoryOf(d Defect) string {
 	switch d {
 	case DefectNegotiation, DefectVersion, DefectVersionMutates:
 		return "negotiation"
+	case DefectStdout:
+		return "session"
 	default:
 		return string(d)
 	}
@@ -739,7 +746,7 @@ func (s *Server) sessionOpen(ctx context.Context, c *websocket.Conn, mu *sync.Mu
 	s.append("s.opened", req.WS, req.WS, map[string]any{"s": id})
 	stdout, code, interactive := interpret(req.Program)
 	if !interactive {
-		if len(stdout) > 0 {
+		if len(stdout) > 0 && s.defect != DefectStdout {
 			s.chunk(ctx, sess, 1, stdout)
 		}
 		s.exit(ctx, sess, code)

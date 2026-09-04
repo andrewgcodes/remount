@@ -521,3 +521,62 @@ func digestOf(artifact string) (string, error) {
 	}
 	return hexPart, nil
 }
+
+// checkSessStdoutReachesTheClient is CONF-SESS-009.
+//
+// Every other row in this category asserts something about the *shape* of the
+// log: that seq 0 is the info chunk, that sequences are dense, that the exit
+// chunk is last, that a replay matches the live tail. All of those hold
+// vacuously for a session that produces no output at all, which is how an
+// implementation whose exec never delivers stdout was observed passing 50 of
+// 52 required rows. §8 calls a session "an append-only log of chunks" and
+// defines st=1 as "the process wrote this"; if those bytes do not arrive, the
+// implementation has not implemented sessions, whatever its sequence numbers
+// look like.
+//
+// The assertion is deliberately about bytes rather than about non-emptiness:
+// output that arrives truncated, re-encoded, or on the wrong stream is the same
+// defect as output that never arrives.
+func checkSessStdoutReachesTheClient(ctx context.Context, s *Session) error {
+	f, err := s.Fixture(ctx)
+	if err != nil {
+		return err
+	}
+	// Spaces and punctuation so that an implementation which splits, trims or
+	// re-quotes the payload fails here rather than in a caller's terminal.
+	const want = "conf-sess-009: stdout must arrive verbatim."
+	run, err := s.Exec(ctx, f, echoProgram(want)...)
+	if err != nil {
+		return err
+	}
+	// An exec that failed to start would otherwise be indistinguishable from
+	// one that ran and delivered nothing, and they are different defects.
+	if run.Exit.Code != 0 {
+		return failf("the program exited %d (%s), so this row cannot judge stdout delivery",
+			run.Exit.Code, run.Exit.Error)
+	}
+	if len(run.Stderr) != 0 {
+		return failf("the program wrote %q to stderr; /bin/echo of a literal must not", run.Stderr)
+	}
+	got := strings.TrimRight(string(run.Stdout), "\r\n")
+	if got != want {
+		return failf("stdout delivered %q, want %q: §8 st=1 chunks carry what the process wrote, byte for byte", got, want)
+	}
+	// The bytes arrived, but they must have arrived *as stdout*. An
+	// implementation that folds every stream into one would pass the
+	// comparison above while making stderr and stdout indistinguishable.
+	var stdoutChunks int
+	for _, frame := range run.Chunks {
+		var body ChunkBody
+		if err := Unmarshal(frame.Body, &body); err != nil {
+			return failf("chunk %d is not a ChunkBody: %v", frame.Seq, err)
+		}
+		if body.St == ChunkStdout {
+			stdoutChunks++
+		}
+	}
+	if stdoutChunks == 0 {
+		return failf("the payload arrived but no chunk was tagged st=1, so stdout is not distinguishable from another stream")
+	}
+	return nil
+}

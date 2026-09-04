@@ -151,9 +151,9 @@ reaches a record.
 ```
 $ conformance --build . --junit b20-junit.xml --evidence b20-evidence.json --scenario B20 --layer artifact
 CONFORMANT: remount standalone (remount)
-  manifest 1.0.0, protocol v1, built-binary, http://127.0.0.1:56476
+  manifest 1.1.0, protocol v1, built-binary, http://127.0.0.1:56476
   59 passed, 0 failed, 8 unavailable of 67 requirements in 11.674s
-    required         52 passed, 0 failed, 0 unavailable
+    required         53 passed, 0 failed, 0 unavailable
     capability-gated  7 passed, 0 failed, 7 unavailable
     extension         0 passed, 0 failed, 1 unavailable
   negotiated: v1, authz-push, controller-epoch, session-cap, chunked-artifacts,
@@ -161,7 +161,7 @@ CONFORMANT: remount standalone (remount)
   cleanup: verified
 ```
 
-**The reference binary currently fails no requirement.** All 52 required rows
+**The reference binary currently fails no requirement.** All 53 required rows
 were observed and held. Seven capability-gated rows passed: the five binding
 rows, the authoritative-snapshot row, and the controller-epoch fence.
 
@@ -184,7 +184,7 @@ or `encrypted-artifacts`. §3.1 says those two are reserved, and the suite
 reports rows gated on them as unavailable rather than passing them.
 
 The already-running-endpoint mode was exercised against a separately started
-`remount standalone`: 52 required passed, 0 failed, and the thirteen
+`remount standalone`: 53 required passed, 0 failed, and the thirteen
 capability-gated rows went unavailable because that endpoint was started
 without a bindings file — which is the mode working correctly, not a defect.
 
@@ -200,7 +200,7 @@ one — it has no authentication, persistence, isolation or security properties
 at all.
 
 The control matters as much as the experiment. `TestB21BaselineShimPassesTheRequiredManifest`
-asserts that the undefective shim passes **all 52 required requirements with
+asserts that the undefective shim passes **all 53 required requirements with
 none unavailable** — the same 52 the reference binary passes. Without that,
 a defective shim failing would prove nothing about the defect.
 
@@ -281,6 +281,32 @@ The second test covers the other side of a version mismatch: a target that
 declares protocol `2` is not measured against the v1 manifest at all. The run
 aborts, produces no results, is not conformant, and emits an `unavailable`
 evidence record naming the mismatch.
+
+
+## Manifest 1.1.0: stdout delivery became a required row
+
+`CONF-SESS-009` was added on 2026-09-03 and the manifest document version moved
+to 1.1.0. Every pre-existing requirement keeps `Version: 1.0.0`, because none of
+their assertions changed meaning; only `Since` and the document version record
+that the set grew.
+
+It was added because the session category could be satisfied by an
+implementation that never delivered any output. Every other row there asserts
+the *shape* of the log — seq 0 is the info chunk, sequences are dense, the exit
+chunk is last, a replay is byte-identical to the live tail — and all of those
+hold vacuously for an empty stream. The gap was found while judging an OCI image
+built `FROM scratch`, where `/bin/echo` does not exist: the run still reported
+**50 of 52 required rows passed**, failing only the two rows that happen to need
+a working program. An implementation whose exec silently produced nothing would
+have been called conformant in every category but two.
+
+`CONF-SESS-009` asserts the bytes arrive, arrive verbatim, arrive tagged `st=1`,
+and arrive alongside the exit status of the program that produced them — so
+truncated, re-encoded, or wrongly-streamed output fails the same row as absent
+output. The shim gained a matching defect (`stdout`) that emits a structurally
+perfect but empty log, and `testdata/failure-seeds.json` pins that the new row
+fails it while `CONF-SESS-001/002/003/005/008` keep passing. Without that seed
+the row would be untested against the thing it exists to catch.
 
 ## What this does not prove
 

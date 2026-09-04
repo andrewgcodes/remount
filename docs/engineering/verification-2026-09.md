@@ -462,6 +462,27 @@ Paired, the stack is `CONFORMANT` on all 52 required rows.
 
 ---
 
+## Conformance manifest 1.1.0, 2026-09-03 (late)
+
+The B32 install lanes recorded above were judged against manifest **1.0.0**, so
+their "52 required passed" lines are correct as observations and are left as
+written. The manifest has since moved to **1.1.0** with the addition of
+`CONF-SESS-009`, and the same lanes now report 53. The counts differ because the
+suite grew, not because anything regressed.
+
+| Command | Result | Status |
+|---|---|---|
+| `go run ./cmd/conformance --build .` | `CONFORMANT`, manifest 1.1.0, required **53 passed, 0 failed, 0 unavailable**; `CONF-SESS-009` passed | verified |
+| `go test ./internal/conformance/...` incl. `TestB21BrokenImplementationFailsEachSemanticCategory/stdout` | ok — the new `stdout` shim defect fails `CONF-SESS-009` while `CONF-SESS-001/002/003/005/008` and every other category keep passing | verified |
+
+Why the row was added is in `docs/engineering/plan-b-b4-conformance.md` under
+"Manifest 1.1.0". In short: an OCI image built `FROM scratch`, where `/bin/echo`
+does not exist, still scored 50 of 52 required rows, because every session
+requirement asserted the shape of the log and a shape assertion holds vacuously
+for a log with no output in it.
+
+---
+
 ## Still not attempted
 
 These remain open with no evidence in this file. Listing them here is

@@ -367,14 +367,14 @@ var scenarios = []Scenario{
 		Layer: LayerArtifact, Required: true, Source: sourcePlanB,
 		Owner: "cmd/conformance --build .",
 		Argv:  []string{"go", "run", "./cmd/conformance", "--build", "."},
-		Note:  "runs the versioned black-box manifest against a freshly built binary; 52 required rows, 0 failed, 8 honestly unavailable with printed reasons",
+		Note:  "runs the versioned black-box manifest against a freshly built binary; 53 required rows, 0 failed, 8 honestly unavailable with printed reasons",
 	},
 	{
 		ID: "B21", Title: "a deliberately broken test implementation fails each semantic category",
 		Layer: LayerCode, Required: true, Source: sourcePlanB,
 		Owner: "internal/conformance.TestB21BrokenImplementationFailsEachSemanticCategory",
 		Argv:  []string{"go", "test", "-count=1", "-run", "^TestB21", "./internal/conformance/"},
-		Note:  "a deliberately broken shim with eleven switchable defects; the control asserts the undefective shim passes all 52 required rows first, so a defect cannot be caught by failing everything",
+		Note:  "a deliberately broken shim with twelve switchable defects; the control asserts the undefective shim passes all 53 required rows first, so a defect cannot be caught by failing everything",
 	},
 	{
 		ID: "B22", Title: "unknown extensions stay ignorable while unknown required capabilities fail",
