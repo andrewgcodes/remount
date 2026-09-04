@@ -481,13 +481,16 @@ REMOUNT_CHAOS_IMAGE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99
 ```
 
 The spike passed both positive controls, all seven denial checks and
-post-revoke denial. `TestE4DenialConformance` passed in 21.50 seconds with no
+post-revoke denial. `TestE4DenialConformance` passed in 22.31 seconds with no
 forbidden destination observed on the host-side veth; the in-flight transfer
 stopped when synchronous revoke returned.
-`TestE4FailedSetupCleanupConformance` passed in 0.23 seconds, and
-`TestE5TenantIsolationConformance` passed in 0.59 seconds. A post-run audit
-found zero `rmh*` links, zero `remount_rmh*` nftables tables, zero
-`/run/remount/netns/rm-*` mounts and zero runsc sandbox/gofer processes.
+`TestE4FailedSetupCleanupConformance` passed in 0.20 seconds.
+`TestE5SiblingTenantsCannotReachEachOther` passed in 9.69 seconds after proving
+each workspace could reach its own broker and could not reach the sibling's
+broker, guest address or DNS path. `TestE5TenantIsolationConformance` passed in
+0.54 seconds. A post-run audit found zero `rmh*` links, zero `remount_rmh*`
+nftables tables, zero `/run/remount/netns/rm-*` mounts and zero runsc
+sandbox/gofer processes.
 **Status: verified on the exact final candidate.**
 
 The startup crash-reclamation boundary was exercised separately:
