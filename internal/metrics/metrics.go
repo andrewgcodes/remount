@@ -277,6 +277,9 @@ var (
 
 	EventsAppended             = Count("remount_events_total", "events appended to the canonical log")
 	EventsPruned               = Count("remount_events_pruned_total", "events removed from the retained sequence prefix")
+	NodeEventPostFailures      = Count("remount_node_event_post_failures_total", "attempts to forward a node's events to control that failed; each is then retried, re-issued, or dropped, and the last two are counted below")
+	NodeEventsResequenced      = Count("remount_node_events_resequenced_total", "node events re-issued under new producer sequences after control reported that a sequence already named a different event")
+	NodeEventsDropped          = Count("remount_node_events_dropped_total", "node events control rejected outright, which the node stopped retrying so the events behind them could be delivered")
 	EventGCRuns                = Count("remount_event_gc_runs_total", "completed event-retention passes")
 	EventGCErrors              = Count("remount_event_gc_errors_total", "event-retention passes that failed")
 	TimersFired                = Count("remount_timers_fired_total", "durable timers that fired")
