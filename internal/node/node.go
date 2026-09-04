@@ -155,6 +155,10 @@ type Node struct {
 	volumes         volume.Backend
 	volumeRoot      *volume.DirectoryResolver
 	events          *eventlog.Log
+	eventStore      *eventlog.Memory
+	producerSeqPath string
+	producerSeqMu   sync.Mutex
+	producerSeqHigh uint64 // highest sequence persisted to producerSeqPath
 	volumeMu        sync.Mutex
 	epochMu         sync.Mutex
 	epochPath       string
@@ -477,6 +481,15 @@ func New(opts Options) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	producerSeqPath := filepath.Join(opts.DataDir, "producer-seq.cbor")
+	producerSeq, err := loadProducerSeq(producerSeqPath)
+	if err != nil {
+		return nil, err
+	}
+	eventStore := eventlog.NewMemory(10000)
+	if producerSeq > 0 {
+		eventStore.Reset(producerSeq + 1)
+	}
 	requestCtx, requestCancel := context.WithCancel(context.Background())
 	overloadLimit := opts.MaxConcurrentRequests / 8
 	if overloadLimit < 8 {
@@ -487,7 +500,9 @@ func New(opts Options) (*Node, error) {
 	}
 	n := &Node{
 		opts: opts, id: id, priv: priv, logger: opts.Logger.With("node", id),
-		store: store, connectors: connectorStore, volumes: opts.Volumes, volumeRoot: volumeRoot, events: eventlog.New(eventlog.NewMemory(10000)),
+		store: store, connectors: connectorStore, volumes: opts.Volumes, volumeRoot: volumeRoot,
+		events: eventlog.New(eventStore), eventStore: eventStore,
+		producerSeqPath: producerSeqPath, producerSeqHigh: producerSeq,
 		workspaces: map[string]*ws{}, materializing: map[string]*materialization{},
 		agentRuns: map[string]*agentRun{}, agentRunsDone: map[string]time.Time{},
 		deadlines: map[string]time.Time{}, quarantined: map[string]struct{}{},
@@ -975,7 +990,52 @@ func (n *Node) emitSession(typ, stream, principal, session string, payload any) 
 	}
 	if err := n.events.Append(context.Background(), e); err != nil {
 		n.logger.Error("append node event", "type", typ, "workspace", stream, "err", err)
+		return
 	}
+	n.notePersistedProducerSeq(e.Seq)
+}
+
+// notePersistedProducerSeq records that this node has assigned seq, so a
+// restart continues numbering above it. Failing to persist is logged, not
+// fatal: the event itself is already appended, and a collision after a
+// restart is recovered by the forwarder.
+func (n *Node) notePersistedProducerSeq(seq uint64) {
+	n.producerSeqMu.Lock()
+	defer n.producerSeqMu.Unlock()
+	if seq <= n.producerSeqHigh {
+		return
+	}
+	if err := persistProducerSeq(n.producerSeqPath, seq); err != nil {
+		n.logger.Error("persist producer sequence watermark", "seq", seq, "err", err)
+		return
+	}
+	n.producerSeqHigh = seq
+}
+
+// producerSeqRecoveryStride is how far the forwarder moves the sequence space
+// when control reports that a sequence it sent already names a different
+// event. The watermark control holds from a previous life is unknown here, so
+// the jump is large; if it still lands short, the next collision jumps again.
+const producerSeqRecoveryStride = 1 << 20
+
+// resequence re-issues events under fresh producer sequences beyond anything
+// control can have recorded from this identity's previous lives. Control notes
+// the jump as one event.gap, which is the honest record of what happened.
+func (n *Node) resequence(events []proto.Event) uint64 {
+	last, _ := n.events.Last(context.Background())
+	base := last + producerSeqRecoveryStride
+	n.eventStore.Reset(base)
+	for i := range events {
+		e := events[i]
+		e.Seq = 0
+		if err := n.events.Append(context.Background(), &e); err != nil {
+			n.logger.Error("re-issue node event after sequence collision", "type", e.Type, "err", err)
+			continue
+		}
+		n.notePersistedProducerSeq(e.Seq)
+		metrics.NodeEventsResequenced.Inc()
+	}
+	return base
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,18 +1093,61 @@ func (n *Node) Run(ctx context.Context) error {
 // eventLoop is the node event outbox. One ordered producer retains an
 // unacknowledged batch across reconnects; control deduplicates retries using
 // the node log's sequence number.
+// eventLoop forwards this node's observations to control's canonical log.
+//
+// A post that fails for a reason that could pass later — the uplink is down,
+// control is slow — is retried with the same batch. A post that control has
+// rejected outright can never pass by repetition, and retrying it would hold
+// every later observation behind it indefinitely without a word in any log;
+// that is exactly what happened when a restarted node's sequences collided
+// with control's watermark. So a collision moves the sequence space and
+// re-issues the batch, and any other outright rejection is bisected until the
+// event control objects to stands alone, which is then dropped and reported.
 func (n *Node) eventLoop(ctx context.Context) {
 	defer n.wg.Done()
-	sub := n.events.Subscribe(1, "")
-	defer sub.Close()
-	var pending []proto.Event
+	// Subscribe from the store's floor rather than a fixed 1. A node that
+	// continued its producer numbering across a restart has a floor above 1,
+	// and asking below it answers CodeEvicted, which used to end this loop
+	// before it forwarded anything.
+	from, err := n.events.First(ctx)
+	if err != nil || from == 0 {
+		from = 1
+	}
+	sub := n.events.Subscribe(from, "")
+	defer func() { sub.Close() }()
+	var pending, deferred []proto.Event
+	var lastErr string
+	var lastLogged time.Time
 	for {
 		if len(pending) == 0 {
-			events, err := sub.Next(ctx)
-			if err != nil {
-				return
+			if len(deferred) > 0 {
+				pending, deferred = deferred, nil
+			} else {
+				events, err := sub.Next(ctx)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					var pe *proto.Error
+					if errors.As(err, &pe) && pe.Code == proto.CodeEvicted {
+						// The floor moved past this cursor. Resume from the
+						// current floor instead of ending the loop: the events
+						// behind it are gone either way, and stopping here
+						// would silently strand every future observation.
+						floor := pe.Oldest
+						if current, ferr := n.events.First(ctx); ferr == nil && current > floor {
+							floor = current
+						}
+						n.logger.Warn("node event cursor fell below the retained floor; resuming from it", "floor", floor)
+						sub.Close()
+						sub = n.events.Subscribe(floor, "")
+						continue
+					}
+					n.logger.Error("read node events for forwarding; stopping the forwarder", "err", err)
+					return
+				}
+				pending = events
 			}
-			pending = events
 		}
 		n.mu.Lock()
 		p := n.peer
@@ -1056,6 +1159,40 @@ func (n *Node) eventLoop(ctx context.Context) {
 			if err == nil {
 				pending = nil
 				continue
+			}
+			metrics.NodeEventPostFailures.Inc()
+			var pe *proto.Error
+			if errors.As(err, &pe) {
+				switch pe.Code {
+				case proto.CodeConflict:
+					n.logger.Error("node event sequences collided with control's history; re-issuing them under new sequences",
+						"events", len(pending), "err", err)
+					// Re-issuing moves the store's sequence space forward, which
+					// leaves this subscription's cursor below the new floor. Read
+					// from the new base rather than letting the next read report
+					// the re-issued events as evicted history.
+					resumeFrom := n.resequence(pending)
+					sub.Close()
+					sub = n.events.Subscribe(resumeFrom, "")
+					pending, deferred = nil, nil
+					continue
+				case proto.CodeBadRequest, proto.CodeDenied, proto.CodeResourceExhausted:
+					if len(pending) > 1 {
+						half := len(pending) / 2
+						deferred = append(append([]proto.Event(nil), pending[half:]...), deferred...)
+						pending = pending[:half]
+						continue
+					}
+					n.logger.Error("control rejected a node event; dropping it so the events behind it can be delivered",
+						"type", pending[0].Type, "stream", pending[0].Stream, "seq", pending[0].Seq, "err", err)
+					metrics.NodeEventsDropped.Inc()
+					pending = nil
+					continue
+				}
+			}
+			if err.Error() != lastErr || time.Since(lastLogged) > time.Minute {
+				n.logger.Warn("forward node events to control; retrying", "events", len(pending), "err", err)
+				lastErr, lastLogged = err.Error(), time.Now()
 			}
 		}
 		select {

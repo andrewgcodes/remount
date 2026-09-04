@@ -1272,3 +1272,47 @@ The corollary for verification: that a fix's tests pass is not evidence the fix
 reaches the failure. What proves it is a test that fails before the change.
 Both destroy tests do; the first `nodeCall` bound had none, which is exactly
 why it survived two rounds of being wrong.
+
+---
+
+## 50. I moved a sequence space forward and stranded every cursor into it
+
+A node's audit events stopped reaching control after the node restarted: no
+`s.opened`, no `cred.used`, no `egress.*`. Sessions ran and credentials were
+brokered with nothing recorded, and `doctor` still said `healthy`.
+
+The cause was real and is worth knowing on its own. The node keeps its event
+store in memory, so a restart began numbering producer sequences at 1 again
+while control still held the watermark from the node's previous life. Every
+post-restart event collided with a sequence control had already recorded,
+control answered "out of order or changed", and the node's forwarder retried
+that same batch forever, holding every later observation behind it.
+
+The fix was to persist the watermark and, on a collision, re-issue the batch
+above it. Both are right. But I shipped each of them with the same defect,
+twice, and the second time I had already been bitten by the first.
+
+Moving the store's sequence space forward — `Reset(base)` at startup from the
+persisted watermark, and `Reset(last + stride)` on a collision — raises the
+store's floor. Every existing cursor into that store is now *below* the floor,
+and this log answers a read below the floor with `CodeEvicted`. The forwarder
+treated any read error as fatal and returned. So:
+
+- the collision path re-issued the events correctly, then died reading them;
+- the startup path subscribed from a hardcoded `1` against a floor of 3, and
+  died before forwarding anything at all.
+
+Each looked like the fix not working. Neither was: the fix worked and the
+forwarder was already gone. And it went silently, because the `return` had no
+log line — the same silence that hid the original bug.
+
+**Lesson.** A sequence number is a shared coordinate. Moving the space it
+indexes invalidates every cursor holding a position in it, and the holders are
+usually not in the function doing the moving. Before renumbering, enumerate who
+is pointing into the range and re-seat them in the same commit — here, both the
+subscription the forwarder holds and the one it creates at startup.
+
+The corollary, which is the part I should have known from #49: a loop that
+exits on an unexamined error exits silently. `if err != nil { return }` inside
+a background goroutine is a way to lose a subsystem with no evidence. Log the
+error, classify the ones that are recoverable, and only then give up.
