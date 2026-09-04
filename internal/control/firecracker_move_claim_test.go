@@ -35,6 +35,28 @@ func movedProcessesClaim(t *testing.T, f *controlFixture, ws string) string {
 	return claim
 }
 
+func claimedRestoreProcesses(t *testing.T, f *controlFixture, ws string) string {
+	t.Helper()
+	events, err := f.log.Read(context.Background(), 0, "", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		event := events[i]
+		if event.Type != proto.EvWSClaimed || event.Workspace != ws {
+			continue
+		}
+		var payload map[string]any
+		if err := proto.Unmarshal(event.Payload, &payload); err != nil {
+			t.Fatalf("decode ws.claimed payload: %v", err)
+		}
+		value, _ := payload["restore_processes"].(string)
+		return value
+	}
+	t.Fatalf("ws.claimed event for %s not found", ws)
+	return ""
+}
+
 // moveWithSnapshotFormat drives one workspace through claim, ready and move,
 // with the node reporting the given checkpoint format on release.
 func moveWithSnapshotFormat(t *testing.T, format string) (*controlFixture, string) {
@@ -85,6 +107,39 @@ func TestMoveNeverClaimsPreservedProcessesBeforeRestore(t *testing.T) {
 	}
 	if claim != "restore_pending" {
 		t.Fatalf("full-VM move recorded processes=%q, want restore_pending", claim)
+	}
+}
+
+func TestFullVMMoveSettlesPreservedOnlyFromDestinationReady(t *testing.T) {
+	f, ws := moveWithSnapshotFormat(t, proto.ArtifactFormatFirecrackerFullV1)
+	claim, err := f.c.wsClaim(context.Background(), "n_one", ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.c.wsReady(context.Background(), "n_one", &proto.WSReadyReq{
+		ID: ws, Gen: claim.Workspace.Generation, RestoreProcesses: proto.RestoreProcessesPreserved,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := movedProcessesClaim(t, f, ws); got != "restore_pending" {
+		t.Fatalf("ws.moved processes = %q, want restore_pending", got)
+	}
+	if got := claimedRestoreProcesses(t, f, ws); got != "preserved" {
+		t.Fatalf("ws.claimed restore_processes = %q, want preserved", got)
+	}
+}
+
+func TestReadyRejectsPreservedClaimForFilesystemRestore(t *testing.T) {
+	f, ws := moveWithSnapshotFormat(t, proto.ArtifactFormatTar)
+	claim, err := f.c.wsClaim(context.Background(), "n_one", ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = f.c.wsReady(context.Background(), "n_one", &proto.WSReadyReq{
+		ID: ws, Gen: claim.Workspace.Generation, RestoreProcesses: proto.RestoreProcessesPreserved,
+	})
+	if err == nil {
+		t.Fatal("filesystem-only restore claimed preserved processes")
 	}
 }
 

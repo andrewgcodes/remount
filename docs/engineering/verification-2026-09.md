@@ -744,6 +744,199 @@ requires the `modal` CLI installed, `modal deploy deploy/modal_app.py` run
 against a disposable environment (`make modal-deploy`), and the same public
 control-plane URL, enrollment token and binary URL as the E2B entry.
 
+## 2026-09-04 — gVisor E4, E5 and B28 on Linux
+
+**Status: verified.** The candidate ran on Ubuntu Linux x86_64, kernel
+`5.15.200`, Docker Server `27.4.1`, and `runsc release-20260817.0`. Docker
+reported the registered runtime name `runsc`. The rootfs and Docker workload
+probe both came from the immutable image
+`alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce`.
+
+The disposable rootfs was built with:
+
+```sh
+sudo rm -rf /tmp/remount-gvisor-rootfs
+mkdir -p /tmp/remount-gvisor-rootfs
+container=$(docker create alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce)
+docker export "$container" | sudo tar -C /tmp/remount-gvisor-rootfs -xf -
+docker rm -f "$container"
+CGO_ENABLED=0 GOOS=linux go build -o /tmp/remount-rawprobe ./internal/workspace/gvisor/testdata/rawprobe
+sudo install -m 0755 /tmp/remount-rawprobe /tmp/remount-gvisor-rootfs/rawprobe
+CGO_ENABLED=0 GOOS=linux go build -o /tmp/remount-udpprobe ./internal/workspace/gvisor/testdata/udpprobe
+sudo install -m 0755 /tmp/remount-udpprobe /tmp/remount-gvisor-rootfs/udpprobe
+```
+
+The owning aggregate command was:
+
+```sh
+REMOUNT_GVISOR_INTEGRATION=1 \
+REMOUNT_GVISOR_ROOTFS=/tmp/remount-gvisor-rootfs \
+REMOUNT_CHAOS_IMAGE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce \
+  ./scripts/gvisor-conformance.sh
+```
+
+The host probe reported Docker and gVisor available against that exact image.
+The mechanism spike then reported broker reachability, a positive UDP echo
+control, denial of direct IPv4 TCP, IPv6, UDP data transfer, DNS to `8.8.8.8`,
+ICMP, a raw socket, and CONNECT to an unlisted host, followed by denial after
+network revoke.
+
+`TestE4DenialConformance` passed all seven denial subtests in 15.88 seconds.
+It also proved that a transfer was advancing before `RevokeNetwork`, that the
+file stopped advancing when synchronous revoke returned, and that the broker
+was no longer connectable. `TestE4FailedSetupCleanupConformance` rejected a
+broker outside the generation link and observed that the namespace, host veth
+and host ingress nftables table were all absent afterward.
+
+`TestE5TenantIsolationConformance` materialized `ws_e5_a` for `tenant-a` and
+`ws_e5_b` for `tenant-b` on one node and one gVisor backend. Each tenant was
+unable to observe the other's workspace file. Each tenant's request toward the
+other tenant's broker endpoint was denied by its own broker, and the node log
+contained exactly one `egress.denied` event attributed to each source
+workspace and tenant. This proves the `isolated` profile and sibling isolation;
+it does **not** advertise gVisor as a `multi_tenant` backend.
+
+**Teardown, verified.** The aggregate script removed its compiled tests and
+spike directory. Both tests destroyed their runsc sandboxes, synchronously
+revoked veths, removed namespaces and host nftables tables, closed brokers, and
+unmounted the disposable `null-netns` mounts. The following postcondition
+command produced empty sections for every resource class:
+
+```sh
+printf '%s\n' namespaces:
+sudo ip netns list | rg '^(rm-|rmspike-)' || true
+printf '%s\n' links:
+ip -o link show | rg 'rm[gh]-|rmh-|rmg-' || true
+printf '%s\n' nftables:
+sudo nft list ruleset | rg 'remount_|rmspike' || true
+printf '%s\n' listeners:
+ps -ef | rg 'socat (TCP4|UDP4)-LISTEN:1744[34],bind=169.254.251.1' | rg -v rg || true
+printf '%s\n' mounts:
+findmnt | rg 'remount-gvisor|runsc' || true
+```
+
+### Post-rebase host-veth proof
+
+The final candidate incorporated the stronger AF_PACKET assertion from
+`origin/main`. A clean-host rerun first showed that the host-side netdev
+ingress rule stopped forwarding but did not stop forbidden frames from
+reaching the host veth:
+
+```text
+packets reached rmh1536 for [1.1.1.1 169.254.84.218]
+```
+
+The boundary now installs a `clsact` flower policy on the guest veth egress
+before runsc starts: ARP and the exact broker IPv4/TCP tuple pass, and a lower
+priority all-protocol rule drops everything else. This uses the traffic-control
+egress hook because Linux 5.15 does not support nftables' `netdev` egress hook.
+The host nftables ingress rule remains as a second boundary. The AF_PACKET
+observer was also made direction-aware so broker replies transmitted from the
+host are not misclassified as workspace egress.
+
+The exact final command used a rootfs exported from the immutable Alpine image
+above, with the two static probe binaries installed:
+
+```sh
+REMOUNT_GVISOR_INTEGRATION=1 \
+REMOUNT_GVISOR_ROOTFS=/home/ubuntu/firecracker-artifacts/gvisor-rootfs-alpine-3.22 \
+REMOUNT_CHAOS_IMAGE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce \
+  ./scripts/gvisor-conformance.sh
+```
+
+The spike passed both positive controls, all seven denial checks and
+post-revoke denial. `TestE4DenialConformance` passed in 22.31 seconds with no
+forbidden destination observed on the host-side veth; the in-flight transfer
+stopped when synchronous revoke returned.
+`TestE4FailedSetupCleanupConformance` passed in 0.20 seconds.
+`TestE5SiblingTenantsCannotReachEachOther` passed in 9.69 seconds after proving
+each workspace could reach its own broker and could not reach the sibling's
+broker, guest address or DNS path. `TestE5TenantIsolationConformance` passed in
+0.54 seconds. A post-run audit found zero `rmh*` links, zero `remount_rmh*`
+nftables tables, zero `/run/remount/netns/rm-*` mounts and zero runsc
+sandbox/gofer processes.
+**Status: verified on the exact final candidate.**
+
+The startup crash-reclamation boundary was exercised separately:
+
+```sh
+sudo env PATH="$PATH" HOME="$HOME" GOCACHE="$HOME/.cache/go-build" \
+  go test -count=10 \
+  -run '^TestReclaimOrphansRemovesOnlyUninhabitedNamespaces$' \
+  -v ./internal/netns
+```
+
+All ten repetitions removed the uninhabited namespace and retained the one
+whose holder had demonstrably entered it. The adoption regression also proved
+that retained generation and mount metadata construct a new deny-first network
+boundary after startup reclamation instead of requiring the deleted veth.
+
+---
+
+## 2026-09-04 — Firecracker 2.3 and B29 on Linux/KVM
+
+**Status: verified on the exact candidate.** Candidate
+`8d27d6d036e246e837d685bc6e4e74c007e96908` ran on Linux x86_64, kernel
+`5.15.200`, with KVM and nested virtualization available. The static
+Firecracker and jailer were both v1.16.1. Their SHA-256 digests were
+`2fd0171309af7e24cf8dafc8a6f921c1434c49b5f9349bb996b7ed0a4deb8aa7`
+and `1f3a0c1fe86212d0001819bfe0819071c01208b3ccc939c8b3bc1b84cf21edd`.
+
+The kernel `/mnt/f/vmlinux-6.1.155` had SHA-256
+`e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2`.
+The rootfs `/mnt/f/remount-rootfs.ext4` had SHA-256
+`2aa1b97ed499d804e4113a1300c99d7495e61a916d9a9409f092643e00c9fb80`.
+The manifest `/mnt/f/guest-manifest.json` had SHA-256
+`25cc5440a8683c943775ae345bca637de48531b3d81c8a53ef909ab653658961`
+and identified guest protocol 1, vsock port 10789, workspace `/workspace`,
+and guest binary SHA-256
+`f9ad7fd58b39d4b66213c910e6b36459b34adf79aac205624ccedd9d92a1ac56`.
+
+The owning aggregate command was:
+
+```sh
+REMOUNT_FIRECRACKER_DATA_ROOT=/mnt/f \
+REMOUNT_FIRECRACKER_BINARY=/home/ubuntu/firecracker-v1.16.1/release-v1.16.1-x86_64/firecracker-v1.16.1-x86_64 \
+REMOUNT_FIRECRACKER_JAILER=/home/ubuntu/firecracker-v1.16.1/release-v1.16.1-x86_64/jailer-v1.16.1-x86_64 \
+REMOUNT_FIRECRACKER_CGROUP_PARENT=remount \
+REMOUNT_FIRECRACKER_KERNEL=/mnt/f/vmlinux-6.1.155 \
+REMOUNT_FIRECRACKER_ROOTFS=/mnt/f/remount-rootfs.ext4 \
+REMOUNT_FIRECRACKER_GUEST_MANIFEST=/mnt/f/guest-manifest.json \
+  ./scripts/firecracker-conformance.sh
+```
+
+The real jailer and vsock bridge booted a guest and passed filesystem write
+and read, exec, PTY size/input/output, guest port, broker access and direct
+public-egress denial. An in-flight broker stream advanced before
+`RevokeNetwork`; synchronous revoke killed and joined the VMM, the guest
+request exited nonzero, and the upstream byte count stopped advancing.
+
+A running guest counter was checkpointed under a generation fence. Abort
+resumed it exactly once. A second prepare committed without resuming the source;
+the source was destroyed, and the destination restored disk, VMM state and VMM
+memory. The PID was unchanged and the observed counter sequence was exactly
+1..N with no repeat or gap. Equal and older restore generations were rejected
+before network preparation or VMM launch. `ws.moved` remained
+`restore_pending`; only the successfully restored destination's `ws.ready`
+settled `restore_processes:"preserved"` on `ws.claimed`. A filesystem restore
+claiming preservation was rejected.
+
+The same command ran package proofs for incompatible CPU fingerprint and
+Firecracker version, corrupt/truncated bundles, manifest hashes, prepare
+abort/commit, failed destruction retention and capability honesty. A
+privileged 64 KiB tmpfs forced restore staging to return `ENOSPC`; the staging
+directory and image admission were released, and the same workspace id could
+be created afterward. The descriptor used by node status and doctor exposed
+`microvm`, `fs+mem`, and `enforced_gateway` only after the exact backend probes
+succeeded; an unverified backend remains `none`, `fs`, and `open`.
+
+**Teardown, verified.** The aggregate command found no Firecracker or jailer
+process, `rm-*` cgroup, Remount netns, Remount veth/TAP, or Remount nftables
+table after the success, stale-generation, corrupt-bundle and disk-full paths.
+The runbook output is archived at
+`docs/engineering/evidence/firecracker-kvm-2026-09-04.log`; the optional KVM
+workflow uploads the same exact-host log under the candidate commit SHA.
+
 ---
 
 ## Performance attribution sweep, 2026-09-03 (late)
@@ -1047,7 +1240,6 @@ deliberate: absence of an entry is not a pass.
 | Temporal Cloud worker restart | no Temporal Cloud credentials |
 | Real Slack signature and delivery | no Slack signing secret or webhook URL |
 | Docker / gVisor scale benchmarks on named hosts | no named benchmark hosts |
-| Firecracker KVM end-to-end | macOS cannot provide `/dev/kvm`; needs a Linux KVM host |
 | E18 signed public release | irreversible public action; requires explicit release authority |
 
 ---
@@ -1061,3 +1253,562 @@ still be rotated as a precaution. The 2026-09-03 run recorded above did **not**
 repeat that pattern: its canary was synthetic and generated at run time, and
 the scans above confirm the real key appeared in no workspace path, no host
 data directory, and no log.
+
+---
+
+## 2026-09-04 — B30, B31, B32 and the isolation scale matrix
+
+Host: `devin-box`, Linux x86_64, kernel 5.15.200, 8 CPUs, 31 GiB RAM and
+no swap. The checkout was based on `origin/main`
+`0f77dad628811737ab2aa1e5c9cd91bfdd41e150`. Nothing was published, pushed to
+an image registry, tagged or signed.
+
+### B30 resource ceilings
+
+Command:
+
+```sh
+./scripts/planb-resource-ceilings.sh
+```
+
+The script used its default `REMOUNT_SCALE_CURSORS=10000` and ran the
+measurement without race instrumentation; `make race` remains a separate
+gate. `TestPlanBScale*` passed in 81.884 seconds after rebasing onto the
+candidate above.
+
+| Proof | Observed result | Status |
+|---|---|---|
+| event retention | 1,200 posts under a 200-event ceiling; all 1,000 pruned events were counted before the retained range was read | verified |
+| slow subscriber and bounded tails | dropped/rejected work was explicit; no silent sequence gap | verified |
+| export backpressure | 1,200 events in batches of at most 64; one rejected 64-event batch left the cursor at 193, and retry exported the complete range without loss | verified |
+| reconnecting cursors | three cycles of 10,000 cursors; 7,500 connections severed per cycle; peak 60,028 goroutines and 922.8 MiB heap-in-use; every cycle settled to 28 goroutines, 17 descriptors and two relay peers | verified |
+| cursor loss accounting | dropped-frame deltas `+250122`, `+264531`, `+250584`; gap delta zero in every cycle | verified |
+| provider burst/drain | four burst cycles returned to zero provider machines; a six-machine wide burst drained in 1.969 seconds; zero provision failures | verified |
+| quota rejection/recovery | 24 workspace rejections in each of two cycles were counted and capacity recovered; session quota rejection also recovered | verified |
+| session-log spill | four sessions emitted about 1.25 MB; 13,441 chunks were evicted explicitly; four spill files totaled 303.0 KiB and replay reported a gap rather than silent loss | verified |
+| snapshot deduplication | four unchanged 20 MiB snapshots: 80 MiB logical, 1.3 MiB uploaded, deduplication ratio 0.9843 | verified |
+
+Two defects were found while earning this result. Cursor teardown had used
+10,000 serialized detach RPCs and could stall indefinitely; teardown now cuts
+the clients and connections directly, including connections racing with
+shutdown, and a 400-cursor control returned to two peers in all three cycles.
+Event retention had accepted the first asynchronous prune before reading the
+range; it now waits for the complete `posts - ceiling` count. Ten focused race
+repetitions of each corrected boundary passed.
+
+### B31 reproducible clean-container builds
+
+Command:
+
+```sh
+./scripts/reproducible-container-builds.sh
+```
+
+The digest-pinned Go image
+`golang@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b`
+built every supported OS/architecture pair twice in clean containers with
+cold caches and different `TMPDIR` values. The two checksum manifests were
+identical:
+
+```text
+verified: two clean containers produced byte-identical static binaries
+```
+
+All containers and output directories were removed. **Status: verified.**
+
+### B32 clean installs and SBOM
+
+Command:
+
+```sh
+PATH=/home/ubuntu/.local/bin:$PATH \
+  go test -count=1 -v -timeout 30m ./integration/installs
+```
+
+The full lane passed in 56.490 seconds. It built and installed the static
+binary, both OCI candidates, Python wheel, npm tarball and external Go module
+consumer in disposable environments; both black-box image checks reported
+manifest 1.1.0 `CONFORMANT`, required 53 passed, 0 failed, 0 unavailable, with
+cleanup verified. Checksums, static-link checks and the installed component
+inventory passed. The SPDX lane used Syft 1.32.0 obtained from
+`anchore/syft@sha256:b6a6da626d98f5cb92e28934176709003cce6cdcf674816959c7d84845d94045`
+and passed. No artifact was published. **Status: verified.**
+
+The aggregate evidence runner executes direct `go test` proofs verbosely and
+treats a selected proof that exits zero with a Go `--- SKIP` as `unavailable`
+when the test names its prerequisite, and as a failure when the skip has no
+`unavailable` reason. B32 therefore cannot become green merely because Syft is
+absent.
+
+### Docker 200-node / 2,000-workspace scale lane
+
+Command:
+
+```sh
+REMOUNT_HANDOFF_SCALE_BACKEND=docker \
+REMOUNT_HANDOFF_SCALE_IMAGE=alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1 \
+  go test -count=1 -run '^TestHandoffScaleAndControlFailover$' \
+  -v -timeout 30m ./internal/sim
+```
+
+Candidate: Docker Server 27.4.1 and the exact Alpine digest above. The host
+reached 1,023 running workspaces and 200 partially created containers before
+Docker failed additional bridge endpoint creation:
+
+```text
+failed to add the host (veth...) <=> sandbox (...) pair interfaces:
+exchange full
+```
+
+The run was terminated rather than misreported as a pass. It produced no
+complete claim, exec, move or reattach distribution, so no Docker benchmark
+number was added to `docs/benchmarks.md`. This named host cannot supply the
+required bridge/veth capacity. **Status: unavailable on `devin-box`.**
+
+The failure also exposed a real cleanup defect: `docker run` can leave a
+container in `Created` after endpoint setup fails, while `Docker.Create`
+removed only the host workspace root. The failure path now inspects the
+container mount, removes only a container proven to own that exact root under
+an independent bounded cleanup context, and reports cleanup failure. Ten race
+repetitions of the regression test passed. After the attempted scale run,
+1,223 containers selected by the `remount.workspace` label were removed;
+zero labeled or `remount-ws-*` containers remained, and the temporary scale
+tree was removed.
+
+### gVisor 200-node / 2,000-workspace scale lane
+
+Command:
+
+```sh
+sudo env \
+  REMOUNT_HANDOFF_SCALE_BACKEND=gvisor \
+  REMOUNT_GVISOR_ROOTFS=/home/ubuntu/firecracker-artifacts/rootfs-tree \
+  REMOUNT_RUNSC=/usr/bin/runsc \
+  PATH="$PATH" \
+  go test -count=1 -run '^TestHandoffScaleAndControlFailover$' \
+  -v -timeout 30m ./internal/sim
+```
+
+Candidate: `runsc release-20260817.0` and the root filesystem tree previously
+used by the successful gVisor cleanup proof. The host used about 1.5 GiB before
+the lane. At 813 live sandboxes it used 14 GiB with 15 GiB available; while
+the test process was being stopped it reached 1,060 sandboxes and 18 GiB used
+with 11 GiB available. The measured slope cannot reach 2,000 sandboxes within
+31 GiB and no swap without risking an OOM kill, so the lane was terminated
+before host exhaustion. It produced no complete claim, exec, move or reattach
+distribution, and no gVisor benchmark number was added. **Status: unavailable
+on `devin-box` because the named host lacks RAM for 2,000 runsc sandboxes.**
+
+Cleanup deleted all 1,060 runsc containers, verified no sandbox or gofer
+process remained, unmounted 197 backend `null-netns` mountpoints, verified no
+mount below the test root remained, and removed the temporary scale tree.
+
+A later preflight before the final E4 rerun corrected that teardown claim:
+1,145 `rmh*` links, 1,061 `remount_rmh*` netdev tables and matching
+`/run/remount/netns/rm-*` mounts from terminated scale attempts still existed.
+They were removed by exact Remount-owned prefixes before rerunning any provider
+proof; the subsequent audit reported zero for every class. The 2,000-workspace
+scale result remains unavailable. The integrated startup reaper now destroys
+containers recorded in the backend's runsc state root and removes only network
+namespaces whose inode is not inhabited by any process, together with their
+veths; the live-namespace regression ensures restart cleanup does not cut the
+network out from under a running workspace.
+
+### B32 reconnect race and final repository gates
+
+Repeated B32 external Go consumer runs exposed an intermittent loss of the
+installed node uplink while the consumer replaced a session cursor. The same
+failure reproduced from an exact detached `origin/main`
+`0f77dad628811737ab2aa1e5c9cd91bfdd41e150` worktree, so the lane was not
+reported green merely because the defect predated this branch. Replacing a
+cursor cancelled the old subscriber while it could be inside a WebSocket
+write; that cancellation could close the shared peer carrying the node
+uplink. Subscriber cancellation now prevents the next write but does not
+cancel a write already active on the shared transport.
+
+Commands:
+
+```sh
+go test -race -count=10 \
+  -run '^TestReplacingSessionCursorDoesNotCancelSharedPeerWrite$' \
+  -timeout 300s ./internal/node
+
+go test -count=10 \
+  -run '^TestB32AGoModuleConsumerBuildsFromTheArtifactAndDrivesTheInstalledServer$' \
+  -timeout 15m ./integration/installs
+
+go test -race -count=5 \
+  -run '^TestB32AGoModuleConsumerBuildsFromTheArtifactAndDrivesTheInstalledServer$' \
+  -timeout 20m ./integration/installs
+```
+
+All repetitions passed. The deterministic node regression models a
+cancellation-sensitive transport write and proves that replacing one cursor
+does not close the shared peer. The ten clean-install repetitions passed in
+66.148 seconds, and the five race-instrumented repetitions passed in 45.410
+seconds. **Status: verified.**
+
+The complete final race gate then passed:
+
+```sh
+make race
+```
+
+The B32 installation package passed under race in 62.340 seconds; the node
+package passed in 45.702 seconds; the simulation package passed in 365.470
+seconds; every package completed successfully. **Status: verified.**
+
+The remaining final-tree gates also passed:
+
+```sh
+make
+make lint
+make test
+make conformance
+go run ./cmd/conformance --build .
+go mod verify
+go mod tidy -diff
+make dist
+go run ./cmd/protogen --check
+make public-api
+scripts/lint-locks.sh
+make fuzz FUZZTIME=5s
+```
+
+The built-binary conformance run reported 60 passed, 0 failed and 8
+unavailable of 68 requirements in 6.793 seconds. All 53 required requirements
+passed; the unavailable capability-gated and extension checks retained their
+named prerequisites. Cleanup was verified. The fuzz gate completed every
+registered target without a failure. No artifact was published.
+
+### Post-rebase aggregate and canonical-event observation, 2026-09-04
+
+The Linux branch was rebased onto `origin/main`
+`0f19959fef6403d0e4f75b09758c4babe6019f7e`, preserving the upstream Modal
+startup fix, conformance grant refresh, gVisor crash reclamation and E5 proof.
+The first aggregate run on candidate
+`e2668ffcfa919f4db099c29f3e1ae63b67449c9b` completed in 1,864,017 ms:
+
+```text
+39 passed, 0 failed, 28 unavailable
+required: 39 of 55 passed, 0 failed, 16 unavailable
+external resources: 1 created, 1 cleanup verified, 0 cleanup failed
+```
+
+The exact command supplied the pinned gVisor and Firecracker candidates and
+ran `go run ./cmd/evidence run`. B28, B29, B30, B31 and B32 passed. Every
+unavailable row retained its named missing prerequisite or explicit release
+decision. The baseline gates passed because their subprocess environment now
+removes scenario-only host switches rather than accidentally activating
+privileged integration tests inside ordinary `make test` and `make race`.
+Post-run inspection found zero `rmh*` links, Remount nftables tables,
+Remount namespace mounts, runsc sandboxes or gofers. **Status: verified.**
+
+The subsequent exact built-binary command exposed a separate intermittent
+conformance-runner race:
+
+```sh
+go run ./cmd/conformance --build .
+```
+
+The denied broker request returned 403, but `CONF-BIND-002` immediately read
+the control-plane event stream before the node's durable event outbox had
+forwarded its `egress.denied` audit. One of five focused repetitions reproduced
+the false failure; the other four observed the same canonical event and
+passed. The checker now polls the canonical log for at most five seconds,
+within the requirement's existing context, and still fails with the original
+diagnostic if the event never arrives. `CONF-BIND-003` uses the same boundary,
+and `CONF-BIND-005` waits until both refused requests are observable before
+asserting that neither audit contains the secret.
+
+Verification:
+
+```text
+go test -count=20 ./internal/conformance
+10 focused built-binary CONF-BIND-002 runs
+go run ./cmd/conformance --build .
+```
+
+All focused repetitions passed. The complete built-binary run reported 60
+passed, 0 failed and 8 unavailable of 68 requirements in 6.838 seconds; all 53
+required requirements passed and cleanup was verified. **Status: verified.**
+
+### Durable session completion and replacement-attach fencing, 2026-09-04
+
+The repeated E11 restart proof exposed a completion-ordering defect. A session
+published its exit chunk, closed `s.exited`, and let `Session.Wait` and readers
+finish before the node's observer committed the complete durable session-log
+record. A node stop in that interval could close the control connection and
+leave the retained record partial even though the client had observed complete
+success.
+
+The completion callback now runs synchronously in `session.finish`, after the
+terminal spill has been sealed and before active-session accounting, `s.exited`,
+terminal visibility, EOF, or observer callbacks. The final spill reference is
+committed directly by the complete-record callback, avoiding a redundant
+partial commit for the same final segment; earlier partial segment commits are
+unchanged. The terminal chunk remains retained but invisible through
+`Log.Next`, `Log.Read`, and `Cursor.Next` until the complete commit returns.
+Commit failures still invoke `OnRecordError`, retain the lower tiers, and do not
+claim a complete durable record.
+
+The deterministic regression blocks `CompleteSessionLogRecord` and proves that
+`Session.Wait`, the terminal chunk, and cursor EOF all remain blocked. Releasing
+the commit publishes the terminal chunk and EOF in order. The E11 node-restart
+proof then passed 50 focused repetitions.
+
+The first complete non-race suite after this fix repeatedly timed out in
+`TestConsoleE15SimulatedOperatorFlow` while a replacement terminal attachment
+waited for exit. The old WebSocket's delayed `s.close` could arrive after the
+new `s.attach`; because detach named only `(client, session)`, it cancelled the
+replacement cursor. `s.attach` and `s.close` now carry an optional unique
+subscription fence. A matching close detaches only its own cursor; omitted
+fields retain the v0 unconditional behavior. Generated Python, TypeScript and
+JSON schema surfaces were regenerated. Unit, wire-compatibility and simulation
+regressions prove that an old decoder ignores the additive field, a new decoder
+accepts legacy bodies, and a delayed old detach cannot remove the replacement
+attachment.
+
+Focused commands:
+
+```sh
+go test -count=50 \
+  -run '^(TestWaitBlocksUntilDurableCompletionRecordCommits|TestE11TieredSessionRecordSurvivesNodeRestart)$' \
+  -timeout 300s ./internal/session ./internal/sim
+
+go test -count=50 \
+  -run '^(TestSessionSubscriptionFieldIsWireCompatible|TestStaleSessionDetachDoesNotCancelReplacementCursor|TestReplacingSessionCursorDoesNotCancelSharedPeerWrite)$' \
+  -timeout 180s ./internal/proto ./internal/node
+
+go test -count=50 \
+  -run '^(TestStaleDetachDoesNotCancelReplacementAttach|TestConsoleE15SimulatedOperatorFlow)$' \
+  -timeout 600s ./internal/sim
+
+go test -race -count=20 \
+  -run '^(TestSessionSubscriptionFieldIsWireCompatible|TestWaitBlocksUntilDurableCompletionRecordCommits|TestStaleSessionDetachDoesNotCancelReplacementCursor|TestReplacingSessionCursorDoesNotCancelSharedPeerWrite|TestStaleDetachDoesNotCancelReplacementAttach|TestE11TieredSessionRecordSurvivesNodeRestart|TestExecRoundTripCostOfTheDurableSessionTier|TestConsoleE15SimulatedOperatorFlow)$' \
+  -timeout 900s ./internal/proto ./internal/session ./internal/node ./internal/sim
+```
+
+Every focused command passed. The final tree also passed:
+
+```sh
+make
+make lint
+make test
+make race
+make conformance
+make fuzz FUZZTIME=5s
+go mod verify
+go mod tidy -diff
+make dist
+go run ./cmd/protogen --check
+make public-api
+scripts/lint-locks.sh
+```
+
+The complete race run passed every package; `internal/sim` completed in
+383.713 seconds. The conformance race subset passed with `internal/sim` in
+380.879 seconds. Every fuzz target completed without failure. Distribution
+artifacts were built locally only and were not published. No external resource
+was created by these regressions. **Status: verified.**
+
+### Aggregate-gate race in restored session-log authority, 2026-09-04
+
+The first clean aggregate run on candidate
+`d865ec62e80bb6ada8a8676e0a0465c75821829a` truthfully failed:
+
+```text
+Rows: 38 passed, 1 failed, 28 unavailable
+Required rows: 38 of 55 passed, 1 failed, 16 unavailable
+B0.conformance: failed
+External resources created: 1; cleanup verified 1, failed 0
+```
+
+`make conformance` detected a data race in
+`TestE11TieredSessionReplayCrossesNodeAndNamesUnavailableBlob`.
+`restoreSessionLog` copied the complete live node workspace after
+`authorizeClaims` released `Node.mu`, while the renew loop updated
+`Workspace.LeaseUntil` under that mutex. Session-log artifact authorization
+needs only the immutable workspace id, tenant and generation, so restoration
+now projects exactly those fields instead of copying mutable lease and
+authorization state.
+
+The focused regression mutates `LeaseUntil` concurrently with 10,000 authority
+projections; it would race if the projection read mutable workspace fields.
+The failing E11 composition test was also repeated under the race detector:
+
+```sh
+go test -race -count=100 \
+  -run '^TestSessionLogAuthorityDoesNotReadMutableLeaseFields$' \
+  -timeout 180s ./internal/node
+
+go test -race -count=20 \
+  -run '^TestE11TieredSessionReplayCrossesNodeAndNamesUnavailableBlob$' \
+  -timeout 600s ./internal/sim
+
+make lint
+make test
+make conformance
+make race
+```
+
+All commands passed. The final `make conformance` simulation package completed
+in 392.930 seconds; the complete final `make race` simulation package
+completed in 400.301 seconds. The failed aggregate run still verified cleanup
+of its one external resource and retained all unavailable rows as unavailable.
+The repaired implementation candidate was committed as
+`7957c40456ef06fdce4ef441dcf8424f875c324a`.
+
+The clean committed-candidate aggregate was then rerun with the gVisor and
+Firecracker host prerequisites named earlier in this ledger:
+
+```sh
+go run ./cmd/evidence run
+```
+
+It exited zero and reported:
+
+```text
+Candidate: 7957c40456ef06fdce4ef441dcf8424f875c324a
+Rows: 39 passed, 0 failed, 28 unavailable
+Required rows: 39 of 55 passed, 0 failed, 16 unavailable
+Registry: 57 scenarios, 6 with no owning proof
+External resources created: 1; cleanup verified 1, failed 0
+```
+
+The command remains truthfully incomplete rather than a completion gate:
+sixteen required rows have no executable aggregate proof and remain named
+unavailable. The host-backed B28 and B29 rows passed on this exact candidate.
+
+Built-binary conformance on the same candidate:
+
+```sh
+go run ./cmd/conformance --build .
+```
+
+reported:
+
+```text
+CONFORMANT: remount standalone (remount)
+60 passed, 0 failed, 8 unavailable of 68 requirements in 6.845s
+required: 53 passed, 0 failed, 0 unavailable
+capability-gated: 7 passed, 0 failed, 7 unavailable
+extension: 0 passed, 0 failed, 1 unavailable
+cleanup: verified
+```
+
+The unavailable requirements named absent node-fault, retention-bound,
+approve-mode egress, transcript-eviction and notification harness
+prerequisites; none was upgraded to passed. Distribution and evidence
+artifacts stayed local and no release, tag, image, package or signed artifact
+was published. **Status: verified on the committed candidate; aggregate
+remains incomplete because its 16 required unavailable rows are unwired.**
+
+### Durable completion failure and CI transport/performance repairs, 2026-09-04
+
+Automated review found that the synchronous session-log seal still discarded a
+failed final `CompleteSessionLogRecord`. The log now retains the completion
+error, keeps the terminal chunk hidden, and returns `ErrIncompleteLog` instead
+of EOF. `session.finish` adds the persistence failure to the terminal
+`ExitInfo` before `Session.Wait` can return, while preserving partial segment
+records and `OnRecordError`. Node subscriptions translate the incomplete-log
+boundary into the failed exit chunk so an attached client does not hang.
+Deterministic regressions verify the failed wait/exit result, callback delivery,
+preserved blob segments, rejected incomplete restart replay, and subscriber
+failure delivery.
+
+The wired-shell evidence runner now treats exit 77 as unavailable only when the
+output contains a non-empty `UNAVAILABLE:` or `unavailable:` reason. Missing
+`socat` and `setsid` cases remain unavailable; an unexplained exit 77 remains a
+failure, and the existing unexplained Go-skip rejection is unchanged.
+
+Focused verification:
+
+```sh
+go test -count=1 \
+  -run 'TestWaitBlocksUntilDurableCompletionRecordCommits|TestDurableCompletionFailureIsObservableAndReplayStaysIncomplete' \
+  -v -timeout 60s ./internal/session
+go test -count=20 \
+  -run 'TestSubscriptionReportsDurableCompletionFailure|TestReplacingSessionCursorDoesNotCancelSharedPeerWrite|TestStaleSessionDetachDoesNotCancelReplacementCursor' \
+  -timeout 120s ./internal/node
+go test -race -count=20 \
+  -run 'TestWaitBlocksUntilDurableCompletionRecordCommits|TestDurableCompletionFailureIsObservableAndReplayStaysIncomplete' \
+  -timeout 300s ./internal/session
+go test -race -count=20 \
+  -run 'TestSubscriptionReportsDurableCompletionFailure' \
+  -timeout 300s ./internal/node
+go test -count=1 -timeout 180s ./internal/session ./internal/node
+go test -race -count=1 -timeout 300s ./internal/session ./internal/node
+```
+
+Every focused command passed.
+
+The S3 compatibility job then reproduced `http: server closed idle connection`
+inside the pinned MinIO lane. The same image and test configuration reproduced
+the failure locally with the prior 25-second idle timeout on a fresh store,
+proving that expiry shorter than a conventional load-balancer timeout did not
+cover endpoints that close a reusable connection immediately. Retrying a
+conditional write after losing its response would be ambiguous, so the
+store-owned default transport now uses a fresh connection instead; a
+caller-supplied HTTP client remains untouched.
+
+Verification against the pinned local MinIO:
+
+```sh
+go test -race -count=1 -run '^TestMinIOIntegration$' \
+  -v -timeout 180s ./internal/artifact/s3
+go test -race -count=20 -run '^TestMinIOControlFailoverE10Core$' \
+  -v -timeout 600s ./integration/failover
+```
+
+The integration passed once and the exact failover core passed 20
+repetitions. The disposable MinIO container was removed after verification.
+
+The conformance job also measured the unchanged incompressible-move floor at
+18.5 MB/s while all conformance packages competed under the race detector.
+Three isolated race repetitions on the same implementation measured 45.0 to
+52.1 MB/s. The 20 MB/s lower bound remains unchanged; `make conformance` now
+runs its packages serially so the physical throughput assertion measures the
+move rather than concurrent package load. The complete conformance command
+passed with `internal/sim` in 399.083 seconds, and the complete race command
+passed with `internal/sim` in 376.935 seconds.
+
+While the final verification was running, `origin/main` advanced from
+`7d1bc8ddbc055be9f57e157bac1915c0cadbe876` to
+`4b05a46834a4a84fd5a812296c280031fc603802`. The new commit changed only the
+Linux handoff documentation and added a session-wrap document. It was merged
+without conflict as `712f4e2a0494c301126bb6232250cf7baf43ea51`.
+
+Post-merge compatibility verification:
+
+```sh
+make docs
+make race
+make conformance
+```
+
+`make docs` regenerated both LLM indexes without changing either file.
+`make race` passed with `internal/sim` in 370.804 seconds. The serial
+conformance target passed with `internal/sim` in 368.098 seconds. The complete
+non-race `make` gate had passed immediately before the documentation-only
+upstream change with the same implementation candidate.
+
+The final pre-stage fetch then found two more upstream fixes at
+`66db37c6b3e8da81bdf200b54ab908fd2d5127e5`: Helm 3/4 document comparison,
+host-sized scale simulation, and container-user model-catalog creation. The
+branch merged them without conflict. The exact affected tests passed under the
+race detector:
+
+```sh
+go test -race -count=1 -p=1 \
+  -run 'TestHelmLint|TestHelmGoldenTemplateIsCurrent|TestHelmRefusesATwoOwnerConfiguration|TestTheChartOwnsNoWorkspaceLifecycle|TestPlanBOpenCodeDeterministicModelLane|TestHandoffScaleAndControlFailover' \
+  -timeout 1200s ./integration/policy ./internal/sim
+```
+
+The policy package passed in 1.284 seconds and the simulation package in
+88.646 seconds.
+
+No public output was published. **Status: implementation and post-upstream
+race/conformance compatibility verification complete; committed-candidate
+aggregate and built-binary conformance remain to be rerun after the final
+commit.**

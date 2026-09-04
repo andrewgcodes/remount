@@ -347,6 +347,14 @@ func (h *handle) MountPath() string {
 }
 func (h *handle) CheckpointKind() workspace.CheckpointKind { return workspace.CheckpointFSMem }
 func (h *handle) BrokerAdvertiseHost() string              { return h.network.HostAddress().String() }
+func (h *handle) RestoreProcesses() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.restored && h.started {
+		return proto.RestoreProcessesPreserved
+	}
+	return proto.RestoreProcessesRestarted
+}
 
 func (h *handle) Prepare(spec *session.Spec) error {
 	endpoint, err := h.guestEndpoint()
@@ -387,12 +395,12 @@ func (h *handle) ApplyNetworkPolicy(ctx context.Context, _ proto.NetworkPolicy, 
 	if broker.Addr() != h.network.HostAddress() {
 		return fmt.Errorf("broker must bind %s, got %s", h.network.HostAddress(), broker.Addr())
 	}
+	if h.restored && endpoint.Generation <= h.sourceGeneration {
+		return proto.Err(proto.CodeDenied, "restore generation %d does not advance checkpoint generation %d", endpoint.Generation, h.sourceGeneration)
+	}
 	tap, err := h.network.Prepare(ctx, endpoint.Generation)
 	if err != nil {
 		return err
-	}
-	if h.restored && endpoint.Generation < h.sourceGeneration {
-		return proto.Err(proto.CodeDenied, "restore generation %d predates checkpoint generation %d", endpoint.Generation, h.sourceGeneration)
 	}
 	machine, err := h.machines.New(ctx, h.id, MachineLaunch{NetworkNamespace: h.network.NamespacePath()})
 	if err != nil {
@@ -437,10 +445,19 @@ func (h *handle) ApplyNetworkPolicy(ctx context.Context, _ proto.NetworkPolicy, 
 func (h *handle) RevokeNetwork(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if err := h.network.Revoke(ctx); err != nil {
-		return err
+	var killErr error
+	if h.machine != nil {
+		killErr = h.machine.Kill(ctx)
+		if killErr == nil {
+			h.machine = nil
+		}
+	}
+	revokeErr := h.network.Revoke(ctx)
+	if killErr != nil || revokeErr != nil {
+		return errors.Join(killErr, revokeErr)
 	}
 	h.revoked = true
+	h.started = false
 	return nil
 }
 func (h *handle) Snapshot(ctx context.Context, excludes []string, w io.Writer) error {

@@ -33,14 +33,52 @@ const (
 	nfDrop   = 0
 	nfAccept = 1
 
-	// netdevTable and netdevChain hold the egress filter that actually
-	// contains a userspace network stack; see installNetdevDenyTable.
-	netdevTable = "remount_dev"
-	netdevChain = "egress_dev"
+	tcHandleRoot         = uint32(0xffff0000)
+	tcParentClsact       = uint32(0xfffffff1)
+	tcParentClsactEgress = uint32(0xfffffff3)
+	tcActionPass         = int32(0)
+	tcActionDrop         = int32(2)
+	tcaFlowerAction      = uint16(3)
+	tcaFlowerKeyEthType  = uint16(8)
+	tcaFlowerKeyIPProto  = uint16(9)
+	tcaFlowerKeyIPv4Dst  = uint16(12)
+	tcaFlowerKeyIPv4Mask = uint16(13)
+	tcaFlowerKeyTCPDst   = uint16(19)
+	tcaFlowerFlags       = uint16(22)
+	tcaActionKind        = uint16(1)
+	tcaActionOptions     = uint16(2)
+	tcaGactParameters    = uint16(2)
 )
 
 type systemKernel struct {
 	seq atomic.Uint32
+}
+
+type tcMessage struct {
+	Family  uint8
+	Pad1    uint8
+	Pad2    uint16
+	Ifindex int32
+	Handle  uint32
+	Parent  uint32
+	Info    uint32
+}
+
+type tcGact struct {
+	Index   uint32
+	Capab   uint32
+	Action  int32
+	Refcnt  int32
+	Bindcnt int32
+}
+
+type tcFlowerRule struct {
+	priority        uint16
+	protocol        uint16
+	action          int32
+	destination     netip.Addr
+	ipProtocol      uint8
+	destinationPort uint16
 }
 
 func newSystemKernel() Kernel {
@@ -211,9 +249,19 @@ func (k *systemKernel) Configure(ctx context.Context, namespace string, link Lin
 	})
 }
 
-func (k *systemKernel) InstallDenyAll(ctx context.Context, namespace string) error {
+func (k *systemKernel) InstallDenyAll(ctx context.Context, namespace string, link Link) error {
+	if err := k.installIngressDenyTable(ctx, link.HostName); err != nil {
+		return err
+	}
 	return k.withNamespace(namespace, func() error {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		guest, err := net.InterfaceByName(link.GuestName)
+		if err != nil {
+			return err
+		}
+		if err := k.installEgressDeny(ctx, guest.Index); err != nil {
 			return err
 		}
 		for _, path := range []string{
@@ -230,21 +278,34 @@ func (k *systemKernel) InstallDenyAll(ctx context.Context, namespace string) err
 		if err := k.installDenyTable(ctx); err != nil {
 			return err
 		}
-		return k.installNetdevDenyTable(ctx)
+		return nil
 	})
 }
 
-func (k *systemKernel) PermitBroker(ctx context.Context, namespace string, broker netip.AddrPort) error {
-	return k.withNamespace(namespace, func() error {
+func (k *systemKernel) PermitBroker(ctx context.Context, namespace string, link Link, broker netip.AddrPort) error {
+	if err := k.withNamespace(namespace, func() error {
+		guest, err := net.InterfaceByName(link.GuestName)
+		if err != nil {
+			return err
+		}
+		if err := k.installEgressBrokerPermit(ctx, guest.Index, broker); err != nil {
+			return err
+		}
 		if err := k.installPermitRule(ctx, broker); err != nil {
 			return err
 		}
 		return k.installForwardPermitRules(ctx, broker)
-	})
+	}); err != nil {
+		return err
+	}
+	if err := k.installIngressARPPermitRule(ctx, link.HostName); err != nil {
+		return err
+	}
+	return k.installIngressPermitRule(ctx, link.HostName, broker)
 }
 
-func (k *systemKernel) CreateTap(ctx context.Context, namespace, name string, uid, gid int, gateway netip.Prefix) error {
-	return k.withNamespace(namespace, func() error {
+func (k *systemKernel) CreateTap(ctx context.Context, namespace, name string, uid, gid int, gateway netip.Prefix, link Link) error {
+	if err := k.withNamespace(namespace, func() error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -278,7 +339,18 @@ func (k *systemKernel) CreateTap(ctx context.Context, namespace, name string, ui
 			return err
 		}
 		return k.setLinkUp(ctx, iface.Index)
-	})
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (k *systemKernel) RouteTap(ctx context.Context, gateway netip.Prefix, link Link) error {
+	host, err := net.InterfaceByName(link.HostName)
+	if err != nil {
+		return err
+	}
+	return k.addRoute(ctx, host.Index, gateway.Masked(), link.Guest.Addr())
 }
 
 func (k *systemKernel) DeleteTap(ctx context.Context, namespace, name string) error {
@@ -338,16 +410,16 @@ func guestNameForHost(host string) string {
 func (k *systemKernel) DeleteVeth(ctx context.Context, hostName string) error {
 	iface, err := net.InterfaceByName(hostName)
 	if err != nil {
-		if errors.Is(err, unix.ENODEV) || strings.Contains(err.Error(), "no such network interface") {
-			return nil
+		if !errors.Is(err, unix.ENODEV) && !strings.Contains(err.Error(), "no such network interface") {
+			return err
 		}
-		return err
+	} else {
+		msg := marshal(unix.IfInfomsg{Family: unix.AF_UNSPEC, Index: int32(iface.Index)})
+		if err := k.route(ctx, unix.RTM_DELLINK, 0, msg); err != nil && !errors.Is(err, unix.ENODEV) {
+			return err
+		}
 	}
-	msg := marshal(unix.IfInfomsg{Family: unix.AF_UNSPEC, Index: int32(iface.Index)})
-	if err := k.route(ctx, unix.RTM_DELLINK, 0, msg); err != nil && !errors.Is(err, unix.ENODEV) {
-		return err
-	}
-	return nil
+	return k.deleteIngressDenyTable(ctx, hostName)
 }
 
 func (k *systemKernel) CloseNamespace(path string) error {
@@ -397,6 +469,17 @@ func (k *systemKernel) addAddress(ctx context.Context, index int, prefix netip.P
 func (k *systemKernel) addDefaultRoute(ctx context.Context, index int, gateway netip.Addr) error {
 	route := unix.RtMsg{Family: unix.AF_INET, Table: unix.RT_TABLE_MAIN, Protocol: unix.RTPROT_STATIC, Scope: unix.RT_SCOPE_UNIVERSE, Type: unix.RTN_UNICAST}
 	msg := append(marshal(route), nlaU32Native(unix.RTA_OIF, uint32(index))...)
+	msg = append(msg, nlaBytes(unix.RTA_GATEWAY, gateway.AsSlice())...)
+	return k.route(ctx, unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_EXCL, msg)
+}
+
+func (k *systemKernel) addRoute(ctx context.Context, index int, destination netip.Prefix, gateway netip.Addr) error {
+	route := unix.RtMsg{
+		Family: unix.AF_INET, Dst_len: uint8(destination.Bits()), Table: unix.RT_TABLE_MAIN,
+		Protocol: unix.RTPROT_STATIC, Scope: unix.RT_SCOPE_UNIVERSE, Type: unix.RTN_UNICAST, Flags: unix.RTNH_F_ONLINK,
+	}
+	msg := append(marshal(route), nlaBytes(unix.RTA_DST, destination.Addr().AsSlice())...)
+	msg = append(msg, nlaU32Native(unix.RTA_OIF, uint32(index))...)
 	msg = append(msg, nlaBytes(unix.RTA_GATEWAY, gateway.AsSlice())...)
 	return k.route(ctx, unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_EXCL, msg)
 }
@@ -462,76 +545,6 @@ func (k *systemKernel) netlink(ctx context.Context, protocol int, typ uint16, fl
 	}
 }
 
-// namespaceDevice returns the namespace's single non-loopback interface, which
-// is the guest end of the veth. The caller must already be inside the
-// namespace.
-func namespaceDevice() (string, error) {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return "", err
-	}
-	var found string
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		if found != "" {
-			return "", fmt.Errorf("netns: expected one non-loopback interface, found %s and %s", found, iface.Name)
-		}
-		found = iface.Name
-	}
-	if found == "" {
-		return "", errors.New("netns: no non-loopback interface to filter on")
-	}
-	return found, nil
-}
-
-// installNetdevDenyTable adds a default-drop netdev egress chain on the guest
-// veth.
-//
-// The inet output chain alone does not contain a sandbox. netfilter's IP hooks
-// only see packets the kernel's own IP stack produced, and a userspace network
-// stack — gVisor's, when run with --network=sandbox — does not use it. It
-// writes Ethernet frames straight to the veth with AF_PACKET, below those
-// hooks, so an output-chain policy filters traffic the sandbox never generates
-// and every packet leaves the namespace regardless of policy. That was measured:
-// with the output chain in place, TCP, UDP and ICMP to forbidden destinations
-// all crossed the veth, and on a host whose FORWARD policy accepts (Docker's
-// default drop is what happened to stop it) they reached the internet and were
-// answered.
-//
-// The netdev egress hook sits at transmit, so it sees frames however they were
-// produced. Verified against the same AF_PACKET injection: the send fails with
-// ENOBUFS once this chain exists, and succeeds without it.
-//
-// See docs/engineering/gvisor-egress-finding-2026-09-04.md.
-func (k *systemKernel) installNetdevDenyTable(ctx context.Context) error {
-	device, err := namespaceDevice()
-	if err != nil {
-		return err
-	}
-	if err := k.nft(ctx, unix.NFT_MSG_NEWTABLE, unix.NLM_F_CREATE|unix.NLM_F_EXCL,
-		unix.NFPROTO_NETDEV, concat(nlaString(unix.NFTA_TABLE_NAME, netdevTable), nlaU32BE(unix.NFTA_TABLE_FLAGS, 0))); err != nil {
-		return fmt.Errorf("create netdev table: %w", err)
-	}
-	hook := nlaNestedAttr(unix.NFTA_CHAIN_HOOK, concat(
-		nlaU32BE(unix.NFTA_HOOK_HOOKNUM, unix.NF_NETDEV_EGRESS),
-		nlaU32BE(unix.NFTA_HOOK_PRIORITY, 0),
-		nlaString(unix.NFTA_HOOK_DEV, device),
-	))
-	attrs := concat(
-		nlaString(unix.NFTA_CHAIN_TABLE, netdevTable),
-		nlaString(unix.NFTA_CHAIN_NAME, netdevChain),
-		nlaString(unix.NFTA_CHAIN_TYPE, "filter"),
-		hook,
-		nlaU32BE(unix.NFTA_CHAIN_POLICY, nfDrop),
-	)
-	if err := k.nft(ctx, unix.NFT_MSG_NEWCHAIN, unix.NLM_F_CREATE|unix.NLM_F_EXCL, unix.NFPROTO_NETDEV, attrs); err != nil {
-		return fmt.Errorf("create netdev egress chain on %s: %w", device, err)
-	}
-	return nil
-}
-
 func (k *systemKernel) installDenyTable(ctx context.Context) error {
 	const table = "remount"
 	if err := k.nft(ctx, unix.NFT_MSG_NEWTABLE, unix.NLM_F_CREATE|unix.NLM_F_EXCL,
@@ -565,6 +578,196 @@ func (k *systemKernel) installDenyTable(ctx context.Context) error {
 	)
 	if err := k.nft(ctx, unix.NFT_MSG_NEWCHAIN, unix.NLM_F_CREATE|unix.NLM_F_EXCL, unix.NFPROTO_INET, forward); err != nil {
 		return fmt.Errorf("create nftables forward chain: %w", err)
+	}
+	return nil
+}
+
+func (k *systemKernel) installEgressDeny(ctx context.Context, ifindex int) error {
+	message := tcMessage{
+		Family:  unix.AF_UNSPEC,
+		Ifindex: int32(ifindex),
+		Handle:  tcHandleRoot,
+		Parent:  tcParentClsact,
+	}
+	body := append(marshal(message), nlaString(unix.TCA_KIND, "clsact")...)
+	if err := k.route(ctx, unix.RTM_NEWQDISC, unix.NLM_F_CREATE|unix.NLM_F_EXCL, body); err != nil {
+		return fmt.Errorf("create guest egress classifier: %w", err)
+	}
+	for _, rule := range denyEgressRules() {
+		if err := k.installEgressRule(ctx, ifindex, rule); err != nil {
+			return fmt.Errorf("install guest egress deny: %w", err)
+		}
+	}
+	return nil
+}
+
+func (k *systemKernel) installEgressBrokerPermit(ctx context.Context, ifindex int, broker netip.AddrPort) error {
+	for _, rule := range brokerEgressRules(broker) {
+		if err := k.installEgressRule(ctx, ifindex, rule); err != nil {
+			return fmt.Errorf("install guest egress broker permit: %w", err)
+		}
+	}
+	return nil
+}
+
+func denyEgressRules() []tcFlowerRule {
+	return []tcFlowerRule{{priority: 100, protocol: unix.ETH_P_ALL, action: tcActionDrop}}
+}
+
+func brokerEgressRules(broker netip.AddrPort) []tcFlowerRule {
+	return []tcFlowerRule{
+		{priority: 1, protocol: unix.ETH_P_ARP, action: tcActionPass},
+		{
+			priority:        2,
+			protocol:        unix.ETH_P_IP,
+			action:          tcActionPass,
+			destination:     broker.Addr(),
+			ipProtocol:      unix.IPPROTO_TCP,
+			destinationPort: broker.Port(),
+		},
+	}
+}
+
+func (k *systemKernel) installEgressRule(ctx context.Context, ifindex int, rule tcFlowerRule) error {
+	options := make([]byte, 0, 128)
+	if rule.destination.IsValid() {
+		options = append(options, nlaBytes(tcaFlowerKeyIPv4Dst, rule.destination.AsSlice())...)
+		options = append(options, nlaBytes(tcaFlowerKeyIPv4Mask, []byte{0xff, 0xff, 0xff, 0xff})...)
+	}
+	if rule.ipProtocol != 0 {
+		options = append(options, nlaBytes(tcaFlowerKeyIPProto, []byte{rule.ipProtocol})...)
+	}
+	if rule.destinationPort != 0 {
+		options = append(options, nlaU16BE(tcaFlowerKeyTCPDst, rule.destinationPort)...)
+	}
+	options = append(options, tcFlowerAction(rule.action)...)
+	options = append(options, nlaU32Native(tcaFlowerFlags, 0)...)
+	if rule.protocol != unix.ETH_P_ALL {
+		options = append(options, nlaU16BE(tcaFlowerKeyEthType, rule.protocol)...)
+	}
+	message := tcMessage{
+		Family:  unix.AF_UNSPEC,
+		Ifindex: int32(ifindex),
+		Parent:  tcParentClsactEgress,
+		Info:    uint32(rule.priority)<<16 | uint32(hostToNetwork16(rule.protocol)),
+	}
+	body := append(marshal(message), nlaString(unix.TCA_KIND, "flower")...)
+	body = append(body, nlaBytes(unix.TCA_OPTIONS, options)...)
+	return k.route(ctx, unix.RTM_NEWTFILTER, unix.NLM_F_CREATE|unix.NLM_F_EXCL, body)
+}
+
+func tcFlowerAction(action int32) []byte {
+	parameters := marshal(tcGact{Action: action})
+	gact := concat(
+		nlaString(tcaActionKind, "gact"),
+		nlaNestedAttr(tcaActionOptions, nlaBytes(tcaGactParameters, parameters)),
+	)
+	return nlaBytes(tcaFlowerAction, nlaBytes(1, gact))
+}
+
+func hostToNetwork16(value uint16) uint16 {
+	return value<<8 | value>>8
+}
+
+func ingressTable(hostName string) string {
+	return "remount_" + hostName
+}
+
+func (k *systemKernel) installIngressDenyTable(ctx context.Context, hostName string) error {
+	table := ingressTable(hostName)
+	if err := k.nft(ctx, unix.NFT_MSG_NEWTABLE, unix.NLM_F_CREATE|unix.NLM_F_EXCL,
+		unix.NFPROTO_NETDEV, concat(nlaString(unix.NFTA_TABLE_NAME, table), nlaU32BE(unix.NFTA_TABLE_FLAGS, 0))); err != nil {
+		return fmt.Errorf("create host ingress table: %w", err)
+	}
+	hook := nlaNestedAttr(unix.NFTA_CHAIN_HOOK, concat(
+		nlaU32BE(unix.NFTA_HOOK_HOOKNUM, unix.NF_NETDEV_INGRESS),
+		nlaU32BE(unix.NFTA_HOOK_PRIORITY, 0),
+		nlaString(unix.NFTA_HOOK_DEV, hostName),
+	))
+	attrs := concat(
+		nlaString(unix.NFTA_CHAIN_TABLE, table),
+		nlaString(unix.NFTA_CHAIN_NAME, "ingress"),
+		nlaString(unix.NFTA_CHAIN_TYPE, "filter"),
+		hook,
+		nlaU32BE(unix.NFTA_CHAIN_POLICY, nfDrop),
+	)
+	if err := k.nft(ctx, unix.NFT_MSG_NEWCHAIN, unix.NLM_F_CREATE|unix.NLM_F_EXCL, unix.NFPROTO_NETDEV, attrs); err != nil {
+		return fmt.Errorf("create host ingress chain: %w", err)
+	}
+	return nil
+}
+
+func (k *systemKernel) installIngressPermitRule(ctx context.Context, hostName string, broker netip.AddrPort) error {
+	expressions := concat(
+		nftExpr("meta", concat(
+			nlaU32BE(unix.NFTA_META_KEY, unix.NFT_META_PROTOCOL),
+			nlaU32BE(unix.NFTA_META_DREG, unix.NFT_REG_1),
+		)),
+		nftCmp(unix.NFT_REG_1, []byte{0x08, 0x00}),
+		nftExpr("payload", concat(
+			nlaU32BE(unix.NFTA_PAYLOAD_BASE, unix.NFT_PAYLOAD_NETWORK_HEADER),
+			nlaU32BE(unix.NFTA_PAYLOAD_OFFSET, 16),
+			nlaU32BE(unix.NFTA_PAYLOAD_LEN, 4),
+			nlaU32BE(unix.NFTA_PAYLOAD_DREG, unix.NFT_REG_1),
+		)),
+		nftCmp(unix.NFT_REG_1, broker.Addr().AsSlice()),
+		nftExpr("meta", concat(
+			nlaU32BE(unix.NFTA_META_KEY, unix.NFT_META_L4PROTO),
+			nlaU32BE(unix.NFTA_META_DREG, unix.NFT_REG_1),
+		)),
+		nftCmp(unix.NFT_REG_1, []byte{unix.IPPROTO_TCP}),
+		nftExpr("payload", concat(
+			nlaU32BE(unix.NFTA_PAYLOAD_BASE, unix.NFT_PAYLOAD_TRANSPORT_HEADER),
+			nlaU32BE(unix.NFTA_PAYLOAD_OFFSET, 2),
+			nlaU32BE(unix.NFTA_PAYLOAD_LEN, 2),
+			nlaU32BE(unix.NFTA_PAYLOAD_DREG, unix.NFT_REG_1),
+		)),
+		nftCmp(unix.NFT_REG_1, []byte{byte(broker.Port() >> 8), byte(broker.Port())}),
+		nftExpr("immediate", concat(
+			nlaU32BE(unix.NFTA_IMMEDIATE_DREG, unix.NFT_REG_VERDICT),
+			nlaNestedAttr(unix.NFTA_IMMEDIATE_DATA,
+				nlaNestedAttr(unix.NFTA_DATA_VERDICT, nlaU32BE(unix.NFTA_VERDICT_CODE, nfAccept))),
+		)),
+	)
+	attrs := concat(
+		nlaString(unix.NFTA_RULE_TABLE, ingressTable(hostName)),
+		nlaString(unix.NFTA_RULE_CHAIN, "ingress"),
+		nlaNestedAttr(unix.NFTA_RULE_EXPRESSIONS, expressions),
+	)
+	if err := k.nft(ctx, unix.NFT_MSG_NEWRULE, unix.NLM_F_CREATE|unix.NLM_F_APPEND, unix.NFPROTO_NETDEV, attrs); err != nil {
+		return fmt.Errorf("install host ingress broker permit: %w", err)
+	}
+	return nil
+}
+
+func (k *systemKernel) installIngressARPPermitRule(ctx context.Context, hostName string) error {
+	expressions := concat(
+		nftExpr("meta", concat(
+			nlaU32BE(unix.NFTA_META_KEY, unix.NFT_META_PROTOCOL),
+			nlaU32BE(unix.NFTA_META_DREG, unix.NFT_REG_1),
+		)),
+		nftCmp(unix.NFT_REG_1, []byte{0x08, 0x06}),
+		nftExpr("immediate", concat(
+			nlaU32BE(unix.NFTA_IMMEDIATE_DREG, unix.NFT_REG_VERDICT),
+			nlaNestedAttr(unix.NFTA_IMMEDIATE_DATA,
+				nlaNestedAttr(unix.NFTA_DATA_VERDICT, nlaU32BE(unix.NFTA_VERDICT_CODE, nfAccept))),
+		)),
+	)
+	attrs := concat(
+		nlaString(unix.NFTA_RULE_TABLE, ingressTable(hostName)),
+		nlaString(unix.NFTA_RULE_CHAIN, "ingress"),
+		nlaNestedAttr(unix.NFTA_RULE_EXPRESSIONS, expressions),
+	)
+	if err := k.nft(ctx, unix.NFT_MSG_NEWRULE, unix.NLM_F_CREATE|unix.NLM_F_APPEND, unix.NFPROTO_NETDEV, attrs); err != nil {
+		return fmt.Errorf("install host ingress ARP permit: %w", err)
+	}
+	return nil
+}
+
+func (k *systemKernel) deleteIngressDenyTable(ctx context.Context, hostName string) error {
+	attrs := nlaString(unix.NFTA_TABLE_NAME, ingressTable(hostName))
+	if err := k.nft(ctx, unix.NFT_MSG_DELTABLE, 0, unix.NFPROTO_NETDEV, attrs); err != nil && !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("delete host ingress table: %w", err)
 	}
 	return nil
 }
@@ -641,86 +844,7 @@ func (k *systemKernel) installPermitRule(ctx context.Context, broker netip.AddrP
 	if err := k.nft(ctx, unix.NFT_MSG_NEWRULE, unix.NLM_F_CREATE|unix.NLM_F_APPEND, unix.NFPROTO_INET, attrs); err != nil {
 		return err
 	}
-	// The same single exception on the netdev egress chain. Without it that
-	// chain's drop policy would also stop the broker, which is the one
-	// destination a workspace is allowed to reach.
-	//
-	// The match cannot be reused verbatim. A netdev chain sees the frame, not a
-	// routed packet, so "meta nfproto" — which the inet chain uses to select
-	// IPv4 — is not set there. The equivalent at this layer is the ethertype,
-	// "meta protocol" == 0x0800. Everything after it is identical, because the
-	// network and transport header offsets resolve the same way.
-	netdevExpressions := concat(
-		nftExpr("meta", concat(
-			nlaU32BE(unix.NFTA_META_KEY, unix.NFT_META_PROTOCOL),
-			nlaU32BE(unix.NFTA_META_DREG, unix.NFT_REG_1),
-		)),
-		nftCmp(unix.NFT_REG_1, []byte{0x08, 0x00}),
-		nftExpr("payload", concat(
-			nlaU32BE(unix.NFTA_PAYLOAD_BASE, unix.NFT_PAYLOAD_NETWORK_HEADER),
-			nlaU32BE(unix.NFTA_PAYLOAD_OFFSET, 16),
-			nlaU32BE(unix.NFTA_PAYLOAD_LEN, 4),
-			nlaU32BE(unix.NFTA_PAYLOAD_DREG, unix.NFT_REG_1),
-		)),
-		nftCmp(unix.NFT_REG_1, broker.Addr().AsSlice()),
-		nftExpr("meta", concat(
-			nlaU32BE(unix.NFTA_META_KEY, unix.NFT_META_L4PROTO),
-			nlaU32BE(unix.NFTA_META_DREG, unix.NFT_REG_1),
-		)),
-		nftCmp(unix.NFT_REG_1, []byte{unix.IPPROTO_TCP}),
-		nftExpr("payload", concat(
-			nlaU32BE(unix.NFTA_PAYLOAD_BASE, unix.NFT_PAYLOAD_TRANSPORT_HEADER),
-			nlaU32BE(unix.NFTA_PAYLOAD_OFFSET, 2),
-			nlaU32BE(unix.NFTA_PAYLOAD_LEN, 2),
-			nlaU32BE(unix.NFTA_PAYLOAD_DREG, unix.NFT_REG_1),
-		)),
-		nftCmp(unix.NFT_REG_1, []byte{byte(broker.Port() >> 8), byte(broker.Port())}),
-		nftExpr("immediate", concat(
-			nlaU32BE(unix.NFTA_IMMEDIATE_DREG, unix.NFT_REG_VERDICT),
-			nlaNestedAttr(unix.NFTA_IMMEDIATE_DATA,
-				nlaNestedAttr(unix.NFTA_DATA_VERDICT,
-					nlaU32BE(unix.NFTA_VERDICT_CODE, nfAccept))),
-		)),
-	)
-	netdevAttrs := concat(
-		nlaString(unix.NFTA_RULE_TABLE, netdevTable),
-		nlaString(unix.NFTA_RULE_CHAIN, netdevChain),
-		nlaNestedAttr(unix.NFTA_RULE_EXPRESSIONS, netdevExpressions),
-	)
-	if err := k.nft(ctx, unix.NFT_MSG_NEWRULE, unix.NLM_F_CREATE|unix.NLM_F_APPEND, unix.NFPROTO_NETDEV, netdevAttrs); err != nil {
-		return err
-	}
-	// ARP has to be allowed, and only a netdev chain ever had to care. An inet
-	// output chain never sees ARP because ARP is not IP, so the existing policy
-	// was silently unaffected by it. A netdev chain sees every frame, so a
-	// drop policy that only excepts IPv4 also drops the sandbox's ARP request
-	// for the host's MAC — after which nothing can be delivered at all, and the
-	// symptom is that even the permitted broker is unreachable.
-	//
-	// This is not an egress path. The device is one end of a veth pair whose
-	// only peer is this workspace's host side, so an ARP frame can reach
-	// nothing else, and the IPv4 rule above still constrains everything that
-	// ARP would resolve a route for. IPv6 needs no equivalent: InstallDenyAll
-	// disables it in this namespace outright.
-	arpExpressions := concat(
-		nftExpr("meta", concat(
-			nlaU32BE(unix.NFTA_META_KEY, unix.NFT_META_PROTOCOL),
-			nlaU32BE(unix.NFTA_META_DREG, unix.NFT_REG_1),
-		)),
-		nftCmp(unix.NFT_REG_1, []byte{0x08, 0x06}),
-		nftExpr("immediate", concat(
-			nlaU32BE(unix.NFTA_IMMEDIATE_DREG, unix.NFT_REG_VERDICT),
-			nlaNestedAttr(unix.NFTA_IMMEDIATE_DATA,
-				nlaNestedAttr(unix.NFTA_DATA_VERDICT,
-					nlaU32BE(unix.NFTA_VERDICT_CODE, nfAccept))),
-		)),
-	)
-	arpAttrs := concat(
-		nlaString(unix.NFTA_RULE_TABLE, netdevTable),
-		nlaString(unix.NFTA_RULE_CHAIN, netdevChain),
-		nlaNestedAttr(unix.NFTA_RULE_EXPRESSIONS, arpExpressions),
-	)
-	return k.nft(ctx, unix.NFT_MSG_NEWRULE, unix.NLM_F_CREATE|unix.NLM_F_APPEND, unix.NFPROTO_NETDEV, arpAttrs)
+	return nil
 }
 
 func (k *systemKernel) nft(ctx context.Context, message uint16, flags uint16, family byte, attrs []byte) error {
@@ -835,6 +959,11 @@ func nlaU32Native(typ uint16, value uint32) []byte {
 func nlaU32BE(typ uint16, value uint32) []byte {
 	b := make([]byte, 4)
 	binary.BigEndian.PutUint32(b, value)
+	return nlaBytes(typ, b)
+}
+func nlaU16BE(typ uint16, value uint16) []byte {
+	b := make([]byte, 2)
+	binary.BigEndian.PutUint16(b, value)
 	return nlaBytes(typ, b)
 }
 func nlaNestedAttr(typ uint16, value []byte) []byte { return nlaBytes(typ|nlaNested, value) }

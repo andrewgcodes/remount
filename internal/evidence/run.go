@@ -2,6 +2,7 @@ package evidence
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -201,7 +202,7 @@ func git(ctx context.Context, root string, args ...string) (string, error) {
 func credentials(lookup Lookup) []Credential {
 	names := map[string]bool{}
 	for _, s := range Scenarios() {
-		for _, name := range s.Env {
+		for _, name := range credentialEnv(s.Env) {
 			names[name] = true
 		}
 	}
@@ -242,6 +243,7 @@ func runGate(ctx context.Context, opts Options, res Result, gate Gate) Record {
 	}
 	cmd := exec.CommandContext(runCtx, gate.Argv[0], gate.Argv[1:]...)
 	cmd.Dir = opts.Root
+	cmd.Env = withoutEnv(os.Environ(), scenarioEnvNames())
 	out, err := cmd.CombinedOutput()
 	rec.DurationMS = opts.Now().Sub(rec.StartedAt).Milliseconds()
 
@@ -281,6 +283,21 @@ func registryEnvNames() []string {
 	seen := map[string]bool{}
 	var names []string
 	for _, s := range Scenarios() {
+		for _, name := range credentialEnv(s.Env) {
+			if !seen[name] {
+				seen[name] = true
+				names = append(names, name)
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func scenarioEnvNames() []string {
+	seen := map[string]bool{}
+	var names []string
+	for _, s := range Scenarios() {
 		for _, name := range s.Env {
 			if !seen[name] {
 				seen[name] = true
@@ -290,6 +307,21 @@ func registryEnvNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func withoutEnv(environ, names []string) []string {
+	blocked := make(map[string]bool, len(names))
+	for _, name := range names {
+		blocked[name] = true
+	}
+	out := make([]string, 0, len(environ))
+	for _, entry := range environ {
+		name, _, _ := strings.Cut(entry, "=")
+		if !blocked[name] {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 // scenarioRecords turns every registry row into a record. An unwired row is
@@ -345,14 +377,15 @@ func scenarioHostAvailable(s Scenario, probes map[string]Probe) bool {
 // than sharing it because a scenario failure is attributed to the scenario, and
 // its log is scanned on the same terms: the evidence must not become the leak.
 func runScenario(ctx context.Context, opts Options, rec Record, s Scenario) Record {
-	rec.Command = strings.Join(s.Argv, " ")
+	argv := scenarioArgv(s.Argv)
+	rec.Command = strings.Join(argv, " ")
 	runCtx := ctx
 	if opts.Timeout > 0 {
 		var cancel context.CancelFunc
 		runCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
 		defer cancel()
 	}
-	cmd := exec.CommandContext(runCtx, s.Argv[0], s.Argv[1:]...)
+	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
 	cmd.Dir = opts.Root
 	output, err := cmd.CombinedOutput()
 	rec.DurationMS = opts.Now().Sub(rec.StartedAt).Milliseconds()
@@ -362,12 +395,85 @@ func runScenario(ctx context.Context, opts Options, rec Record, s Scenario) Reco
 		rec.Artifacts = []string{log}
 	}
 	if err != nil {
+		if reason, ok := scenarioUnavailableReason(err, string(output)); ok {
+			rec.Status = StatusUnavailable
+			rec.Reason = reason
+			return rec
+		}
 		rec.Status = StatusFailed
 		rec.Reason = fmt.Sprintf("%s: %v (see %s)", rec.Command, err, log)
 		return rec
 	}
+	if reasons, unexplained := scenarioSkipReasons(string(output)); len(reasons) > 0 || unexplained != "" {
+		if unexplained != "" {
+			rec.Status = StatusFailed
+			rec.Reason = unexplained + " (see " + log + ")"
+			return rec
+		}
+		rec.Status = StatusUnavailable
+		rec.Reason = strings.Join(reasons, "; ")
+		return rec
+	}
 	rec.Status = StatusPassed
 	return rec
+}
+
+func scenarioUnavailableReason(err error, output string) (string, bool) {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 77 {
+		return "", false
+	}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		for _, prefix := range []string{"UNAVAILABLE:", "unavailable:"} {
+			if reason, ok := strings.CutPrefix(line, prefix); ok && strings.TrimSpace(reason) != "" {
+				return strings.TrimSpace(reason), true
+			}
+		}
+	}
+	return "", false
+}
+
+func scenarioArgv(argv []string) []string {
+	if len(argv) < 2 || argv[0] != "go" || argv[1] != "test" {
+		return argv
+	}
+	for _, arg := range argv[2:] {
+		if arg == "-v" || arg == "-json" {
+			return argv
+		}
+	}
+	verbose := make([]string, 0, len(argv)+1)
+	verbose = append(verbose, argv[:2]...)
+	verbose = append(verbose, "-v")
+	return append(verbose, argv[2:]...)
+}
+
+func scenarioSkipReasons(output string) ([]string, string) {
+	lines := strings.Split(output, "\n")
+	var reasons []string
+	for i, line := range lines {
+		if !strings.Contains(line, "--- SKIP:") {
+			continue
+		}
+		reason := ""
+		for j := i - 1; j >= 0 && j >= i-8; j-- {
+			if strings.Contains(lines[j], "=== RUN") || strings.Contains(lines[j], "--- PASS:") || strings.Contains(lines[j], "--- FAIL:") || strings.Contains(lines[j], "--- SKIP:") {
+				break
+			}
+			if marker := strings.Index(lines[j], "unavailable:"); marker >= 0 {
+				reason = strings.TrimSpace(lines[j][marker+len("unavailable:"):])
+				break
+			}
+		}
+		if reason == "" {
+			return nil, "owning proof skipped without an unavailable reason"
+		}
+		if !slices.Contains(reasons, reason) {
+			reasons = append(reasons, reason)
+		}
+	}
+	return reasons, ""
 }
 
 func scenarioReason(s Scenario, probes map[string]Probe, lookup Lookup, selection []string) string {
@@ -403,6 +509,8 @@ var hostProbeFor = map[string]string{
 	"E5":  "gvisor",
 	"B28": "gvisor",
 	"B29": "firecracker",
+	"B31": "docker",
+	"B32": "docker",
 }
 
 func missingEnv(names []string, lookup Lookup) []string {

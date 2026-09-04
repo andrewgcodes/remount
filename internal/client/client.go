@@ -398,9 +398,38 @@ func (c *Client) ListWorkspaces(ctx context.Context) ([]proto.Workspace, error) 
 }
 
 // DestroyWorkspace destroys a workspace.
+//
+// Control refuses to commit a destroy while the workspace's node is offline,
+// and says so: the operation "remains uncommitted". A node whose uplink is
+// reconnecting is offline for a few backoff intervals, so that refusal is
+// retried against the same bounded budget nodeCall uses. Retrying is safe
+// precisely because control declined to commit anything, and the request
+// carries the caller's idempotency key either way.
 func (c *Client) DestroyWorkspace(ctx context.Context, id string, options ...OperationOption) error {
 	idem, _ := operationKey(options)
-	return c.call(ctx, proto.PeerControl, proto.OpWSDestroy, proto.WSGetReq{ID: id, IdempotencyKey: idem}, nil)
+	req := proto.WSGetReq{ID: id, IdempotencyKey: idem}
+	start := time.Now()
+	backoff := 25 * time.Millisecond
+	for {
+		err := c.call(ctx, proto.PeerControl, proto.OpWSDestroy, req, nil)
+		var pe *proto.Error
+		if !errors.As(err, &pe) || pe.Code != proto.CodeUnreachable {
+			return err
+		}
+		if time.Since(start) >= nodeCallRetryBudget {
+			return err
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if backoff < 500*time.Millisecond {
+			backoff *= 2
+		}
+	}
 }
 
 // MoveWorkspace snapshots and re-queues a workspace with new requirements.
@@ -918,32 +947,74 @@ func (c *Client) forgetGrant(wsID string) {
 	c.mu.Unlock()
 }
 
+const (
+	// nodeCallConvergeBudget bounds the wait for a node that has not yet
+	// adopted the grant's authorization revision.
+	nodeCallConvergeBudget = 15 * time.Second
+	// nodeCallRetryBudget bounds the wait for a node that reports a conflict or
+	// is unreachable. A node whose uplink is reconnecting returns within a few
+	// backoff intervals, but one that is genuinely gone must not hold the
+	// caller for the whole convergence budget: every filesystem and session
+	// call takes this path.
+	nodeCallRetryBudget = 5 * time.Second
+)
+
 // nodeCall performs a request against the node holding wsID, attaching a
-// grant. A stale grant or a node still applying a newer authorization
-// revision is refreshed and retried within a bounded interval.
+// grant. A stale grant is refreshed, and a node that has not yet adopted the
+// grant's authorization revision gets a bounded interval to converge. A
+// conflict from an authorization push still in flight, and a node whose uplink
+// is reconnecting, are retried the same way against the shorter budget.
 func (c *Client) nodeCall(ctx context.Context, wsID, op string, body func(g *proto.Grant) any, out any) error {
-	const attempts = 5
-	for attempt := 0; attempt < attempts; attempt++ {
+	start := time.Now()
+	backoff := 25 * time.Millisecond
+	for attempt := 0; ; attempt++ {
 		g, err := c.grant(ctx, wsID)
 		if err != nil {
 			return err
 		}
 		err = c.call(ctx, g.Node, op, body(g), out)
 		var pe *proto.Error
-		retryable := errors.As(err, &pe) &&
-			(pe.Code == proto.CodeConflict || pe.Code == proto.CodeUnreachable || pe.Code == proto.CodeUnauthorized)
-		if retryable && attempt+1 < attempts {
-			c.forgetGrant(wsID)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
+		if !errors.As(err, &pe) {
+			return err
+		}
+		var budget time.Duration
+		switch pe.Code {
+		case proto.CodeConflict, proto.CodeUnreachable:
+			budget = nodeCallRetryBudget
+		case proto.CodeUnauthorized:
+			if !staleGrantAuthority(pe) {
+				return err
 			}
+			budget = nodeCallConvergeBudget
+		default:
+			return err
+		}
+		// Drop the grant so the next attempt fetches one that reflects
+		// whatever the node has since adopted.
+		c.forgetGrant(wsID)
+		if attempt == 0 {
 			continue
 		}
-		return err
+		if time.Since(start) >= budget {
+			return err
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if backoff < 500*time.Millisecond {
+			backoff *= 2
+		}
 	}
-	return nil
+}
+
+func staleGrantAuthority(err *proto.Error) bool {
+	return err.Msg == "grant authorization revision or tenant is stale" ||
+		err.Msg == "grant authorization revision is stale" ||
+		err.Msg == "grant controller epoch is stale"
 }
 
 // ---------------------------------------------------------------------------
@@ -1375,6 +1446,7 @@ type Session struct {
 	exited       chan struct{}
 	closed       bool
 	attached     bool
+	subscription string
 	attachMu     sync.Mutex
 	inputMu      sync.Mutex
 	iseq         uint64
@@ -1456,11 +1528,14 @@ func (c *Client) OpenPort(ctx context.Context, wsID string, port int, options ..
 func (c *Client) Attach(ctx context.Context, wsID, sid string, from uint64) (*Session, error) {
 	s := c.newSession(sid, wsID, "")
 	s.next = from
+	s.subscription = ids.New("sub")
 	c.mu.Lock()
 	c.sessions[sid] = s
 	c.mu.Unlock()
 	var res proto.SOpenRes
-	err := c.nodeCall(ctx, wsID, proto.OpSAttach, func(g *proto.Grant) any { return proto.SAttachReq{S: sid, From: from, Grant: g} }, &res)
+	err := c.nodeCall(ctx, wsID, proto.OpSAttach, func(g *proto.Grant) any {
+		return proto.SAttachReq{S: sid, From: from, Subscription: s.subscription, Grant: g}
+	}, &res)
 	if err != nil {
 		c.mu.Lock()
 		delete(c.sessions, sid)
@@ -1731,11 +1806,11 @@ func (s *Session) reattach(ctx context.Context, generation uint64) {
 			s.mu.Unlock()
 			return
 		}
-		from, id, ws := s.next, s.ID, s.WS
+		from, id, ws, subscription := s.next, s.ID, s.WS, s.subscription
 		s.mu.Unlock()
 		var res proto.SOpenRes
 		err := s.c.nodeCall(ctx, ws, proto.OpSAttach, func(g *proto.Grant) any {
-			return proto.SAttachReq{S: id, From: from, Grant: g}
+			return proto.SAttachReq{S: id, From: from, Subscription: subscription, Grant: g}
 		}, &res)
 		if err == nil {
 			s.seedInputSeq(res.LastInputSeq)
@@ -1814,11 +1889,11 @@ func (s *Session) Signal(ctx context.Context, sig string) error {
 // Close detaches; kill also terminates the process.
 func (s *Session) Close(ctx context.Context, kill bool) error {
 	s.mu.Lock()
-	id, ws := s.ID, s.WS
+	id, ws, subscription := s.ID, s.WS, s.subscription
 	s.mu.Unlock()
 	s.fail(proto.Err(proto.CodeClosed, "session detached"))
 	return s.c.nodeCall(ctx, ws, proto.OpSClose, func(g *proto.Grant) any {
-		return proto.SCloseReq{S: id, Kill: kill, Grant: g}
+		return proto.SCloseReq{S: id, Kill: kill, Subscription: subscription, Grant: g}
 	}, nil)
 }
 

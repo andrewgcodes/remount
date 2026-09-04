@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/netip"
 	"os"
@@ -227,8 +228,15 @@ func TestRestoreLoadsBeforeResumeAndNeverStartsFresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := raw.(*handle).ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, endpoint()); err != nil {
+	h := raw.(*handle)
+	if got := h.RestoreProcesses(); got != proto.RestoreProcessesRestarted {
+		t.Fatalf("restore outcome before guest serviceability = %q", got)
+	}
+	if err := h.ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, endpoint()); err != nil {
 		t.Fatal(err)
+	}
+	if got := h.RestoreProcesses(); got != proto.RestoreProcessesPreserved {
+		t.Fatalf("restore outcome after guest serviceability = %q", got)
 	}
 	got := log.joined()
 	if !strings.Contains(got, "net-prepare,new-machine,load,resume,net-activate") {
@@ -341,6 +349,9 @@ func TestRevokedNetworkIsTerminalAndCannotLaunchSecondMachine(t *testing.T) {
 	if err := h.RevokeNetwork(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if got := log.joined(); !strings.HasSuffix(got, "kill,net-revoke") {
+		t.Fatalf("terminal revoke did not join the VMM before network cleanup: %s", got)
+	}
 	if err := h.ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, endpoint()); !errors.Is(err, proto.Err(proto.CodeClosed, "")) {
 		t.Fatalf("reapply after revoke err=%v", err)
 	}
@@ -368,18 +379,22 @@ func TestActiveGenerationReplayRejectsChangedBrokerIdentity(t *testing.T) {
 }
 
 func TestRestoreRejectsGenerationOlderThanCheckpointBeforeMachineLaunch(t *testing.T) {
-	b, log := fixture(t, true)
-	raw, err := b.Adopt(context.Background(), "ws_one")
-	if err != nil {
-		t.Fatal(err)
-	}
-	stale := endpoint()
-	stale.Generation = 5
-	if err := raw.(*handle).ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, stale); !errors.Is(err, proto.Err(proto.CodeDenied, "")) {
-		t.Fatalf("stale restore err=%v", err)
-	}
-	if strings.Contains(log.joined(), "new-machine") {
-		t.Fatalf("stale restore launched VMM: %s", log.joined())
+	for _, generation := range []uint64{5, 6} {
+		t.Run(fmt.Sprint(generation), func(t *testing.T) {
+			b, log := fixture(t, true)
+			raw, err := b.Adopt(context.Background(), "ws_one")
+			if err != nil {
+				t.Fatal(err)
+			}
+			stale := endpoint()
+			stale.Generation = generation
+			if err := raw.(*handle).ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, stale); !errors.Is(err, proto.Err(proto.CodeDenied, "")) {
+				t.Fatalf("stale restore err=%v", err)
+			}
+			if strings.Contains(log.joined(), "net-prepare") || strings.Contains(log.joined(), "new-machine") {
+				t.Fatalf("stale restore touched host resources: %s", log.joined())
+			}
+		})
 	}
 }
 

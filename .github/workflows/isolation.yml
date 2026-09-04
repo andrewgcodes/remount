@@ -34,28 +34,38 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y runsc
           runsc --version
+          sudo runsc install --runtime=runsc
+          sudo systemctl restart docker
+          for attempt in $(seq 1 30); do
+            docker info >/dev/null 2>&1 && break
+            if [ "$attempt" -eq 30 ]; then
+              echo "Docker did not recover after runsc registration" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          docker info --format '{{json .Runtimes}}' | grep -q '"runsc"'
       - name: Build disposable Alpine rootfs
         shell: bash
         run: |
           set -euo pipefail
-          container=$(docker create alpine:3.22)
+          container=$(docker create alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce)
           trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          sudo rm -rf /tmp/remount-gvisor-rootfs
           mkdir -p /tmp/remount-gvisor-rootfs
           docker export "$container" | sudo tar -C /tmp/remount-gvisor-rootfs -xf -
           CGO_ENABLED=0 GOOS=linux go build -o /tmp/rawprobe ./internal/workspace/gvisor/testdata/rawprobe
           sudo install -m 0755 /tmp/rawprobe /tmp/remount-gvisor-rootfs/rawprobe
-      - name: Run mechanism spike
+          CGO_ENABLED=0 GOOS=linux go build -o /tmp/udpprobe ./internal/workspace/gvisor/testdata/udpprobe
+          sudo install -m 0755 /tmp/udpprobe /tmp/remount-gvisor-rootfs/udpprobe
+      - name: Run gVisor isolation conformance
         shell: bash
         run: |
           set -euo pipefail
-          sudo env REMOUNT_GVISOR_ROOTFS=/tmp/remount-gvisor-rootfs ./scripts/gvisor-spike.sh
-      - name: Run backend denial and revoke conformance
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test -c -o /tmp/remount-gvisor.test ./internal/workspace/gvisor
-          sudo env REMOUNT_GVISOR_INTEGRATION=1 REMOUNT_GVISOR_ROOTFS=/tmp/remount-gvisor-rootfs \
-            /tmp/remount-gvisor.test -test.run '^TestE4DenialConformance$' -test.v -test.timeout=2m
+          REMOUNT_GVISOR_INTEGRATION=1 \
+          REMOUNT_GVISOR_ROOTFS=/tmp/remount-gvisor-rootfs \
+          REMOUNT_CHAOS_IMAGE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce \
+            ./scripts/gvisor-conformance.sh
       - name: Unit and race tests
         shell: bash
         run: |

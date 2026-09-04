@@ -84,7 +84,12 @@ func (n *Node) completeSessionLogRecord(id string, spec session.Spec, info proto
 	return n.callSessionLogControl(proto.OpSessionLogCommit, request, nil)
 }
 
+func sessionLogAuthority(w *ws) proto.Workspace {
+	return proto.Workspace{ID: w.ID, Generation: w.Generation, Tenant: w.Tenant}
+}
+
 func (n *Node) restoreSessionLog(ctx context.Context, w *ws, id string) (*session.Session, error) {
+	authority := sessionLogAuthority(w)
 	if !n.tieredSessionLogsEnabled() {
 		return nil, proto.Err(proto.CodeNotFound, "session %s", id)
 	}
@@ -96,14 +101,13 @@ func (n *Node) restoreSessionLog(ctx context.Context, w *ws, id string) (*sessio
 	}
 	var record proto.SessionLogRecord
 	if err := peer.Call(ctx, proto.PeerControl, proto.OpSessionLogGet, proto.SessionLogGetReq{
-		Session: id, Workspace: w.ID, Generation: w.Generation,
+		Session: id, Workspace: authority.ID, Generation: authority.Generation,
 	}, &record); err != nil {
 		return nil, err
 	}
-	if record.Workspace != w.ID || record.Tenant != w.Tenant || record.Session != id {
+	if record.Workspace != authority.ID || record.Tenant != authority.Tenant || record.Session != id {
 		return nil, proto.Err(proto.CodeConflict, "control returned a mismatched session log record")
 	}
-	authority := w.Workspace
 	store := &workspaceBlobStore{n: n, ctx: context.Background(), w: &authority}
 	return n.sessions.RestoreArchived(record, store)
 }

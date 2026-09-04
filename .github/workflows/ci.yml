@@ -33,10 +33,10 @@ jobs:
       - name: lock discipline
         run: ./scripts/lint-locks.sh .
       - name: test
-        run: go test -p 1 -count=1 -timeout 600s -skip '^(TestExecRoundTripCostOfTheDurableSessionTier|TestHandoffScaleAndControlFailover)$' ./...
+        run: go test -p 1 -count=1 -timeout 600s -skip '^(TestExecRoundTripCostOfTheDurableSessionTier|TestHandoffScaleAndControlFailover|TestPlanbPerfMoveIncompressible)$' ./...
       # The failure model lives in internal/sim and is where races would show.
       - name: race
-        run: go test -race -p 1 -count=1 -timeout 1200s -skip '^(TestExecRoundTripCostOfTheDurableSessionTier|TestHandoffScaleAndControlFailover)$' ./...
+        run: go test -race -p 1 -count=1 -timeout 1200s -skip '^(TestExecRoundTripCostOfTheDurableSessionTier|TestHandoffScaleAndControlFailover|TestPlanbPerfMoveIncompressible)$' ./...
       - name: record hosted-runner measurement debt
         if: always()
         run: |
@@ -47,7 +47,10 @@ jobs:
             echo '- `TestExecRoundTripCostOfTheDurableSessionTier`: process-start overhead can mask the artifact-tier seal cost.'
             echo '- `TestHandoffScaleAndControlFailover`:'
             echo 'under hosted-runner load, the 200-session post-restart reattach deadline is not reliable.'
-            echo 'Both exact tests remain in `make test`, `make race`, and focused developer runs.'
+            echo '- `TestPlanbPerfMoveIncompressible`: a shared runner measured 17.9 MB/s against'
+            echo 'the 20 MB/s floor on the same commit that runs at 188 MB/s on a dedicated host,'
+            echo 'so this lane measures runner I/O contention rather than the move path.'
+            echo 'All three exact tests remain in `make test`, `make race`, and focused developer runs.'
           } >> "$GITHUB_STEP_SUMMARY"
 
   windows-test:

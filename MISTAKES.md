@@ -1224,3 +1224,51 @@ That playbook is also the cross-cutting pattern analysis for mistakes 23-41:
 truth must survive asynchronous boundaries, authorization must be revalidated
 at use, destructive work waits for durable commit, every retained structure is
 bounded, and verification must distinguish success from work that never ran.
+
+---
+
+## 49. I fixed the retry in the function the failing call does not use
+
+A macOS CI lane failed one installs test:
+
+```
+consumer: unreachable: workspace source node n_... is unavailable;
+          destroy remains uncommitted
+...
+level=WARN msg="uplink lost; reconnecting" backoff=100ms
+```
+
+The node's uplink dropped for a few hundred milliseconds and a destroy landed
+in the gap. I had just merged two versions of `Client.nodeCall`, one of which
+retries `CodeUnreachable`, so I read the failure as confirmation that its retry
+budget was wrong, and spent two rounds tuning it: first bounding it by attempt
+count, then noticing the bound waited *less* than the version it replaced
+(175 ms against roughly a second) and replacing it with a per-code budget.
+
+All of that was work on a function this call never enters.
+`DestroyWorkspace` calls `c.call(ctx, proto.PeerControl, ...)` directly.
+`nodeCall` is for calls addressed to a *node*; destroy is addressed to
+*control*. And `c.call` retries only `transport.ErrClosed` — the client's own
+socket — so a `CodeUnreachable` that control returns as a value was never
+retried by anything, at any budget.
+
+Two things made this easy to get wrong. The error code was the same one
+`nodeCall` retries, so the fix I had just been editing looked like the fix.
+And the retry I was tuning was real and worth having, so every test I ran kept
+passing; nothing contradicted me.
+
+The per-code budget was still right to keep, and the destroy retry is a
+separate change with its own test. But the first two rounds bought nothing,
+and I would have skipped both by opening `DestroyWorkspace` before opening the
+retry loop.
+
+**Lesson.** When a failure names an error, find the call that produced it and
+read *that* function's caller before touching the code that handles the same
+error elsewhere. A shared error code is not a shared code path. The question
+that settles it in one step is not "where is this error retried?" but "what
+does this specific caller do next?" — and the answer here was: it returns.
+
+The corollary for verification: that a fix's tests pass is not evidence the fix
+reaches the failure. What proves it is a test that fails before the change.
+Both destroy tests do; the first `nodeCall` bound had none, which is exactly
+why it survived two rounds of being wrong.

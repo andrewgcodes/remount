@@ -71,7 +71,9 @@ resource behind:
   below netfilter's IP hooks, so the output chain never saw them and every
   forbidden destination crossed the veth. Containment came only from Docker's
   default `FORWARD policy drop`; with `FORWARD ACCEPT` a sandbox reached 8.8.8.8
-  and was answered. Now carried by a netdev egress chain on the workspace veth.
+  and was answered. Now carried by a `clsact` egress classifier on the
+  workspace veth, with the host nftables ingress rule retained as defense in
+  depth.
 - an `nsfs` mount leaked per workspace on the successful path. Now released in
   `execRuntime.destroy`.
 

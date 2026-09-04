@@ -1,0 +1,22 @@
+candidate=8d27d6d036e246e837d685bc6e4e74c007e96908
+host=Linux 5.15.200 x86_64 GNU/Linux
+Firecracker v1.16.1
+Jailer v1.16.1
+firecracker_sha256=2fd0171309af7e24cf8dafc8a6f921c1434c49b5f9349bb996b7ed0a4deb8aa7
+jailer_sha256=1f3a0c1fe86212d0001819bfe0819071c01208b3ccc939c8b3bc1b84cf21edd
+kernel_sha256=e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2
+rootfs_sha256=2aa1b97ed499d804e4113a1300c99d7495e61a916d9a9409f092643e00c9fb80
+guest_manifest_sha256=25cc5440a8683c943775ae345bca637de48531b3d81c8a53ef909ab653658961
+guest_binary_sha256=f9ad7fd58b39d4b66213c910e6b36459b34adf79aac205624ccedd9d92a1ac56
+guest_protocol=1
+guest_vsock_port=10789
+
+ok  	remount.dev/remount/internal/workspace/firecracker	0.036s
+=== RUN   TestB29FirecrackerHostSmoke
+--- PASS: TestB29FirecrackerHostSmoke (4.70s)
+=== RUN   TestB29FirecrackerCheckpointMoveRestore
+--- PASS: TestB29FirecrackerCheckpointMoveRestore (23.84s)
+=== RUN   TestDiskFullRestoreStagingFailsClosedAndCleansUp
+--- PASS: TestDiskFullRestoreStagingFailsClosedAndCleansUp (0.00s)
+PASS
+PASS: Firecracker B29 exact-host conformance, lifecycle failure proofs and cleanup

@@ -99,8 +99,9 @@ type Session struct {
 	timeout     *time.Timer
 	outputReady chan struct{} // pumps wait until StreamInfo is committed at seq 0
 	logErr      error
-	onFinish    func() // commits manager accounting before exited is closed
-	closeReason string // recorded in the exit chunk when the node ends the session
+	onComplete  func(proto.ExitInfo, LogRecord) error // commits durability before exited is closed
+	onFinish    func()                                // commits manager accounting before exited is closed
+	closeReason string                                // recorded in the exit chunk when the node ends the session
 	// onSignal is how a record-only session (kind acp) hears a kill: there is
 	// no process, so the owner that appends to it decides what stopping means.
 	onSignal func(name string)
@@ -163,6 +164,15 @@ func (s *Session) Wait(ctx context.Context) (*proto.ExitInfo, error) {
 	}
 }
 
+// alreadyClosed reports whether err is the close of something already closed.
+// Delivering EOF twice is not a failure: the second close means the first took
+// effect. The two runtimes disagree about which sentinel says so — a pipe
+// reports os.ErrClosed, a socket net.ErrClosed — and errors.Is does not relate
+// them, so a port session that had lost its peer used to fail an ordinary EOF.
+func alreadyClosed(err error) bool {
+	return err == nil || errors.Is(err, os.ErrClosed) || errors.Is(err, net.ErrClosed)
+}
+
 // Input writes to the process. Inputs carry a client-side sequence; an iseq
 // at or below the last applied one is a retry and is dropped (idempotent).
 func (s *Session) Input(iseq uint64, data []byte, eof bool) error {
@@ -191,16 +201,16 @@ func (s *Session) Input(iseq uint64, data []byte, eof bool) error {
 	}
 	if eof {
 		if running != nil {
-			if err := running.CloseWrite(); err != nil {
+			if err := running.CloseWrite(); !alreadyClosed(err) {
 				return proto.Err(proto.CodeClosed, "stdin close: %v", err)
 			}
 		} else if kind == proto.SessionExec {
-			if err := stdin.Close(); err != nil {
+			if err := stdin.Close(); !alreadyClosed(err) {
 				return proto.Err(proto.CodeClosed, "stdin close: %v", err)
 			}
 		} else if kind == proto.SessionPort {
 			if cw, ok := conn.(interface{ CloseWrite() error }); ok {
-				if err := cw.CloseWrite(); err != nil {
+				if err := cw.CloseWrite(); !alreadyClosed(err) {
 					return proto.Err(proto.CodeClosed, "stdin close: %v", err)
 				}
 			}
@@ -329,11 +339,32 @@ func (s *Session) finish(info proto.ExitInfo) {
 		}
 		s.mu.Unlock()
 	}
+	s.mu.Lock()
+	finalInfo := *s.exit
+	s.mu.Unlock()
 	// A successful Wait must mean that the active-session admission slot is
-	// reusable. Commit manager accounting before publishing session exit; doing
-	// this in an observer after close(s.exited) left a scheduler-sized window in
-	// which a completed process could still spuriously exhaust active capacity.
-	_ = s.Log.closeWithPublish(func() {
+	// reusable and any advertised durable replay record is complete. Commit
+	// both before publishing session exit; doing either in an observer after
+	// close(s.exited) leaves a node-loss window after the client observes EOF.
+	var finalCommit func(LogRecord) error
+	if s.onComplete != nil {
+		finalCommit = func(record LogRecord) error {
+			return s.onComplete(finalInfo, record)
+		}
+	}
+	_ = s.Log.closeWithPublish(finalCommit, func(commitErr error) {
+		if commitErr != nil {
+			s.mu.Lock()
+			failed := *s.exit
+			message := "session log completion: " + commitErr.Error()
+			if failed.Error == "" {
+				failed.Error = message
+			} else {
+				failed.Error += "; " + message
+			}
+			s.exit = &failed
+			s.mu.Unlock()
+		}
 		if onFinish != nil {
 			onFinish()
 		}
@@ -787,6 +818,17 @@ func (m *Manager) OpenOrReplay(spec Spec) (s *Session, created bool, err error) 
 		ID: id, WS: spec.WS, Kind: spec.Kind, Log: log, exited: make(chan struct{}), observed: make(chan struct{}), startDone: make(chan struct{}), outputReady: make(chan struct{}), Principal: spec.Principal, Tenant: spec.Tenant,
 		Info: proto.SessionInfo{ID: id, WS: spec.WS, Kind: spec.Kind, Program: spec.Program, OpenedAt: time.Now().UnixMilli(), Run: spec.Run},
 	}
+	s.onComplete = func(info proto.ExitInfo, record LogRecord) error {
+		if m.opts.CompleteSessionLogRecord != nil {
+			if err := m.opts.CompleteSessionLogRecord(s.ID, spec, s.Info, info, record); err != nil {
+				if m.opts.OnRecordError != nil {
+					m.opts.OnRecordError(s.ID, err)
+				}
+				return err
+			}
+		}
+		return nil
+	}
 	s.onFinish = func() { m.markInactive(id, s) }
 	m.sessions[id] = s
 	m.byWS[spec.WS]++
@@ -798,7 +840,7 @@ func (m *Manager) OpenOrReplay(spec Spec) (s *Session, created bool, err error) 
 	}
 	m.mu.Unlock()
 	m.observers.Add(1)
-	go m.observe(s, spec)
+	go m.observe(s)
 	defer close(s.startDone)
 
 	var startErr error
@@ -862,16 +904,11 @@ func sessionFingerprint(spec Spec) [32]byte {
 	return sha256.Sum256(proto.MustMarshal(copySpec))
 }
 
-func (m *Manager) observe(s *Session, spec Spec) {
+func (m *Manager) observe(s *Session) {
 	defer m.observers.Done()
 	defer close(s.observed)
 	<-s.exited
 	info := *s.ExitInfo()
-	if m.opts.CompleteSessionLogRecord != nil {
-		if err := m.opts.CompleteSessionLogRecord(s.ID, spec, s.Info, info, s.Log.Record()); err != nil && m.opts.OnRecordError != nil {
-			m.opts.OnRecordError(s.ID, err)
-		}
-	}
 	if m.opts.OnExit != nil {
 		m.opts.OnExit(s, info)
 	}

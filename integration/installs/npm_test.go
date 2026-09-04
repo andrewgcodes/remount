@@ -177,7 +177,24 @@ func TestB32ALinkedNpmInstallIsCaught(t *testing.T) {
 		[]byte(`{"name":"b32-linked","version":"0.0.0","private":true,"type":"module"}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out, err := runCleanErr(t, install, cleanEnv(t), npm, "link", "--no-audit", "--no-fund", "--omit=dev",
+	// `npm link <dir>` writes the link into npm's *global* prefix, so without
+	// a prefix of our own the test both depends on and mutates the runner's
+	// global npm state. On a Windows runner that directory does not exist at
+	// all and npm fails with ENOENT rather than creating it. A per-test prefix
+	// removes the dependency and the side effect together.
+	prefix := t.TempDir()
+	// npm expects the global tree to exist and will not create it: POSIX npm
+	// resolves <prefix>/lib/node_modules, Windows npm <prefix>\node_modules.
+	for _, dir := range []string{
+		filepath.Join(prefix, "lib", "node_modules"),
+		filepath.Join(prefix, "node_modules"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := runCleanErr(t, install, cleanEnv(t, "npm_config_prefix="+prefix), npm,
+		"link", "--no-audit", "--no-fund", "--omit=dev",
 		filepath.Join(root, "sdk", "typescript"))
 	skipIfOffline(t, "npm link of the package directory", out, err)
 
