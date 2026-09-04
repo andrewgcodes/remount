@@ -50,12 +50,12 @@ func TestHelmGoldenTemplateIsCurrent(t *testing.T) {
 	// property of the chart. Helm 3 and 4 disagree about where a `---`
 	// separator goes and whether a trailing empty document is emitted, so a
 	// byte comparison is really a comparison against whichever helm the runner
-	// ships. And a Windows checkout stores the golden with CRLF, which helm
-	// never emits.
+	// ships. And line endings differ on Windows on *both* sides: the checkout
+	// stores the golden with CRLF, and helm writes CRLF there too.
 	//
 	// Everything this test exists to catch survives both normalisations: chart
 	// drift changes a document's content, and any such change still shows up.
-	goldenText := strings.ReplaceAll(string(golden), "\r\n", "\n")
+	goldenText := string(golden)
 	if sameDocuments(rendered, goldenText) {
 		return
 	}
@@ -68,9 +68,21 @@ func TestHelmGoldenTemplateIsCurrent(t *testing.T) {
 }
 
 func TestHelmGoldenComparisonNormalizesWindowsCheckouts(t *testing.T) {
-	golden := strings.ReplaceAll("line one\r\nline two\r\n", "\r\n", "\n")
-	if diff := firstDifference(golden, "line one\nline two\n"); diff != nil {
-		t.Fatalf("line-ending-only difference = %v", diff)
+	// Both sides carry CRLF on Windows, and a difference confined to an
+	// interior line is the one that TrimSpace cannot reach.
+	crlf := "apiVersion: v1\r\nkind: Service\r\nmetadata:\r\n  name: n\r\n"
+	lf := "apiVersion: v1\nkind: Service\nmetadata:\n  name: n\n"
+	for _, c := range []struct{ name, a, b string }{
+		{"golden crlf", crlf, lf},
+		{"rendered crlf", lf, crlf},
+		{"both crlf", crlf, crlf},
+	} {
+		if !sameDocuments(c.a, c.b) {
+			t.Errorf("%s: line-ending-only difference compared unequal", c.name)
+		}
+	}
+	if sameDocuments(lf, "apiVersion: v1\nkind: Service\nmetadata:\n  name: other\n") {
+		t.Error("a real content difference compared equal")
 	}
 }
 
@@ -199,6 +211,11 @@ func TestTheChartOwnsNoWorkspaceLifecycle(t *testing.T) {
 // deliberately textual: the point is to ignore how helm punctuated the stream,
 // not to interpret the YAML.
 func documents(stream string) []string {
+	// Normalise here rather than at the call sites: TrimSpace below only
+	// reaches each document's edges, so a CRLF on an interior line survives
+	// and makes two identical documents compare unequal — printing a diff
+	// whose two sides look character-for-character the same.
+	stream = strings.ReplaceAll(stream, "\r\n", "\n")
 	var out []string
 	for _, doc := range strings.Split(stream, "\n---") {
 		if trimmed := strings.TrimSpace(doc); trimmed != "" {

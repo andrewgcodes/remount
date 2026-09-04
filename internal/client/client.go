@@ -398,9 +398,38 @@ func (c *Client) ListWorkspaces(ctx context.Context) ([]proto.Workspace, error) 
 }
 
 // DestroyWorkspace destroys a workspace.
+//
+// Control refuses to commit a destroy while the workspace's node is offline,
+// and says so: the operation "remains uncommitted". A node whose uplink is
+// reconnecting is offline for a few backoff intervals, so that refusal is
+// retried against the same bounded budget nodeCall uses. Retrying is safe
+// precisely because control declined to commit anything, and the request
+// carries the caller's idempotency key either way.
 func (c *Client) DestroyWorkspace(ctx context.Context, id string, options ...OperationOption) error {
 	idem, _ := operationKey(options)
-	return c.call(ctx, proto.PeerControl, proto.OpWSDestroy, proto.WSGetReq{ID: id, IdempotencyKey: idem}, nil)
+	req := proto.WSGetReq{ID: id, IdempotencyKey: idem}
+	start := time.Now()
+	backoff := 25 * time.Millisecond
+	for {
+		err := c.call(ctx, proto.PeerControl, proto.OpWSDestroy, req, nil)
+		var pe *proto.Error
+		if !errors.As(err, &pe) || pe.Code != proto.CodeUnreachable {
+			return err
+		}
+		if time.Since(start) >= nodeCallRetryBudget {
+			return err
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if backoff < 500*time.Millisecond {
+			backoff *= 2
+		}
+	}
 }
 
 // MoveWorkspace snapshots and re-queues a workspace with new requirements.
@@ -918,18 +947,25 @@ func (c *Client) forgetGrant(wsID string) {
 	c.mu.Unlock()
 }
 
-// nodeCallRetryAttempts bounds retries for a node that reports a conflict or is
-// unreachable. A node that is simply gone must fail fast; only an authorization
-// revision that has not converged earns the longer deadline inside nodeCall.
-const nodeCallRetryAttempts = 5
+const (
+	// nodeCallConvergeBudget bounds the wait for a node that has not yet
+	// adopted the grant's authorization revision.
+	nodeCallConvergeBudget = 15 * time.Second
+	// nodeCallRetryBudget bounds the wait for a node that reports a conflict or
+	// is unreachable. A node whose uplink is reconnecting returns within a few
+	// backoff intervals, but one that is genuinely gone must not hold the
+	// caller for the whole convergence budget: every filesystem and session
+	// call takes this path.
+	nodeCallRetryBudget = 5 * time.Second
+)
 
 // nodeCall performs a request against the node holding wsID, attaching a
 // grant. A stale grant is refreshed, and a node that has not yet adopted the
 // grant's authorization revision gets a bounded interval to converge. A
-// conflict from an authorization push still in flight is retried the same way,
-// but only nodeCallRetryAttempts times.
+// conflict from an authorization push still in flight, and a node whose uplink
+// is reconnecting, are retried the same way against the shorter budget.
 func (c *Client) nodeCall(ctx context.Context, wsID, op string, body func(g *proto.Grant) any, out any) error {
-	deadline := time.Now().Add(15 * time.Second)
+	start := time.Now()
 	backoff := 25 * time.Millisecond
 	for attempt := 0; ; attempt++ {
 		g, err := c.grant(ctx, wsID)
@@ -941,28 +977,25 @@ func (c *Client) nodeCall(ctx context.Context, wsID, op string, body func(g *pro
 		if !errors.As(err, &pe) {
 			return err
 		}
+		var budget time.Duration
 		switch pe.Code {
 		case proto.CodeConflict, proto.CodeUnreachable:
-			// A node that is simply gone must not hold the caller for the whole
-			// convergence interval, so these get a bounded number of attempts
-			// rather than the deadline below.
-			if attempt+1 >= nodeCallRetryAttempts {
-				return err
-			}
+			budget = nodeCallRetryBudget
 		case proto.CodeUnauthorized:
 			if !staleGrantAuthority(pe) {
 				return err
 			}
+			budget = nodeCallConvergeBudget
 		default:
 			return err
 		}
-		// Retryable. Drop the grant so the next attempt fetches one that
-		// reflects whatever the node has since adopted.
+		// Drop the grant so the next attempt fetches one that reflects
+		// whatever the node has since adopted.
 		c.forgetGrant(wsID)
 		if attempt == 0 {
 			continue
 		}
-		if !time.Now().Before(deadline) {
+		if time.Since(start) >= budget {
 			return err
 		}
 		timer := time.NewTimer(backoff)
