@@ -88,7 +88,7 @@ modal-smoke:
 # packages. Run them under the race detector so this target cannot become a
 # documentation-only success gate again.
 conformance:
-	go test -race -count=1 -timeout 1200s \
+	go test -race -count=1 -p=1 -timeout 1200s \
 		./internal/artifact ./internal/broker ./internal/client ./internal/control \
 		./internal/fsops ./internal/node ./internal/proto ./internal/relay \
 		./internal/server ./internal/session ./internal/sim ./internal/transport \

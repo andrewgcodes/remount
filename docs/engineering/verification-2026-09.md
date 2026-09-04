@@ -1339,3 +1339,112 @@ prerequisites; none was upgraded to passed. Distribution and evidence
 artifacts stayed local and no release, tag, image, package or signed artifact
 was published. **Status: verified on the committed candidate; aggregate
 remains incomplete because its 16 required unavailable rows are unwired.**
+
+### Durable completion failure and CI transport/performance repairs, 2026-09-04
+
+Automated review found that the synchronous session-log seal still discarded a
+failed final `CompleteSessionLogRecord`. The log now retains the completion
+error, keeps the terminal chunk hidden, and returns `ErrIncompleteLog` instead
+of EOF. `session.finish` adds the persistence failure to the terminal
+`ExitInfo` before `Session.Wait` can return, while preserving partial segment
+records and `OnRecordError`. Node subscriptions translate the incomplete-log
+boundary into the failed exit chunk so an attached client does not hang.
+Deterministic regressions verify the failed wait/exit result, callback delivery,
+preserved blob segments, rejected incomplete restart replay, and subscriber
+failure delivery.
+
+The wired-shell evidence runner now treats exit 77 as unavailable only when the
+output contains a non-empty `UNAVAILABLE:` or `unavailable:` reason. Missing
+`socat` and `setsid` cases remain unavailable; an unexplained exit 77 remains a
+failure, and the existing unexplained Go-skip rejection is unchanged.
+
+Focused verification:
+
+```sh
+go test -count=1 \
+  -run 'TestWaitBlocksUntilDurableCompletionRecordCommits|TestDurableCompletionFailureIsObservableAndReplayStaysIncomplete' \
+  -v -timeout 60s ./internal/session
+go test -count=20 \
+  -run 'TestSubscriptionReportsDurableCompletionFailure|TestReplacingSessionCursorDoesNotCancelSharedPeerWrite|TestStaleSessionDetachDoesNotCancelReplacementCursor' \
+  -timeout 120s ./internal/node
+go test -race -count=20 \
+  -run 'TestWaitBlocksUntilDurableCompletionRecordCommits|TestDurableCompletionFailureIsObservableAndReplayStaysIncomplete' \
+  -timeout 300s ./internal/session
+go test -race -count=20 \
+  -run 'TestSubscriptionReportsDurableCompletionFailure' \
+  -timeout 300s ./internal/node
+go test -count=1 -timeout 180s ./internal/session ./internal/node
+go test -race -count=1 -timeout 300s ./internal/session ./internal/node
+```
+
+Every focused command passed.
+
+The S3 compatibility job then reproduced `http: server closed idle connection`
+inside the pinned MinIO lane. The same image and test configuration reproduced
+the failure locally with the prior 25-second idle timeout on a fresh store,
+proving that expiry shorter than a conventional load-balancer timeout did not
+cover endpoints that close a reusable connection immediately. Retrying a
+conditional write after losing its response would be ambiguous, so the
+store-owned default transport now uses a fresh connection instead; a
+caller-supplied HTTP client remains untouched.
+
+Verification against the pinned local MinIO:
+
+```sh
+go test -race -count=1 -run '^TestMinIOIntegration$' \
+  -v -timeout 180s ./internal/artifact/s3
+go test -race -count=20 -run '^TestMinIOControlFailoverE10Core$' \
+  -v -timeout 600s ./integration/failover
+```
+
+The integration passed once and the exact failover core passed 20
+repetitions. The disposable MinIO container was removed after verification.
+
+The conformance job also measured the unchanged incompressible-move floor at
+18.5 MB/s while all conformance packages competed under the race detector.
+Three isolated race repetitions on the same implementation measured 45.0 to
+52.1 MB/s. The 20 MB/s lower bound remains unchanged; `make conformance` now
+runs its packages serially so the physical throughput assertion measures the
+move rather than concurrent package load. The complete conformance command
+passed with `internal/sim` in 399.083 seconds, and the complete race command
+passed with `internal/sim` in 376.935 seconds.
+
+While the final verification was running, `origin/main` advanced from
+`7d1bc8ddbc055be9f57e157bac1915c0cadbe876` to
+`4b05a46834a4a84fd5a812296c280031fc603802`. The new commit changed only the
+Linux handoff documentation and added a session-wrap document. It was merged
+without conflict as `712f4e2a0494c301126bb6232250cf7baf43ea51`.
+
+Post-merge compatibility verification:
+
+```sh
+make docs
+make race
+make conformance
+```
+
+`make docs` regenerated both LLM indexes without changing either file.
+`make race` passed with `internal/sim` in 370.804 seconds. The serial
+conformance target passed with `internal/sim` in 368.098 seconds. The complete
+non-race `make` gate had passed immediately before the documentation-only
+upstream change with the same implementation candidate.
+
+The final pre-stage fetch then found two more upstream fixes at
+`66db37c6b3e8da81bdf200b54ab908fd2d5127e5`: Helm 3/4 document comparison,
+host-sized scale simulation, and container-user model-catalog creation. The
+branch merged them without conflict. The exact affected tests passed under the
+race detector:
+
+```sh
+go test -race -count=1 -p=1 \
+  -run 'TestHelmLint|TestHelmGoldenTemplateIsCurrent|TestHelmRefusesATwoOwnerConfiguration|TestTheChartOwnsNoWorkspaceLifecycle|TestPlanBOpenCodeDeterministicModelLane|TestHandoffScaleAndControlFailover' \
+  -timeout 1200s ./integration/policy ./internal/sim
+```
+
+The policy package passed in 1.284 seconds and the simulation package in
+88.646 seconds.
+
+No public output was published. **Status: implementation and post-upstream
+race/conformance compatibility verification complete; committed-candidate
+aggregate and built-binary conformance remain to be rerun after the final
+commit.**
