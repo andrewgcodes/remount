@@ -847,3 +847,45 @@ func TestACallerSuppliedHTTPClientIsNotRewritten(t *testing.T) {
 		t.Fatalf("a caller-supplied transport was replaced with %T", store.httpClient.Transport)
 	}
 }
+
+func TestConditionalWritesDoNotReuseConnections(t *testing.T) {
+	tests := []struct {
+		name string
+		opts PutOptions
+	}{
+		{name: "If-None-Match", opts: PutOptions{IfNoneMatch: "*"}},
+		{name: "If-Match", opts: PutOptions{IfMatch: "etag"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transport := &preconditionTransport{}
+			store, err := New(Config{
+				Endpoint: "http://s3.test", Region: "us-east-1", Bucket: "bucket",
+				AccessKeyID: "access", SecretAccessKey: "secret",
+				HTTPClient: &http.Client{Transport: transport},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.PutObject(context.Background(), "object", strings.NewReader("body"), 4, test.opts); !errors.Is(err, ErrPreconditionFailed) {
+				t.Fatalf("PutObject error = %v, want ErrPreconditionFailed", err)
+			}
+			if !transport.requestClose {
+				t.Fatal("conditional PUT allowed its connection to return to the idle pool")
+			}
+		})
+	}
+}
+
+type preconditionTransport struct {
+	requestClose bool
+}
+
+func (t *preconditionTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.requestClose = req.Close
+	return &http.Response{
+		StatusCode: http.StatusPreconditionFailed,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("<Error><Code>PreconditionFailed</Code></Error>")),
+	}, nil
+}

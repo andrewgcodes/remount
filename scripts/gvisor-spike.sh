@@ -10,7 +10,7 @@ if [[ $(id -u) -ne 0 ]]; then
   exit 77
 fi
 
-for binary in ip nft runsc socat; do
+for binary in ip mountpoint nft runsc socat umount; do
   if ! command -v "$binary" >/dev/null; then
     echo "unavailable: $binary is required" >&2
     exit 77
@@ -39,6 +39,7 @@ cleanup() {
   if [[ -n $broker_pid ]]; then kill "$broker_pid" >/dev/null 2>&1 || true; fi
   ip link delete "$host_if" >/dev/null 2>&1 || true
   ip netns delete "$namespace" >/dev/null 2>&1 || true
+  if mountpoint -q "$state/null-netns"; then umount "$state/null-netns"; fi
   rm -rf -- "$spike_dir"
 }
 trap cleanup EXIT

@@ -121,7 +121,22 @@ The spike now mirrors the production boundary with a netdev egress chain on
 the namespace veth. Its final counter-and-drop rule directly proves the
 connectionless UDP frame reached the deny-first policy; unlike `nc -u` exit
 status, that assertion does not confuse a locally accepted send with escaped
-traffic.
+traffic. The corrected denial probe passed every E4 check, then exposed a
+separate cleanup defect: runsc left its state-root `null-netns` mount attached,
+so recursive removal failed with `Device or resource busy`. Cleanup now
+unmounts that runsc-owned mount after deleting the sandbox and before removing
+the temporary state directory.
+
+**A MinIO precondition response poisoned the next write connection.** The
+`s3-compatibility` lane repeatedly failed `TestMinIOIntegration` in
+`internal/artifact/s3` with `EOF` or `http: server closed idle connection` on
+the private conditional probe. Local repetitions reproduced both errors.
+MinIO closes some connections after returning the expected HTTP 412 response;
+depending on close timing, that connection can briefly remain selectable for
+the next non-replayable PUT. The client does not retry an ambiguous write.
+Conditional PUTs now opt out of connection reuse, so a precondition response
+cannot poison the next write. A transport-level regression test pins that
+behavior.
 
 **A Windows-hosted Docker conformance run selected Windows commands for a
 Linux workspace.** Command selection was compiled from the runner's OS, so
