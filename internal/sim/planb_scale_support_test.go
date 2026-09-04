@@ -178,6 +178,18 @@ func planbScaleSize(t *testing.T, full, short int) int {
 	return full
 }
 
+func planbScaleSizeFromEnv(t *testing.T, name string, full, short int) int {
+	t.Helper()
+	if raw := os.Getenv(name); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			t.Fatalf("%s=%q: want a positive integer", name, raw)
+		}
+		return parsed
+	}
+	return planbScaleSize(t, full, short)
+}
+
 // planbScaleGrowth reports the fractional growth of b over a, and 0 when a is
 // zero and b is not positive.
 func planbScaleGrowth(a, b uint64) float64 {

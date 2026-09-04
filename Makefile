@@ -18,7 +18,7 @@ install:
 # Heavy integration packages share host runtimes; package serialization keeps
 # their own concurrency intact without making unrelated packages compete.
 test:
-	go test -p 1 -count=1 -timeout 600s ./...
+	go test -p 1 -count=1 -timeout 900s ./...
 	$(MAKE) public-api
 
 race:

@@ -66,6 +66,22 @@ func TestShortValuesDoNotDrownTheScanInFalsePositives(t *testing.T) {
 	}
 }
 
+func TestHostPrerequisiteValuesAreNotCredentials(t *testing.T) {
+	lookup := fakeEnv(map[string]string{
+		"REMOUNT_FIRECRACKER_CGROUP_PARENT": "remount",
+		"E2B_API_KEY":                       "e2b_0123456789abcdef0123",
+	})
+	findings := ScanEnvValues(
+		"gate log",
+		"remount e2b_0123456789abcdef0123",
+		credentialEnv([]string{"REMOUNT_FIRECRACKER_CGROUP_PARENT", "E2B_API_KEY"}),
+		lookup,
+	)
+	if len(findings) != 1 || findings[0].Rule != "env-value:E2B_API_KEY" {
+		t.Fatalf("credential findings = %v", findings)
+	}
+}
+
 func TestSecretShapedStringsAreFound(t *testing.T) {
 	cases := map[string]string{
 		"openai-key":        Canary,

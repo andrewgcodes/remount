@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +24,50 @@ import (
 	"remount.dev/remount/internal/volume"
 	"remount.dev/remount/internal/workspace"
 )
+
+type cancelClosingConn struct {
+	sendStarted chan struct{}
+	releaseSend chan struct{}
+	closed      chan struct{}
+	startOnce   sync.Once
+	closeOnce   sync.Once
+}
+
+func newCancelClosingConn() *cancelClosingConn {
+	return &cancelClosingConn{
+		sendStarted: make(chan struct{}),
+		releaseSend: make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
+}
+
+func (c *cancelClosingConn) Send(ctx context.Context, f *proto.Frame) error {
+	if f.T != proto.KindChunk {
+		return nil
+	}
+	c.startOnce.Do(func() { close(c.sendStarted) })
+	select {
+	case <-ctx.Done():
+		_ = c.Close()
+		return ctx.Err()
+	case <-c.releaseSend:
+		return nil
+	}
+}
+
+func (c *cancelClosingConn) Recv(ctx context.Context) (*proto.Frame, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.closed:
+		return nil, transport.ErrClosed
+	}
+}
+
+func (c *cancelClosingConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
 
 func newTestNode(t *testing.T, configure func(*Options)) *Node {
 	t.Helper()
@@ -38,6 +83,117 @@ func newTestNode(t *testing.T, configure func(*Options)) *Node {
 	}
 	t.Cleanup(n.shutdown)
 	return n
+}
+
+func TestReplacingSessionCursorDoesNotCancelSharedPeerWrite(t *testing.T) {
+	n := newTestNode(t, nil)
+	s, err := n.sessions.Open(session.Spec{WS: "ws_cursor", Kind: proto.SessionExec, Program: []string{"/bin/cat"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { n.sessions.Remove(s.ID, true) })
+
+	conn := newCancelClosingConn()
+	p := transport.NewPeer(conn, nil)
+	t.Cleanup(func() { _ = p.Close() })
+
+	n.subscribe(p, "c_cursor", s, 0, "")
+	select {
+	case <-conn.sendStarted:
+	case <-time.After(time.Second):
+		t.Fatal("initial cursor did not start its chunk write")
+	}
+
+	n.subscribe(p, "c_cursor", s, 0, "")
+	select {
+	case <-p.Done():
+		t.Fatalf("replacing the cursor closed the shared peer: %v", p.Err())
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(conn.releaseSend)
+}
+
+func TestStaleSessionDetachDoesNotCancelReplacementCursor(t *testing.T) {
+	n := newTestNode(t, nil)
+	s, err := n.sessions.Open(session.Spec{WS: "ws_cursor", Kind: proto.SessionExec, Program: []string{"/bin/cat"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { n.sessions.Remove(s.ID, true) })
+
+	conn := newCancelClosingConn()
+	p := transport.NewPeer(conn, nil)
+	t.Cleanup(func() { _ = p.Close() })
+
+	n.subscribe(p, "c_cursor", s, 0, "sub_old")
+	n.subscribe(p, "c_cursor", s, 0, "sub_new")
+	n.unsubscribe("c_cursor", s.ID, "sub_old")
+
+	n.mu.Lock()
+	current := n.subs["c_cursor|"+s.ID]
+	n.mu.Unlock()
+	if current == nil || current.subscription != "sub_new" {
+		t.Fatal("stale detach removed the replacement cursor")
+	}
+	close(conn.releaseSend)
+}
+
+func TestSubscriptionReportsDurableCompletionFailure(t *testing.T) {
+	n := newTestNode(t, nil)
+	n.sessions.Close()
+	store, err := artifact.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitErr := errors.New("complete record rejected")
+	n.sessions = session.NewManager(session.ManagerOptions{
+		SpillDir: t.TempDir(), MemBytes: 1, SpillBytes: 1 << 20, MaxChunk: 16, SegmentBytes: 64,
+		Retention:          time.Hour,
+		BlobStoreForTenant: func(string) (artifact.BlobStore, error) { return store, nil },
+		CommitSessionLogRecord: func(string, session.Spec, session.LogRecord) error {
+			return nil
+		},
+		CompleteSessionLogRecord: func(string, session.Spec, proto.SessionInfo, proto.ExitInfo, session.LogRecord) error {
+			return commitErr
+		},
+	})
+	s, err := n.sessions.Open(session.Spec{
+		WS: "ws_completion_failure", Tenant: "tenant", Principal: "principal",
+		Kind: proto.SessionExec, Program: []string{"sh", "-c", "printf output"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeConn, clientConn := transport.Pipe(16)
+	p := transport.NewPeer(nodeConn, nil)
+	t.Cleanup(func() {
+		_ = p.Close()
+		_ = clientConn.Close()
+	})
+	n.subscribe(p, "c_completion_failure", s, 0, "")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for {
+		frame, err := clientConn.Recv(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body proto.ChunkBody
+		if err := proto.Unmarshal(frame.Body, &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Stream != proto.StreamExit {
+			continue
+		}
+		var exit proto.ExitInfo
+		if err := proto.Unmarshal(body.Data, &exit); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(exit.Error, commitErr.Error()) {
+			t.Fatalf("exit = %+v, want durable completion failure", exit)
+		}
+		return
+	}
 }
 
 func closeNodeRuntimeForTest(n *Node) {
@@ -1149,6 +1305,35 @@ func TestRejectedRenewalFencesAndRetainsFilesystem(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(root, "keep"))
 	if err != nil || string(got) != "current bytes" {
 		t.Fatalf("fence lost filesystem: %q, %v", got, err)
+	}
+}
+
+func TestSessionLogAuthorityDoesNotReadMutableLeaseFields(t *testing.T) {
+	w := &ws{Workspace: proto.Workspace{
+		ID: "ws_log", Generation: 7, Tenant: "tenant", LeaseUntil: 1,
+	}}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				w.LeaseUntil++
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-done
+	}()
+	for i := 0; i < 10000; i++ {
+		authority := sessionLogAuthority(w)
+		if authority.ID != w.ID || authority.Generation != w.Generation || authority.Tenant != w.Tenant {
+			t.Fatalf("session log authority = %+v", authority)
+		}
 	}
 }
 

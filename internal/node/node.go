@@ -221,10 +221,11 @@ type Node struct {
 // ws is a claimed workspace on this node.
 type ws struct {
 	proto.Workspace
-	handle       workspace.Handle
-	broker       *broker.Broker
-	leases       []proto.BindingLease
-	lastSnapshot time.Time
+	handle           workspace.Handle
+	broker           *broker.Broker
+	leases           []proto.BindingLease
+	lastSnapshot     time.Time
+	restoreProcesses string
 	// treeMu serializes node filesystem mutations/session startup with archive
 	// construction. checkpointing is guarded by Node.mu and rejects newly
 	// authorized work while an authoritative checkpoint fences sessions.
@@ -234,10 +235,11 @@ type ws struct {
 
 // subscriber streams one session's log to one client.
 type subscriber struct {
-	client  string
-	ws      string
-	session string
-	cancel  context.CancelFunc
+	client       string
+	ws           string
+	session      string
+	subscription string
+	cancel       context.CancelFunc
 }
 
 type preparedRelease struct {
@@ -1613,7 +1615,9 @@ func (n *Node) resync(ctx context.Context) {
 	}
 	for _, w := range held {
 		rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		err := p.Call(rctx, proto.PeerControl, proto.OpWSReady, proto.WSReadyReq{ID: w.ID, Gen: w.Generation}, nil)
+		err := p.Call(rctx, proto.PeerControl, proto.OpWSReady, proto.WSReadyReq{
+			ID: w.ID, Gen: w.Generation, RestoreProcesses: w.restoreProcesses,
+		}, nil)
 		cancel()
 		if err == nil {
 			n.mu.Lock()
@@ -2324,6 +2328,13 @@ func cloneGrant(g *proto.Grant) *proto.Grant {
 	return &cp
 }
 
+func prepareFilesystemAccess(ctx context.Context, w *ws) error {
+	if preparer, ok := w.handle.(workspace.FilesystemAccessPreparer); ok {
+		return preparer.PrepareFilesystemAccess(ctx)
+	}
+	return nil
+}
+
 // lockWorkspaceTree closes the authorization-to-operation race. A lifecycle
 // transition can remove or checkpoint a workspace after authorize returns but
 // before an operation reaches treeMu. Revalidate only after acquiring the tree
@@ -2515,7 +2526,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		n.subscribe(p, f.From, s, req.From)
+		n.subscribe(p, f.From, s, req.From, req.Subscription)
 		return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq()}, nil
 	case proto.OpSInput:
 		req, err := decode[proto.SInputReq](f)
@@ -2565,7 +2576,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		n.unsubscribe(f.From, s.ID)
+		n.unsubscribe(f.From, s.ID, req.Subscription)
 		if req.Kill {
 			n.sessions.Remove(s.ID, true)
 		}
@@ -2624,6 +2635,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		defer unlock()
+		if err := prepareFilesystemAccess(ctx, w); err != nil {
+			return nil, err
+		}
 		return w.handle.FS().Read(req.Path, req.Offset, req.Limit)
 	case proto.OpFSWrite:
 		req, err := decode[proto.FSWriteReq](f)
@@ -2643,6 +2657,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 				return nil, err
 			}
 			defer unlock()
+			if err := prepareFilesystemAccess(ctx, w); err != nil {
+				return nil, err
+			}
 			if err := w.handle.FS().Write(req.Path, req.Data, req.Mode, req.Append, req.MkdirP); err != nil {
 				return nil, err
 			}
@@ -2664,6 +2681,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		defer unlock()
+		if err := prepareFilesystemAccess(ctx, w); err != nil {
+			return nil, err
+		}
 		ents, err := w.handle.FS().List(req.Path)
 		if err != nil {
 			return nil, err
@@ -2683,6 +2703,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		defer unlock()
+		if err := prepareFilesystemAccess(ctx, w); err != nil {
+			return nil, err
+		}
 		e, err := w.handle.FS().Stat(req.Path)
 		if err != nil {
 			return nil, err
@@ -2706,6 +2729,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 				return nil, err
 			}
 			defer unlock()
+			if err := prepareFilesystemAccess(ctx, w); err != nil {
+				return nil, err
+			}
 			if err := w.handle.FS().Mkdir(req.Path); err != nil {
 				return nil, err
 			}
@@ -2731,6 +2757,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 				return nil, err
 			}
 			defer unlock()
+			if err := prepareFilesystemAccess(ctx, w); err != nil {
+				return nil, err
+			}
 			if err := w.handle.FS().Remove(req.Path, req.Recursive); err != nil {
 				return nil, err
 			}
@@ -2756,6 +2785,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 				return nil, err
 			}
 			defer unlock()
+			if err := prepareFilesystemAccess(ctx, w); err != nil {
+				return nil, err
+			}
 			if err := w.handle.FS().Rename(req.From, req.To); err != nil {
 				return nil, err
 			}
@@ -2778,6 +2810,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		defer unlock()
+		if err := prepareFilesystemAccess(ctx, w); err != nil {
+			return nil, err
+		}
 		return w.handle.FS().Search(req.Path, req.Pattern, req.Glob, req.MaxResults)
 	case proto.OpFSEdit:
 		req, err := decode[proto.FSEditReq](f)
@@ -2797,6 +2832,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 				return nil, err
 			}
 			defer unlock()
+			if err := prepareFilesystemAccess(ctx, w); err != nil {
+				return nil, err
+			}
 			nrep, err := w.handle.FS().Edit(req.Path, req.Edits)
 			if err != nil {
 				return nil, err
@@ -3215,7 +3253,7 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 		}
 	}
 	if !req.NoSubscribe {
-		n.subscribe(p, client, s, 0)
+		n.subscribe(p, client, s, 0, "")
 	}
 	return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq()}, nil
 }
@@ -3258,17 +3296,17 @@ func (n *Node) portOpen(ctx context.Context, p *transport.Peer, client string, c
 		}
 		return nil, proto.Err(proto.CodeUnreachable, "port %d: %s", req.Port, msg)
 	}
-	n.subscribe(p, client, s, 0)
+	n.subscribe(p, client, s, 0, "")
 	return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq()}, nil
 }
 
 // subscribe streams s's log to client from seq `from` until the client
 // detaches, the connection dies, or the log ends. One stream per
 // (client, session): a re-attach replaces the previous cursor.
-func (n *Node) subscribe(p *transport.Peer, client string, s *session.Session, from uint64) {
+func (n *Node) subscribe(p *transport.Peer, client string, s *session.Session, from uint64, subscription string) {
 	key := client + "|" + s.ID
 	ctx, cancel := context.WithCancel(context.Background())
-	sub := &subscriber{client: client, ws: s.WS, session: s.ID, cancel: cancel}
+	sub := &subscriber{client: client, ws: s.WS, session: s.ID, subscription: subscription, cancel: cancel}
 	n.mu.Lock()
 	if old, ok := n.subs[key]; ok {
 		old.cancel()
@@ -3287,6 +3325,21 @@ func (n *Node) subscribe(p *transport.Peer, client string, s *session.Session, f
 		for {
 			chunks, err := cur.Next(ctx, 64)
 			if err != nil {
+				var incomplete *session.ErrIncompleteLog
+				if errors.As(err, &incomplete) {
+					info := s.ExitInfo()
+					if info == nil {
+						return
+					}
+					f := &proto.Frame{
+						V: proto.Version, T: proto.KindChunk, To: client, S: s.ID, WS: s.WS, Seq: cur.Seq(),
+						Body: proto.MustMarshal(proto.ChunkBody{Stream: proto.StreamExit, Data: proto.MustMarshal(*info)}),
+					}
+					if ctx.Err() != nil || p.Send(context.WithoutCancel(ctx), f) != nil {
+						return
+					}
+					return
+				}
 				var unavailable *session.ErrTierUnavailable
 				var ev *session.ErrEvicted
 				if errors.As(err, &ev) {
@@ -3298,7 +3351,7 @@ func (n *Node) subscribe(p *transport.Peer, client string, s *session.Session, f
 					}
 					gap := proto.MustMarshal(proto.Gap{From: ev.Requested, To: ev.Oldest - 1, Tier: tier})
 					f := &proto.Frame{V: proto.Version, T: proto.KindChunk, To: client, S: s.ID, WS: s.WS, Seq: ev.Requested, Body: proto.MustMarshal(proto.ChunkBody{Stream: proto.StreamGap, Data: gap})}
-					if p.Send(ctx, f) != nil {
+					if ctx.Err() != nil || p.Send(context.WithoutCancel(ctx), f) != nil {
 						return
 					}
 					cur.Skip(ev.Oldest)
@@ -3308,7 +3361,10 @@ func (n *Node) subscribe(p *transport.Peer, client string, s *session.Session, f
 			}
 			for _, c := range chunks {
 				f := &proto.Frame{V: proto.Version, T: proto.KindChunk, To: client, S: s.ID, WS: s.WS, Seq: c.Seq, Body: proto.MustMarshal(proto.ChunkBody{Stream: c.Stream, Data: c.Data})}
-				if err := p.Send(ctx, f); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if err := p.Send(context.WithoutCancel(ctx), f); err != nil {
 					return
 				}
 			}
@@ -3316,11 +3372,14 @@ func (n *Node) subscribe(p *transport.Peer, client string, s *session.Session, f
 	}()
 }
 
-func (n *Node) unsubscribe(client, sid string) {
+func (n *Node) unsubscribe(client, sid, subscription string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	key := client + "|" + sid
 	if s, ok := n.subs[key]; ok {
+		if subscription != "" && s.subscription != subscription {
+			return
+		}
 		s.cancel()
 		delete(n.subs, key)
 	}
@@ -3494,6 +3553,9 @@ func (n *Node) materializeWithReadyHook(ctx context.Context, w proto.Workspace, 
 		}
 	}
 	entry := &ws{Workspace: w, handle: handle}
+	if w.Spec.RestoreFrom != "" && !adopt {
+		entry.restoreProcesses = proto.RestoreProcessesRestarted
+	}
 	retainOnError := func(err error) error {
 		detachErr := n.detachWorkspaceVolumes(context.WithoutCancel(ctx), entry, entry.Spec.Volumes)
 		if revokeErr := n.revokeWorkspaceNetwork(ctx, entry); revokeErr != nil {
@@ -3653,6 +3715,11 @@ func (n *Node) materializeWithReadyHook(ctx context.Context, w proto.Workspace, 
 	if err := writeWorkspaceEnv(handle, entry); err != nil {
 		return retainOnError(fmt.Errorf("write workspace environment: %w", err))
 	}
+	if entry.restoreProcesses != "" {
+		if reporter, ok := handle.(workspace.RestoreProcessReporter); ok {
+			entry.restoreProcesses = reporter.RestoreProcesses()
+		}
+	}
 	if beforePublish != nil {
 		publish, err := beforePublish(entry)
 		if err != nil {
@@ -3699,7 +3766,9 @@ func (n *Node) materializeWithReadyHook(ctx context.Context, w proto.Workspace, 
 		return proto.Err(proto.CodeUnreachable, "control connection lost before ws.ready")
 	}
 	rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	err = p.Call(rctx, proto.PeerControl, proto.OpWSReady, proto.WSReadyReq{ID: w.ID, Gen: w.Generation}, nil)
+	err = p.Call(rctx, proto.PeerControl, proto.OpWSReady, proto.WSReadyReq{
+		ID: w.ID, Gen: w.Generation, RestoreProcesses: entry.restoreProcesses,
+	}, nil)
 	cancel()
 	if err != nil {
 		n.fenceWorkspace(ctx, w.ID, "ws.ready rejected: "+err.Error())

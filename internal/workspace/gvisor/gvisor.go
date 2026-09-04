@@ -169,21 +169,12 @@ func (b *Backend) Adopt(ctx context.Context, id string) (workspace.Handle, error
 	if err := proto.ValidateMountPath(retained.Mount); err != nil {
 		return nil, fmt.Errorf("retained gvisor mount: %w", err)
 	}
-	network, err := b.network.Adopt(ctx, retained.Network)
-	if err != nil {
-		return nil, err
-	}
-	// Broker ports are materialization-local. Stop the old sandbox and remove
-	// its veth before the node starts a new broker; ApplyNetworkPolicy rebuilds
-	// both with the authoritative generation before ws.ready.
+	// New reaps the previous runsc state and every uninhabited network
+	// namespace before the backend becomes available. Broker ports are
+	// materialization-local, so retained metadata carries only the generation
+	// and mount needed to construct a new denied boundary before ws.ready.
 	if err := b.runtime.destroy(ctx, containerName(id)); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = network.Revoke(cleanupCtx)
 		return nil, fmt.Errorf("stop retained runsc sandbox: %w", err)
-	}
-	if err := network.Revoke(ctx); err != nil {
-		return nil, err
 	}
 	return b.handle(ctx, id, bundle, work, retained.Mount, retained.Generation)
 }

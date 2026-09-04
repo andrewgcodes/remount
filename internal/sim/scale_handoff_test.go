@@ -25,6 +25,8 @@ import (
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/server"
 	"remount.dev/remount/internal/transport"
+	"remount.dev/remount/internal/workspace"
+	"remount.dev/remount/internal/workspace/gvisor"
 )
 
 const (
@@ -70,17 +72,33 @@ func handoffScaleNodeCount() int {
 }
 
 // TestHandoffScaleAndControlFailover exercises the Phase 6.4 target without
-// replacing peers with mocks. The process backend is deliberate: Docker and
-// gVisor need separately gated hosts, while this scenario must run under the
-// race detector on an ordinary development machine.
+// replacing peers with mocks. It defaults to process for ordinary development;
+// named isolation hosts select docker or gvisor explicitly.
 func TestHandoffScaleAndControlFailover(t *testing.T) {
 	if testing.Short() {
 		t.Skip("200-node/2,000-workspace scale evidence is not a short test")
 	}
 
+	backend := os.Getenv("REMOUNT_HANDOFF_SCALE_BACKEND")
+	if backend == "" {
+		backend = "process"
+	}
+	switch backend {
+	case "process", "docker":
+	case "gvisor":
+		if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+			t.Skip("unavailable: the gVisor scale lane requires root on Linux")
+		}
+		if os.Getenv("REMOUNT_GVISOR_ROOTFS") == "" {
+			t.Skip("unavailable: REMOUNT_GVISOR_ROOTFS is not set")
+		}
+	default:
+		t.Fatalf("unsupported REMOUNT_HANDOFF_SCALE_BACKEND %q", backend)
+	}
+
 	baseline := runtime.NumGoroutine()
 	t.Run("real-peers-and-durable-restart", func(t *testing.T) {
-		w, err := newHandoffScaleWorld(t)
+		w, err := newHandoffScaleWorld(t, backend)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -100,6 +118,17 @@ func TestHandoffScaleAndControlFailover(t *testing.T) {
 		clients := w.StartClients(handoffScaleNodes)
 
 		workspaceIDs := make([][]string, handoffScaleNodes)
+		if backend != "process" {
+			defer func() {
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+				defer cleanupCancel()
+				if err := destroyHandoffScaleWorkspaces(cleanupCtx, clients, workspaceIDs); err != nil {
+					t.Errorf("isolation-backend teardown: %v", err)
+				} else {
+					t.Logf("teardown backend=%s workspaces=%d result=verified_absent", backend, handoffScaleWorkspaces)
+				}
+			}()
+		}
 		claimLatency := make([]time.Duration, handoffScaleWorkspaces)
 		err = runHandoffParallel(handoffScaleNodes, func(i int) error {
 			workspaceIDs[i] = make([]string, handoffWorkspacesPerNode)
@@ -107,7 +136,7 @@ func TestHandoffScaleAndControlFailover(t *testing.T) {
 				started := time.Now()
 				ws, createErr := clients[i].CreateWorkspace(ctx, proto.WorkspaceSpec{
 					Name:      fmt.Sprintf("scale-%03d-%02d", i, j),
-					Requires:  proto.Requires{Backend: "process"},
+					Requires:  proto.Requires{Backend: backend},
 					Placement: proto.Placement{Node: nodes[i].ID()},
 				})
 				if createErr != nil {
@@ -264,8 +293,7 @@ func TestHandoffScaleAndControlFailover(t *testing.T) {
 		if err := verifyHandoffInventory(ctx, clients[0], nodes, workspaceIDs, true); err != nil {
 			t.Fatal(err)
 		}
-		t.Logf("scale_evidence nodes=%d workspaces=%d clients=%d backend=process reconnect_peers=%d", handoffScaleNodes, handoffScaleWorkspaces, handoffScaleNodes, len(next.Relay.Peers()))
-		t.Log("backend_evidence docker_benchmark=unavailable gvisor_benchmark=unavailable reason=host-specific runtimes are not modeled by internal/sim; run integration/chaos/backend-gates.sh on each named benchmark host")
+		t.Logf("scale_evidence nodes=%d workspaces=%d clients=%d backend=%s reconnect_peers=%d", handoffScaleNodes, handoffScaleWorkspaces, handoffScaleNodes, backend, len(next.Relay.Peers()))
 	})
 
 	deadline := time.Now().Add(30 * time.Second)
@@ -278,17 +306,35 @@ func TestHandoffScaleAndControlFailover(t *testing.T) {
 	}
 }
 
+func destroyHandoffScaleWorkspaces(ctx context.Context, clients []*client.Client, workspaceIDs [][]string) error {
+	return runHandoffParallel(len(workspaceIDs), func(i int) error {
+		if i >= len(clients) || clients[i] == nil {
+			return nil
+		}
+		for _, id := range workspaceIDs[i] {
+			if id == "" {
+				continue
+			}
+			if err := clients[i].DestroyWorkspace(ctx, id); err != nil {
+				return fmt.Errorf("destroy %s: %w", id, err)
+			}
+		}
+		return nil
+	})
+}
+
 type handoffServerGeneration struct {
 	server  *server.Server
 	handler http.Handler
 }
 
 type handoffScaleWorld struct {
-	root   string
-	opts   server.Options
-	ctx    context.Context
-	cancel context.CancelFunc
-	http   *httptest.Server
+	root    string
+	opts    server.Options
+	backend string
+	ctx     context.Context
+	cancel  context.CancelFunc
+	http    *httptest.Server
 
 	generation atomic.Pointer[handoffServerGeneration]
 	closeOnce  sync.Once
@@ -305,7 +351,7 @@ type handoffScaleWorld struct {
 	acceptWG sync.WaitGroup
 }
 
-func newHandoffScaleWorld(t *testing.T) (*handoffScaleWorld, error) {
+func newHandoffScaleWorld(t *testing.T, backend string) (*handoffScaleWorld, error) {
 	root := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	opts := server.Options{
@@ -328,7 +374,7 @@ func newHandoffScaleWorld(t *testing.T) (*handoffScaleWorld, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	w := &handoffScaleWorld{root: root, opts: opts, ctx: ctx, cancel: cancel}
+	w := &handoffScaleWorld{root: root, opts: opts, backend: backend, ctx: ctx, cancel: cancel}
 	w.generation.Store(&handoffServerGeneration{server: srv, handler: srv.Handler()})
 	w.http = httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		generation := w.generation.Load()
@@ -379,8 +425,32 @@ func (w *handoffScaleWorld) StartNodes(ctx context.Context, count int) ([]*node.
 	w.nodeRunErrs = make([]error, count)
 	w.nodeCancels = make([]context.CancelFunc, count)
 	for i := 0; i < count; i++ {
+		dataDir := filepath.Join(w.root, "nodes", fmt.Sprintf("%03d", i))
+		var backends *workspace.Registry
+		switch w.backend {
+		case "docker":
+			image := os.Getenv("REMOUNT_HANDOFF_SCALE_IMAGE")
+			if image == "" {
+				image = "alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1"
+			}
+			backend, err := workspace.NewDocker(filepath.Join(dataDir, "docker"), image)
+			if err != nil {
+				return nil, fmt.Errorf("new docker backend %d: %w", i, err)
+			}
+			backends = workspace.NewRegistry(backend)
+		case "gvisor":
+			backend, err := gvisor.New(ctx, gvisor.Options{
+				Dir:    filepath.Join(dataDir, "gvisor"),
+				RootFS: os.Getenv("REMOUNT_GVISOR_ROOTFS"),
+				Runsc:  os.Getenv("REMOUNT_RUNSC"),
+			})
+			if err != nil {
+				return nil, fmt.Errorf("new gvisor backend %d: %w", i, err)
+			}
+			backends = workspace.NewRegistry(backend)
+		}
 		n, err := node.New(node.Options{
-			DataDir:               filepath.Join(w.root, "nodes", fmt.Sprintf("%03d", i)),
+			DataDir:               dataDir,
 			Dialer:                w.dialer(),
 			Token:                 w.opts.Token,
 			ArtifactURL:           w.http.URL + "/v1/artifacts",
@@ -389,6 +459,7 @@ func (w *handoffScaleWorld) StartNodes(ctx context.Context, count int) ([]*node.
 			MaxConcurrentRequests: 64,
 			MaxSessions:           64,
 			MaxActiveSessions:     8,
+			Backends:              backends,
 			Logger:                w.opts.Logger,
 		})
 		if err != nil {

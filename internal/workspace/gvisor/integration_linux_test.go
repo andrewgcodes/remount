@@ -4,17 +4,21 @@ package gvisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"golang.org/x/sys/unix"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
+	"remount.dev/remount/internal/netns"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/session"
 	"remount.dev/remount/internal/workspace"
@@ -24,21 +28,32 @@ func TestE4DenialConformance(t *testing.T) {
 	if os.Getenv("REMOUNT_GVISOR_INTEGRATION") != "1" {
 		t.Skip("unavailable: set REMOUNT_GVISOR_INTEGRATION=1 on a privileged Linux host with runsc")
 	}
+	if os.Geteuid() != 0 {
+		t.Skip("unavailable: gVisor integration requires root for runsc, netns and nftables")
+	}
 	rootfs := os.Getenv("REMOUNT_GVISOR_ROOTFS")
 	if rootfs == "" {
 		t.Skip("unavailable: REMOUNT_GVISOR_ROOTFS is not set")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	b, err := New(ctx, Options{Dir: t.TempDir(), RootFS: rootfs})
+	dir := t.TempDir()
+	b, err := New(ctx, Options{Dir: dir, RootFS: rootfs})
 	if err != nil {
 		t.Fatalf("gvisor backend unavailable in required lane: %v", err)
 	}
+	defer func() {
+		err := unix.Unmount(filepath.Join(dir, ".runsc", "null-netns"), 0)
+		if err != nil && !errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.ENOENT) {
+			t.Errorf("unmount runsc network namespace: %v", err)
+		}
+	}()
 	raw, err := b.Create(ctx, "ws_e4", proto.WorkspaceSpec{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	h := raw.(*handle)
+	networkState := h.network.State()
 	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cleanupCancel()
@@ -58,10 +73,35 @@ func TestE4DenialConformance(t *testing.T) {
 			if err != nil {
 				return
 			}
-			_ = conn.Close()
+			go func() {
+				defer conn.Close()
+				payload := make([]byte, 1024)
+				ticker := time.NewTicker(25 * time.Millisecond)
+				defer ticker.Stop()
+				for range ticker.C {
+					if _, err := conn.Write(payload); err != nil {
+						return
+					}
+				}
+			}()
 		}
 	}()
 	endpoint := "http://" + listener.Addr().String()
+	udpListener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(h.BrokerAdvertiseHost())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpListener.Close()
+	go func() {
+		buffer := make([]byte, 128)
+		for {
+			n, peer, err := udpListener.ReadFromUDP(buffer)
+			if err != nil {
+				return
+			}
+			_, _ = udpListener.WriteToUDP(buffer[:n], peer)
+		}
+	}()
 	if err := h.ApplyNetworkPolicy(ctx, proto.NetworkPolicy{Default: proto.NetworkDefaultDeny}, workspace.NetworkEndpoint{
 		Workspace: "ws_e4", Generation: 1, ReverseProxyURL: endpoint, ForwardProxyURL: endpoint,
 	}); err != nil {
@@ -80,8 +120,32 @@ func TestE4DenialConformance(t *testing.T) {
 		return nil
 	}
 	host, port, _ := net.SplitHostPort(listener.Addr().String())
-	if err := run("nc -z -w 2 " + host + " " + port); err != nil {
-		t.Fatalf("broker was not reachable: %v", err)
+	transferCtx, stopTransfer := context.WithCancel(ctx)
+	transfer := exec.CommandContext(transferCtx, h.runtime.binaryPath(), "--root="+h.runtime.stateRoot(), "exec", containerName(h.id),
+		"/bin/sh", "-c", "nc "+host+" "+port+" > /work/inflight")
+	if err := transfer.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		stopTransfer()
+		_ = transfer.Wait()
+	}()
+	transferPath := filepath.Join(h.bundle, "work", "inflight")
+	var transferred int64
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		info, err := os.Stat(transferPath)
+		if err == nil && info.Size() > 0 {
+			transferred = info.Size()
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if transferred == 0 {
+		t.Fatal("broker transfer did not start")
+	}
+	udpHost, udpPort, _ := net.SplitHostPort(udpListener.LocalAddr().String())
+	if out, err := exec.CommandContext(ctx, filepath.Join(rootfs, "udpprobe"), udpHost, udpPort).CombinedOutput(); err != nil {
+		t.Fatalf("UDP probe positive control failed: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	denied := map[string]string{
 		"direct IPv4 TCP":         "nc -z -w 2 1.1.1.1 443",
@@ -133,6 +197,20 @@ func TestE4DenialConformance(t *testing.T) {
 	}
 	if err := h.RevokeNetwork(ctx); err != nil {
 		t.Fatal(err)
+	}
+	assertNetworkGone(t, networkState)
+	info, err := os.Stat(transferPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revokedAt := info.Size()
+	time.Sleep(500 * time.Millisecond)
+	info, err = os.Stat(transferPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != revokedAt {
+		t.Fatalf("in-flight transfer advanced after synchronous revoke: %d to %d bytes", revokedAt, info.Size())
 	}
 	revoked := exec.CommandContext(ctx, h.runtime.binaryPath(), "--root="+h.runtime.stateRoot(), "exec", containerName(h.id),
 		"/bin/sh", "-c", "nc -z -w 2 "+host+" "+port)
@@ -213,9 +291,12 @@ func (w *escapeWatcher) escaped() []string {
 	seen := map[string]struct{}{}
 	buf := make([]byte, 2048)
 	for {
-		n, err := unix.Read(w.fd, buf)
+		n, peer, err := unix.Recvfrom(w.fd, buf, 0)
 		if err != nil || n <= 0 {
 			break
+		}
+		if link, ok := peer.(*unix.SockaddrLinklayer); ok && link.Pkttype == unix.PACKET_OUTGOING {
+			continue
 		}
 		// Ethernet header is 14 bytes; IPv4 needs 20 more.
 		if n < 34 || buf[12] != 0x08 || buf[13] != 0x00 {
@@ -347,4 +428,64 @@ func runIn(ctx context.Context, h *handle, command string) error {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func TestE4FailedSetupCleanupConformance(t *testing.T) {
+	if os.Getenv("REMOUNT_GVISOR_INTEGRATION") != "1" {
+		t.Skip("unavailable: set REMOUNT_GVISOR_INTEGRATION=1 on a privileged Linux host with runsc")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("unavailable: gVisor integration requires root for runsc, netns and nftables")
+	}
+	rootfs := os.Getenv("REMOUNT_GVISOR_ROOTFS")
+	if rootfs == "" {
+		t.Skip("unavailable: REMOUNT_GVISOR_ROOTFS is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	b, err := New(ctx, Options{Dir: dir, RootFS: rootfs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err := unix.Unmount(filepath.Join(dir, ".runsc", "null-netns"), 0)
+		if err != nil && !errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.ENOENT) {
+			t.Errorf("unmount runsc network namespace: %v", err)
+		}
+	}()
+	raw, err := b.Create(ctx, "ws_e4_failed_setup", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := raw.(*handle)
+	state := h.network.State()
+	err = h.ApplyNetworkPolicy(ctx, proto.NetworkPolicy{Default: proto.NetworkDefaultDeny}, workspace.NetworkEndpoint{
+		Workspace: h.id, Generation: 1,
+		ReverseProxyURL: "http://127.0.0.1:17443", ForwardProxyURL: "http://127.0.0.1:17443",
+	})
+	if err == nil {
+		t.Fatal("setup with a broker outside the generation link succeeded")
+	}
+	if h.network != nil {
+		t.Fatal("failed setup retained the network handle")
+	}
+	assertNetworkGone(t, state)
+	if err := h.Destroy(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertNetworkGone(t *testing.T, state netns.State) {
+	t.Helper()
+	if _, err := os.Stat(state.Namespace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("network namespace survived cleanup: %v", err)
+	}
+	if out, err := exec.Command("ip", "link", "show", "dev", state.Link.HostName).CombinedOutput(); err == nil {
+		t.Fatalf("host veth survived cleanup: %s", strings.TrimSpace(string(out)))
+	}
+	table := "remount_" + state.Link.HostName
+	if out, err := exec.Command("nft", "list", "table", "netdev", table).CombinedOutput(); err == nil {
+		t.Fatalf("host ingress policy survived cleanup: %s", strings.TrimSpace(string(out)))
+	}
 }

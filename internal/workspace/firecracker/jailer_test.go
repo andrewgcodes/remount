@@ -171,6 +171,23 @@ func TestJailerFactoryArgumentsAreJailedBoundedAndNamespaced(t *testing.T) {
 	}
 }
 
+func TestJailerSocketPathLimitIsExplicit(t *testing.T) {
+	path := strings.Repeat("x", maxUnixSocketPath+1)
+	if err := validateUnixSocketPath(path); err == nil || !strings.Contains(err.Error(), "Unix sockets permit at most") {
+		t.Fatalf("long socket path error = %v", err)
+	}
+	if err := validateUnixSocketPath(strings.Repeat("x", maxUnixSocketPath)); err != nil {
+		t.Fatalf("maximum socket path rejected: %v", err)
+	}
+}
+
+func TestFirstLineIgnoresTimestampedExitLog(t *testing.T) {
+	output := "Firecracker v1.16.1\n\n2026-09-04T04:22:34Z Firecracker exiting successfully."
+	if got := firstLine(output); got != "Firecracker v1.16.1" {
+		t.Fatalf("identity = %q", got)
+	}
+}
+
 func TestJailerFactoryProbeIsUnavailableOffLinux(t *testing.T) {
 	if runtime.GOOS == "linux" {
 		t.Skip("non-Linux assertion")

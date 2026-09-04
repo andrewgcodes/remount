@@ -26,6 +26,7 @@ const (
 	defaultNoFileLimit  = 2048
 	defaultFileSize     = int64(256 << 30)
 	defaultAPITimeout   = 10 * time.Second
+	maxUnixSocketPath   = 107
 )
 
 // JailerOptions configures the production Firecracker process adapter. The
@@ -201,6 +202,9 @@ func (f *JailerFactory) Probe(ctx context.Context) error {
 	if err := recoverOwnedJails(ctx, f.opts.ChrootBase, filepath.Base(f.opts.Firecracker), f.opts.MaxMachines*4); err != nil {
 		return fmt.Errorf("recover retained Firecracker jails: %w", err)
 	}
+	if err := recoverOwnedCgroups(f.opts, f.opts.MaxMachines*4); err != nil {
+		return fmt.Errorf("recover retained Firecracker cgroups: %w", err)
+	}
 	if err := validateRelativePath(f.opts.CgroupParent); err != nil {
 		return fmt.Errorf("cgroup parent: %w", err)
 	}
@@ -282,6 +286,10 @@ func (f *JailerFactory) New(ctx context.Context, workspace string, launch Machin
 
 	id := jailID(workspace, f.serial.Add(1), time.Now().UnixNano())
 	root := filepath.Join(f.opts.ChrootBase, filepath.Base(f.opts.Firecracker), id, "root")
+	socket := filepath.Join(root, "run", "firecracker.socket")
+	if err := validateUnixSocketPath(socket); err != nil {
+		return nil, err
+	}
 	if _, err := os.Lstat(filepath.Dir(root)); err == nil {
 		return nil, fmt.Errorf("firecracker: jail %s already exists; refusing to reuse ambiguous state", id)
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -299,13 +307,12 @@ func (f *JailerFactory) New(ctx context.Context, workspace string, launch Machin
 		done: make(chan struct{}), waitErr: make(chan error, 1),
 		maxVCPU: f.opts.MaxVCPU, maxMemMiB: f.opts.MaxMemMiB,
 		uid: f.opts.UID, gid: f.opts.GID, fileSizeLimit: f.opts.FileSizeLimit,
-		compatibility: f.compat,
+		compatibility: f.compat, cgroupPaths: machineCgroupPaths(f.opts, id),
 	}
 	go func() {
 		m.waitErr <- cmd.Wait()
 		close(m.done)
 	}()
-	socket := filepath.Join(root, "run", "firecracker.socket")
 	m.api = newUnixAPI(socket, f.opts.APITimeout)
 	readyCtx, cancel := context.WithTimeout(ctx, f.opts.StartTimeout)
 	defer cancel()
@@ -363,6 +370,7 @@ type jailerMachine struct {
 	uid, gid           int
 	fileSizeLimit      int64
 	compatibility      Compatibility
+	cgroupPaths        []string
 
 	killMu     sync.Mutex
 	killSent   bool
@@ -535,6 +543,8 @@ func (m *jailerMachine) Kill(ctx context.Context) error {
 	}
 	if stopErr == nil {
 		if err := removeJailRoot(m.root, m.factory.opts.ChrootBase); err != nil {
+			stopErr = err
+		} else if err := removeMachineCgroups(m.cgroupPaths); err != nil {
 			stopErr = err
 		} else {
 			m.factory.release(m.workspace, m)
@@ -756,6 +766,72 @@ func removeJailRoot(root, base string) error {
 		return fmt.Errorf("firecracker: refusing unsafe jail cleanup %q", root)
 	}
 	return os.RemoveAll(filepath.Dir(root))
+}
+
+func validateUnixSocketPath(path string) error {
+	if len(path) > maxUnixSocketPath {
+		return fmt.Errorf("firecracker: API socket path is %d bytes; Unix sockets permit at most %d: %q", len(path), maxUnixSocketPath, path)
+	}
+	return nil
+}
+
+func machineCgroupPaths(opts JailerOptions, id string) []string {
+	if opts.CgroupVersion == 2 {
+		return []string{filepath.Join("/sys/fs/cgroup", opts.CgroupParent, id)}
+	}
+	seen := make(map[string]struct{})
+	var paths []string
+	for _, control := range opts.Cgroups {
+		name, _, _ := strings.Cut(control, "=")
+		controller, _, _ := strings.Cut(name, ".")
+		path := filepath.Join("/sys/fs/cgroup", controller, opts.CgroupParent, id)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+func removeMachineCgroups(paths []string) error {
+	var err error
+	for _, path := range paths {
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			err = errors.Join(err, fmt.Errorf("remove Firecracker cgroup %q: %w", path, removeErr))
+		}
+	}
+	return err
+}
+
+func recoverOwnedCgroups(opts JailerOptions, maxScan int) error {
+	parents := make(map[string]struct{})
+	for _, path := range machineCgroupPaths(opts, "placeholder") {
+		parents[filepath.Dir(path)] = struct{}{}
+	}
+	owned := 0
+	for parent := range parents {
+		entries, err := os.ReadDir(parent)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "rm-") {
+				continue
+			}
+			owned++
+			if owned > maxScan {
+				return fmt.Errorf("more than %d retained Remount cgroups require operator inspection", maxScan)
+			}
+			if err := removeMachineCgroups([]string{filepath.Join(parent, entry.Name())}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func expectedKill(err error) bool {

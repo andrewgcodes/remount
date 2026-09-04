@@ -4357,6 +4357,16 @@ func (c *Control) wsReady(ctx context.Context, node string, req *proto.WSReadyRe
 		c.mu.Unlock()
 		return proto.Err(proto.CodeConflict, "stale ready for %s", req.ID)
 	}
+	if req.RestoreProcesses != "" {
+		expected := proto.RestoreProcessesRestarted
+		if ws.Spec.RestoreFormat == proto.ArtifactFormatFirecrackerFullV1 {
+			expected = proto.RestoreProcessesPreserved
+		}
+		if ws.Spec.RestoreFrom == "" || req.RestoreProcesses != expected {
+			c.mu.Unlock()
+			return proto.Err(proto.CodeConflict, "invalid restore process outcome for %s", req.ID)
+		}
+	}
 	if ws.State == proto.WSClaimed {
 		next, transitionErr := transitionWorkspace(ws, lifecycleTransition{
 			operation: transitionReady, actor: actorNode, to: proto.WSClaimed,
@@ -4391,7 +4401,11 @@ func (c *Control) wsReady(ctx context.Context, node string, req *proto.WSReadyRe
 		return transitionErr
 	}
 	next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
-	if err := c.persistWS(&next, c.wsEvent(&next, proto.EvWSClaimed, "", node, map[string]any{"gen": next.Generation, "restore_from": next.Spec.RestoreFrom})); err != nil {
+	payload := map[string]any{"gen": next.Generation, "restore_from": next.Spec.RestoreFrom}
+	if req.RestoreProcesses != "" {
+		payload["restore_processes"] = req.RestoreProcesses
+	}
+	if err := c.persistWS(&next, c.wsEvent(&next, proto.EvWSClaimed, "", node, payload)); err != nil {
 		c.mu.Unlock()
 		return err
 	}

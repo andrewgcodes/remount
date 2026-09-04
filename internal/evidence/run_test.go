@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -116,6 +117,21 @@ func TestAnUnselectedGateIsUnavailableNotPassed(t *testing.T) {
 		return
 	}
 	t.Fatal("B0.lint is missing from the report")
+}
+
+func TestBaselineGateEnvironmentExcludesScenarioPrerequisites(t *testing.T) {
+	t.Setenv("REMOUNT_GVISOR_INTEGRATION", "1")
+	t.Setenv("REMOUNT_GVISOR_ROOTFS", "/rootfs")
+	t.Setenv("PATH", "/bin")
+	env := withoutEnv(os.Environ(), scenarioEnvNames())
+	if slices.ContainsFunc(env, func(entry string) bool {
+		return strings.HasPrefix(entry, "REMOUNT_GVISOR_")
+	}) {
+		t.Fatal("a host-gated scenario prerequisite leaked into the baseline gate")
+	}
+	if !slices.Contains(env, "PATH=/bin") {
+		t.Fatal("the baseline gate lost an unrelated environment variable")
+	}
 }
 
 func TestRunWritesAllThreeSummariesAndListsWhatItCouldNotProve(t *testing.T) {
@@ -272,7 +288,7 @@ func TestHostProbesComeFromTheCheckedInGateScripts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write(backendGatesScript, "#!/bin/sh\nprintf 'docker status=available server_version=29.4.1\\n'\nprintf 'gvisor status=unavailable reason=runsc is not registered with Docker\\n'\nexit 4\n")
+	write(backendGatesScript, "#!/bin/sh\n[ \"${1:-}\" = --probe ] || exit 2\nprintf 'docker status=available server_version=29.4.1\\n'\nprintf 'gvisor status=unavailable reason=runsc is not registered with Docker\\n'\nexit 4\n")
 	write(firecrackerGateScript, "#!/bin/sh\necho 'UNAVAILABLE: /dev/kvm is not read-write' >&2\nexit 77\n")
 
 	probes := ProbeBackends(context.Background(), dir)
@@ -350,6 +366,112 @@ func TestAWiredScenarioActuallyExecutesItsProof(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("%s is missing from the report", wired.ID)
+	}
+}
+
+func TestScenarioSkipIsUnavailableRatherThanPassed(t *testing.T) {
+	reasons, unexplained := scenarioSkipReasons("=== RUN   TestNeedsTool\n    tool_test.go:12: unavailable: syft is not installed\n--- SKIP: TestNeedsTool (0.00s)\nPASS\n")
+	if unexplained != "" {
+		t.Fatal(unexplained)
+	}
+	if !slices.Equal(reasons, []string{"syft is not installed"}) {
+		t.Fatalf("skip reasons = %v", reasons)
+	}
+}
+
+func TestScenarioSkipWithoutUnavailableReasonIsRejected(t *testing.T) {
+	reasons, unexplained := scenarioSkipReasons("=== RUN   TestPrevious\n    previous_test.go:10: unavailable: unrelated prerequisite\n--- PASS: TestPrevious (0.00s)\n=== RUN   TestNeedsTool\n--- SKIP: TestNeedsTool (0.00s)\nPASS\n")
+	if len(reasons) != 0 {
+		t.Fatalf("skip reasons = %v", reasons)
+	}
+	if unexplained == "" {
+		t.Fatal("unexplained skip was accepted")
+	}
+}
+
+func TestAWiredScenarioSkipCannotPass(t *testing.T) {
+	dir := newRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.invalid/skip\n\ngo 1.27\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "skip_test.go"), []byte(`package skip
+
+import "testing"
+
+func TestNeedsTool(t *testing.T) {
+	t.Skip("unavailable: syft is not installed")
+}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wired := Scenario{
+		ID: "B8", Title: "wired probe", Layer: LayerCode, Required: true,
+		Owner: "probe", Argv: []string{"go", "test", "./..."},
+	}
+	res, err := Run(context.Background(), Options{
+		Root: dir, Out: t.TempDir(), Dev: true, Gates: noGates, Lookup: fakeEnv(nil),
+		Scenarios: []string{wired.ID}, overrideScenario: &wired,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range res.Records {
+		if rec.Scenario != wired.ID {
+			continue
+		}
+		if rec.Status != StatusUnavailable {
+			t.Fatalf("a skipped wired scenario reported %s, want unavailable", rec.Status)
+		}
+		if rec.Reason != "syft is not installed" {
+			t.Fatalf("skip reason = %q", rec.Reason)
+		}
+		if rec.Command != "go test -v ./..." {
+			t.Fatalf("command = %q", rec.Command)
+		}
+		return
+	}
+	t.Fatalf("%s is missing from the report", wired.ID)
+}
+
+func TestAWiredShellScenarioExit77IsUnavailableOnlyWithAReason(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		output string
+		status Status
+		reason string
+	}{
+		{name: "missing socat", output: "unavailable: socat is required", status: StatusUnavailable, reason: "socat is required"},
+		{name: "missing setsid", output: "UNAVAILABLE: setsid is required", status: StatusUnavailable, reason: "setsid is required"},
+		{name: "unexplained", output: "host proof could not start", status: StatusFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := newRepo(t)
+			wired := Scenario{
+				ID: "B8", Title: "wired host proof", Layer: LayerHostCI, Required: true,
+				Owner: "scripts/gvisor-conformance.sh",
+				Argv:  []string{"sh", "-c", "printf '%s\\n' \"$1\" >&2; exit 77", "gvisor-conformance", tc.output},
+			}
+			res, err := Run(context.Background(), Options{
+				Root: dir, Out: t.TempDir(), Gates: noGates, Lookup: fakeEnv(nil),
+				Scenarios: []string{wired.ID}, overrideScenario: &wired,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, rec := range res.Records {
+				if rec.Scenario != wired.ID {
+					continue
+				}
+				if rec.Status != tc.status {
+					t.Fatalf("status = %s, want %s (%s)", rec.Status, tc.status, rec.Reason)
+				}
+				if tc.reason != "" && rec.Reason != tc.reason {
+					t.Fatalf("reason = %q, want %q", rec.Reason, tc.reason)
+				}
+				return
+			}
+			t.Fatalf("%s is missing from the report", wired.ID)
+		})
 	}
 }
 

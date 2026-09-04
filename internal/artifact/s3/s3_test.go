@@ -806,33 +806,14 @@ func writeXML(w http.ResponseWriter, value any) {
 	_ = xml.NewEncoder(w).Encode(value)
 }
 
-// TestIdleConnectionsExpireBeforeAServerWouldCloseThem pins the remedy for a
-// failure that has nothing to do with the request being made.
-//
-// net/http reuses keep-alive connections, and Request.isReplayable replays only
-// GET, HEAD, OPTIONS and TRACE. So when an endpoint closes an idle connection
-// and this client then hands the next request to it, a PUT fails with "server
-// closed idle connection" and is not retried. TestMinIOIntegration failed in CI
-// exactly that way, on the first upload after an idle gap.
-//
-// Retrying is not the remedy: a conditional PUT retried after a lost response
-// can return 412 and be read as a conflict that never occurred. So the client
-// expires idle connections before a server would, and this test fails if that
-// default is ever dropped or raised past the shortest idle timeout endpoints
-// commonly use.
-func TestIdleConnectionsExpireBeforeAServerWouldCloseThem(t *testing.T) {
+func TestDefaultClientDoesNotReuseAmbiguousConditionalWriteConnections(t *testing.T) {
 	_, store := newFakeStore(t, Config{})
 	transport, ok := store.httpClient.Transport.(*http.Transport)
 	if !ok {
-		t.Fatalf("the default client has transport %T; it must own one so its idle timeout is not net/http's 90s default", store.httpClient.Transport)
+		t.Fatalf("the default client has transport %T", store.httpClient.Transport)
 	}
-	if transport.IdleConnTimeout <= 0 {
-		t.Fatal("idle connections never expire, so this client will eventually hand a request to a connection the server has already closed")
-	}
-	// 60s is what AWS ELB, MinIO and most reverse proxies use. Anything at or
-	// above it reintroduces the race this exists to close.
-	if transport.IdleConnTimeout >= 60*time.Second {
-		t.Errorf("IdleConnTimeout is %v, which is not inside the 60s idle timeout endpoints commonly use", transport.IdleConnTimeout)
+	if !transport.DisableKeepAlives {
+		t.Fatal("the default client can reuse a server-closed connection for a non-replayable conditional write")
 	}
 }
 
@@ -855,7 +836,6 @@ func TestACallerSuppliedHTTPClientIsNotRewritten(t *testing.T) {
 type staleOnceTransport struct {
 	inner  http.RoundTripper
 	failed bool
-	bodies []int64 // bytes the server received per attempt
 }
 
 func (t *staleOnceTransport) RoundTrip(r *http.Request) (*http.Response, error) {

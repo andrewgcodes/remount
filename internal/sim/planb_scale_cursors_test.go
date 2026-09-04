@@ -42,6 +42,7 @@ import (
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/node"
 	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/server"
 	"remount.dev/remount/internal/transport"
 )
 
@@ -53,6 +54,7 @@ type planbScaleFleet struct {
 	conns   []transport.Conn
 	clients []*client.Client
 	cursors []*client.Session
+	closed  bool
 }
 
 func newPlanbScaleFleet(w *world) *planbScaleFleet { return &planbScaleFleet{world: w} }
@@ -64,6 +66,11 @@ func (f *planbScaleFleet) dialer() transport.Dialer {
 		a, b := transport.Pipe(256)
 		go f.world.srv.AcceptConn(f.world.ctx, b)
 		f.mu.Lock()
+		if f.closed {
+			f.mu.Unlock()
+			_ = a.Close()
+			return nil, transport.ErrClosed
+		}
 		f.conns = append(f.conns, a)
 		f.mu.Unlock()
 		return a, nil
@@ -108,11 +115,14 @@ func (f *planbScaleFleet) cut(rng *rand.Rand, fraction float64) int {
 }
 
 // close detaches every cursor, closes every client, and releases every
-// connection the fleet is still holding.
+// connection the fleet is still holding. The fleet is marked closed under the
+// same lock that takes the cursors, so a cursor reconnecting concurrently is
+// not re-registered behind the teardown.
 func (f *planbScaleFleet) close(ctx context.Context) int {
 	f.mu.Lock()
-	cursors, clients, conns := f.cursors, f.clients, f.conns
-	f.cursors, f.clients, f.conns = nil, nil, nil
+	f.closed = true
+	cursors, clients := f.cursors, f.clients
+	f.cursors, f.clients = nil, nil
 	f.mu.Unlock()
 	var wg sync.WaitGroup
 	var detachFailures atomic.Int64
@@ -134,6 +144,12 @@ func (f *planbScaleFleet) close(ctx context.Context) int {
 	for _, c := range clients {
 		_ = c.Close()
 	}
+	// Collected after the clients are closed: closing a client releases the
+	// connection underneath it, so taking conns earlier would race that.
+	f.mu.Lock()
+	conns := f.conns
+	f.conns = nil
+	f.mu.Unlock()
 	for _, c := range conns {
 		_ = c.Close()
 	}
@@ -149,10 +165,12 @@ func TestPlanBScaleReconnectingCursorsReleaseTheirState(t *testing.T) {
 	if testing.Short() {
 		t.Skip("simultaneous-cursor scale evidence is not a short test")
 	}
-	cursors := planbScaleSize(t, 400, 40)
+	cursors := planbScaleSizeFromEnv(t, "REMOUNT_SCALE_CURSORS", 400, 40)
 	rng := planbScaleRand(t)
 
-	w := newWorld(t)
+	w := newWorldWith(t, func(o *server.Options) {
+		o.LeaseSec = 300
+	})
 	w.nodeWith("n1", func(o *node.Options) {
 		o.MaxSessions = 64
 		o.MaxActiveSessions = 16

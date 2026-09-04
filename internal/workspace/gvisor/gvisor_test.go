@@ -4,6 +4,7 @@ package gvisor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/netip"
 	"os"
@@ -59,8 +60,10 @@ func (f *fakeKernel) CreateNamespace(context.Context, string) (string, error) {
 }
 func (f *fakeKernel) CreateVeth(context.Context, string, string, string) error { return f.call("veth") }
 func (f *fakeKernel) Configure(context.Context, string, netns.Link) error      { return f.call("configure") }
-func (f *fakeKernel) InstallDenyAll(context.Context, string) error             { return f.call("deny") }
-func (f *fakeKernel) PermitBroker(context.Context, string, netip.AddrPort) error {
+func (f *fakeKernel) InstallDenyAll(context.Context, string, netns.Link) error {
+	return f.call("deny")
+}
+func (f *fakeKernel) PermitBroker(context.Context, string, netns.Link, netip.AddrPort) error {
 	return f.call("permit")
 }
 func (f *fakeKernel) BringUp(context.Context, string, string) error { return f.call("up") }
@@ -205,5 +208,39 @@ func TestWrongGenerationCannotReplaceActiveBoundary(t *testing.T) {
 	first.Generation++
 	if err := h.ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, first); err == nil {
 		t.Fatal("stale handle accepted a new generation")
+	}
+}
+
+func TestAdoptRebuildsNetworkAfterStartupReap(t *testing.T) {
+	log := &callLog{}
+	kernel := &fakeKernel{log: log}
+	runtime := &fakeRuntime{log: log, root: "/state", binary: "/usr/bin/runsc"}
+	b := testBackend(t, kernel, runtime)
+	bundle := filepath.Join(b.dir, "ws_one")
+	if err := os.MkdirAll(filepath.Join(bundle, "work"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(metadata{
+		Generation: 9,
+		Mount:      "/workspace",
+		Network: netns.State{
+			Slot:      7,
+			Namespace: "/run/remount/netns/rm-7-9",
+			Link:      netns.Link{HostName: "rmh0007", GuestName: "rmg0007"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, metadataName), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := b.Adopt(context.Background(), "ws_one"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"destroy", "namespace", "veth", "configure", "deny"}
+	if strings.Join(log.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", log.calls, want)
 	}
 }

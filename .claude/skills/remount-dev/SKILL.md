@@ -189,6 +189,32 @@ here against 5 ms unloaded); and `control.(*Control).dispatch` contention is the
 control plane's single state machine lock, which `wsReady`, `wsCreate` and
 `wsClaim` legitimately serialise on.
 
+**"Already closed" has two sentinels and `errors.Is` does not relate them.**
+A pipe reports `os.ErrClosed` ("file already closed"); a socket reports
+`net.ErrClosed` ("use of closed network connection"), and
+`errors.Is(err, os.ErrClosed)` on a closed `net.Conn` is **false**. Any close
+path that tolerates a redundant close must test both — `internal/session`'s
+`alreadyClosed` does — or it will pass on a pipe and fail on a socket. This
+failed only on Windows, but nothing about it is Windows-specific: that lane
+just happened to be the one running a port session whose peer had gone.
+
+Verify a sentinel question with a five-line program rather than reasoning about
+the standard library's wrapping. It takes a minute and the answer is exact.
+
+**A failure names an error code you already retry somewhere.** Find the call
+that produced it and read *that* caller before touching the handler you
+recognise. A shared code is not a shared path: `CodeUnreachable` is retried by
+`Client.nodeCall`, but `DestroyWorkspace` addresses control, not a node, and
+goes through `Client.call`, which retries only `transport.ErrClosed` — so the
+error control returns as a *value* was retried by nothing. Two rounds of tuning
+`nodeCall`'s budget bought nothing (`MISTAKES.md` #49). Ask "what does this
+caller do next?", not "where is this error handled?".
+
+The verification corollary, which applies to every fix here: a fix whose tests
+pass is not shown to reach the failure. Run the new test against the unfixed
+code and watch it fail first. A budget or a retry with no such test can survive
+several rounds of being wrong, because nothing it runs ever contradicts it.
+
 **An error names a file, device or lock as "busy" or "exists".** The name is not
 the subject. It is the fingerprint of an owner that a cleanup path failed to
 release, and the owner is what to look for. `create veth: file exists` meant a
