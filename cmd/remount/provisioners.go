@@ -34,8 +34,6 @@ type provisionerEntry struct {
 	Environment    string `json:"environment,omitempty"`
 	TokenIDEnv     string `json:"token_id_env,omitempty"`
 	TokenSecretEnv string `json:"token_secret_env,omitempty"`
-	Playground     string `json:"playground,omitempty"`
-	Account        string `json:"account,omitempty"`
 	Tenant         string `json:"tenant,omitempty"`
 	Pool           string `json:"pool,omitempty"`
 	Host           string `json:"host,omitempty"`
@@ -120,8 +118,8 @@ func buildProvisioner(vendor string, entry provisionerEntry) (provision.Driver, 
 		if err != nil {
 			return nil, err
 		}
-		return ix.New(ix.Config{Helper: entry.Helper, Playground: entry.Playground, Account: entry.Account,
-			APIKey: key, Tenant: entry.Tenant, Pool: entry.Pool})
+		return ix.New(ix.Config{Helper: entry.Helper, APIKey: key,
+			Region: entry.Region, Tenant: entry.Tenant, Pool: entry.Pool})
 	case "ssh":
 		return ssh.New(ssh.Config{Host: entry.Host, Port: entry.Port, User: entry.User, IdentityFile: entry.IdentityFile,
 			KnownHostsFile: entry.KnownHostsFile, RemoteHelper: entry.RemoteHelper, Tenant: entry.Tenant,

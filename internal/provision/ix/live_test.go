@@ -13,8 +13,8 @@ import (
 )
 
 func TestLiveProvisionerLifecycle(t *testing.T) {
-	values := requireLiveEnv(t, "IX_DEV_API_KEY", "REMOUNT_IX_HELPER", "REMOUNT_IX_PLAYGROUND", "REMOUNT_IX_ACCOUNT", "REMOUNT_VENDOR_SERVER_URL", "REMOUNT_VENDOR_ENROLL_TOKEN", "REMOUNT_VENDOR_BINARY_URL", "REMOUNT_VENDOR_TENANT", "REMOUNT_VENDOR_POOL")
-	driver, err := New(Config{Helper: values["REMOUNT_IX_HELPER"], Playground: values["REMOUNT_IX_PLAYGROUND"], Account: values["REMOUNT_IX_ACCOUNT"], APIKey: values["IX_DEV_API_KEY"], Tenant: values["REMOUNT_VENDOR_TENANT"], Pool: values["REMOUNT_VENDOR_POOL"]})
+	values := requireLiveEnv(t, "IX_TOKEN", "REMOUNT_IX_HELPER", "REMOUNT_VENDOR_SERVER_URL", "REMOUNT_VENDOR_ENROLL_TOKEN", "REMOUNT_VENDOR_BINARY_URL", "REMOUNT_VENDOR_TENANT", "REMOUNT_VENDOR_POOL")
+	driver, err := New(Config{Helper: values["REMOUNT_IX_HELPER"], APIKey: values["IX_TOKEN"], Region: os.Getenv("REMOUNT_IX_REGION"), Tenant: values["REMOUNT_VENDOR_TENANT"], Pool: values["REMOUNT_VENDOR_POOL"]})
 	if err != nil {
 		t.Fatal(err)
 	}

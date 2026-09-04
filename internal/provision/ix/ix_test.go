@@ -47,7 +47,7 @@ func (r *fakeRunner) Run(_ context.Context, command providerutil.Command) ([]byt
 func TestHelperDriverContractAndDedicatedTenant(t *testing.T) {
 	const token = "one-time-secret-canary"
 	runner := &fakeRunner{}
-	driver, err := New(Config{Helper: "/opt/remount-ix-helper", Runner: runner, Playground: "ubuntu", Account: "dedicated", APIKey: "api-key", Tenant: "tenant-a", Pool: "pool-a"})
+	driver, err := New(Config{Helper: "/opt/remount-ix-helper", Runner: runner, APIKey: "api-key", Region: "us-east-1", Tenant: "tenant-a", Pool: "pool-a"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,8 +69,13 @@ func TestHelperDriverContractAndDedicatedTenant(t *testing.T) {
 		if strings.Contains(strings.Join(command.Args, " "), token) {
 			t.Fatalf("token in argv: %v", command.Args)
 		}
-		if command.Env["IX_DEV_API_KEY"] != "api-key" {
-			t.Fatalf("credential not isolated to helper env: %v", command.Env)
+		// IX_TOKEN is the vendor's own variable. The credential must reach the
+		// helper through the environment and never through argv.
+		if command.Env["IX_TOKEN"] != "api-key" {
+			t.Fatalf("credential not isolated to helper env under IX_TOKEN: %v", command.Env)
+		}
+		if command.Env["IX_REGION"] != "us-east-1" {
+			t.Fatalf("region not passed to helper: %v", command.Env)
 		}
 	}
 	foreign := request
@@ -78,9 +83,29 @@ func TestHelperDriverContractAndDedicatedTenant(t *testing.T) {
 	if _, err := driver.Create(context.Background(), foreign); err == nil {
 		t.Fatal("accepted another tenant on dedicated account")
 	}
-	request.Region = "us-east-1"
-	if _, err := driver.Create(context.Background(), request); !errors.Is(err, provision.ErrUnavailable) {
-		t.Fatalf("region error=%v", err)
+	// ix.dev places by region, so a region is honoured rather than refused.
+	regional := testRequest(token)
+	regional.Name = "node-regional"
+	regional.Region = "us-west-1"
+	if _, err := driver.Create(context.Background(), regional); err != nil {
+		t.Fatalf("regional create: %v", err)
+	}
+	var sawRegion bool
+	for _, command := range runner.commands {
+		var input helperRequest
+		if json.Unmarshal(command.Stdin, &input) == nil && input.Region == "us-west-1" {
+			sawRegion = true
+		}
+	}
+	if !sawRegion {
+		t.Fatal("the requested region never reached the helper")
+	}
+	// Size is not part of the documented machine surface.
+	sized := testRequest(token)
+	sized.Name = "node-sized"
+	sized.Size = "big"
+	if _, err := driver.Create(context.Background(), sized); !errors.Is(err, provision.ErrUnavailable) {
+		t.Fatalf("size error=%v", err)
 	}
 	if err := driver.Destroy(context.Background(), machine.ID); err != nil {
 		t.Fatal(err)
