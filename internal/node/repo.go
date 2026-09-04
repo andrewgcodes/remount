@@ -71,6 +71,9 @@ func gitConfigEnv(b *broker.Broker, repo proto.RepoSpec, leases []proto.BindingL
 	gitBase := b.GitURL() + "/" + host + "/"
 	entries := [][2]string{
 		{"url." + gitBase + ".insteadOf", "https://" + host + "/"},
+		// Repository objects are byte-identical across hosts. A Windows user's
+		// global autocrlf setting must not rewrite the managed checkout.
+		{"core.autocrlf", "false"},
 		// Credentials arrive as an Authorization header the broker rewrites, so
 		// no helper may cache or prompt for anything.
 		{"credential.helper", ""},

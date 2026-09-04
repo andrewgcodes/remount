@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -29,6 +30,9 @@ import (
 // task hash but never the task text, and the launcher never travels in a
 // snapshot.
 func TestRunCustomRecipeEndToEnd(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: recipe launchers require a POSIX shell in process workspaces")
+	}
 	var gotAuth atomic.Value
 	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth.Store(r.Header.Get("Authorization"))
@@ -185,6 +189,9 @@ func TestRunCustomRecipeEndToEnd(t *testing.T) {
 // carry is refused before anything is written, and an idempotent replay of
 // the open does not emit a second run.started.
 func TestRunReusesWorkspaceAndReplaysIdempotently(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: recipe launchers require a POSIX shell in process workspaces")
+	}
 	w := newWorld(t, control.Binding{ID: "b_llm", Secret: "x", Destinations: []string{"api.openai.com"}, TTLSec: 60})
 	w.node("n1", nil)
 	c := w.client("c1")

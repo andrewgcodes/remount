@@ -7,7 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"remount.dev/remount/internal/session"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +16,7 @@ import (
 	"remount.dev/remount/internal/acp"
 	"remount.dev/remount/internal/acp/acptest"
 	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/session"
 	"remount.dev/remount/internal/workspace"
 )
 
@@ -65,9 +66,15 @@ func fakeACPConfig(mode string) acptest.Config {
 		}
 	case "terminal":
 		cfg.Turn = func(ctx context.Context, s *acptest.Session, req acp.PromptRequest) (acp.StopReason, error) {
+			command := "/bin/sh"
+			args := []string{"-c", "echo hello-from-terminal; echo REMOUNT_WORKSPACE=$REMOUNT_WORKSPACE; exit 3"}
+			if runtime.GOOS == "windows" {
+				command = "cmd.exe"
+				args = []string{"/d", "/s", "/c", "echo hello-from-terminal&& echo REMOUNT_WORKSPACE=%REMOUNT_WORKSPACE%&& exit 3"}
+			}
 			var created acp.CreateTerminalResponse
 			if err := s.Call(ctx, acp.MethodTerminalCreate, acp.CreateTerminalRequest{
-				SessionID: s.ID, Command: "/bin/sh", Args: []string{"-c", "echo hello-from-terminal; echo REMOUNT_WORKSPACE=$REMOUNT_WORKSPACE; exit 3"},
+				SessionID: s.ID, Command: command, Args: args,
 			}, &created); err != nil {
 				return "", err
 			}
@@ -238,6 +245,11 @@ func (f *agentFixture) request(t *testing.T, mode string, msgs ...string) proto.
 		Agent: "ag_1", Run: "run_" + mode, Attempt: 1, WS: f.w.ID, Gen: f.w.Generation, Tenant: "t", Owner: "u",
 		Spec:   proto.AgentSpec{ACPCommand: []string{"/usr/bin/env", fakeACPEnv + "=1", fakeACPModeEnv + "=" + mode, exe}},
 		Policy: proto.AgentPolicy{Approve: proto.ApproveOnRequest}, Mode: proto.AgentModeACP,
+	}
+	if runtime.GOOS == "windows" {
+		f.w.Spec.Env[fakeACPEnv] = "1"
+		f.w.Spec.Env[fakeACPModeEnv] = mode
+		req.Spec.ACPCommand = []string{exe}
 	}
 	for i, m := range msgs {
 		req.Messages = append(req.Messages, proto.AgentMessage{ID: fmt.Sprintf("m%d", i+1), Kind: proto.AgentMessageFollowUp, Text: m})
@@ -451,13 +463,9 @@ func TestAgentRunPolicyAutoAndNeverAnswerWithoutParking(t *testing.T) {
 	for _, tc := range []struct{ policy, want string }{{proto.ApproveAuto, "selected:yes"}, {proto.ApproveNever, "selected:no"}} {
 		t.Run(tc.policy, func(t *testing.T) {
 			f := newAgentFixture(t)
-			exe, _ := os.Executable()
-			req := proto.AgentRunReq{
-				Agent: "ag_1", Run: "run_" + tc.policy, Attempt: 1, WS: f.w.ID, Gen: f.w.Generation,
-				Spec:     proto.AgentSpec{ACPCommand: []string{"/usr/bin/env", fakeACPEnv + "=1", fakeACPModeEnv + "=permission", exe}},
-				Policy:   proto.AgentPolicy{Approve: tc.policy},
-				Messages: []proto.AgentMessage{{ID: "m1", Kind: proto.AgentMessageFollowUp, Text: "go"}},
-			}
+			req := f.request(t, "permission", "go")
+			req.Run = "run_" + tc.policy
+			req.Policy.Approve = tc.policy
 			if _, err := f.n.agentRunStart(context.Background(), nil, &req); err != nil {
 				t.Fatal(err)
 			}
@@ -693,6 +701,9 @@ acp:
 }
 
 func TestAgentRunInstallsRecipeOncePerGeneration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: recipe install and ACP launcher scripts require a POSIX shell")
+	}
 	f := newAgentFixture(t)
 	req := f.request(t, "echo", "hello")
 	req.Spec = proto.AgentSpec{Recipe: "inst", RecipeYAML: installRecipe(t, "echo", `echo "installed key=${OPENAI_API_KEY:-none}" >&2; echo run >> installs.txt`)}
@@ -757,6 +768,9 @@ func TestAgentRunInstallsRecipeOncePerGeneration(t *testing.T) {
 }
 
 func TestAgentRunInstallFailureFailsTheRun(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: recipe install and ACP launcher scripts require a POSIX shell")
+	}
 	f := newAgentFixture(t)
 	req := f.request(t, "echo", "hello")
 	req.Spec = proto.AgentSpec{Recipe: "inst", RecipeYAML: installRecipe(t, "echo", `echo "no network" >&2; exit 3`)}
@@ -794,6 +808,9 @@ func (h envRewritingHandle) Prepare(spec *session.Spec) error {
 // rewrote the spec. With the docker shape of Prepare the old order saw only
 // the host environment and let a workspace token through.
 func TestAgentRunRedactsWorkspaceEnvWhenBackendRewritesSpec(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: this models a Unix container launcher with /usr/bin/env")
+	}
 	f := newAgentFixture(t)
 	f.n.mu.Lock()
 	f.w.handle = envRewritingHandle{f.w.handle}
@@ -983,6 +1000,9 @@ func TestAgentReporterBoundsQueueAndPlacesGapInOrder(t *testing.T) {
 // ends the run then, not when the install script gives up. The install has
 // no ACP turn to cancel, so it is the run's own cancel that has to reach it.
 func TestAgentRunCancelInterruptsInstall(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: recipe install scripts require a POSIX shell")
+	}
 	f := newAgentFixture(t)
 	req := f.request(t, "echo", "hello")
 	req.Spec = proto.AgentSpec{Recipe: "inst", RecipeYAML: installRecipe(t, "echo", `echo installing >&2; sleep 60`)}

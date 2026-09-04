@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -215,7 +216,7 @@ func Launch(ctx context.Context, opts LaunchOptions) (*Target, error) {
 			if err != nil {
 				return nil, err
 			}
-			bin = filepath.Join(dir, "remount")
+			bin = filepath.Join(dir, localExecutableName("remount"))
 		}
 		build := exec.CommandContext(ctx, "go", "build", "-o", bin, pkg)
 		build.Dir = opts.ModuleDir
@@ -302,6 +303,13 @@ func Launch(ctx context.Context, opts LaunchOptions) (*Target, error) {
 	// qualified, and the manifest asserts only the former.
 	delete(t.Prereqs, PrereqQuiescedSnapshot)
 	return t, nil
+}
+
+func localExecutableName(name string) string {
+	if runtime.GOOS == "windows" {
+		return name + ".exe"
+	}
+	return name
 }
 
 // Health is the /healthz document every implementation publishes.

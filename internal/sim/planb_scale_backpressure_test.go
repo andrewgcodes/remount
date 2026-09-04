@@ -161,10 +161,20 @@ func TestPlanBScaleEventLogRetentionCeilingIsCountedAndExplicit(t *testing.T) {
 	}
 	t.Logf("evicted read reports oldest=%d", pe.Oldest)
 
-	// Recovery: reading from the oldest surviving sequence works again.
-	events, err := c.ReadEvents(ctx, pe.Oldest, "")
-	if err != nil {
-		t.Fatalf("read from the reported oldest sequence: %v", err)
+	// Recovery: the asynchronous retention pass may advance again between
+	// requests while the final posts are still being collected. Follow each
+	// explicit watermark until the retained window stabilizes.
+	oldest := pe.Oldest
+	var events []proto.Event
+	for {
+		events, err = c.ReadEvents(ctx, oldest, "")
+		if err == nil {
+			break
+		}
+		if !errors.As(err, &pe) || pe.Code != proto.CodeEvicted || pe.Oldest <= oldest {
+			t.Fatalf("read from reported oldest sequence %d: %v", oldest, err)
+		}
+		oldest = pe.Oldest
 	}
 	if len(events) == 0 {
 		t.Fatal("read from the reported oldest sequence returned nothing")

@@ -153,12 +153,11 @@ func TestRepoClonedAtMaterializeWithoutTokenInWorkspace(t *testing.T) {
 	if hits := scanForToken(t, info.Root, fakeInstallationToken); len(hits) != 1 || filepath.Base(hits[0]) != "canary.txt" {
 		t.Fatalf("scan did not find the planted canary: %v", hits)
 	}
-	out, _, _, _ := c.Run(ctx, ws.ID, "sh", "-c", `env | grep -c `+fakeInstallationToken+` || true`)
-	if strings.TrimSpace(string(out)) != "0" {
-		t.Fatalf("token in session environment (%s matches)", strings.TrimSpace(string(out)))
+	out, _, _, _ := c.Run(ctx, ws.ID, repoEnvironmentProgram()...)
+	if bytes.Contains(out, []byte(fakeInstallationToken)) {
+		t.Fatal("token in session environment")
 	}
-	out, _, _, _ = c.Run(ctx, ws.ID, "sh", "-c", `env | grep -c '^GIT_CONFIG_KEY_' || true`)
-	if strings.TrimSpace(string(out)) == "0" {
+	if !bytes.Contains(out, []byte("GIT_CONFIG_KEY_")) {
 		t.Fatal("session environment carries no git routing through the broker")
 	}
 	for _, e := range evs {
@@ -175,7 +174,7 @@ func TestRepoClonedAtMaterializeWithoutTokenInWorkspace(t *testing.T) {
 	// The checkout is a working remote: a session commits and pushes through
 	// the same broker, and the hosting service ends up at the new commit.
 	script := `git config user.email w@example.invalid && git config user.name w && git add canary.txt && git commit -q -m c && git push -q origin HEAD:main && git rev-parse HEAD`
-	out, errb, exit, err := c.Run(ctx, ws.ID, "sh", "-c", script)
+	out, errb, exit, err := c.Run(ctx, ws.ID, repoShellProgram(script)...)
 	if err != nil || exit.Code != 0 {
 		t.Fatalf("push from workspace: %v %+v %s %s", err, exit, out, errb)
 	}
@@ -196,8 +195,9 @@ func TestRepoClonedAtMaterializeWithoutTokenInWorkspace(t *testing.T) {
 	if g.svc.Requests() != requests {
 		t.Fatal("move re-cloned the repository")
 	}
-	out, errb, exit, err = c.Run(ctx, ws.ID, "sh", "-c", "git fetch -q origin && git rev-parse HEAD && cat canary.txt | grep -c "+fakeInstallationToken)
-	if err != nil || exit.Code != 0 || !strings.Contains(string(out), "1") {
+	out, errb, exit, err = c.Run(ctx, ws.ID, repoShellProgram("git fetch -q origin && git rev-parse HEAD")...)
+	canary, readErr := c.ReadFile(ctx, ws.ID, "canary.txt")
+	if err != nil || exit.Code != 0 || readErr != nil || !bytes.Contains(canary, []byte(fakeInstallationToken)) {
 		t.Fatalf("fetch after move: %v %+v %s %s", err, exit, out, errb)
 	}
 	evs, _ = c.ReadEvents(ctx, 1, ws.ID)

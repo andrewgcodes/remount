@@ -1,0 +1,11 @@
+* text=auto
+*.go text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+web/dist.sha256 text eol=lf
+web/dist/** -text
+internal/conformance/testdata/golden/** -text

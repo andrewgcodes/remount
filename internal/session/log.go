@@ -341,6 +341,20 @@ func (l *Log) Close() error {
 	return l.closeWithPublish(nil, nil)
 }
 
+// closeLocal releases the spill file without publishing anything. Tests use it
+// to release a log's descriptor during cleanup, which matters on Windows where
+// an open handle blocks the temporary directory from being removed.
+func (l *Log) closeLocal() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.spill == nil {
+		return nil
+	}
+	err := l.spill.Close()
+	l.spill = nil
+	return err
+}
+
 // closeWithPublish runs finalCommit and publish after every archival producer
 // has joined and while readers are still excluded from observing EOF. Session
 // uses it to commit durability, capacity, and exit as one ordered handoff.
