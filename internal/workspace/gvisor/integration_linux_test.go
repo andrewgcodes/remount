@@ -291,9 +291,12 @@ func (w *escapeWatcher) escaped() []string {
 	seen := map[string]struct{}{}
 	buf := make([]byte, 2048)
 	for {
-		n, err := unix.Read(w.fd, buf)
+		n, peer, err := unix.Recvfrom(w.fd, buf, 0)
 		if err != nil || n <= 0 {
 			break
+		}
+		if link, ok := peer.(*unix.SockaddrLinklayer); ok && link.Pkttype == unix.PACKET_OUTGOING {
+			continue
 		}
 		// Ethernet header is 14 bytes; IPv4 needs 20 more.
 		if n < 34 || buf[12] != 0x08 || buf[13] != 0x00 {
