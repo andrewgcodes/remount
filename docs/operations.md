@@ -19,8 +19,17 @@ remount server --listen 0.0.0.0:7443 --data /var/lib/remount --token "$REMOUNT_T
 |---|---|---|
 | `--listen` | `127.0.0.1:7443` | bind address; also `REMOUNT_LISTEN` |
 | `--data` | `./remount-data` | state directory; also `REMOUNT_DATA` |
-| `--token` | `$REMOUNT_TOKEN` | shared bearer token, standalone mode only |
+| `--token` | `$REMOUNT_TOKEN` | shared bearer token, standalone mode only. Prefer the environment variable: an argument is visible to every local user in the process table |
 | `--insecure` | off | allow an empty token, for local experiments only |
+
+**Do not pass a bearer as a command-line argument on a shared host.** Process
+arguments are world-readable — `ps aux` shows them to any local user, and they
+reach process listings, crash dumps and monitoring agents that never see an
+environment variable. Every flag that takes a credential also reads an
+environment variable, and `remount up`, `remount server` and the client all
+accept `REMOUNT_TOKEN`. Production mode avoids the question entirely: it issues
+per-principal tokens through `--bootstrap-token-file`, an exclusive mode-0600
+path, and `remount token issue`, rather than a shared secret anyone can reuse.
 | `--bindings` | none | JSON file of secrets the nodes may lease |
 | `--provisioners` | none | provider registry JSON; credentials are named environment references |
 | `--notifications` | none | provider-webhook and outbound-notification JSON; credentials are named environment references |

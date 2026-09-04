@@ -278,7 +278,62 @@ and removed, `remount-control` secret and `remount-migrate-data` volume
 deleted. `modal app list` shows no deployed remount app; `modal secret list`
 shows no `remount-control`.
 
-### Gap found: the Modal demo cannot broker a credential
+## 2026-09-03 — an AI agent on Modal, brokered, and what the migration cost
+
+**Status: verified for the agent and the broker; the large-workspace migration
+is an open performance finding.**
+
+The gap recorded below — that `deploy/modal_app.py` allowed egress to
+`api.openai.com` but configured no binding, so no harness could run there — is
+now **closed**. The control function writes a `b_openai` binding whose secret is
+the `$OPENAI_API_KEY` *name*, resolved by the node at lease time from an
+optional Modal secret. The secret is genuinely optional: a deploy with it
+absent prints why and proceeds with no binding, verified by deploying against a
+deliberately nonexistent secret name.
+
+**Brokering on Modal, verified.** A workspace on the Modal node holds only the
+placeholder:
+
+```
+KEY=sk-proj-REMOUNT-PLACEHOLDER-NOT-A-REAL-KEY
+BASE=http://127.0.0.1:58118/c/<per-workspace-token>/d/api.openai.com/v1
+```
+
+A live `POST /chat/completions` through that broker returned the model's reply,
+`brokered-from-modal`, and the real key appeared in **0** environment entries
+and **0** files in the workspace.
+
+**A real agent ran on Modal.** `remount run opencode --binding b_openai` in the
+cloud installed the harness, reached OpenAI through the broker, and produced a
+durable agent: `waiting_input`, 14 transcript records, an ACP session id, and
+its own URL. It stopped on OpenCode's own sandbox permission prompt for the
+workspace path, which is a harness-configuration issue rather than a Remount
+one, and it stopped *durably* — the agent survived as a resumable record.
+
+**The migration finding.** Moving that agent's workspace from Modal to a laptop
+began correctly — a real checkpoint, generation 2, `claiming` on the laptop
+node, and the agent record survived the move with its ACP session intact
+(transcript 14 → 15). But the restore transferred roughly **113 KB/s**: 562 MB
+of OpenCode's `node_modules` in about 25 minutes, still incomplete when the run
+was abandoned. The same round trip with a small workspace completes in seconds
+(see the entry above), so the cost is the artifact, not the mechanism.
+
+Two things follow, and both are honest limits rather than defects:
+
+- pulling a large legacy-tar checkpoint through Modal's web endpoint is
+  impractically slow, so a cloud-to-laptop migration of a harness workspace
+  needs either chunked artifacts on this path or an S3-compatible blob store
+  both ends can reach directly; and
+- `remount run` writes the harness into the workspace, so the workspace
+  inherits `node_modules`. A base image carrying the harness would move a small
+  delta instead of the whole tree.
+
+**Teardown, verified.** Local node stopped, app stopped, `remount-control`
+secret and `remount-broker-data` volume deleted, the throwaway
+`remount-nobind` test app and its volume removed. `modal app list` shows no
+deployed remount app and no `remount-control` secret.
+
+### Gap found (closed 2026-09-03): the Modal demo cannot broker a credential
 
 `deploy/modal_app.py` passes `--allow api.openai.com` to the node but no
 `--bindings` to the server, so a workspace there can reach the provider and has
