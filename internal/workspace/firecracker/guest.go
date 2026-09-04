@@ -166,16 +166,60 @@ func writeAll(w io.Writer, b []byte) error {
 	return nil
 }
 
+// guestDialRetryInterval is how often dial retries a guest that is not
+// answering yet. Small relative to a microVM's boot, so the first successful
+// attempt is close to the moment the guest is actually ready.
+const guestDialRetryInterval = 100 * time.Millisecond
+
 func (g *GuestBridge) dial(ctx context.Context, endpoint GuestEndpoint) (net.Conn, error) {
 	if endpoint.Socket == "" || endpoint.Generation == 0 {
 		return nil, proto.Err(proto.CodeClosed, "guest endpoint is not active")
 	}
-	d := net.Dialer{Timeout: g.opts.Timeout}
+	// Retry until the budget is gone rather than failing the first attempt.
+	//
+	// The socket exists as soon as the VMM does, but nothing is listening on
+	// the far side until the guest has booted and the agent has bound its
+	// vsock port — about two and a half seconds on the kernel this ships
+	// against. A single attempt therefore raced the boot and lost, and the
+	// materialization failed with "guest vsock handshake failed: EOF" on a
+	// guest that was about to be perfectly healthy.
+	//
+	// Retrying is safe here in a way it would not be for an arbitrary
+	// operation: this establishes a connection and exchanges a fixed CONNECT
+	// line, so a retried attempt cannot repeat work or observe a partial
+	// effect. A guest that is genuinely dead still fails, just at the end of
+	// the budget instead of the start of it.
+	deadline := time.Now().Add(g.opts.Timeout)
+	if got, ok := ctx.Deadline(); ok && got.Before(deadline) {
+		deadline = got
+	}
+	var lastErr error
+	for {
+		conn, err := g.dialOnce(ctx, endpoint, deadline)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, proto.Err(proto.CodeUnreachable, "guest vsock: %v", ctxErr)
+		}
+		if !time.Now().Add(guestDialRetryInterval).Before(deadline) {
+			return nil, lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return nil, proto.Err(proto.CodeUnreachable, "guest vsock: %v", ctx.Err())
+		case <-time.After(guestDialRetryInterval):
+		}
+	}
+}
+
+func (g *GuestBridge) dialOnce(ctx context.Context, endpoint GuestEndpoint, deadline time.Time) (net.Conn, error) {
+	d := net.Dialer{Deadline: deadline}
 	conn, err := d.DialContext(ctx, "unix", endpoint.Socket)
 	if err != nil {
 		return nil, proto.Err(proto.CodeUnreachable, "guest vsock: %v", err)
 	}
-	deadline := time.Now().Add(g.opts.Timeout)
 	_ = conn.SetDeadline(deadline)
 	if err := writeAll(conn, []byte(fmt.Sprintf("CONNECT %d\n", guestVsockPort))); err != nil {
 		_ = conn.Close()
