@@ -22,7 +22,7 @@ full-suite Docker OpenCode lanes remain known failing and are visible CI
 debt.**
 
 Host: Windows Server 2022 amd64. Go: 1.27.1. Race C toolchain: MinGW-w64
-16.1.0. Final verification integrated `origin/main` at `7d1bc8d`.
+16.1.0. Final post-merge verification used `origin/main` at `51185dd`.
 
 ### Final command results
 
@@ -259,12 +259,25 @@ test remain unchanged in developer package targets.
 
 ## Current-main compatibility recheck
 
-The final branch contains `origin/main` at
-`7d1bc8ddbc055be9f57e157bac1915c0cadbe876`; no mainline commit was missing.
-On that combined history, native Windows passed build, vet, the complete
+After the Windows pull request merged, `origin/main` was
+`51185ddeda5c4451c024a1fd7c660e4cc271a52b`. That history includes the Windows
+work and four commits that landed concurrently: the Helm document comparator,
+safe retry of an S3 request the transport never wrote, host-sized simulation
+loads with container-user catalog writes, and the September 4 session handoff.
+
+The merged Helm test retains both document-level semantic comparison and
+CRLF/LF normalization. The S3 suite retains both the conditional-write
+connection-closing regression and the rewindable unused-connection retry
+regression. The OpenCode lane retains the assertion that transient state does
+not enter the workspace while writing its model catalog as the container user.
+Focused policy and S3 package tests passed, and the deterministic OpenCode model
+lane passed in 46.128 seconds.
+
+On the merged history, native Windows passed build, vet, the complete
 serialized ordinary package lane with the five documented Windows exclusions,
 the nested public-SDK module, and the complete serialized race package lane
-with its four documented exclusions. Built-binary conformance remained:
+with its four documented exclusions. Formatting, lock-discipline lint, and
+diff checks also passed. Built-binary conformance remained:
 
 ```text
 60 passed, 0 failed, 8 unavailable of 68 requirements
