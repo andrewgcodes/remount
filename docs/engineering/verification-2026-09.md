@@ -1878,3 +1878,71 @@ passed broker reachability, IPv4 TCP, IPv6, UDP, DNS, ICMP, raw-socket, unlisted
 CONNECT, and post-revoke denial checks. Its exit trap deleted the runsc
 sandbox, veth, nftables table, network namespace, bind mount, and temporary
 directory. **Status: verified.**
+
+### 2026-09-04 — B32 aggregate correction and merged-main follow-up
+
+The first aggregate run on committed candidate
+`a48d046132ba01976fb799424607654bb33c32b9` correctly failed:
+
+```text
+evidence: verdict failed: 1 required rows failed, 20 unavailable, 0 leaks
+B32: owning proof skipped without an unavailable reason
+```
+
+The B32 registry command ran the entire `integration/installs` package even
+though its owner is `integration/installs.TestB32*`. The package also contains
+the unrelated `TestCleanEnvKeepsWindowsPackageManagerRoots`, whose
+Windows-contract skip is not a B32 proof. The evidence parser remains strict;
+the registry command was narrowed to its owning tests and a regression fixes
+that exact command:
+
+```sh
+go test -count=1 -timeout=20m -run '^TestB32' ./integration/installs/
+```
+
+On committed candidate `ed84f259c17043b81391ae758df2048faa950014`,
+the command passed in 45.813 seconds. The clean committed-candidate aggregate
+then completed:
+
+```sh
+go run ./cmd/evidence run
+```
+
+```text
+Rows: 35 passed, 0 failed, 32 unavailable
+Required rows: 35 of 55 passed, 0 failed, 20 unavailable
+External resources created: 1; cleanup verified 1, failed 0
+```
+
+This result is deliberately **incomplete**, not passed: all 20 required rows
+that did not execute remain unavailable with named missing prerequisites or
+unwired owning proofs. B32 passed and no required row failed.
+
+Built-binary conformance on the same candidate:
+
+```sh
+go run ./cmd/conformance --build .
+```
+
+```text
+60 passed, 0 failed, 8 unavailable of 68 requirements
+required: 53 passed, 0 failed, 0 unavailable
+cleanup: verified
+```
+
+After the original pull request merged, the unmerged work was moved to a
+follow-up branch based on current `main`. The exact Linux host proof was
+re-run:
+
+```sh
+sudo -n env \
+  REMOUNT_GVISOR_ROOTFS=/home/ubuntu/firecracker-artifacts/gvisor-rootfs-alpine-3.22 \
+  scripts/gvisor-spike.sh
+```
+
+Linux 5.15 again rejected the guest netdev egress hook with `Operation not
+supported`. The host-veth ingress fallback installed; the positive control,
+all denial probes, and post-revoke denial passed; the script reported
+`gVisor E4 spike passed`. Its exit trap removed the runsc sandbox, nftables
+tables, namespace, veth pair, bind mount, bundle, and state root. B32 removed
+its temporary install and build directories. **Status: verified.**
