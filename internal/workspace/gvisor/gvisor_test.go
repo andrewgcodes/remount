@@ -2,6 +2,7 @@ package gvisor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/netip"
 	"os"
@@ -205,5 +206,39 @@ func TestWrongGenerationCannotReplaceActiveBoundary(t *testing.T) {
 	first.Generation++
 	if err := h.ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, first); err == nil {
 		t.Fatal("stale handle accepted a new generation")
+	}
+}
+
+func TestAdoptRebuildsNetworkAfterStartupReap(t *testing.T) {
+	log := &callLog{}
+	kernel := &fakeKernel{log: log}
+	runtime := &fakeRuntime{log: log, root: "/state", binary: "/usr/bin/runsc"}
+	b := testBackend(t, kernel, runtime)
+	bundle := filepath.Join(b.dir, "ws_one")
+	if err := os.MkdirAll(filepath.Join(bundle, "work"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(metadata{
+		Generation: 9,
+		Mount:      "/workspace",
+		Network: netns.State{
+			Slot:      7,
+			Namespace: "/run/remount/netns/rm-7-9",
+			Link:      netns.Link{HostName: "rmh0007", GuestName: "rmg0007"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, metadataName), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := b.Adopt(context.Background(), "ws_one"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"destroy", "namespace", "veth", "configure", "deny"}
+	if strings.Join(log.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", log.calls, want)
 	}
 }

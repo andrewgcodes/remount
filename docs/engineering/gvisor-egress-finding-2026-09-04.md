@@ -7,10 +7,11 @@ test.
 
 ## 1. The deny-first egress policy was not enforced
 
-**Status: FIXED and verified.** A netdev egress chain on the workspace veth now
-carries the policy; `TestE4DenialConformance` passes, three consecutive runs,
-with no resource left behind. The history below is kept because the way this
-hid for so long is the useful part.
+**Status: FIXED and verified.** A traffic-control `clsact` egress classifier on
+the workspace veth now carries the policy; `TestE4DenialConformance` passes
+with no forbidden frame reaching the host veth and no resource left behind.
+The history below is kept because the way this hid for so long is the useful
+part.
 
 **Severity as found:** the workspace network boundary did not hold at all.
 Containment on the tested host came entirely from Docker's default
@@ -125,7 +126,7 @@ existing."
 
 ## What the fix has to do
 
-Enforce on a hook that sees link-layer-injected traffic. The natural place is
+Enforce on a hook that sees link-layer-injected traffic. One natural place is
 the host side of the veth, as a `netdev` filter:
 
 ```
@@ -134,24 +135,19 @@ table netdev remount {
 }
 ```
 
-An `ingress` netdev hook sees frames as they arrive from the peer regardless of
-how the peer produced them, so AF_PACKET injection cannot bypass it. Kernels
-5.16+ also offer `hook egress` for the symmetric direction.
+An ingress netdev hook sees frames as they arrive from the peer regardless of
+how the peer produced them, so AF_PACKET injection cannot bypass it. Linux
+5.16+ also offers a netdev egress hook for the symmetric direction, but the
+verified Linux 5.15 host rejects that hook with `EOPNOTSUPP`.
 
-**This is what was done**, in `internal/netns/netns_linux.go`, and two details
-cost real time and are worth writing down:
-
-1. **`meta nfproto` does not work in a netdev chain.** That match selects IPv4
-   for the inet family, and a netdev chain sees a frame rather than a routed
-   packet, so it never matches and the broker rule is dead. The equivalent at
-   this layer is the ethertype, `meta protocol == 0x0800`.
-2. **ARP has to be excepted explicitly.** An inet output chain never sees ARP
-   because ARP is not IP, so the original policy was silently unaffected by it.
-   A netdev chain sees every frame, so a drop policy excepting only IPv4 also
-   drops the sandbox's ARP request for the host's MAC — after which nothing can
-   be delivered and the symptom is that even the *permitted* broker is
-   unreachable. Allowing it is not an egress path: the device is one end of a
-   veth pair whose only peer is this workspace's host side.
+The final implementation in `internal/netns/netns_linux.go` therefore installs
+a traffic-control `clsact` egress classifier on the guest veth before runsc
+starts. It permits ARP and the exact broker IPv4/TCP tuple at higher priority,
+then drops every other Ethernet protocol. The host-side nftables ingress rule
+remains a second boundary. ARP must be excepted because the sandbox needs the
+peer's MAC before it can reach the permitted broker; that exception cannot
+reach beyond the veth peer, and the IPv4/TCP classifier still constrains the
+traffic ARP enables.
 
 Verified twice over. The in-test AF_PACKET watcher reports nothing crossing, and
 an independent `tcpdump` during the same run captures zero packets to any
@@ -173,9 +169,8 @@ awk '{print $3, $5, $6, $7}' /tmp/all.txt | sort | uniq -c | sort -rn
 Any line whose source is the sandbox address is traffic that crossed the
 boundary. There should be none.
 
-Note that a killed run leaves state behind that makes the next run fail on
-`create veth: file exists` or `create network namespace: ... file exists`; see
-the resource-leak finding recorded alongside this one.
+The startup reaper recorded below now removes state left by a killed run before
+the next workspace is materialized.
 
 ---
 
@@ -191,7 +186,7 @@ reclaims what the backend created:
 | the veth `rmh<slot>` | `create veth: file exists` |
 | the `runsc-sandbox` and `runsc-gofer` processes | none, they simply run forever |
 
-**One part of this is now fixed.** The `nsfs` mount runsc leaves at
+**Fixed and verified.** The `nsfs` mount runsc leaves at
 `<state-root>/null-netns` leaked on the *successful* path too, not only after a
 kill: a completed run took the host from 9 such mounts to 10, so a node that
 creates and destroys workspaces accumulated one mount per workspace forever.
@@ -199,11 +194,14 @@ creates and destroys workspaces accumulated one mount per workspace forever.
 so `execRuntime.destroy` now unmounts it. Measured after: 0 before a run, 0
 after.
 
-The three rows below still leak when the process is killed:
-
-The orphaned sandboxes are the worst of the three because they are silent. One
-observed here had been running **1733 seconds** after the test that created it
-was killed, holding its memory and its gofer.
+At backend startup, runsc containers in the backend's state root are destroyed
+before namespace reclamation. The network reaper then compares each retained
+namespace inode with `/proc/<pid>/ns/net`, removes only uninhabited namespaces,
+and deletes their matching host veths. The live-namespace regression waits
+until its holder has actually entered the namespace before invoking the reaper;
+ten privileged repetitions retained the live namespace and removed the orphan.
+Adoption rebuilds a fresh deny-first boundary from retained generation and
+mount metadata after startup cleanup.
 
 **Correction to an earlier reading of this.** The names look like PIDs and are
 not: `netns.Manager` formats them from an allocator *slot*, `rm-%x-%x` for the
@@ -215,17 +213,9 @@ previous process left behind. A node that was killed once will collide on its
 very next start, deterministically, and report `create veth: file exists` — an
 error naming a file rather than the cause.
 
-A node has no startup reconciliation for these. `docs/engineering/handoff-linux-host-2026-09-03.md`
-§1 asks that "cleanup runs after every failure path"; cleanup does run on the
-error paths inside the process, and does not run when the process is not there
-to run it, which is exactly when it matters.
-
-What a fix needs: a reaper at backend startup that removes netns files no
-process still inhabits, together with their veths, and kills sandboxes whose
-workspace this node does not hold. "No process inhabits it" is decidable: stat
-the netns file for its inode and compare against the `net:[inode]` link every
-`/proc/<pid>/ns/net` reports. The existing `consistency.orphan_on_node` doctor check covers the control
-plane's view of workspaces, not host resources beneath a dead node.
+The existing `consistency.orphan_on_node` doctor check covers the control
+plane's view of workspaces; this startup reconciliation covers the host
+resources beneath a dead node.
 
 A cleanup script sufficient for a developer host, used while investigating:
 
