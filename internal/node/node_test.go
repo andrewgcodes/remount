@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,6 +22,50 @@ import (
 	"remount.dev/remount/internal/transport"
 	"remount.dev/remount/internal/workspace"
 )
+
+type cancelClosingConn struct {
+	sendStarted chan struct{}
+	releaseSend chan struct{}
+	closed      chan struct{}
+	startOnce   sync.Once
+	closeOnce   sync.Once
+}
+
+func newCancelClosingConn() *cancelClosingConn {
+	return &cancelClosingConn{
+		sendStarted: make(chan struct{}),
+		releaseSend: make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
+}
+
+func (c *cancelClosingConn) Send(ctx context.Context, f *proto.Frame) error {
+	if f.T != proto.KindChunk {
+		return nil
+	}
+	c.startOnce.Do(func() { close(c.sendStarted) })
+	select {
+	case <-ctx.Done():
+		_ = c.Close()
+		return ctx.Err()
+	case <-c.releaseSend:
+		return nil
+	}
+}
+
+func (c *cancelClosingConn) Recv(ctx context.Context) (*proto.Frame, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.closed:
+		return nil, transport.ErrClosed
+	}
+}
+
+func (c *cancelClosingConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
 
 func newTestNode(t *testing.T, configure func(*Options)) *Node {
 	t.Helper()
@@ -36,6 +81,34 @@ func newTestNode(t *testing.T, configure func(*Options)) *Node {
 	}
 	t.Cleanup(func() { n.sessions.Close() })
 	return n
+}
+
+func TestReplacingSessionCursorDoesNotCancelSharedPeerWrite(t *testing.T) {
+	n := newTestNode(t, nil)
+	s, err := n.sessions.Open(session.Spec{WS: "ws_cursor", Kind: proto.SessionExec, Program: []string{"/bin/cat"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { n.sessions.Remove(s.ID, true) })
+
+	conn := newCancelClosingConn()
+	p := transport.NewPeer(conn, nil)
+	t.Cleanup(func() { _ = p.Close() })
+
+	n.subscribe(p, "c_cursor", s, 0)
+	select {
+	case <-conn.sendStarted:
+	case <-time.After(time.Second):
+		t.Fatal("initial cursor did not start its chunk write")
+	}
+
+	n.subscribe(p, "c_cursor", s, 0)
+	select {
+	case <-p.Done():
+		t.Fatalf("replacing the cursor closed the shared peer: %v", p.Err())
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(conn.releaseSend)
 }
 
 func nodeDigest(body string) string {

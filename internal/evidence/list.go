@@ -11,10 +11,8 @@ type ScenarioView struct {
 	Scenario
 	// MissingEnv names the variables the owner needs that are not set here.
 	MissingEnv []string `json:"missing_env,omitempty"`
-	// Evidence is the outcome this repository can currently claim for the row.
-	// It is never `passed`: no row is wired into the aggregate runner yet, and a
-	// recorded outcome from a document is provenance, not evidence re-earned
-	// against this candidate.
+	// Evidence is unavailable when the aggregate runner cannot execute the row.
+	// A blank value means wired but not executed by this listing command.
 	Evidence Status `json:"evidence"`
 }
 
@@ -55,7 +53,7 @@ func RenderList(views []ScenarioView) string {
 	}
 	fmt.Fprintf(&b, "%d of %d registered acceptance scenarios shown; %d of them have no owning proof (%d of those are required).\n",
 		len(views), len(scenarios), unowned, requiredUnowned)
-	b.WriteString("No scenario is wired into the aggregate runner yet, so no row below is evidence for this candidate.\n\n")
+	b.WriteString("This listing executes no proofs; a blank evidence cell means wired, and unavailable means not wired.\n\n")
 	fmt.Fprintf(&b, "%-5s %-13s %-9s %-11s %s\n", "ID", "LAYER", "REQUIRED", "EVIDENCE", "OWNER / OPEN")
 	for _, v := range views {
 		owner := v.Owner

@@ -347,6 +347,14 @@ func (h *handle) MountPath() string {
 }
 func (h *handle) CheckpointKind() workspace.CheckpointKind { return workspace.CheckpointFSMem }
 func (h *handle) BrokerAdvertiseHost() string              { return h.network.HostAddress().String() }
+func (h *handle) RestoreProcesses() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.restored && h.started {
+		return proto.RestoreProcessesPreserved
+	}
+	return proto.RestoreProcessesRestarted
+}
 
 func (h *handle) Prepare(spec *session.Spec) error {
 	endpoint, err := h.guestEndpoint()

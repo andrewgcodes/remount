@@ -226,8 +226,15 @@ func TestRestoreLoadsBeforeResumeAndNeverStartsFresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := raw.(*handle).ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, endpoint()); err != nil {
+	h := raw.(*handle)
+	if got := h.RestoreProcesses(); got != proto.RestoreProcessesRestarted {
+		t.Fatalf("restore outcome before guest serviceability = %q", got)
+	}
+	if err := h.ApplyNetworkPolicy(context.Background(), proto.NetworkPolicy{}, endpoint()); err != nil {
 		t.Fatal(err)
+	}
+	if got := h.RestoreProcesses(); got != proto.RestoreProcessesPreserved {
+		t.Fatalf("restore outcome after guest serviceability = %q", got)
 	}
 	got := log.joined()
 	if !strings.Contains(got, "net-prepare,new-machine,load,resume,net-activate") {

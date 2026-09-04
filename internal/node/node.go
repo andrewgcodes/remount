@@ -3325,7 +3325,7 @@ func (n *Node) subscribe(p *transport.Peer, client string, s *session.Session, f
 					}
 					gap := proto.MustMarshal(proto.Gap{From: ev.Requested, To: ev.Oldest - 1, Tier: tier})
 					f := &proto.Frame{V: proto.Version, T: proto.KindChunk, To: client, S: s.ID, WS: s.WS, Seq: ev.Requested, Body: proto.MustMarshal(proto.ChunkBody{Stream: proto.StreamGap, Data: gap})}
-					if p.Send(ctx, f) != nil {
+					if ctx.Err() != nil || p.Send(context.WithoutCancel(ctx), f) != nil {
 						return
 					}
 					cur.Skip(ev.Oldest)
@@ -3335,7 +3335,10 @@ func (n *Node) subscribe(p *transport.Peer, client string, s *session.Session, f
 			}
 			for _, c := range chunks {
 				f := &proto.Frame{V: proto.Version, T: proto.KindChunk, To: client, S: s.ID, WS: s.WS, Seq: c.Seq, Body: proto.MustMarshal(proto.ChunkBody{Stream: c.Stream, Data: c.Data})}
-				if err := p.Send(ctx, f); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if err := p.Send(context.WithoutCancel(ctx), f); err != nil {
 					return
 				}
 			}
@@ -3523,11 +3526,6 @@ func (n *Node) materializeWithReadyHook(ctx context.Context, w proto.Workspace, 
 	entry := &ws{Workspace: w, handle: handle}
 	if w.Spec.RestoreFrom != "" && !adopt {
 		entry.restoreProcesses = proto.RestoreProcessesRestarted
-		if w.Spec.RestoreFormat == proto.ArtifactFormatFirecrackerFullV1 {
-			if checkpointer, ok := handle.(workspace.Checkpointer); ok && workspace.KindOf(checkpointer) == workspace.CheckpointFSMem {
-				entry.restoreProcesses = proto.RestoreProcessesPreserved
-			}
-		}
 	}
 	retainOnError := func(err error) error {
 		detachErr := n.detachWorkspaceVolumes(context.WithoutCancel(ctx), entry, entry.Spec.Volumes)
@@ -3687,6 +3685,11 @@ func (n *Node) materializeWithReadyHook(ctx context.Context, w proto.Workspace, 
 	// start-up is the portable way to find it.
 	if err := writeWorkspaceEnv(handle, entry); err != nil {
 		return retainOnError(fmt.Errorf("write workspace environment: %w", err))
+	}
+	if entry.restoreProcesses != "" {
+		if reporter, ok := handle.(workspace.RestoreProcessReporter); ok {
+			entry.restoreProcesses = reporter.RestoreProcesses()
+		}
 	}
 	if beforePublish != nil {
 		publish, err := beforePublish(entry)

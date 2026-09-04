@@ -153,6 +153,12 @@ type FilesystemAccessPreparer interface {
 	PrepareFilesystemAccess(context.Context) error
 }
 
+// RestoreProcessReporter reports process continuity after a restored backend
+// has completed its serviceability checks.
+type RestoreProcessReporter interface {
+	RestoreProcesses() string
+}
+
 // SessionPreparer turns a portable session request into a backend-specific
 // process specification.
 type SessionPreparer interface {
@@ -600,10 +606,46 @@ func (d *Docker) Create(ctx context.Context, id string, spec proto.WorkspaceSpec
 	}
 	args = append(args, image, "sleep", "infinity")
 	if out, err := exec.CommandContext(ctx, d.Binary, args...).CombinedOutput(); err != nil {
-		_ = os.RemoveAll(root)
+		cleanupErr := d.cleanupFailedContainer(ctx, name, root)
+		if cleanupErr == nil {
+			if removeErr := os.RemoveAll(root); removeErr != nil {
+				cleanupErr = fmt.Errorf("remove workspace root: %w", removeErr)
+			}
+		}
+		if cleanupErr != nil {
+			return nil, proto.Err(proto.CodeInternal, "docker run: %s; cleanup: %v", strings.TrimSpace(string(out)), cleanupErr)
+		}
 		return nil, proto.Err(proto.CodeInternal, "docker run: %s", strings.TrimSpace(string(out)))
 	}
 	return d.handle(id, root, name, mount)
+}
+
+func (d *Docker) cleanupFailedContainer(ctx context.Context, name, root string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(cleanupCtx, d.Binary, "inspect", "--format", "{{range .Mounts}}{{println .Source}}{{end}}", name).CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(out))
+		if strings.Contains(strings.ToLower(message), "no such") {
+			return nil
+		}
+		return fmt.Errorf("inspect %s: %s", name, message)
+	}
+	ownsContainer := false
+	for _, source := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if source == root {
+			ownsContainer = true
+			break
+		}
+	}
+	if !ownsContainer {
+		return fmt.Errorf("container %s does not mount workspace root %s", name, root)
+	}
+	out, err = exec.CommandContext(cleanupCtx, d.Binary, "rm", "-f", name).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func (d *Docker) Adopt(ctx context.Context, id string) (Handle, error) {

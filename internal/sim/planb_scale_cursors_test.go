@@ -53,6 +53,7 @@ type planbScaleFleet struct {
 	conns   []transport.Conn
 	clients []*client.Client
 	cursors []*client.Session
+	closed  bool
 }
 
 func newPlanbScaleFleet(w *world) *planbScaleFleet { return &planbScaleFleet{world: w} }
@@ -64,6 +65,11 @@ func (f *planbScaleFleet) dialer() transport.Dialer {
 		a, b := transport.Pipe(256)
 		go f.world.srv.AcceptConn(f.world.ctx, b)
 		f.mu.Lock()
+		if f.closed {
+			f.mu.Unlock()
+			_ = a.Close()
+			return nil, transport.ErrClosed
+		}
 		f.conns = append(f.conns, a)
 		f.mu.Unlock()
 		return a, nil
@@ -107,20 +113,21 @@ func (f *planbScaleFleet) cut(rng *rand.Rand, fraction float64) int {
 	return sever
 }
 
-// close detaches every cursor, closes every client, and releases every
-// connection the fleet is still holding.
-func (f *planbScaleFleet) close(ctx context.Context) {
+// close abruptly disconnects every cursor so the server-side connection
+// teardown path must release its subscriber state.
+func (f *planbScaleFleet) close() {
 	f.mu.Lock()
-	cursors, clients, conns := f.cursors, f.clients, f.conns
-	f.cursors, f.clients, f.conns = nil, nil, nil
+	f.closed = true
+	clients := f.clients
+	f.cursors, f.clients = nil, nil
 	f.mu.Unlock()
-	for _, s := range cursors {
-		// Detach, never kill: the producer must survive for the next cycle.
-		_ = s.Close(ctx, false)
-	}
 	for _, c := range clients {
 		_ = c.Close()
 	}
+	f.mu.Lock()
+	conns := f.conns
+	f.conns = nil
+	f.mu.Unlock()
 	for _, c := range conns {
 		_ = c.Close()
 	}
@@ -194,7 +201,7 @@ func TestPlanBScaleReconnectingCursorsReleaseTheirState(t *testing.T) {
 		t.Logf("cycle %d severed %d of %d cursor connections", cycle, severed, cursors)
 		planbScaleAwaitCursorChunks(t, ctx, fleet, cycle, "after cut")
 
-		fleet.close(ctx)
+		fleet.close()
 
 		// Teardown is asynchronous: wait for the relay to observe every
 		// disconnect before concluding anything about retained state.
