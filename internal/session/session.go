@@ -612,12 +612,52 @@ func (m *Manager) Close() {
 	for _, s := range all {
 		m.Remove(s.ID, true)
 	}
-	m.observers.Wait()
+	// Bounded for the same reason as Shutdown: a producer that will not stop
+	// must not turn Close into a hang.
+	_ = m.joinObservers()
+}
+
+// observerJoinTimeout bounds how long a shutdown waits for output producers
+// to stop. The per-session Wait already has its own bound; this one covers the
+// pumps, which block in a read on a live child's descriptor and therefore stop
+// only when that child does. Without a bound here a process that ignores
+// termination pins node shutdown forever, and the symptom is a node that never
+// exits rather than one that reports what it could not join.
+var observerJoinTimeout = 10 * time.Second
+
+// observerJoinTimeoutForTest shortens the bound and returns a restore func, so
+// a test can prove the bound is honoured without spending the production one.
+func observerJoinTimeoutForTest(d time.Duration) func() {
+	previous := observerJoinTimeout
+	observerJoinTimeout = d
+	return func() { observerJoinTimeout = previous }
+}
+
+// joinObservers waits for the producer group, bounded. It reports whether
+// every producer stopped; false means shutdown proceeded while at least one
+// was still running, which the caller must be able to say out loud.
+func (m *Manager) joinObservers() bool {
+	done := make(chan struct{})
+	go func() {
+		m.observers.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(observerJoinTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 // Shutdown joins live producers while preserving durable log references. It
 // is used for node process shutdown; retention remains control-plane owned.
-func (m *Manager) Shutdown() {
+//
+// It returns false when a producer did not stop within the bound, so the
+// caller reports an unclean shutdown instead of blocking on it.
+func (m *Manager) Shutdown() bool {
 	m.mu.Lock()
 	m.closed = true
 	all := make([]*Session, 0, len(m.sessions))
@@ -634,7 +674,7 @@ func (m *Manager) Shutdown() {
 		_, _ = s.Wait(ctx)
 		cancel()
 	}
-	m.observers.Wait()
+	return m.joinObservers()
 }
 
 // Open starts a session. If spec.IdempotencyKey names an existing session it

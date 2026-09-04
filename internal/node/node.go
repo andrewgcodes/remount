@@ -1219,7 +1219,11 @@ func (n *Node) shutdown() {
 			n.logger.Error("revoke workspace network during shutdown", "ws", w.ID, "err", err)
 		}
 	}
-	n.sessions.Shutdown()
+	if !n.sessions.Shutdown() {
+		// Say so rather than exiting quietly: a producer still running at this
+		// point means output may be lost that the log would otherwise have kept.
+		n.logger.Error("session producers did not stop within the shutdown bound")
+	}
 	n.capabilityWG.Wait()
 	for w := range held {
 		if w.broker != nil {
