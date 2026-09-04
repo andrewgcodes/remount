@@ -18,7 +18,6 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/component: remount-node
 automountServiceAccountToken: false
-
 ---
 # Source: remount-node/templates/configmap.yaml
 # The capability labels this release advertises, published as data so an
@@ -45,7 +44,6 @@ data:
     backend=process
     tier=general
     zone=a
-
 ---
 # Source: remount-node/templates/daemonset.yaml
 # One Remount node per matching Kubernetes node.
