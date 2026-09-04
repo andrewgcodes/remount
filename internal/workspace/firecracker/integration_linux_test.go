@@ -520,6 +520,10 @@ func waitForGuestPort(t *testing.T, ctx context.Context, manager *session.Manage
 		if errors.Is(err, context.DeadlineExceeded) {
 			return s
 		}
+		if !manager.Remove(s.ID, false) {
+			t.Fatalf("finished guest port probe %s could not be removed", s.ID)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("guest port %d did not become ready", port)
 	return nil
