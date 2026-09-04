@@ -90,8 +90,8 @@ conformance runs passed all 60 available rows.
 
 ### Post-review CI findings
 
-The first pull-request CI run exposed four additional defects. Each failure is
-retained here rather than being folded into a passing summary.
+Pull-request CI exposed five additional defects. Each failure is retained here
+rather than being folded into a passing summary.
 
 **Linux gVisor setup failed before the sandbox started:**
 
@@ -105,6 +105,23 @@ only the guest endpoint up before adding the route succeeds while the host
 endpoint remains down, so no traffic can cross before the deny-all policy and
 sandbox are ready. `bash -n scripts/gvisor-spike.sh` passed after the ordering
 fix.
+
+The next CI run reached the denial probe and exposed that the spike still
+installed only the ineffective inet output chain documented by the Linux
+verification:
+
+```text
+PASS: broker reachable
+PASS: direct IPv4 TCP denied
+PASS: IPv6 denied
+FAIL: UDP unexpectedly succeeded
+```
+
+The spike now mirrors the production boundary with a netdev egress chain on
+the namespace veth. Its final counter-and-drop rule directly proves the
+connectionless UDP frame reached the deny-first policy; unlike `nc -u` exit
+status, that assertion does not confuse a locally accepted send with escaped
+traffic.
 
 **A Windows-hosted Docker conformance run selected Windows commands for a
 Linux workspace.** Command selection was compiled from the runner's OS, so
