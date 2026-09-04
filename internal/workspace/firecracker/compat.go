@@ -35,6 +35,27 @@ func DetectCompatibility(ctx context.Context, firecracker string) (Compatibility
 	if err != nil {
 		return Compatibility{}, fmt.Errorf("firecracker snapshot version: %w", err)
 	}
+	// Keep only the answer, not the log line that follows it.
+	//
+	// `firecracker --snapshot-version` prints the version and then its own
+	// timestamped shutdown line on the same captured stream:
+	//
+	//	v10.0.0
+	//	2026-09-04T03:02:44.629903024 [anonymous-instance:main] Firecracker exiting successfully. exit_code=0
+	//
+	// A timestamp makes this value different on every invocation, and this
+	// struct is compared for equality to decide whether a snapshot may be
+	// restored. Two components each detect compatibility independently — the
+	// jailer factory and the CoW volume provider — so the fence never matched
+	// itself and every checkpoint failed with "Firecracker snapshot
+	// compatibility changed while checkpointing". The fence was not merely
+	// wrong, it was unsatisfiable: no snapshot could ever be taken.
+	//
+	// `--version` happens to print one line today and is trimmed the same way
+	// on purpose, so a future release that adds a log line there cannot
+	// reintroduce this.
+	version = firstLine(version)
+	snapshot = firstLine(snapshot)
 	kernel, err := os.ReadFile("/proc/sys/kernel/osrelease")
 	if err != nil {
 		return Compatibility{}, fmt.Errorf("host kernel: %w", err)
@@ -48,6 +69,18 @@ func DetectCompatibility(ctx context.Context, firecracker string) (Compatibility
 		HostKernel: strings.TrimSpace(string(kernel)), Firecracker: strings.TrimSpace(version),
 		Snapshot: strings.TrimSpace(snapshot), GuestProtocol: GuestProtocolVersion,
 	}, nil
+}
+
+// firstLine returns the first non-empty line, which is where these commands put
+// their answer. Anything after it is diagnostic output, and diagnostic output
+// carries timestamps.
+func firstLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func stableCPUFingerprint() (string, error) {

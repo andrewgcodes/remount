@@ -46,7 +46,7 @@ type Machine interface {
 	Start(context.Context) error
 	Pause(context.Context) error
 	CreateSnapshot(context.Context) (SnapshotFiles, error)
-	LoadSnapshot(context.Context, SnapshotFiles, string) error
+	LoadSnapshot(context.Context, SnapshotFiles, string, string) error
 	Resume(context.Context) error
 	// GuestSocket is the exact host UDS backing this VM's virtio-vsock device.
 	GuestSocket() string
@@ -411,7 +411,7 @@ func (h *handle) ApplyNetworkPolicy(ctx context.Context, _ proto.NetworkPolicy, 
 		}
 	}()
 	if h.restored {
-		if err = machine.LoadSnapshot(ctx, h.snapshotFiles, h.volume.ImagePath()); err != nil {
+		if err = machine.LoadSnapshot(ctx, h.snapshotFiles, h.volume.ImagePath(), tap); err != nil {
 			return err
 		}
 		if err = machine.Resume(ctx); err != nil {

@@ -126,8 +126,22 @@ func TestListRendersWithoutReadingACredentialValue(t *testing.T) {
 	if strings.Contains(out, "sk-planted") {
 		t.Fatal("the listing printed a credential value")
 	}
-	if !strings.Contains(out, "OPEN: Plan B phase") {
-		t.Fatalf("the unowned required rows were not listed:\n%s", out)
+	// The point of this test is that a credential is never printed, so it has
+	// to be listing something — a filter that matches nothing would pass
+	// trivially. It deliberately does not require the *required-and-unowned*
+	// set to be non-empty: that set shrinking to zero is the project getting
+	// finished, and a test that fails when the work succeeds is a bad test. So
+	// the anti-vacuity guard is on the wider `--unowned` set, which is
+	// non-empty as long as any optional row is unproven.
+	var wide strings.Builder
+	if err := list([]string{"--unowned"}, &wide); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(wide.String(), "sk-planted") {
+		t.Fatal("the listing printed a credential value")
+	}
+	if !strings.Contains(wide.String(), "OPEN: ") {
+		t.Fatalf("no unowned rows were listed at all, so neither listing proves anything:\n%s", wide.String())
 	}
 	for _, id := range []string{"E1", "E7"} {
 		if strings.Contains(out, "\n"+id+" ") {
