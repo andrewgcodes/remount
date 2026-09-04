@@ -551,6 +551,20 @@ func (h *handle) Destroy(ctx context.Context) error {
 	if h.destroyed {
 		return nil
 	}
+	// Order matters here and is deliberately unchanged: nothing is dismantled
+	// until the network boundary is confirmed gone, so a failed teardown never
+	// leaves a half-destroyed workspace that can still carry traffic.
+	// TestDestroyRetainsLaterResourcesUntilEachPriorBoundarySucceeds pins it.
+	//
+	// On real hardware that invariant is currently unsatisfiable, and this is
+	// the open defect recorded in
+	// docs/engineering/gvisor-egress-finding-2026-09-04.md: Revoke both denies
+	// traffic and deletes the devices, and the VMM holds the TAP for as long as
+	// it lives, so revoking a live machine fails with "delete TAP: device or
+	// resource busy" and destroy, move and quarantine all stop there. Killing
+	// first would satisfy the kernel and break the invariant, so it is not done.
+	// The resolution is to split Revoke into a deny phase that runs while the
+	// machine lives and a release phase that runs after it dies.
 	if err := h.network.Revoke(ctx); err != nil {
 		return err
 	}
