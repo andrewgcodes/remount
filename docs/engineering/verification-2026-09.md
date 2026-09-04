@@ -1247,3 +1247,50 @@ The complete race run passed every package; `internal/sim` completed in
 380.879 seconds. Every fuzz target completed without failure. Distribution
 artifacts were built locally only and were not published. No external resource
 was created by these regressions. **Status: verified.**
+
+### Aggregate-gate race in restored session-log authority, 2026-09-04
+
+The first clean aggregate run on candidate
+`d865ec62e80bb6ada8a8676e0a0465c75821829a` truthfully failed:
+
+```text
+Rows: 38 passed, 1 failed, 28 unavailable
+Required rows: 38 of 55 passed, 1 failed, 16 unavailable
+B0.conformance: failed
+External resources created: 1; cleanup verified 1, failed 0
+```
+
+`make conformance` detected a data race in
+`TestE11TieredSessionReplayCrossesNodeAndNamesUnavailableBlob`.
+`restoreSessionLog` copied the complete live node workspace after
+`authorizeClaims` released `Node.mu`, while the renew loop updated
+`Workspace.LeaseUntil` under that mutex. Session-log artifact authorization
+needs only the immutable workspace id, tenant and generation, so restoration
+now projects exactly those fields instead of copying mutable lease and
+authorization state.
+
+The focused regression mutates `LeaseUntil` concurrently with 10,000 authority
+projections; it would race if the projection read mutable workspace fields.
+The failing E11 composition test was also repeated under the race detector:
+
+```sh
+go test -race -count=100 \
+  -run '^TestSessionLogAuthorityDoesNotReadMutableLeaseFields$' \
+  -timeout 180s ./internal/node
+
+go test -race -count=20 \
+  -run '^TestE11TieredSessionReplayCrossesNodeAndNamesUnavailableBlob$' \
+  -timeout 600s ./internal/sim
+
+make lint
+make test
+make conformance
+make race
+```
+
+All commands passed. The final `make conformance` simulation package completed
+in 392.930 seconds; the complete final `make race` simulation package
+completed in 400.301 seconds. The failed aggregate run still verified cleanup
+of its one external resource and retained all unavailable rows as unavailable.
+**Status: verified after repair; aggregate rerun required on the committed
+candidate.**
