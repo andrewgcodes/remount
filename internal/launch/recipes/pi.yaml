@@ -8,9 +8,12 @@ providers: [anthropic, openai, openrouter, google, groq, xai, mistral]
 hosts:
   - registry.npmjs.org
 install: |
+  export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.local}"
+  export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
   command -v pi >/dev/null 2>&1 || npm install -g @earendil-works/pi-coding-agent
 env:
   PI_CODING_AGENT_DIR: "$PWD/.pi/agent"
+  PATH: "${NPM_CONFIG_PREFIX:-$HOME/.local}/bin:$PATH"
 configure:
   # models.json overrides a native provider's base URL; the apiKey value is an
   # env reference pi resolves at request time, so the file holds no key.
