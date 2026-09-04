@@ -796,7 +796,10 @@ func TestUnknownProviderSettlementIsExplicitlyRequestOnly(t *testing.T) {
 	}
 }
 
-func TestBudgetReservationIdempotencyDistinguishesIntentionalRepeats(t *testing.T) {
+// Every admitted attempt reserves under a fresh key. A workspace-controlled
+// Idempotency-Key is not proof that the upstream deduplicates the effect, so
+// it never turns a second attempt into a replay of the first reservation.
+func TestBudgetReservationKeyIsFreshPerAdmittedAttempt(t *testing.T) {
 	up := newUpstream(t)
 	requests := make(chan proto.BudgetReserveReq, 4)
 	b := New(Options{
@@ -828,8 +831,8 @@ func TestBudgetReservationIdempotencyDistinguishesIntentionalRepeats(t *testing.
 		}
 	}
 	first, second = <-requests, <-requests
-	if first.Key != second.Key {
-		t.Fatalf("explicit idempotency key produced %q then %q", first.Key, second.Key)
+	if first.Key == second.Key {
+		t.Fatalf("workspace idempotency key collapsed two upstream attempts into reservation %q", first.Key)
 	}
 }
 
