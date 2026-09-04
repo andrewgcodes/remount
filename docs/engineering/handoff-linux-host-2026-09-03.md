@@ -118,6 +118,29 @@ firecracker status=unavailable reason=Firecracker requires Linux
 `firecracker` and `jailer`, a trusted guest kernel and rootfs, and a cgroup
 parent.
 
+**A Mac can now be that host, which changes who should do this.** Apple Silicon
+M3 and later with macOS 15+ support nested virtualization, and Colima exposes it
+with one flag. Verified on an M5 Pro / macOS 26.3:
+
+```sh
+colima delete --force
+colima start --nested-virtualization --arch aarch64 --cpu 4 --memory 6 --disk 20
+colima ssh -- ls -la /dev/kvm        # crw-rw---- 1 root kvm 10, 232
+```
+
+With real firecracker + jailer v1.16.1, the Firecracker CI kernel
+(`vmlinux-5.10.223`, aarch64) and a 256 MiB ext4 rootfs built from `alpine:3.20`,
+`integration/firecracker/host-gate.sh` reports **AVAILABLE** rather than
+"Firecracker requires Linux", and `go test -race -count=10
+./internal/workspace/firecracker` is green.
+
+**That is a host, not a pass.** Those 31 tests are deterministic ordering proofs
+that finish in 0.00 s and boot no microVM. The gap this section describes is
+unchanged: `.github/workflows/kvm.yml` still fails its last step on purpose
+until the node-owned TAP, the coherent CoW volume, the jailed API and the
+guest-executor adapters are integrated. The value of the above is only that you
+no longer need to find a Linux box to do that work on.
+
 **The full required-proof list is in `handoff-2026-09-03-codex-wrap.md` §5**
 ("P1 — finish the Firecracker production proof"). In summary: build the guest
 agent and verify its manifest hash; boot through the real jailer and vsock

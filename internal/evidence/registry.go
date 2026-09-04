@@ -431,7 +431,7 @@ var scenarios = []Scenario{
 		Layer: LayerHostCI, Required: true, Source: sourcePlanB,
 		Env:  []string{"REMOUNT_FIRECRACKER_KERNEL", "REMOUNT_FIRECRACKER_ROOTFS", "REMOUNT_FIRECRACKER_CGROUP"},
 		Open: notLanded("B7 (§15)", "11"),
-		Note: "integration/firecracker/host-gate.sh is the exact-host gate; unit and simulation tests may not upgrade its status",
+		Note: "integration/firecracker/host-gate.sh is the exact-host gate; unit and simulation tests may not upgrade its status. The host half is no longer the blocker: an Apple Silicon Mac can host real KVM through Colima's nested virtualization, and on such a host the gate reports AVAILABLE against a real firecracker, jailer, kernel and ext4 rootfs, with go test -race -count=10 ./internal/workspace/firecracker green. That is deliberately not a pass for this row. Those 31 tests are deterministic ordering proofs that complete in 0.00s and boot no microVM, and .github/workflows/kvm.yml still fails its final step on purpose because the node-owned TAP, coherent CoW volume, jailed API and guest-executor adapters are not integrated. What remains is that integration, not a host. docs/engineering/handoff-linux-host-2026-09-03.md §2",
 	},
 	{
 		ID: "B30", Title: "reconnect and pool bursts stay within declared resource ceilings",
