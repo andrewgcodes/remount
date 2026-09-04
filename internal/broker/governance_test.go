@@ -338,6 +338,56 @@ func TestPackageCacheHitStillConsumesBudgetAdmission(t *testing.T) {
 	}
 }
 
+// A package request the connector can never execute (malformed digest, Range)
+// is refused by its side-effect-free authorization before governance, so it
+// consumes neither an approval nor a budget unit; the next valid request still
+// finds both available.
+func TestInvalidPackageRequestConsumesNoApprovalOrBudget(t *testing.T) {
+	up := newUpstream(t)
+	rule := proto.EgressRule{
+		ID: "packages", Connector: proto.EgressConnectorPackage, Protocol: proto.EgressProtocolHTTPS,
+		Hosts: []string{up.host}, Methods: []string{http.MethodGet}, SharedState: proto.SharedStateImmutableRead,
+		Mode: proto.EgressModeApprove, MaxRequests: 1,
+	}
+	var approvals, reserves atomic.Int64
+	b := New(Options{
+		WS: "ws_gov", Tenant: "t", Generation: 3, Principal: "alice", RootCAs: up.pool(),
+		AllowPrivate: []string{"127.0.0.1"}, ConnectorStore: newConnectorStore(t),
+		Network: proto.NetworkPolicy{Default: proto.NetworkDefaultDeny, Rules: []proto.EgressRule{rule}},
+		Approval: func(context.Context, proto.EgressApprovalReq) (*proto.EgressApprovalRes, error) {
+			approvals.Add(1)
+			return &proto.EgressApprovalRes{ID: "ap_gov", Status: proto.ApprovalDecided, Allowed: true}, nil
+		},
+		BudgetReserve: func(context.Context, proto.BudgetReserveReq) (*proto.BudgetReservation, error) {
+			reserves.Add(1)
+			return &proto.BudgetReservation{}, nil
+		},
+	})
+	if _, err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	target := b.PackageURL() + "/" + up.host + "/artifact.whl"
+	invalid := []struct {
+		name   string
+		header map[string]string
+		status int
+	}{
+		{"malformed digest", map[string]string{connector.ExpectedDigestHeader: "sha256:not-hex"}, http.StatusBadRequest},
+		{"range", map[string]string{"Range": "bytes=0-9"}, http.StatusForbidden},
+	}
+	for _, tc := range invalid {
+		resp, _ := get(t, target, tc.header)
+		if resp.StatusCode != tc.status || approvals.Load() != 0 || reserves.Load() != 0 || up.hits() != 0 {
+			t.Fatalf("%s: status=%d approval_calls=%d reservation_calls=%d upstream_hits=%d", tc.name, resp.StatusCode, approvals.Load(), reserves.Load(), up.hits())
+		}
+	}
+	resp, _ := get(t, target, nil)
+	if resp.StatusCode != http.StatusOK || approvals.Load() != 1 || reserves.Load() != 1 || up.hits() != 1 {
+		t.Fatalf("valid request after invalid ones: status=%d approval_calls=%d reservation_calls=%d upstream_hits=%d", resp.StatusCode, approvals.Load(), reserves.Load(), up.hits())
+	}
+}
+
 // RMR-005: a workspace-controlled Idempotency-Key names an upstream contract
 // the broker cannot verify. Every admitted upstream attempt consumes one
 // request unit from the real ledger; the header itself still reaches the
