@@ -17,12 +17,12 @@ in this file, and no run below printed one.
 
 ## 2026-09-04 - native Windows host verification
 
-**Status: required conformance verified; one performance gate and two
+**Status: required conformance verified; two performance gates and two
 full-suite Docker OpenCode lanes remain known failing and are visible CI
 debt.**
 
 Host: Windows Server 2022 amd64. Go: 1.27.1. Race C toolchain: MinGW-w64
-16.1.0. Final verification integrated `origin/main` at `f61843a`.
+16.1.0. Final verification integrated `origin/main` at `7d1bc8d`.
 
 ### Final command results
 
@@ -30,10 +30,10 @@ Host: Windows Server 2022 amd64. Go: 1.27.1. Race C toolchain: MinGW-w64
 |---|---|
 | `go build ./...` | passed |
 | `go vet ./...` | passed |
-| `go test -count=1 -timeout 40m ./...` | failed `remount.dev/remount/internal/sim.TestPlanbPerfMoveIncompressible` at 9.2 MB/s versus 20 MB/s; a later run excluding only that gate also exposed the two full-suite Docker OpenCode failures recorded below |
-| `go test -race -count=1 -timeout 60m ./...` | timed out after one hour in `remount.dev/remount/internal/sim.TestPlanBOpenCodeDeterministicModelLane`; earlier race rounds also exposed the fixed handle/process races recorded below |
-| `go test -count=1 -timeout 40m -skip '^(TestPlanbPerfMoveIncompressible\|TestPlanBOpenCodeAgentTranscriptApprovalAndResume\|TestPlanBOpenCodeDeterministicModelLane)$' ./...` | passed |
-| `go test -race -count=1 -timeout 60m -skip '^(TestPlanbPerfMoveIncompressible\|TestPlanBOpenCodeAgentTranscriptApprovalAndResume\|TestPlanBOpenCodeDeterministicModelLane)$' ./...` | passed |
+| `go test -count=1 -timeout 40m ./...` | failed `remount.dev/remount/internal/sim.TestExecRoundTripCostOfTheDurableSessionTier` at 1.18x versus the 1.2x skipped-success guard and `TestPlanbPerfMoveIncompressible` at 9.0 MB/s versus 20 MB/s; earlier full-suite runs also exposed the two Docker OpenCode failures recorded below |
+| `go test -race -count=1 -timeout 60m ./...` | failed `TestPlanBOpenCodeAgentTranscriptApprovalAndResume` with a 12,730-byte node transcript versus a 12,465-byte mirror, `TestPlanBOpenCodeDeterministicModelLane` when its session stream did not close in ten minutes, and `TestPlanbPerfMoveIncompressible` at 7.4 MB/s |
+| `go test -p 1 -count=1 -timeout 40m -skip '^(TestExecRoundTripCostOfTheDurableSessionTier\|TestPlanbPerfMoveIncompressible\|TestPlanBOpenCodeAgentTranscriptApprovalAndResume\|TestPlanBOpenCodeDeterministicModelLane)$' ./...` | passed after the final upstream merge; package serialization isolated the sim timing lanes from cross-compilation and artifact-install load |
+| `go test -race -p 1 -count=1 -timeout 60m -skip '^(TestPlanbPerfMoveIncompressible\|TestPlanBOpenCodeAgentTranscriptApprovalAndResume\|TestPlanBOpenCodeDeterministicModelLane)$' ./...` | passed after the final upstream merge; package serialization avoided the Windows asynchronous file-I/O exhaustion observed when race packages ran concurrently |
 | `go run ./cmd/conformance --build .` | 60 passed, 0 failed, 8 unavailable; all 53 required rows passed; cleanup verified |
 | `remount-windows-amd64.exe version` | `remount v0.0.0-20260904095415-3e577228074c` |
 | `go run ./cmd/conformance --binary .\remount-windows-amd64.exe` | 60 passed, 0 failed, 8 unavailable; all 53 required rows passed; cleanup verified |
@@ -58,6 +58,21 @@ names this exact exclusion in the workflow and job summary.
 After integrating `d938d7b`, three focused reruns still failed at 7.6, 8.0,
 and 8.3 MB/s against the 20 MB/s gate.
 
+The final ordinary suite also found a second Windows performance-lane boundary:
+
+```text
+--- FAIL: TestExecRoundTripCostOfTheDurableSessionTier (2.25s)
+    exec_seal_cost_test.go:104: exec round trip p50: artifact tier off 31ms, on 37ms, ratio 1.18x (n=24 each)
+    exec_seal_cost_test.go:115: the artifact tier cost nothing (1.18x: 31.0813ms -> 36.7439ms): the node is almost certainly not sealing session logs at all, so this lane is measuring two identical configurations and cannot detect the regression it exists for
+```
+
+Three focused ordinary runs measured 1.22x (pass), 1.15x (fail), and 1.14x
+(fail). Three focused race runs measured 1.47x, 1.44x, and 1.32x and passed.
+The portable behavior is covered elsewhere; this timing control cannot
+reliably distinguish the seal cost from Windows process-start overhead in an
+ordinary build. It remains a named ordinary Windows CI exclusion, not a pass;
+the race lane still runs it.
+
 The first post-integration `go run ./cmd/conformance --build .` also exposed
 the same asynchronous audit race in `CONF-BIND-003` that an earlier fix had
 closed for `CONF-BIND-002`:
@@ -72,6 +87,58 @@ The denied request completes before the canonical event append is necessarily
 visible. `CONF-BIND-003` now polls for the event using the same bounded,
 context-aware rule as `CONF-BIND-002`; five consecutive built-binary
 conformance runs passed all 60 available rows.
+
+### Post-review CI findings
+
+The first pull-request CI run exposed four additional defects. Each failure is
+retained here rather than being folded into a passing summary.
+
+**Linux gVisor setup failed before the sandbox started:**
+
+```text
+Error: Nexthop has invalid gateway.
+```
+
+The failing command installed the namespace default route while its veth
+endpoint was still down. WSL reproduced the same kernel rejection. Bringing
+only the guest endpoint up before adding the route succeeds while the host
+endpoint remains down, so no traffic can cross before the deny-all policy and
+sandbox are ready. `bash -n scripts/gvisor-spike.sh` passed after the ordering
+fix.
+
+**A Windows-hosted Docker conformance run selected Windows commands for a
+Linux workspace.** Command selection was compiled from the runner's OS, so
+Docker sessions received `cmd.exe` even though they execute inside Linux. The
+selector now follows the workspace backend: native Windows process workspaces
+use Windows programs, while Docker, gVisor, and Firecracker use POSIX programs.
+The eight session requirements passed against a Linux Docker workspace hosted
+on this Windows VM.
+
+**The development binary selected an invalid Docker image reference:**
+
+```text
+image "ghcr.io/andrewgcodes/remount-workspace:v0.0.0-20260904095559-f3fb13569f00+dirty"
+docker: invalid reference format
+```
+
+Go pseudo-versions and dirty build versions are not published release image
+tags, and `+dirty` is not valid in a Docker tag. Only numeric
+`vMAJOR.MINOR.PATCH` versions now select a versioned workspace image; every
+development, pseudo-version, or dirty build selects `latest`.
+
+**macOS rejected a Windows-motivated cwd assertion.** `TestExecEnvAndCwd`
+compared `/var/...` with the equivalent `/private/var/...` literally. Both
+paths are now resolved through `filepath.EvalSymlinks` before comparison, while
+the Windows CRLF normalization remains in place.
+
+Review also identified a real Job Object registration window. Starting a
+Windows process before assigning it to the Job Object allowed it to spawn an
+uncontained descendant in between. Windows commands now start suspended, are
+assigned to the kill-on-close Job Object, and only then have their primary
+thread resumed. `TestWindowsProcessIsContainedBeforeItCanSpawn` proves the
+command cannot create its immediate child before registration; ten ordinary
+and three race repetitions passed together with the descendant-termination
+test.
 
 ### Confirmed defects found and fixed
 
@@ -93,6 +160,7 @@ conformance runs passed all 60 available rows.
 | Conformance unbound-audit visibility | `CONF-BIND-003` | an immediate event-tail read could race the canonical audit append; the denied request was observed before its `egress.denied` event |
 | Race cleanup | `internal/session.TestE11FastProducerReplaysEverySequenceAcrossTiers` | `TempDir RemoveAll cleanup: unlinkat ...\session.log: The process cannot access the file because it is being used by another process.` |
 | Race process registration | `internal/sim.TestHandoffScaleAndControlFailover/real-peers-and-durable-restart` | fast processes could exit while Job Object assignment returned `Access is denied`, surfacing as `contain process tree: Access is denied.` |
+| Pre-containment process execution | `internal/session.TestWindowsProcessIsContainedBeforeItCanSpawn` | a process started running before Job Object assignment and could spawn descendants outside the containment boundary |
 | Job Object descendant test synchronization | `internal/session.TestKillWorkspaceTerminatesWindowsDescendants` | the PID file could be observed after creation but before `WriteAllText` stored the PID, producing `strconv.Atoi: parsing "": invalid syntax` |
 | Tiered session restart test synchronization | `internal/sim.TestE11TieredSessionRecordSurvivesNodeRestart` | collecting the terminal chunk did not prove the asynchronous `session.log.committed` completion event was durable before the simulated node death; 2 of 10 focused runs failed with `internal: session: incomplete archived record` |
 | Docker OpenCode installation in the full suite | `internal/sim.TestPlanBOpenCodeAgentTranscriptApprovalAndResume` | the Docker workspace fenced at its local lease safety deadline while installing pinned OpenCode; the install session returned `context deadline exceeded` after fifteen minutes, while a focused ordinary run passed in 77 seconds |
@@ -100,6 +168,9 @@ conformance runs passed all 60 available rows.
 | Install artifact source scan | `integration/installs.TestB32TheSourceTreeScanCatchesAnUntrimmedBinary` | Go recorded source paths with `/`, so a detector searching only for the host's `\` form missed an untrimmed binary |
 | Local Go module proxy | `integration/installs.TestB32AGoModuleConsumerBuildsFromTheArtifactAndDrivesTheInstalledServer` and `TestB32AReplaceIntoTheCheckoutIsCaught` | Windows paths produced invalid `file://C:%5C...` proxy URLs |
 | Linked npm control | `integration/installs.TestB32ALinkedNpmInstallIsCaught` | npm used a Windows junction, but the detector treated its installed path as an ordinary copied directory |
+| Backend-aware conformance programs | eight `CONF-SESS-*` rows against a Windows-hosted Docker workspace | compile-time Windows selection sent `cmd.exe` and PowerShell programs into Linux containers |
+| Development Docker image selection | `internal/workspace.TestDefaultImageTracksRelease` | Go pseudo-versions and `+dirty` versions were treated as published image tags; Docker rejected the resulting reference |
+| All-package resource pressure | `integration/installs.TestB32AGoModuleConsumerBuildsFromTheArtifactAndDrivesTheInstalledServer`, `integration/reproducible.TestB31BinariesAreAFunctionOfTheSourceAlone`, `internal/sim.TestHandoffScaleAndControlFailover`, `TestAgentEndToEndTurnsAndTranscript`, and `TestAgentSurvivesNodeLoss` | parallel packages produced Windows `The supplied user buffer is not valid for the requested operation` writes, scale reattach deadlines, and lease-fencing failures; focused reruns passed or reached their named prerequisite boundary, so Windows CI serializes packages with `-p 1` while retaining concurrency coverage within each package |
 
 The concurrent `c47b4bb` integration also exposed
 `integration/policy.TestInfrastructureDoesNotOwnRuntimeFacts` on every host:
