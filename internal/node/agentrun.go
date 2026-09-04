@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
-	"path"
 	"strings"
 	"sync"
 	"time"
@@ -870,6 +869,11 @@ func (r *agentRun) spawn() (*exec.Cmd, *acp.Client, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, nil, proto.Err(proto.CodeInternal, "start harness: %v", err)
 	}
+	if err := session.RegisterProcessGroup(cmd); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, nil, proto.Err(proto.CodeInternal, "contain harness process tree: %v", err)
+	}
 	r.stdin = stdin
 	go r.drainStderr(stderr)
 	client := acp.NewClient(stdout, stdin, acp.Options{
@@ -891,8 +895,7 @@ func (r *agentRun) program() ([]string, map[string]string, error) {
 		return nil, nil, err
 	}
 	if spec.Recipe == "" {
-		program := append([]string{"/bin/sh", "-c", acpLauncherEnvScript, "remount-acp"}, spec.ACPCommand...)
-		return program, env, nil
+		return explicitACPProgram(r.w.handle.Backend(), spec.ACPCommand), env, nil
 	}
 	recipe, data, err := r.recipe()
 	if err != nil {
@@ -902,8 +905,7 @@ func (r *agentRun) program() ([]string, map[string]string, error) {
 		return nil, nil, proto.Err(proto.CodeUnsupported, "recipe %s has no acp command", recipe.Name)
 	}
 	if len(spec.ACPCommand) > 0 {
-		program := append([]string{"/bin/sh", "-c", acpLauncherEnvScript, "remount-acp"}, spec.ACPCommand...)
-		return program, env, nil
+		return explicitACPProgram(r.w.handle.Backend(), spec.ACPCommand), env, nil
 	}
 	script, err := recipe.ACPLauncher(data)
 	if err != nil {
@@ -913,7 +915,11 @@ func (r *agentRun) program() ([]string, map[string]string, error) {
 	if err := r.w.handle.FS().Write(lp, []byte(script), 0o755, false, true); err != nil {
 		return nil, nil, err
 	}
-	return []string{"/bin/sh", lp}, env, nil
+	program, err := recipeACPProgram(r.w.handle.Backend(), lp)
+	if err != nil {
+		return nil, nil, err
+	}
+	return program, env, nil
 }
 
 // bindingEnv is the placeholder environment the workspace's bindings give
@@ -1167,6 +1173,7 @@ const harnessExitCode = -1
 func harnessExit(cmd *exec.Cmd, grace time.Duration) int {
 	done := make(chan int, 1)
 	go func() {
+		defer session.ReleaseProcessGroup(cmd)
 		code, _ := session.ExitStatus(cmd.Wait())
 		done <- code
 	}()
@@ -1180,6 +1187,7 @@ func harnessExit(cmd *exec.Cmd, grace time.Duration) int {
 	case code := <-done:
 		return code
 	case <-time.After(grace):
+		session.ReleaseProcessGroup(cmd)
 		return harnessExitCode
 	}
 }
@@ -1464,20 +1472,7 @@ type agentHandler struct{ r *agentRun }
 // tree) to a jail-relative path. A path outside the mount is refused before
 // the jail ever sees it; a relative path is taken as relative to the root.
 func (h *agentHandler) wsPath(p string) (string, error) {
-	if p == "" {
-		return "", proto.Err(proto.CodeBadRequest, "path is required")
-	}
-	if !strings.HasPrefix(p, "/") {
-		return path.Clean(p), nil
-	}
-	mount := strings.TrimSuffix(h.r.mount, "/")
-	if p == mount {
-		return ".", nil
-	}
-	if !strings.HasPrefix(p, mount+"/") {
-		return "", proto.Err(proto.CodeDenied, "path %q is outside the workspace", p)
-	}
-	return path.Clean(strings.TrimPrefix(p, mount+"/")), nil
+	return workspaceRelativePath(h.r.mount, p)
 }
 
 func (h *agentHandler) RequestPermission(ctx context.Context, req acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {

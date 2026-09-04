@@ -19,6 +19,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -524,6 +525,9 @@ func TestAuthoritativeCheckpointFencesManagedProcessWriters(t *testing.T) {
 }
 
 func TestPTYAndStdin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: the session PTY backend uses Unix PTYs; ConPTY is not implemented")
+	}
 	w := newWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
@@ -884,7 +888,7 @@ func TestSecretBlindWorkspace(t *testing.T) {
 	}
 	// 2. Through the broker the upstream receives the real secret.
 	out, errb, exit, _ := c.Run(ctx, ws.ID, "sh", "-c", `curl -s -H "Authorization: Bearer $API_KEY" "$API_URL/v1/thing"`)
-	if exit.Code != 0 || string(out) != "ok" {
+	if exit.Code != 0 || strings.TrimSpace(string(out)) != "ok" {
 		t.Fatalf("curl failed: %d %q %q", exit.Code, out, errb)
 	}
 	if gotAuth.Load() != "Bearer sk-REAL-SECRET" {
@@ -964,13 +968,19 @@ func TestProxyHonoringClientReachesNonLoopbackBroker(t *testing.T) {
 		Env:      map[string]string{"API_KEY": "ref:b_api", "API_URL": "${REMOUNT_BROKER}/d/" + upHost},
 	})
 	ctx := ctxT(t, 60*time.Second)
-	out, _, _, _ := c.Run(ctx, ws.ID, "sh", "-c", `echo "$REMOUNT_BROKER"; echo "$HTTPS_PROXY"; echo "$NO_PROXY"`)
+	program := []string{"sh", "-c", `echo "$REMOUNT_BROKER"; echo "$HTTPS_PROXY"; echo "$NO_PROXY"`}
+	curlProgram := []string{"sh", "-c", `curl -s -H "Authorization: Bearer $API_KEY" "$API_URL/v1/thing"`}
+	if runtime.GOOS == "windows" {
+		program = []string{"cmd.exe", "/d", "/s", "/c", "echo %REMOUNT_BROKER%& echo %HTTPS_PROXY%& echo %NO_PROXY%"}
+		curlProgram = []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", `$proxy = [System.Net.WebProxy]::new($env:HTTPS_PROXY); $proxy.BypassList = @($env:NO_PROXY.Split(",") | ForEach-Object { [regex]::Escape($_) }); $client = [System.Net.WebClient]::new(); $client.Proxy = $proxy; $client.Headers["Authorization"] = "Bearer " + $env:API_KEY; $client.DownloadString($env:API_URL + "/v1/thing")`}
+	}
+	out, _, _, _ := c.Run(ctx, ws.ID, program...)
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	if len(lines) != 3 || !strings.HasPrefix(lines[0], "http://127.0.0.2:") || !strings.Contains(lines[1], "@127.0.0.2:") || !strings.Contains(","+lines[2]+",", ",127.0.0.2,") {
 		t.Fatalf("env: %q", out)
 	}
-	out, errb, exit, _ := c.Run(ctx, ws.ID, "sh", "-c", `curl -s -H "Authorization: Bearer $API_KEY" "$API_URL/v1/thing"`)
-	if exit.Code != 0 || string(out) != "ok" {
+	out, errb, exit, _ := c.Run(ctx, ws.ID, curlProgram...)
+	if exit.Code != 0 || strings.TrimSpace(string(out)) != "ok" {
 		t.Fatalf("curl failed: %d %q %q", exit.Code, out, errb)
 	}
 	if gotAuth.Load() != "Bearer sk-REAL-SECRET" {

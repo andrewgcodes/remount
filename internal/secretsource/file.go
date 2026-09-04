@@ -10,10 +10,14 @@ import (
 
 func parseFileSource(source string) (string, error) {
 	u, err := url.Parse(source)
-	if err != nil || u.Scheme != "file" || u.Host != "" || u.RawQuery != "" || u.Fragment != "" || !filepath.IsAbs(u.Path) {
+	if err != nil || u.Scheme != "file" || u.Host != "" || u.RawQuery != "" || u.Fragment != "" {
 		return "", errors.New("secretsource: file source must be an absolute file URL")
 	}
-	return filepath.Clean(u.Path), nil
+	path, err := fileURLPath(u.Path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(path), nil
 }
 
 func readSecretFile(path string, maxBytes int64) ([]byte, error) {

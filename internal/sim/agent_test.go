@@ -21,9 +21,14 @@ import (
 const (
 	fakeACPEnv     = "REMOUNT_SIM_FAKE_ACP"
 	fakeACPModeEnv = "REMOUNT_SIM_FAKE_ACP_MODE"
+	fakeACPArg     = "-remount-sim-fake-acp"
 )
 
 func TestMain(m *testing.M) {
+	if len(os.Args) == 3 && os.Args[1] == fakeACPArg {
+		acptest.Main(simACPConfig(os.Args[2]))
+		return
+	}
 	if os.Getenv(fakeACPEnv) == "1" {
 		acptest.Main(simACPConfig(os.Getenv(fakeACPModeEnv)))
 		return
@@ -74,7 +79,7 @@ func fakeACPCommand(t *testing.T, mode string) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return []string{"/usr/bin/env", fakeACPEnv + "=1", fakeACPModeEnv + "=" + mode, exe}
+	return []string{exe, fakeACPArg, mode}
 }
 
 // waitAgent polls until pred holds for the agent or the context ends.

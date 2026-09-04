@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -24,9 +25,16 @@ import (
 )
 
 // The CLI tests re-exec their own binary as the ACP harness, like the sim.
-const cliFakeACPEnv = "REMOUNT_CLI_FAKE_ACP"
+const (
+	cliFakeACPEnv = "REMOUNT_CLI_FAKE_ACP"
+	cliFakeACPArg = "-remount-cli-fake-acp"
+)
 
 func TestMain(m *testing.M) {
+	if len(os.Args) == 2 && os.Args[1] == cliFakeACPArg {
+		acptest.Main(acptest.Config{Info: acp.Implementation{Name: "cli-fake", Version: "t"}})
+		return
+	}
 	if os.Getenv(cliFakeACPEnv) == "1" {
 		acptest.Main(acptest.Config{Info: acp.Implementation{Name: "cli-fake", Version: "t"}})
 		return
@@ -75,7 +83,7 @@ func fakeACPRecipe(t *testing.T) (string, *launch.Recipe, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	yaml := "name: fakeacp\nauth: workspace_resident\ncommand: [\"/bin/true\"]\nacp:\n  command: [\"/usr/bin/env\", \"" + cliFakeACPEnv + "=1\", \"" + exe + "\"]\n"
+	yaml := "name: fakeacp\nauth: workspace_resident\ncommand: [\"/bin/true\"]\nacp:\n  command: [\"" + filepath.ToSlash(exe) + "\", \"" + cliFakeACPArg + "\"]\n"
 	file := filepath.Join(t.TempDir(), "fakeacp.yaml")
 	if err := os.WriteFile(file, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
@@ -92,6 +100,9 @@ func fakeACPRecipe(t *testing.T) (string, *launch.Recipe, string) {
 // type a follow-up on stdin, and see it finish by --max-turns with the
 // harness's echoed replies in order.
 func TestAgentCreateWatchConversation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: recipe ACP launcher scripts require a POSIX shell")
+	}
 	if os.Getenv("REMOUNT_TEST_LOCAL_SERVER") == "" && testing.Short() {
 		t.Skip("short")
 	}
@@ -265,6 +276,9 @@ func TestAgentTranscriptRenderer(t *testing.T) {
 }
 
 func TestAgentCommandsValidateBeforeDialing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: recipe ACP launcher scripts require a POSIX shell")
+	}
 	ctx := context.Background()
 	t.Setenv("REMOUNT_AUTOSTART", "off")
 	file, _, _ := fakeACPRecipe(t)
@@ -304,6 +318,9 @@ func TestAgentCommandsValidateBeforeDialing(t *testing.T) {
 }
 
 func TestRunUsesAgentForACPRecipes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: recipe ACP launcher scripts require a POSIX shell")
+	}
 	t.Setenv("REMOUNT_AUTOSTART", "off")
 	file, _, _ := fakeACPRecipe(t)
 	// An ACP recipe run without a task fails in the agent planner, proving

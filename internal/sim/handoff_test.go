@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -56,6 +57,9 @@ func readOut(t *testing.T, s *client.Session) string {
 // without a mount namespace is refused with a clear reason rather than
 // symlinked into place.
 func TestHandoffThenResumeCarriesHarnessState(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: recipe launchers require a POSIX shell in process workspaces")
+	}
 	w := newWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
@@ -248,6 +252,9 @@ func TestHandoffThenResumeCarriesHarnessState(t *testing.T) {
 // node after the first one is gone with nothing about the cursor stored in
 // the tree. Events carry indexes and exits, never the task text.
 func TestQueueRunsTasksAcrossSleepAndMove(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: recipe launchers require a POSIX shell in process workspaces")
+	}
 	w := newWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")

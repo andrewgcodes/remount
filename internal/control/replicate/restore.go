@@ -167,7 +167,7 @@ func (r *Restorer) materialize(ctx context.Context, m Manifest, destination stri
 		os.Remove(stage)
 		return "", fmt.Errorf("%w: %v", ErrCorruptRecoveryPoint, err)
 	}
-	file, err := os.OpenFile(stage, os.O_RDONLY, 0)
+	file, err := os.OpenFile(stage, os.O_RDWR, 0)
 	if err != nil {
 		os.Remove(stage)
 		return "", err
@@ -219,9 +219,5 @@ func atomicReplace(stage, destination string) error {
 	if err := os.Rename(stage, destination); err != nil {
 		return err
 	}
-	dir, err := os.Open(filepath.Dir(destination))
-	if err != nil {
-		return err
-	}
-	return errors.Join(dir.Sync(), dir.Close())
+	return syncDirectory(filepath.Dir(destination))
 }

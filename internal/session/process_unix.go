@@ -14,6 +14,10 @@ func configureProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
+func registerProcessGroup(*exec.Cmd) error { return nil }
+
+func releaseProcessGroup(*exec.Cmd) {}
+
 func signalProcess(cmd *exec.Cmd, name string) error {
 	signals := map[string]syscall.Signal{
 		"TERM": syscall.SIGTERM, "KILL": syscall.SIGKILL, "INT": syscall.SIGINT,

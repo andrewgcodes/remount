@@ -919,17 +919,26 @@ func (c *Client) forgetGrant(wsID string) {
 }
 
 // nodeCall performs a request against the node holding wsID, attaching a
-// grant. A stale grant (workspace moved) is refreshed once.
+// grant. A stale grant or a node still applying a newer authorization
+// revision is refreshed and retried within a bounded interval.
 func (c *Client) nodeCall(ctx context.Context, wsID, op string, body func(g *proto.Grant) any, out any) error {
-	for attempt := 0; attempt < 2; attempt++ {
+	const attempts = 5
+	for attempt := 0; attempt < attempts; attempt++ {
 		g, err := c.grant(ctx, wsID)
 		if err != nil {
 			return err
 		}
 		err = c.call(ctx, g.Node, op, body(g), out)
 		var pe *proto.Error
-		if errors.As(err, &pe) && (pe.Code == proto.CodeConflict || pe.Code == proto.CodeUnreachable || pe.Code == proto.CodeUnauthorized) && attempt == 0 {
+		retryable := errors.As(err, &pe) &&
+			(pe.Code == proto.CodeConflict || pe.Code == proto.CodeUnreachable || pe.Code == proto.CodeUnauthorized)
+		if retryable && attempt+1 < attempts {
 			c.forgetGrant(wsID)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
+			}
 			continue
 		}
 		return err

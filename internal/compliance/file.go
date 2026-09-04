@@ -128,15 +128,6 @@ func (w *boundedWriter) Write(data []byte) (int, error) {
 	return written, err
 }
 
-func syncDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
-}
-
 // CleanupStaging removes at most limit owned, regular staging files older than
 // before. Symlinks, directories, unrelated files, and recent exports remain.
 func (s *AtomicFileSink) CleanupStaging(ctx context.Context, before time.Time, limit int) (int, error) {

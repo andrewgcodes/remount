@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -35,7 +36,11 @@ func TestEnvAndFileSourcesRejectLiterals(t *testing.T) {
 	if err := os.WriteFile(file, []byte("file-secret-value"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	fileSource := (&url.URL{Scheme: "file", Path: file}).String()
+	fileURLPath := filepath.ToSlash(file)
+	if runtime.GOOS == "windows" {
+		fileURLPath = "/" + fileURLPath
+	}
+	fileSource := (&url.URL{Scheme: "file", Path: fileURLPath}).String()
 	value, err = resolver.Resolve(context.Background(), fileSource)
 	if err != nil || value != "file-secret-value" {
 		t.Fatalf("file Resolve = %q, %v", value, err)

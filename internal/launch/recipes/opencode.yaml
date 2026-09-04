@@ -11,6 +11,8 @@ install: |
   command -v opencode >/dev/null 2>&1 || npm install -g opencode-ai
 env:
   OPENCODE_DISABLE_AUTOUPDATE: "1"
+  # Process locks are host-local coordination, not movable workspace state.
+  XDG_STATE_HOME: "/tmp/remount-opencode-state-$REMOUNT_WORKSPACE"
   # Custom config sits between the global and the project opencode.json, so
   # a project's own settings still win and nothing in the repo is clobbered.
   OPENCODE_CONFIG: "$PWD/.remount/launch/opencode.json"

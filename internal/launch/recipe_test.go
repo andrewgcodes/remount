@@ -90,6 +90,7 @@ func TestLauncherWritesConfigWithRuntimeBrokerAndQuotesTask(t *testing.T) {
 		`"\$schema"`,
 		"mkdir -p .remount/launch\ncat > .remount/launch/opencode.json <<REMOUNT_EOF_0",
 		`export OPENCODE_CONFIG="$PWD/.remount/launch/opencode.json"`,
+		`export XDG_STATE_HOME="/tmp/remount-opencode-state-$REMOUNT_WORKSPACE"`,
 		"exec opencode run 'write a file; then $(echo pwned) '\\''quoted'\\'' \"double\"'",
 	} {
 		if !strings.Contains(script, want) {
@@ -147,6 +148,21 @@ func TestLauncherWritesConfigWithRuntimeBrokerAndQuotesTask(t *testing.T) {
 	} {
 		if !strings.Contains(string(cfg), want) {
 			t.Errorf("config lacks %q:\n%s", want, cfg)
+		}
+	}
+}
+
+func TestOpenCodeKeepsTransientStateOutsideWorkspace(t *testing.T) {
+	r, err := Load("opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Env["XDG_STATE_HOME"]; got != "/tmp/remount-opencode-state-$REMOUNT_WORKSPACE" {
+		t.Fatalf("XDG_STATE_HOME = %q", got)
+	}
+	for _, dir := range r.StateDirs {
+		if dir == ".local/state/opencode" {
+			t.Fatal("transient OpenCode state must not be declared movable")
 		}
 	}
 }

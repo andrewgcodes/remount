@@ -319,6 +319,17 @@ func (l *Log) Close() error {
 	return l.closeWithPublish(nil)
 }
 
+func (l *Log) closeLocal() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.spill == nil {
+		return nil
+	}
+	err := l.spill.Close()
+	l.spill = nil
+	return err
+}
+
 // closeWithPublish runs publish after every archival producer has joined and
 // while readers are still excluded from observing EOF. Session uses it to
 // commit capacity and publish its exited channel as one ordered handoff.

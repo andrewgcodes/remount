@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -108,21 +109,35 @@ func (f *planbScaleFleet) cut(rng *rand.Rand, fraction float64) int {
 
 // close detaches every cursor, closes every client, and releases every
 // connection the fleet is still holding.
-func (f *planbScaleFleet) close(ctx context.Context) {
+func (f *planbScaleFleet) close(ctx context.Context) int {
 	f.mu.Lock()
 	cursors, clients, conns := f.cursors, f.clients, f.conns
 	f.cursors, f.clients, f.conns = nil, nil, nil
 	f.mu.Unlock()
+	var wg sync.WaitGroup
+	var detachFailures atomic.Int64
 	for _, s := range cursors {
-		// Detach, never kill: the producer must survive for the next cycle.
-		_ = s.Close(ctx, false)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Detach, never kill: the producer must survive for the next cycle.
+			// Partition recovery is concurrent in production, so do not let one
+			// lost detach response serialize the teardown of every cursor.
+			detachCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			if err := s.Close(detachCtx, false); err != nil {
+				detachFailures.Add(1)
+			}
+		}()
 	}
+	wg.Wait()
 	for _, c := range clients {
 		_ = c.Close()
 	}
 	for _, c := range conns {
 		_ = c.Close()
 	}
+	return int(detachFailures.Load())
 }
 
 // TestPlanBScaleReconnectingCursorsReleaseTheirState opens N cursors on one
@@ -191,7 +206,7 @@ func TestPlanBScaleReconnectingCursorsReleaseTheirState(t *testing.T) {
 		t.Logf("cycle %d severed %d of %d cursor connections", cycle, severed, cursors)
 		planbScaleAwaitCursorChunks(t, ctx, fleet, cycle, "after cut")
 
-		fleet.close(ctx)
+		detachFailures := fleet.close(ctx)
 
 		// Teardown is asynchronous: wait for the relay to observe every
 		// disconnect before concluding anything about retained state.
@@ -202,6 +217,9 @@ func TestPlanBScaleReconnectingCursorsReleaseTheirState(t *testing.T) {
 			cycle, cursors, settled, after["remount_peers_connected"],
 			planbScaleDelta(before, after, "remount_frames_dropped_total"),
 			planbScaleDelta(before, after, "remount_session_gaps_total"))
+		if detachFailures > 0 {
+			t.Logf("cycle %d closed %d cursors by disconnect after their bounded detach did not return", cycle, detachFailures)
+		}
 		cycles = append(cycles, settled)
 	}
 

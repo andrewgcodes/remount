@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -316,9 +317,13 @@ func TestHostCIRowsCarryTheirProbeReason(t *testing.T) {
 func TestAWiredScenarioActuallyExecutesItsProof(t *testing.T) {
 	dir := newRepo(t)
 	marker := filepath.Join(t.TempDir(), "scenario-ran")
+	argv := []string{"sh", "-c", "printf ran > " + marker}
+	if runtime.GOOS == "windows" {
+		argv = []string{"cmd.exe", "/d", "/s", "/c", "echo ran>" + marker}
+	}
 	wired := Scenario{
 		ID: "B8", Title: "wired probe", Layer: LayerCode, Required: true,
-		Owner: "probe", Argv: []string{"sh", "-c", "printf ran > " + marker},
+		Owner: "probe", Argv: argv,
 	}
 	res, err := Run(context.Background(), Options{
 		Root: dir, Out: t.TempDir(), Gates: noGates, Lookup: fakeEnv(nil),

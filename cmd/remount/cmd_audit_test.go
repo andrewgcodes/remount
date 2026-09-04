@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -58,7 +59,9 @@ func TestWriteAuditBundleIsAtomicAndNeverClobbers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS == "windows" {
+		t.Log("unavailable: Go file modes do not expose Windows ACL confidentiality")
+	} else if info.Mode().Perm() != 0o600 {
 		t.Fatalf("bundle mode = %v", info.Mode().Perm())
 	}
 	if err := writeAuditBundle(context.Background(), path, []byte("second\n")); err == nil {
