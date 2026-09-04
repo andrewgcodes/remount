@@ -28,7 +28,7 @@ func TestB29FirecrackerHostSmoke(t *testing.T) {
 		t.Skip("set REMOUNT_FIRECRACKER_INTEGRATION=1 on a Linux KVM host")
 	}
 	if os.Geteuid() != 0 {
-		t.Fatal("Firecracker integration requires root for KVM, jailer, cgroups, TAP and netns")
+		t.Skip("unavailable: Firecracker integration requires root for KVM, jailer, cgroups, TAP and netns")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -181,7 +181,7 @@ func TestB29FirecrackerCheckpointMoveRestore(t *testing.T) {
 		t.Skip("set REMOUNT_FIRECRACKER_INTEGRATION=1 on a Linux KVM host")
 	}
 	if os.Geteuid() != 0 {
-		t.Fatal("Firecracker integration requires root for KVM, jailer, cgroups, TAP and netns")
+		t.Skip("unavailable: Firecracker integration requires root for KVM, jailer, cgroups, TAP and netns")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()

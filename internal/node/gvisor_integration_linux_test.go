@@ -27,6 +27,9 @@ func TestE5TenantIsolationConformance(t *testing.T) {
 	if testing.Short() || os.Getenv("REMOUNT_GVISOR_INTEGRATION") != "1" {
 		t.Skip("unavailable: set REMOUNT_GVISOR_INTEGRATION=1 on a privileged Linux host with runsc")
 	}
+	if os.Geteuid() != 0 {
+		t.Skip("unavailable: gVisor integration requires root for runsc, netns and nftables")
+	}
 	rootfs := os.Getenv("REMOUNT_GVISOR_ROOTFS")
 	if rootfs == "" {
 		t.Skip("unavailable: REMOUNT_GVISOR_ROOTFS is not set")
