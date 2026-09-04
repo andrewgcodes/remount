@@ -483,6 +483,149 @@ for a log with no output in it.
 
 ---
 
+## Plan B phase B5 — OpenTofu and Helm validation, 2026-09-03 (late)
+
+**Status: verified for the static gates; the live-cluster and live-cloud halves
+are unavailable and named below.**
+
+Host: Darwin 25.3.0 arm64. `tofu` OpenTofu v1.12.6 (darwin_arm64), `helm`
+v4.2.4. Nothing was applied, installed, pushed or published: Plan B §18 cuts
+public release actions and no cloud or cluster credential was used or present in
+the validators' environment.
+
+This closes work items 2, 3 and 7 of §13. Items 1, 4, 5 and 6 are separate:
+item 1 (the Compose stack) was already proven and was re-proven here because
+this change pinned one of its images; items 4, 5 and 6 remain open.
+
+### What was added
+
+| Path | What it is |
+|---|---|
+| `deploy/tofu/modules/{network,control,artifact-store,node-pool}` | infrastructure only: network inputs, the single-writer control service, the artifact bucket, node capacity and capability labels |
+| `deploy/tofu/examples/reference` | the root module the gates validate |
+| `deploy/helm/remount-node` | a DaemonSet chart that schedules nodes and advertises capability labels; no CRD, no controller, no RBAC |
+| `deploy/helm/remount-node/golden/default.yaml` | the committed render, diffed by a test so chart drift is visible in review |
+| `integration/policy` | the §13.7 policy tests, each with a control that has been watched failing |
+
+Runtime workspaces, sessions, claims, moves and checkpoints are outside
+Terraform state and outside the chart, and that is asserted rather than
+asserted-in-prose: see the rejection tables below.
+
+### Gates
+
+| Command | Observed | Verdict |
+|---|---|---|
+| `tofu fmt -check -recursive deploy/tofu` | exit 0, no output | verified |
+| `tofu init -backend=false` then `tofu validate -no-color` in `deploy/tofu/examples/reference` | `Success! The configuration is valid.`, exit 0 | verified |
+| the same, with an allow-list environment (`PATH`, `HOME`, `TMPDIR`, `CHECKPOINT_DISABLE`, `TF_IN_AUTOMATION`, `TF_INPUT`) and no cloud variables | `Success! The configuration is valid.` | verified |
+| `helm lint deploy/helm/remount-node -f deploy/helm/remount-node/golden/values.yaml` | `1 chart(s) linted, 0 chart(s) failed` (one INFO: no icon) | verified |
+| `helm template remount-nodes deploy/helm/remount-node --namespace remount -f .../golden/values.yaml \| diff -u .../golden/default.yaml -` | no diff, exit 0 | verified |
+| `go test -count=1 ./integration/policy/` | ok, 12 tests, 14 rejection sub-cases | verified |
+| `gofmt -l .` | no output | verified |
+| `go vet ./...` | clean | verified |
+| `staticcheck ./...` | exit 0, no findings | verified |
+| `docker compose -f deploy/compose/compose.yaml config` | valid after the MinIO digest pin | verified |
+| `./deploy/compose/smoke.sh` after rebuilding both images | `2 nodes online`, workspace created, `filesystem reads back composed`, moved off `n_06g6p1szz2j499z088b0w61cqw`, `filesystem survived the move`, `OK` | verified |
+
+The Compose smoke was re-run because this change pinned MinIO by digest, and a
+proven stack whose image reference changed is no longer a proven stack until it
+is re-proven. `make dist`, both image builds, `up -d`, `smoke.sh`, then
+`docker compose down -v --remove-orphans`; `docker ps -a` and `docker volume ls`
+filtered on `remount-reference` both came back empty, so cleanup is verified.
+
+**Validation needs no account, by construction.** No module declares
+`required_providers`; the provider seam is `terraform_data`, a builtin. So
+`tofu init -backend=false` contacts no registry and `tofu validate` needs no
+cloud identity. `integration/policy.TestTheModulesDeclareNoProvider` fails if a
+module ever grows one, because that is the change that would quietly make this
+gate un-runnable in CI.
+
+### Every image reference is now pinned by digest
+
+`integration/policy.TestEveryImageReferenceIsPinnedByDigest` scans `deploy/**`,
+`packaging/container/Dockerfile` and `images/workspace/Dockerfile`. Four
+references were floating and were pinned; all four digests resolve to
+multi-architecture indexes, so the pins are not architecture-specific:
+
+| Reference | Digest |
+|---|---|
+| `minio/minio:RELEASE.2025-04-22T22-12-26Z` (compose) | `sha256:a1ea29fa2835…b015e` |
+| `debian:bookworm-slim` (`deploy/compose/node.Dockerfile`) | `sha256:88200866dfff…a4171` |
+| `node:22-bookworm-slim` (`images/workspace/Dockerfile`) | `sha256:83f487e0a634…a7e5` |
+| `ghcr.io/astral-sh/uv:0.9.5` (`images/workspace/Dockerfile`) | `sha256:f459f6f73a8c…89b7` |
+
+Two exemptions, both narrow and both tested in each direction by
+`TestALocalBuildIsNotAFloatingTag`: `scratch` has nothing to pin, and
+`remount:local` / `remount-node:local` are built by this tree, so a digest
+written into the file would pin the reference to somebody else's build.
+
+### The §13.7 rejections, and the proof each one can fail
+
+Each rejection is a root module or a set of Helm values that `tofu validate` or
+`helm template` must refuse. Each was then re-run with its rule deleted, and the
+test was watched failing. A rule nobody has seen reject something is not yet a
+rule.
+
+| Rejected configuration | Refused by | With the rule deleted |
+|---|---|---|
+| `node_assignments = { ws_01HZQ = "n_a1" }` — Terraform pinning a live workspace to a node | `tofu validate`: "Terraform does not place, move, or pin live workspaces." | `tofu validate accepted moves-a-live-workspace` |
+| `capability_labels = { vendor = "sk-live-…" }` | `tofu validate`: "looks like a reusable credential" | `tofu validate accepted credential-in-node-labels` |
+| `admin_token_env = "sk-live-…"` — a token where the module wants a variable name | `tofu validate`: "admin_token_env is the NAME of an environment variable" | `tofu validate accepted credential-as-token-value` |
+| `image = "ghcr.io/example/remount-node:latest"` | `tofu validate`: "image must be pinned by digest" | `tofu validate accepted floating-node-image` |
+| `replicas = 2` on the control service | `tofu validate`: "The control plane is a single writer; replicas must be 1." | `tofu validate accepted two-control-replicas` |
+| `capability_labels = { workspace = "ws_01HZQ" }` | `tofu validate`: "Labels describe what a node can do, not what is running on it." | `tofu validate accepted workspace-in-node-labels` |
+| `--set capabilityLabels.workspace=ws_01HZQ` | `helm template` fails | `helm template accepted [capabilityLabels.workspace=…]` |
+| `--set capabilityLabels.vendor=sk-live-…` | `helm template` fails | (same rule as above) |
+| `--set capabilityLabels.openai_api_key=…` | `helm template` fails: "must not name a credential" | (same rule) |
+| `--set node.extraArgs[0]='ws move ws_01HZQ'` | `helm template` fails: "runtime workspace operation" | (same rule) |
+| `--set image.digest=` | `helm template` fails: "must be pinned by digest" | n/a, `required` |
+| `--set image.digest=latest` | `helm template` fails: "must be sha256:" | n/a |
+| `--set image.repository=ghcr.io/andrewgcodes/remount` | `helm template` fails: the control-plane image is FROM scratch | `helm template accepted [image.repository=…/remount]` |
+| `--set control.endpoint=` | `helm template` fails: "control.endpoint is required" | n/a, `required` |
+
+The static scanners were injected against as well, on the real tree rather than
+on a fixture, and each was watched catching its injection:
+
+| Injected defect | What caught it |
+|---|---|
+| `node_assignments` added to `deploy/tofu/examples/reference/main.tf` | `two owners for one fact: …main.tf:75: workspace-assignment` |
+| `vendor: sk-live-…` added to the chart's `capabilityLabels` | `a credential has two owners: …values.yaml:53: credential-literal` |
+| `--token=an-actual-bearer-value` substituted in `compose.yaml` | `…compose.yaml:48: credential-field-holds-a-literal` |
+| the MinIO digest removed, leaving the tag | `floating image reference: …compose.yaml:106: manifest-image` |
+| `maxUnavailable` changed in the chart without regenerating the golden | `the chart no longer renders …golden/default.yaml` |
+| the ownership canary manifest emptied | `rule "kubernetes-workspace-object" found nothing in the canary` |
+| the floating-tag canary Dockerfile emptied | `the digest scan found no floating FROM in the canary Dockerfile` |
+
+The last two are the control on the controls. Every scanner is additionally
+pointed at `integration/policy/testdata/canary`, where each violation is planted
+deliberately; if a scanner comes back clean there, the test fails. This is the
+`grep … | head` lesson from AGENTS.md applied to a scan whose passing result
+would otherwise be indistinguishable from a scan that had stopped working.
+
+### A real defect found on the way
+
+The repository's `.gitignore` carried an unanchored `remount-node/`, meant for
+the data directory `remount up` creates in the working tree. It also matched
+`deploy/helm/remount-node/`, so the entire Helm chart was invisible to git and
+would have been silently omitted from the commit — `git status` simply did not
+list it. The patterns are now anchored (`/remount-node/`, `/remount-data/`).
+
+### Unavailable, with reasons
+
+| Check | Why it could not run here |
+|---|---|
+| `helm install` / `helm upgrade` against a cluster | no Kubernetes cluster on this host, and Plan B §18 forbids provisioning one for this phase |
+| the DaemonSet actually scheduling nodes that join a fleet | same: needs a cluster |
+| `tofu plan` or `tofu apply` against any provider | forbidden by the phase's own rules; validation must not require an account, and no cloud credential was present |
+| the modules against a real provider (`aws_instance`, a managed instance group, …) | the provider seam is `terraform_data` by design; substituting a real resource is a per-target edit that this repository has not operated |
+| §13 work items 4 (private-network examples), 5 (secret-manager adapters) and 6 (Prometheus scrape and event-export examples) | not attempted in this pass |
+
+The chart and the modules have therefore been **validated, not operated**. This
+repository does not claim that any AWS, Azure, GCP or Kubernetes deployment of
+Remount has been run.
+
+---
+
 ## Still not attempted
 
 These remain open with no evidence in this file. Listing them here is

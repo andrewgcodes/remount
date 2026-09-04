@@ -1,0 +1,19 @@
+apiVersion: v2
+name: remount-node
+description: Schedules Remount nodes on Kubernetes and advertises their capability labels. Kubernetes does not own Remount workspace lifecycle.
+type: application
+version: 0.1.0
+appVersion: "dev"
+kubeVersion: ">=1.25.0-0"
+keywords:
+  - remount
+  - agent
+  - workspace
+home: https://github.com/andrewgcodes/remount
+sources:
+  - https://github.com/andrewgcodes/remount
+maintainers:
+  - name: Remount
+    url: https://github.com/andrewgcodes/remount
+annotations:
+  remount.dev/owns-workspace-lifecycle: "false"

@@ -1,0 +1,20 @@
+# The values the golden render in golden/default.yaml is produced from.
+#
+# The digest is a placeholder: this repository publishes no image, because
+# Plan B §18 cuts public release, image push and package publish. It is
+# syntactically a digest so the chart's digest requirement is exercised the way
+# a real deployment exercises it, and it resolves to nothing on purpose.
+image:
+  repository: ghcr.io/andrewgcodes/remount-node
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+control:
+  endpoint: http://remount-control.remount.svc.cluster.local:7443
+  tokenSecret:
+    name: remount-control-token
+    key: token
+
+capabilityLabels:
+  backend: process
+  tier: general
+  zone: a
