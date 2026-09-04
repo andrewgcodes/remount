@@ -323,6 +323,32 @@ The lanes that would have caught them:
 - A single-session exec round trip with an artifact URL configured, which is
   what makes the session-log upload path live.
 
+**All three now exist**, and so does the step they all depended on. The scale
+test already computed and logged every regressed number, and
+`bench/results/scale-process-local.json` already stored them; what was missing
+was anything that compared one run against another. `bench/compare.py` is that
+step:
+
+```sh
+python3 bench/compare.py --baseline bench/results/scale-process-local.json \
+                         --candidate /tmp/new-run.json
+```
+
+It reports a ratio per operation at both p50 and p99 and exits non-zero above a
+threshold. Both percentiles, because the claim regression never moved p50 at
+all — a comparison looking only at the median would have called it clean, and
+`test_compare_reports_the_claim_regression_that_only_moved_the_tail` pins that.
+An operation present in one run and missing from the other is reported
+`unavailable` rather than passing, because a renamed or dropped measurement is
+exactly how a regression becomes invisible. Runs whose host, backend or shape
+differ are refused rather than compared, since a ratio between a loaded laptop
+and a quiet CI box is a number with no meaning and reporting it as a regression
+would teach people to ignore the tool.
+
+It is a comparison tool rather than a threshold inside a test on purpose: an
+absolute wall-clock bound on a shared developer machine is a flaky test, while a
+ratio between two named files is a fact about those two files.
+
 ---
 
 ## Disposition, 2026-09-03 (added after the sweep)
