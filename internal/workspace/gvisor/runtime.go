@@ -3,6 +3,8 @@ package gvisor
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -52,11 +54,43 @@ func (r execRuntime) destroy(ctx context.Context, id string) error {
 	}
 	return err
 }
+
+// run invokes runsc and returns its output only on failure.
+//
+// It deliberately does not use CombinedOutput. `runsc create` and `runsc start`
+// leave a sandbox process and a gofer process running after they themselves
+// exit, and those daemons inherit whatever stdout and stderr they were given.
+// CombinedOutput supplies an os.Pipe and then waits for every writer to close
+// it, so the wait does not end when runsc exits — it ends when the sandbox
+// does, which is to say never. The call hangs forever holding the workspace's
+// network policy half applied.
+//
+// Handing os/exec a real *os.File avoids it entirely: os/exec passes a file
+// descriptor straight to the child and starts no copying goroutine, so nothing
+// is left waiting on a descriptor the daemon still holds. This was observed as
+// ApplyNetworkPolicy hanging indefinitely on a Linux host with runsc
+// registered; see docs/engineering/verification-2026-09.md.
 func (r execRuntime) run(ctx context.Context, args ...string) error {
 	full := append([]string{"--root=" + r.root}, args...)
-	out, err := exec.CommandContext(ctx, r.binary, full...).CombinedOutput()
+	log, err := os.CreateTemp("", "runsc-output-*")
 	if err != nil {
-		return fmt.Errorf("runsc %s: %s: %w", args[0], strings.TrimSpace(string(out)), err)
+		return fmt.Errorf("runsc %s: capture output: %w", args[0], err)
 	}
-	return nil
+	defer func() {
+		_ = log.Close()
+		_ = os.Remove(log.Name())
+	}()
+	cmd := exec.CommandContext(ctx, r.binary, full...)
+	cmd.Stdout, cmd.Stderr = log, log
+	runErr := cmd.Run()
+	if runErr == nil {
+		return nil
+	}
+	// Only read the output on the failure path, and bound it: a runsc failure
+	// can be verbose and the message ends up in an error a caller may log.
+	var out []byte
+	if _, seekErr := log.Seek(0, io.SeekStart); seekErr == nil {
+		out, _ = io.ReadAll(io.LimitReader(log, 8<<10))
+	}
+	return fmt.Errorf("runsc %s: %s: %w", args[0], strings.TrimSpace(string(out)), runErr)
 }
