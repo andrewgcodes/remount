@@ -1292,5 +1292,50 @@ All commands passed. The final `make conformance` simulation package completed
 in 392.930 seconds; the complete final `make race` simulation package
 completed in 400.301 seconds. The failed aggregate run still verified cleanup
 of its one external resource and retained all unavailable rows as unavailable.
-**Status: verified after repair; aggregate rerun required on the committed
-candidate.**
+The repaired implementation candidate was committed as
+`7957c40456ef06fdce4ef441dcf8424f875c324a`.
+
+The clean committed-candidate aggregate was then rerun with the gVisor and
+Firecracker host prerequisites named earlier in this ledger:
+
+```sh
+go run ./cmd/evidence run
+```
+
+It exited zero and reported:
+
+```text
+Candidate: 7957c40456ef06fdce4ef441dcf8424f875c324a
+Rows: 39 passed, 0 failed, 28 unavailable
+Required rows: 39 of 55 passed, 0 failed, 16 unavailable
+Registry: 57 scenarios, 6 with no owning proof
+External resources created: 1; cleanup verified 1, failed 0
+```
+
+The command remains truthfully incomplete rather than a completion gate:
+sixteen required rows have no executable aggregate proof and remain named
+unavailable. The host-backed B28 and B29 rows passed on this exact candidate.
+
+Built-binary conformance on the same candidate:
+
+```sh
+go run ./cmd/conformance --build .
+```
+
+reported:
+
+```text
+CONFORMANT: remount standalone (remount)
+60 passed, 0 failed, 8 unavailable of 68 requirements in 6.845s
+required: 53 passed, 0 failed, 0 unavailable
+capability-gated: 7 passed, 0 failed, 7 unavailable
+extension: 0 passed, 0 failed, 1 unavailable
+cleanup: verified
+```
+
+The unavailable requirements named absent node-fault, retention-bound,
+approve-mode egress, transcript-eviction and notification harness
+prerequisites; none was upgraded to passed. Distribution and evidence
+artifacts stayed local and no release, tag, image, package or signed artifact
+was published. **Status: verified on the committed candidate; aggregate
+remains incomplete because its 16 required unavailable rows are unwired.**
