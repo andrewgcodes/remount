@@ -388,6 +388,23 @@ type Memory struct {
 // NewMemory returns an in-memory store keeping at most max events (0 = all).
 func NewMemory(max int) *Memory { return &Memory{next: 1, first: 1, max: max} }
 
+// Reset discards the retained events and makes the next appended event carry
+// seq. A node uses it twice: at startup, to continue its producer numbering
+// from durable state rather than begin again at one; and after control reports
+// that a sequence it sent already names a different event, to move past the
+// history it collided with. Retained events exist only to be forwarded, so a
+// caller that re-issues what was still pending loses nothing by the discard.
+func (m *Memory) Reset(seq uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if seq < 1 {
+		seq = 1
+	}
+	m.events = nil
+	m.first = seq
+	m.next = seq
+}
+
 func (m *Memory) Append(ctx context.Context, e *proto.Event) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
