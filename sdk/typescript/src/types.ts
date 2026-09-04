@@ -585,6 +585,36 @@ export interface DiagReq {
   "verify"?: boolean;
 }
 
+export interface E2EEKeyExchange {
+  "type": string;
+  "suite"?: string;
+  "caps"?: Array<string>;
+  "session": Uint8Array;
+  "from": string;
+  "to": string;
+  "eph"?: Uint8Array;
+  "nonce"?: Uint8Array;
+  "ts"?: number;
+  "binding"?: PeerBinding;
+  "sig"?: Uint8Array;
+  "reason"?: string;
+}
+
+export interface E2EEPayload {
+  "op"?: string;
+  "s"?: string;
+  "ws"?: string;
+  "seq"?: number;
+  "body"?: Uint8Array;
+  "err"?: Error | null;
+}
+
+export interface E2EESealed {
+  "sid": Uint8Array;
+  "n": number;
+  "ct": Uint8Array;
+}
+
 export interface EgressApprovalReq {
   "ws": string;
   "gen": number;
@@ -1011,6 +1041,15 @@ export interface NodeStatus {
   "last_seen": number;
   "workspaces"?: Array<string>;
   "protocol"?: Array<string>;
+}
+
+export interface PeerBinding {
+  "peer": string;
+  "key": Uint8Array;
+  "tenant"?: string;
+  "issued"?: number;
+  "exp": number;
+  "sig"?: Uint8Array;
 }
 
 export interface Placement {
@@ -1905,6 +1944,8 @@ export const OPERATIONS = {
   "budget.settle": { constant: "OpBudgetSettle", request: "BudgetSettleReq", response: "BudgetSettlement" },
   "controller.state": { constant: "OpControllerState", request: "", response: "" },
   "diag": { constant: "OpDiag", request: "DiagReq", response: "ControlDiag" },
+  "e2ee.kx": { constant: "OpE2EEKeyExchange", request: "", response: "" },
+  "e2ee.sealed": { constant: "OpE2EESealed", request: "", response: "" },
   "egress.approval": { constant: "OpEgressApproval", request: "EgressApprovalReq", response: "EgressApprovalRes" },
   "events.post": { constant: "OpEventsPost", request: "EventPost", response: "" },
   "events.stop": { constant: "OpEventsStop", request: "EventsStopReq", response: "" },

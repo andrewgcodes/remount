@@ -588,6 +588,36 @@ DiagReq = TypedDict("DiagReq", {
     "verify": NotRequired[bool],
 }, total=False)
 
+E2EEKeyExchange = TypedDict("E2EEKeyExchange", {
+    "type": Required[str],
+    "suite": NotRequired[str],
+    "caps": NotRequired[list[str]],
+    "session": Required[bytes],
+    "from": Required[str],
+    "to": Required[str],
+    "eph": NotRequired[bytes],
+    "nonce": NotRequired[bytes],
+    "ts": NotRequired[int],
+    "binding": NotRequired["PeerBinding"],
+    "sig": NotRequired[bytes],
+    "reason": NotRequired[str],
+}, total=False)
+
+E2EEPayload = TypedDict("E2EEPayload", {
+    "op": NotRequired[str],
+    "s": NotRequired[str],
+    "ws": NotRequired[str],
+    "seq": NotRequired[int],
+    "body": NotRequired[bytes],
+    "err": NotRequired[Optional["Error"]],
+}, total=False)
+
+E2EESealed = TypedDict("E2EESealed", {
+    "sid": Required[bytes],
+    "n": Required[int],
+    "ct": Required[bytes],
+}, total=False)
+
 EgressApprovalReq = TypedDict("EgressApprovalReq", {
     "ws": Required[str],
     "gen": Required[int],
@@ -1014,6 +1044,15 @@ NodeStatus = TypedDict("NodeStatus", {
     "last_seen": Required[int],
     "workspaces": NotRequired[list[str]],
     "protocol": NotRequired[list[str]],
+}, total=False)
+
+PeerBinding = TypedDict("PeerBinding", {
+    "peer": Required[str],
+    "key": Required[bytes],
+    "tenant": NotRequired[str],
+    "issued": NotRequired[int],
+    "exp": Required[int],
+    "sig": NotRequired[bytes],
 }, total=False)
 
 Placement = TypedDict("Placement", {
@@ -1908,6 +1947,8 @@ OPERATIONS: dict[str, dict[str, object]] = {
     "budget.settle": {"constant": "OpBudgetSettle", "request": "BudgetSettleReq", "response": "BudgetSettlement"},
     "controller.state": {"constant": "OpControllerState", "request": "", "response": ""},
     "diag": {"constant": "OpDiag", "request": "DiagReq", "response": "ControlDiag"},
+    "e2ee.kx": {"constant": "OpE2EEKeyExchange", "request": "", "response": ""},
+    "e2ee.sealed": {"constant": "OpE2EESealed", "request": "", "response": ""},
     "egress.approval": {"constant": "OpEgressApproval", "request": "EgressApprovalReq", "response": "EgressApprovalRes"},
     "events.post": {"constant": "OpEventsPost", "request": "EventPost", "response": ""},
     "events.stop": {"constant": "OpEventsStop", "request": "EventsStopReq", "response": ""},

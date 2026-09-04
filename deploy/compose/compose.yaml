@@ -1,0 +1,128 @@
+# Remount reference deployment for local integration.
+#
+# This composes Remount with the infrastructure categories an operator already
+# runs; it does not replace any of them. The control plane owns workspace
+# identity, placement and the event log. MinIO owns bytes. The exporter owns
+# telemetry. Each stays in its own lane, which is the property Plan B phase B5
+# exists to demonstrate.
+#
+# This is a development stack. It uses a shared bearer token and plaintext HTTP
+# on a private network, which production must not: see docs/operations.md for
+# production mode, per-tenant identity and TLS.
+#
+#   docker compose -f deploy/compose/compose.yaml config      # validate
+#   docker compose -f deploy/compose/compose.yaml up -d       # start
+#   ./deploy/compose/smoke.sh                                 # prove it works
+#
+# The remount image is built from packaging/container/Dockerfile against the
+# binaries `make dist` produces. Build it first:
+#
+#   make dist
+#   docker build --build-arg TARGETARCH=$(go env GOARCH) \
+#     -f packaging/container/Dockerfile -t remount:local .
+#   docker build --build-arg TARGETARCH=$(go env GOARCH) \
+#     -f deploy/compose/node.Dockerfile -t remount-node:local .
+
+name: remount-reference
+
+x-remount-image: &remount-image
+  image: ${REMOUNT_IMAGE:-remount:local}
+
+# Nodes use a different image on purpose: see deploy/compose/node.Dockerfile.
+# The release image is FROM scratch, which is right for the control plane and
+# the CLI and impossible for a process-backend node, whose workspaces need a
+# userland to run in.
+x-remount-node-image: &remount-node-image
+  image: ${REMOUNT_NODE_IMAGE:-remount-node:local}
+
+services:
+  # The control plane, relay and artifact HTTP surface are one process. It is a
+  # single writer over SQLite by design; see the residual risk register in
+  # docs/engineering/implementation-closure-2026-09-03.md.
+  control:
+    <<: *remount-image
+    command:
+      - server
+      - --listen=0.0.0.0:7443
+      - --data=/var/lib/remount
+      - --token=${REMOUNT_TOKEN:-reference-development-token}
+    environment:
+      # Names only. A literal secret does not belong in a compose file.
+      REMOUNT_MASTER_KEY: ${REMOUNT_MASTER_KEY:-}
+    ports:
+      - "127.0.0.1:${REMOUNT_PORT:-7443}:7443"
+    volumes:
+      - control-data:/var/lib/remount
+    healthcheck:
+      # The scratch image carries no shell and no curl, so the binary probes
+      # itself. A health check that cannot run must not read as healthy.
+      test: ["CMD", "/usr/local/bin/remount", "status", "--server", "http://127.0.0.1:7443", "--token", "${REMOUNT_TOKEN:-reference-development-token}"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 3s
+    restart: unless-stopped
+
+  # Two nodes, so placement, movement and node loss are observable rather than
+  # theoretical. Both run the process backend: this stack proves composition,
+  # not isolation, and claiming otherwise would be the exact overreach the
+  # capability model refuses.
+  node-a:
+    <<: *remount-node-image
+    command:
+      - up
+      - --server=http://control:7443
+      - --token=${REMOUNT_TOKEN:-reference-development-token}
+      - --data=/var/lib/remount-node
+      - --backend=process
+      - --label=zone=a
+    depends_on:
+      control:
+        condition: service_healthy
+    volumes:
+      - node-a-data:/var/lib/remount-node
+    restart: unless-stopped
+
+  node-b:
+    <<: *remount-node-image
+    command:
+      - up
+      - --server=http://control:7443
+      - --token=${REMOUNT_TOKEN:-reference-development-token}
+      - --data=/var/lib/remount-node
+      - --backend=process
+      - --label=zone=b
+    depends_on:
+      control:
+        condition: service_healthy
+    volumes:
+      - node-b-data:/var/lib/remount-node
+    restart: unless-stopped
+
+  # S3-compatible artifact storage. Remount speaks S3 with a hand-written
+  # SigV4; MinIO is here to prove that contract against a real implementation
+  # rather than a fake.
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-remountadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-remountadmin}
+    ports:
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 3s
+    restart: unless-stopped
+
+volumes:
+  control-data:
+  node-a-data:
+  node-b-data:
+  minio-data:

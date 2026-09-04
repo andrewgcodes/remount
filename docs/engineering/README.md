@@ -54,6 +54,17 @@ a real pinned harness in a docker workspace, and the broker path that keeps the
 workspace holding a placeholder. Read it before changing the harness pin or the
 model fake's script.
 
+### Platform handoffs — [Linux](./handoff-linux-host-2026-09-03.md) · [Windows](./handoff-windows-host-2026-09-03.md)
+
+What could not be proven on a macOS arm64 host, split by the platform that can
+prove it. Each item names the exact missing prerequisite and the exact command,
+so neither document needs re-derivation.
+
+Linux carries gVisor, Firecracker KVM, the live E2B pool lanes, the
+docker/gVisor scale matrix, and Terraform/Helm validation. Windows carries the
+least-verified surface in the repository: seven Windows-specific source files
+ship in every release and no test has ever run on that platform.
+
 ### [External and live verification ledger — 2026-09](./verification-2026-09.md)
 
 The point-in-time record of external verification runs: the exact command, the

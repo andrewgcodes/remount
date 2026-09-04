@@ -1974,6 +1974,115 @@
       },
       "additionalProperties": true
     },
+    "E2EEKeyExchange": {
+      "type": "object",
+      "properties": {
+        "binding": {
+          "$ref": "#/$defs/PeerBinding"
+        },
+        "caps": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "eph": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "nonce": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "session": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "sig": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "suite": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        },
+        "ts": {
+          "type": "integer"
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "session",
+        "to",
+        "type"
+      ],
+      "additionalProperties": true
+    },
+    "E2EEPayload": {
+      "type": "object",
+      "properties": {
+        "body": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "err": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Error"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "op": {
+          "type": "string"
+        },
+        "s": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "E2EESealed": {
+      "type": "object",
+      "properties": {
+        "ct": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "n": {
+          "type": "integer"
+        },
+        "sid": {
+          "contentEncoding": "base64",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ct",
+        "n",
+        "sid"
+      ],
+      "additionalProperties": true
+    },
     "EgressApprovalReq": {
       "type": "object",
       "properties": {
@@ -3503,6 +3612,37 @@
         "info",
         "last_seen",
         "online"
+      ],
+      "additionalProperties": true
+    },
+    "PeerBinding": {
+      "type": "object",
+      "properties": {
+        "exp": {
+          "type": "integer"
+        },
+        "issued": {
+          "type": "integer"
+        },
+        "key": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "peer": {
+          "type": "string"
+        },
+        "sig": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "exp",
+        "key",
+        "peer"
       ],
       "additionalProperties": true
     },
@@ -6726,6 +6866,14 @@
       "name": "diag",
       "request": "DiagReq",
       "response": "ControlDiag"
+    },
+    {
+      "constant": "OpE2EEKeyExchange",
+      "name": "e2ee.kx"
+    },
+    {
+      "constant": "OpE2EESealed",
+      "name": "e2ee.sealed"
     },
     {
       "constant": "OpEgressApproval",

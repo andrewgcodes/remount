@@ -1,0 +1,655 @@
+{
+  "version": "1.0.0",
+  "protocol_version": "1",
+  "requirements": [
+    {
+      "id": "CONF-NEG-001",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "negotiation",
+      "tier": "required",
+      "title": "a hello offering the v1 baseline is accepted and the response echoes v1",
+      "spec": "PROTOCOL.md §3, §3.1"
+    },
+    {
+      "id": "CONF-NEG-002",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "negotiation",
+      "tier": "required",
+      "title": "the negotiated capability list is the ordered intersection, v1 first, and never echoes an identifier the implementation does not implement",
+      "spec": "PROTOCOL.md §3.1"
+    },
+    {
+      "id": "CONF-NEG-003",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "negotiation",
+      "tier": "required",
+      "title": "a hello without the v1 baseline is refused with the stable code unsupported, and an empty capability list is not an implicit wildcard",
+      "spec": "PROTOCOL.md §2 rule 1, §3.1"
+    },
+    {
+      "id": "CONF-NEG-004",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "negotiation",
+      "tier": "required",
+      "title": "a frame whose version was never negotiated fails closed before its kind or body is interpreted",
+      "spec": "PROTOCOL.md §2 rule 1, §13"
+    },
+    {
+      "id": "CONF-NEG-005",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "negotiation",
+      "tier": "required",
+      "title": "an unknown operation is answered with a res carrying the stable code unsupported, not a dropped request",
+      "spec": "PROTOCOL.md §2 rule 2"
+    },
+    {
+      "id": "CONF-NEG-006",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "negotiation",
+      "tier": "required",
+      "title": "no frame may precede the hello; a connection that opens with anything else is refused",
+      "spec": "PROTOCOL.md §3"
+    },
+    {
+      "id": "CONF-NEG-007",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "negotiation",
+      "tier": "required",
+      "title": "every protocol failure carries one of the twelve stable error codes, so a caller can match on the code and never on the message",
+      "spec": "PROTOCOL.md §2"
+    },
+    {
+      "id": "CONF-NEG-008",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "negotiation",
+      "tier": "required",
+      "title": "the handshake response names the lease interval and the control plane's grant-signing key, so a node can renew and verify offline",
+      "spec": "PROTOCOL.md §3"
+    },
+    {
+      "id": "CONF-NEG-009",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "negotiation",
+      "tier": "capability-gated",
+      "title": "a peer that negotiated controller-epoch is told a nonzero epoch and persists it on every event, so a superseded controller's decisions are distinguishable",
+      "spec": "PROTOCOL.md §3.2",
+      "capability": "controller-epoch"
+    },
+    {
+      "id": "CONF-WS-001",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "workspace",
+      "tier": "required",
+      "title": "ws.create returns a workspace with an id, a generation and a state drawn from the lifecycle table",
+      "spec": "PROTOCOL.md §5, §5.1"
+    },
+    {
+      "id": "CONF-WS-002",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "workspace",
+      "tier": "required",
+      "title": "replaying a mutating request with the same idempotency key is a no-op that returns the original result",
+      "spec": "PROTOCOL.md §6"
+    },
+    {
+      "id": "CONF-WS-003",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "workspace",
+      "tier": "required",
+      "title": "ws.ready gates claimed: a workspace reported claimed names the node holding it and a nonzero generation",
+      "spec": "PROTOCOL.md §5, §12 item 6"
+    },
+    {
+      "id": "CONF-WS-004",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "workspace",
+      "tier": "required",
+      "title": "ws.get of an id that does not exist is not_found, never an empty success",
+      "spec": "PROTOCOL.md §6"
+    },
+    {
+      "id": "CONF-WS-005",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "workspace",
+      "tier": "required",
+      "title": "a mount path inside a system directory is refused with bad_request at create time",
+      "spec": "PROTOCOL.md §5.2"
+    },
+    {
+      "id": "CONF-WS-006",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "workspace",
+      "tier": "required",
+      "title": "ws.list reports a created workspace at the same generation ws.get reports",
+      "spec": "PROTOCOL.md §6"
+    },
+    {
+      "id": "CONF-WS-007",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "workspace",
+      "tier": "required",
+      "title": "destroyed is absorbing: after ws.destroy the workspace is gone or terminal and never returns to a serving state",
+      "spec": "PROTOCOL.md §5.1"
+    },
+    {
+      "id": "CONF-AUTH-001",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "authority",
+      "tier": "required",
+      "title": "a grant is issued only for a claimed workspace and binds client, workspace, node and generation",
+      "spec": "PROTOCOL.md §4, §5"
+    },
+    {
+      "id": "CONF-AUTH-002",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "authority",
+      "tier": "required",
+      "title": "a grant request for a workspace that does not exist is refused, not answered with a grant for nothing",
+      "spec": "PROTOCOL.md §4"
+    },
+    {
+      "id": "CONF-AUTH-003",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "authority",
+      "tier": "required",
+      "title": "a node refuses a grant whose generation is not the workspace's current one",
+      "spec": "PROTOCOL.md §4, §12 item 4"
+    },
+    {
+      "id": "CONF-AUTH-004",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "authority",
+      "tier": "required",
+      "title": "a node refuses a grant whose workspace does not match the request it accompanies",
+      "spec": "PROTOCOL.md §4"
+    },
+    {
+      "id": "CONF-AUTH-005",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "authority",
+      "tier": "required",
+      "title": "a node operation presented with no grant at all is refused",
+      "spec": "PROTOCOL.md §7"
+    },
+    {
+      "id": "CONF-AUTH-006",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "authority",
+      "tier": "required",
+      "title": "a move increments the generation, and every grant minted under the previous one stops working",
+      "spec": "PROTOCOL.md §4, §5"
+    },
+    {
+      "id": "CONF-AUTH-007",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "authority",
+      "tier": "capability-gated",
+      "title": "an expired lease returns the workspace to pending with its last snapshot, and a node dying is the same event as a node moving",
+      "spec": "PROTOCOL.md §5, §5.1",
+      "prereqs": [
+        "node-fault"
+      ]
+    },
+    {
+      "id": "CONF-SESS-001",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "session",
+      "tier": "required",
+      "title": "seq 0 of every session is the info chunk, so a replay from 0 reconstructs the session header",
+      "spec": "PROTOCOL.md §8 guarantee 1, §12 item 1"
+    },
+    {
+      "id": "CONF-SESS-002",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "session",
+      "tier": "required",
+      "title": "the exit chunk is the last chunk and the log is closed after it",
+      "spec": "PROTOCOL.md §8 guarantee 2, §12 item 1"
+    },
+    {
+      "id": "CONF-SESS-003",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "session",
+      "tier": "required",
+      "title": "chunk sequence numbers start at 0 and increase by exactly one, with no reordering and no hole",
+      "spec": "PROTOCOL.md §8 guarantee 1"
+    },
+    {
+      "id": "CONF-SESS-004",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "session",
+      "tier": "required",
+      "title": "input is deduplicated by iseq: a retried keystroke at or below the last applied sequence is dropped, never typed twice",
+      "spec": "PROTOCOL.md §8, §12 item 3"
+    },
+    {
+      "id": "CONF-SESS-005",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "session",
+      "tier": "required",
+      "title": "s.attach from 0 replays the retained log byte-identically through the same path as the live tail",
+      "spec": "PROTOCOL.md §8 guarantee 3"
+    },
+    {
+      "id": "CONF-SESS-006",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "session",
+      "tier": "required",
+      "title": "s.wait reports the exit status the exit chunk carried, so a detached client learns the outcome",
+      "spec": "PROTOCOL.md §7, §8"
+    },
+    {
+      "id": "CONF-SESS-007",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "session",
+      "tier": "capability-gated",
+      "title": "a replay from an evicted seq emits a gap chunk naming the lost range, continues from the oldest retained chunk, and does not kill the session",
+      "spec": "PROTOCOL.md §8 guarantee 4, §12 item 2",
+      "prereqs": [
+        "session-eviction"
+      ]
+    },
+    {
+      "id": "CONF-SESS-008",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "session",
+      "tier": "required",
+      "title": "an attach past the produced range never fabricates output: the node reports where live begins and emits nothing before it",
+      "spec": "PROTOCOL.md §8 guarantee 3"
+    },
+    {
+      "id": "CONF-SNAP-001",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "snapshot",
+      "tier": "required",
+      "title": "the same tree always produces the same artifact id: a snapshot is deterministic, not merely reproducible in principle",
+      "spec": "PROTOCOL.md §10"
+    },
+    {
+      "id": "CONF-SNAP-002",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "snapshot",
+      "tier": "required",
+      "title": "an artifact id is the digest of its bytes and GET returns exactly those bytes",
+      "spec": "PROTOCOL.md §10"
+    },
+    {
+      "id": "CONF-SNAP-003",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "snapshot",
+      "tier": "required",
+      "title": "a workspace restored from a snapshot serves the files the source held",
+      "spec": "PROTOCOL.md §10"
+    },
+    {
+      "id": "CONF-SNAP-004",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "snapshot",
+      "tier": "required",
+      "title": "an ordinary snapshot is labelled live and is never reported authoritative, because it may have observed a changing tree",
+      "spec": "PROTOCOL.md §7, §12 item 12"
+    },
+    {
+      "id": "CONF-SNAP-005",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "snapshot",
+      "tier": "required",
+      "title": "an unknown artifact is not found, and a digest held by another tenant is indistinguishable from one that does not exist",
+      "spec": "PROTOCOL.md §10"
+    },
+    {
+      "id": "CONF-SNAP-006",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "snapshot",
+      "tier": "required",
+      "title": "an upload is published only after its digest matches the id it was stored under",
+      "spec": "PROTOCOL.md §10"
+    },
+    {
+      "id": "CONF-SNAP-007",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "snapshot",
+      "tier": "required",
+      "title": "a move advances the generation and the destination serves the source tree: the filesystem, identity and policy travel",
+      "spec": "PROTOCOL.md §5, §10"
+    },
+    {
+      "id": "CONF-SNAP-008",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "snapshot",
+      "tier": "capability-gated",
+      "title": "an authoritative snapshot quiesces the workspace, reports consistency quiesced, and only then becomes committable failover state",
+      "spec": "PROTOCOL.md §7, §12 item 12",
+      "prereqs": [
+        "quiesced-snapshot"
+      ]
+    },
+    {
+      "id": "CONF-BIND-001",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "binding",
+      "tier": "capability-gated",
+      "title": "the workspace holds a placeholder and never the secret: the environment the node writes carries a reference, and the real value appears nowhere in the tree",
+      "spec": "PROTOCOL.md §9",
+      "prereqs": [
+        "bindings"
+      ]
+    },
+    {
+      "id": "CONF-BIND-002",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "binding",
+      "tier": "capability-gated",
+      "title": "a placeholder aimed at a host its binding does not cover blocks the request and records the decision as leak_blocked, rather than forwarding it",
+      "spec": "PROTOCOL.md §9 rule 1, §12 item 5",
+      "prereqs": [
+        "bindings"
+      ]
+    },
+    {
+      "id": "CONF-BIND-003",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "binding",
+      "tier": "capability-gated",
+      "title": "a destination no rule and no binding covers is denied before any byte is sent upstream",
+      "spec": "PROTOCOL.md §9 rules 2 and 4",
+      "prereqs": [
+        "bindings"
+      ]
+    },
+    {
+      "id": "CONF-BIND-004",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "binding",
+      "tier": "capability-gated",
+      "title": "a destination resolving to a loopback, private, link-local or multicast address is refused unless explicitly allowed, which closes the metadata endpoint by default",
+      "spec": "PROTOCOL.md §9 rule 5",
+      "prereqs": [
+        "bindings"
+      ]
+    },
+    {
+      "id": "CONF-BIND-005",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "binding",
+      "tier": "capability-gated",
+      "title": "no event payload carries the secret a binding holds; the audit record names the decision, not the credential",
+      "spec": "PROTOCOL.md §9, §11",
+      "prereqs": [
+        "bindings"
+      ]
+    },
+    {
+      "id": "CONF-APP-001",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "approval",
+      "tier": "required",
+      "title": "approval.get of an id that does not exist is not_found",
+      "spec": "PROTOCOL.md §6, §6.1"
+    },
+    {
+      "id": "CONF-APP-002",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "approval",
+      "tier": "required",
+      "title": "approval.list returns pending rows unless a status is named, so a caller polling for work never sees a decided row as outstanding",
+      "spec": "PROTOCOL.md §6"
+    },
+    {
+      "id": "CONF-APP-003",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "approval",
+      "tier": "capability-gated",
+      "title": "an approve-mode request releases no upstream byte before a durable decision, and the row is idempotent on the request fingerprint",
+      "spec": "PROTOCOL.md §6.1, §9",
+      "capability": "approvals",
+      "prereqs": [
+        "bindings",
+        "egress-approval"
+      ]
+    },
+    {
+      "id": "CONF-APP-004",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "approval",
+      "tier": "capability-gated",
+      "title": "a second decision on a decided row is conflict, while a replay carrying the original idempotency key returns the row as decided",
+      "spec": "PROTOCOL.md §6.1",
+      "prereqs": [
+        "bindings",
+        "egress-approval"
+      ]
+    },
+    {
+      "id": "CONF-APP-005",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "approval",
+      "tier": "capability-gated",
+      "title": "a decision is durable: it survives a control-plane restart and is still the answer the broker gets",
+      "spec": "PROTOCOL.md §6.1",
+      "prereqs": [
+        "bindings",
+        "egress-approval",
+        "restart"
+      ]
+    },
+    {
+      "id": "CONF-AGT-001",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "agent",
+      "tier": "required",
+      "title": "agent.create returns a durable agent with a workspace, a derived status and an inbox, so nothing about the conversation lives only in a process",
+      "spec": "PROTOCOL.md §6.1"
+    },
+    {
+      "id": "CONF-AGT-002",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "agent",
+      "tier": "required",
+      "title": "agent.message appends to the inbox and the message stays there until a turn consumes it",
+      "spec": "PROTOCOL.md §6.1"
+    },
+    {
+      "id": "CONF-AGT-003",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "agent",
+      "tier": "required",
+      "title": "the inbox is bounded and refuses the excess with resource_exhausted rather than growing without limit",
+      "spec": "PROTOCOL.md §6.1"
+    },
+    {
+      "id": "CONF-AGT-004",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "agent",
+      "tier": "required",
+      "title": "agent.transcript answers from the durable mirror with a page and a continuation cursor, and never wakes the workspace to do it",
+      "spec": "PROTOCOL.md §6.2"
+    },
+    {
+      "id": "CONF-AGT-005",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "agent",
+      "tier": "capability-gated",
+      "title": "a transcript read below the oldest retained index names the evicted range as a gap, so a reader never sees a shorter log without being told",
+      "spec": "PROTOCOL.md §6.2",
+      "prereqs": [
+        "transcript-eviction"
+      ]
+    },
+    {
+      "id": "CONF-AGT-006",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "agent",
+      "tier": "required",
+      "title": "agent.sleep pauses the workspace and a later message wakes it, reporting that it did",
+      "spec": "PROTOCOL.md §6.1"
+    },
+    {
+      "id": "CONF-AGT-007",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "agent",
+      "tier": "required",
+      "title": "agent.get of an id that does not exist is not_found",
+      "spec": "PROTOCOL.md §6"
+    },
+    {
+      "id": "CONF-AGT-008",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "agent",
+      "tier": "required",
+      "title": "a destroyed agent is terminal and is never resurrected by a later message, wake or read",
+      "spec": "PROTOCOL.md §6.1"
+    },
+    {
+      "id": "CONF-EVT-001",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "event",
+      "tier": "required",
+      "title": "seq is assigned by the control plane and is the only total order: a tail is strictly increasing in seq",
+      "spec": "PROTOCOL.md §11"
+    },
+    {
+      "id": "CONF-EVT-002",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "event",
+      "tier": "required",
+      "title": "the canonical log is dense: a tail from the oldest retained sequence has no hole",
+      "spec": "PROTOCOL.md §11, §11.1"
+    },
+    {
+      "id": "CONF-EVT-003",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "event",
+      "tier": "required",
+      "title": "a stream filter returns one workspace's whole history and nothing else",
+      "spec": "PROTOCOL.md §11"
+    },
+    {
+      "id": "CONF-EVT-004",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "event",
+      "tier": "required",
+      "title": "a state change that emits no event is a bug: creating and claiming a workspace emits ws.created, then ws.claiming, then ws.claimed, in that order",
+      "spec": "PROTOCOL.md §5, §11"
+    },
+    {
+      "id": "CONF-EVT-005",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "event",
+      "tier": "required",
+      "title": "lifecycle events use the canonical type names, so a reader of another implementation's log recognises them",
+      "spec": "PROTOCOL.md §11"
+    },
+    {
+      "id": "CONF-EVT-006",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "event",
+      "tier": "required",
+      "title": "a tail from a sequence beyond the head returns nothing and no error, rather than blocking or inventing a page",
+      "spec": "PROTOCOL.md §11"
+    },
+    {
+      "id": "CONF-EVT-007",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "event",
+      "tier": "required",
+      "title": "an out-of-band append is assigned a sequence by the control plane and becomes visible in the canonical order",
+      "spec": "PROTOCOL.md §11"
+    },
+    {
+      "id": "CONF-EVT-008",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "event",
+      "tier": "required",
+      "title": "an out-of-band append carrying a field the implementation does not know is refused, rather than silently half-applied",
+      "spec": "PROTOCOL.md §11"
+    },
+    {
+      "id": "CONF-EVT-009",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "event",
+      "tier": "extension",
+      "title": "an export cursor advances only after its destination accepts the bounded batch, so retries may duplicate but never skip",
+      "spec": "PROTOCOL.md §11",
+      "extension": "notifier"
+    },
+    {
+      "id": "CONF-EVT-010",
+      "version": "1.0.0",
+      "since": "1.0.0",
+      "category": "event",
+      "tier": "capability-gated",
+      "title": "a request older than the retention watermark fails with evicted and names the oldest retained sequence; it never silently starts at a newer one",
+      "spec": "PROTOCOL.md §11, §11.1",
+      "prereqs": [
+        "event-eviction"
+      ]
+    }
+  ]
+}
