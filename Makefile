@@ -16,7 +16,7 @@ install:
 	CGO_ENABLED=0 go install -trimpath -ldflags="$(LDFLAGS)" ./cmd/remount
 
 test:
-	go test -count=1 -timeout 300s ./...
+	go test -count=1 -timeout 600s ./...
 	$(MAKE) public-api
 
 race:

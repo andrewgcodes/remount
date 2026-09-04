@@ -138,6 +138,20 @@ Conditional PUTs now opt out of connection reuse, so a precondition response
 cannot poison the next write. A transport-level regression test pins that
 behavior.
 
+**The first compatibility follow-up exposed three Ubuntu test-environment
+defects.** `TestB32TheStaticBinaryInstallsAndPassesTheBlackBoxSmoke` reached
+the package-wide five-minute timeout while real builds and smoke tests were
+competing across packages, so the ordinary suite now retains every assertion
+with a ten-minute package budget. Helm 3.21.4 on the current runner
+rendered the committed chart without two insignificant inter-document blank
+lines; CI and release verification now pin Helm 3.20.0 and the reviewed golden
+matches that output. `TestPlanBOpenCodeDeterministicModelLane` failed
+`planBWriteCatalog` with `openat .config/opencode/.remount-...: permission
+denied` because the earlier version probe had let container-root create
+OpenCode's workspace config directory. The pin probe now uses a temporary
+`HOME`; the actual model run still uses the workspace home and the same
+catalog and isolation assertions.
+
 **A Windows-hosted Docker conformance run selected Windows commands for a
 Linux workspace.** Command selection was compiled from the runner's OS, so
 Docker sessions received `cmd.exe` even though they execute inside Linux. The

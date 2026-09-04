@@ -188,7 +188,7 @@ func planBInstallOpenCode(t *testing.T, ctx context.Context, c *client.Client, w
 	if err := c.WriteFile(ctx, ws, planBShimDir+"/opencode", []byte(shim), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	out, errOut, exit, err := c.Run(ctx, ws, "/bin/sh", "-c", `command -v opencode && opencode --version`)
+	out, errOut, exit, err := c.Run(ctx, ws, "/bin/sh", "-c", `command -v opencode && HOME=/tmp/remount-planb-home opencode --version`)
 	if err != nil || exit == nil || exit.Code != 0 {
 		t.Fatalf("pin opencode %s: err=%v exit=%+v\n%s\n%s", planBOpenCodeVersion, err, exit, out, errOut)
 	}
