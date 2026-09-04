@@ -123,7 +123,7 @@ func TestJailerMachineUsesFullSnapshotAndPrebootLoadSchemas(t *testing.T) {
 	}
 	restoreAPI := &recordingAPI{root: restoredRoot}
 	restored := &jailerMachine{workspace: "ws_one", root: restoredRoot, api: restoreAPI, uid: os.Getuid(), gid: os.Getgid(), fileSizeLimit: 1 << 20}
-	if err := restored.LoadSnapshot(context.Background(), SnapshotFiles{State: state, Memory: memory}, drive); err != nil {
+	if err := restored.LoadSnapshot(context.Background(), SnapshotFiles{State: state, Memory: memory}, drive, "tap-restored"); err != nil {
 		t.Fatal(err)
 	}
 	load, ok := restoreAPI.call("/snapshot/load")

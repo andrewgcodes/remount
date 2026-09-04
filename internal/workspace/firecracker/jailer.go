@@ -471,7 +471,7 @@ func (m *jailerMachine) CreateSnapshot(ctx context.Context) (SnapshotFiles, erro
 	return files, nil
 }
 
-func (m *jailerMachine) LoadSnapshot(ctx context.Context, files SnapshotFiles, rootDrive string) error {
+func (m *jailerMachine) LoadSnapshot(ctx context.Context, files SnapshotFiles, rootDrive, tapName string) error {
 	if _, err := m.stageLink("rootfs.ext4", rootDrive, 0o600); err != nil {
 		return err
 	}
@@ -483,11 +483,23 @@ func (m *jailerMachine) LoadSnapshot(ctx context.Context, files SnapshotFiles, r
 	if err != nil {
 		return err
 	}
+	// The snapshot records the host TAP the original VM was attached to, and a
+	// restored workspace gets a different one — its network is allocated fresh,
+	// per workspace and per generation. Without an override Firecracker tries to
+	// reopen the recorded device and the load fails with "Failed to restore
+	// devices: Error restoring MMIO devices: Net: Failed to create a network
+	// device: Open tap", which reads like a permissions problem and is not.
+	//
+	// This is the same reason vsock_override is already here: both devices are
+	// named by host resources that do not survive the move.
 	return m.api.Put(ctx, "/snapshot/load", map[string]any{
 		"snapshot_path": state,
 		"mem_backend":   map[string]string{"backend_type": "File", "backend_path": memory},
 		"vsock_override": map[string]string{
 			"uds_path": "/run/guest.vsock",
+		},
+		"network_overrides": []map[string]string{
+			{"iface_id": "eth0", "host_dev_name": tapName},
 		},
 		"resume_vm": false,
 	})
