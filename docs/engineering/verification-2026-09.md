@@ -732,6 +732,49 @@ Remount has been run.
 
 ---
 
+## Modal, judged over the public internet, 2026-09-04
+
+The earlier attempt at this was abandoned at a 303 and recorded as not
+verified. Chasing it found two real defects, both now fixed, and the deployment
+is now **CONFORMANT** across the public internet.
+
+| Command | Result | Status |
+|---|---|---|
+| `make modal-deploy` then `GET /healthz` | 303 after 150 s, twice | the finding, not a flake |
+| `modal app logs remount-demo` | `ExecutionError: Function has 3 dependencies but container got 4 object ids` | root cause |
+| `GET /healthz` after the fix | **200 in 1.4 s**, then 0.47 s warm | verified |
+| `go run ./cmd/conformance --endpoint https://action-dev--remount-demo-control.modal.run --external --token …` | **CONFORMANT**, required **53 passed, 0 failed, 0 unavailable**, 1 m 38 s | verified |
+| Same suite against a local build | `CONFORMANT`, 53/0/0 — unchanged | verified |
+
+**Defect 1: the Modal deployment could not start at all.**
+`model_secrets = _optional_model_secret() if modal.is_local() else []` attaches
+one secret at deploy time and declares none inside the container, and Modal
+refuses to run a function whose dependency count disagrees with what it was
+given. The `is_local()` guard reads like an optimisation and is a correctness
+bug; whatever that expression does, it has to do it identically on both sides.
+This was a regression introduced earlier in the same session while making the
+model secret optional — the deploy succeeded, so it looked fine, and only the
+container logs showed otherwise.
+
+**Defect 2: the conformance suite could not judge a remote implementation.**
+`Session.Fixture` creates one shared workspace and grant behind a `sync.Once`
+and never refreshes it. A grant lives about twenty seconds; the suite takes
+about ninety-five over a WAN. So the last checks presented an expired grant and
+`CONF-SNAP-004` failed with `unauthorized: grant expired` — the suite reporting
+its own bookkeeping as a defect in the implementation under test. It reproduced
+every run against Modal and never once locally, which is the shape of a bug that
+only appears in the case the tool exists for: judging somebody else's deployment
+over a network.
+
+The fix refreshes the shared grant when less than ten seconds of it remain. The
+first version of that fix did nothing at all, because `ExpiresAt` is in
+milliseconds and it was compared against `time.Now().Unix()` in seconds, which
+makes every grant appear to expire fifty thousand years from now. That is a bug
+that hides itself — the refresh silently never runs and the symptom is
+unchanged — and it was found only by printing the two numbers side by side.
+
+---
+
 ## Still not attempted
 
 These remain open with no evidence in this file. Listing them here is

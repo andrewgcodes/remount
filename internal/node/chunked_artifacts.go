@@ -28,7 +28,14 @@ type workspaceBlobStore struct {
 }
 
 func (s *workspaceBlobStore) Put(r io.Reader) (string, int64, error) {
-	id, size, err := s.n.store.PutLimit(r, s.n.opts.MaxArtifactBytes)
+	// The node's own store is a cache here, not the authority. The very next
+	// statement uploads the object to the control plane's store, which is
+	// durable, and the caller only commits a record naming it after that
+	// succeeds. An object stranded by a crash in between is referenced by no
+	// record and is collected as garbage, so syncing it to the platter first
+	// bought nothing and cost two fsyncs on the critical path of every session
+	// close. See PutLimitCached.
+	id, size, err := s.n.store.PutLimitCached(r, s.n.opts.MaxArtifactBytes)
 	if err != nil {
 		return "", 0, err
 	}

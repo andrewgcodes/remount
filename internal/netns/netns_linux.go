@@ -26,8 +26,17 @@ const (
 	vethInfoPeer = 1
 	nlaNested    = uint16(1 << 15)
 
+	// namespaceDir holds the bind mounts that keep a workspace's network
+	// namespace alive across the process that created it.
+	namespaceDir = "/run/remount/netns"
+
 	nfDrop   = 0
 	nfAccept = 1
+
+	// netdevTable and netdevChain hold the egress filter that actually
+	// contains a userspace network stack; see installNetdevDenyTable.
+	netdevTable = "remount_dev"
+	netdevChain = "egress_dev"
 )
 
 type systemKernel struct {
@@ -75,8 +84,8 @@ func (k *systemKernel) Validate(ctx context.Context, namespace string, link Link
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if filepath.Dir(filepath.Clean(namespace)) != "/run/remount/netns" {
-		return fmt.Errorf("namespace %q is outside /run/remount/netns", namespace)
+	if filepath.Dir(filepath.Clean(namespace)) != namespaceDir {
+		return fmt.Errorf("namespace %q is outside %s", namespace, namespaceDir)
 	}
 	if _, err := os.Stat(namespace); err != nil {
 		return err
@@ -105,7 +114,7 @@ func (k *systemKernel) CreateNamespace(ctx context.Context, name string) (path s
 		return "", err
 	}
 	defer original.Close()
-	dir := "/run/remount/netns"
+	dir := namespaceDir
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
@@ -218,7 +227,10 @@ func (k *systemKernel) InstallDenyAll(ctx context.Context, namespace string) err
 		if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0o600); err != nil {
 			return fmt.Errorf("enable namespace forwarding: %w", err)
 		}
-		return k.installDenyTable(ctx)
+		if err := k.installDenyTable(ctx); err != nil {
+			return err
+		}
+		return k.installNetdevDenyTable(ctx)
 	})
 }
 
@@ -450,6 +462,76 @@ func (k *systemKernel) netlink(ctx context.Context, protocol int, typ uint16, fl
 	}
 }
 
+// namespaceDevice returns the namespace's single non-loopback interface, which
+// is the guest end of the veth. The caller must already be inside the
+// namespace.
+func namespaceDevice() (string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+	var found string
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if found != "" {
+			return "", fmt.Errorf("netns: expected one non-loopback interface, found %s and %s", found, iface.Name)
+		}
+		found = iface.Name
+	}
+	if found == "" {
+		return "", errors.New("netns: no non-loopback interface to filter on")
+	}
+	return found, nil
+}
+
+// installNetdevDenyTable adds a default-drop netdev egress chain on the guest
+// veth.
+//
+// The inet output chain alone does not contain a sandbox. netfilter's IP hooks
+// only see packets the kernel's own IP stack produced, and a userspace network
+// stack — gVisor's, when run with --network=sandbox — does not use it. It
+// writes Ethernet frames straight to the veth with AF_PACKET, below those
+// hooks, so an output-chain policy filters traffic the sandbox never generates
+// and every packet leaves the namespace regardless of policy. That was measured:
+// with the output chain in place, TCP, UDP and ICMP to forbidden destinations
+// all crossed the veth, and on a host whose FORWARD policy accepts (Docker's
+// default drop is what happened to stop it) they reached the internet and were
+// answered.
+//
+// The netdev egress hook sits at transmit, so it sees frames however they were
+// produced. Verified against the same AF_PACKET injection: the send fails with
+// ENOBUFS once this chain exists, and succeeds without it.
+//
+// See docs/engineering/gvisor-egress-finding-2026-09-04.md.
+func (k *systemKernel) installNetdevDenyTable(ctx context.Context) error {
+	device, err := namespaceDevice()
+	if err != nil {
+		return err
+	}
+	if err := k.nft(ctx, unix.NFT_MSG_NEWTABLE, unix.NLM_F_CREATE|unix.NLM_F_EXCL,
+		unix.NFPROTO_NETDEV, concat(nlaString(unix.NFTA_TABLE_NAME, netdevTable), nlaU32BE(unix.NFTA_TABLE_FLAGS, 0))); err != nil {
+		return fmt.Errorf("create netdev table: %w", err)
+	}
+	hook := nlaNestedAttr(unix.NFTA_CHAIN_HOOK, concat(
+		nlaU32BE(unix.NFTA_HOOK_HOOKNUM, unix.NF_NETDEV_EGRESS),
+		nlaU32BE(unix.NFTA_HOOK_PRIORITY, 0),
+		nlaString(unix.NFTA_HOOK_DEV, device),
+	))
+	attrs := concat(
+		nlaString(unix.NFTA_CHAIN_TABLE, netdevTable),
+		nlaString(unix.NFTA_CHAIN_NAME, netdevChain),
+		nlaString(unix.NFTA_CHAIN_TYPE, "filter"),
+		hook,
+		nlaU32BE(unix.NFTA_CHAIN_POLICY, nfDrop),
+	)
+	if err := k.nft(ctx, unix.NFT_MSG_NEWCHAIN, unix.NLM_F_CREATE|unix.NLM_F_EXCL, unix.NFPROTO_NETDEV, attrs); err != nil {
+		return fmt.Errorf("create netdev egress chain on %s: %w", device, err)
+	}
+	return nil
+}
+
 func (k *systemKernel) installDenyTable(ctx context.Context) error {
 	const table = "remount"
 	if err := k.nft(ctx, unix.NFT_MSG_NEWTABLE, unix.NLM_F_CREATE|unix.NLM_F_EXCL,
@@ -556,7 +638,89 @@ func (k *systemKernel) installPermitRule(ctx context.Context, broker netip.AddrP
 		nlaString(unix.NFTA_RULE_CHAIN, "egress"),
 		nlaNestedAttr(unix.NFTA_RULE_EXPRESSIONS, expressions),
 	)
-	return k.nft(ctx, unix.NFT_MSG_NEWRULE, unix.NLM_F_CREATE|unix.NLM_F_APPEND, unix.NFPROTO_INET, attrs)
+	if err := k.nft(ctx, unix.NFT_MSG_NEWRULE, unix.NLM_F_CREATE|unix.NLM_F_APPEND, unix.NFPROTO_INET, attrs); err != nil {
+		return err
+	}
+	// The same single exception on the netdev egress chain. Without it that
+	// chain's drop policy would also stop the broker, which is the one
+	// destination a workspace is allowed to reach.
+	//
+	// The match cannot be reused verbatim. A netdev chain sees the frame, not a
+	// routed packet, so "meta nfproto" — which the inet chain uses to select
+	// IPv4 — is not set there. The equivalent at this layer is the ethertype,
+	// "meta protocol" == 0x0800. Everything after it is identical, because the
+	// network and transport header offsets resolve the same way.
+	netdevExpressions := concat(
+		nftExpr("meta", concat(
+			nlaU32BE(unix.NFTA_META_KEY, unix.NFT_META_PROTOCOL),
+			nlaU32BE(unix.NFTA_META_DREG, unix.NFT_REG_1),
+		)),
+		nftCmp(unix.NFT_REG_1, []byte{0x08, 0x00}),
+		nftExpr("payload", concat(
+			nlaU32BE(unix.NFTA_PAYLOAD_BASE, unix.NFT_PAYLOAD_NETWORK_HEADER),
+			nlaU32BE(unix.NFTA_PAYLOAD_OFFSET, 16),
+			nlaU32BE(unix.NFTA_PAYLOAD_LEN, 4),
+			nlaU32BE(unix.NFTA_PAYLOAD_DREG, unix.NFT_REG_1),
+		)),
+		nftCmp(unix.NFT_REG_1, broker.Addr().AsSlice()),
+		nftExpr("meta", concat(
+			nlaU32BE(unix.NFTA_META_KEY, unix.NFT_META_L4PROTO),
+			nlaU32BE(unix.NFTA_META_DREG, unix.NFT_REG_1),
+		)),
+		nftCmp(unix.NFT_REG_1, []byte{unix.IPPROTO_TCP}),
+		nftExpr("payload", concat(
+			nlaU32BE(unix.NFTA_PAYLOAD_BASE, unix.NFT_PAYLOAD_TRANSPORT_HEADER),
+			nlaU32BE(unix.NFTA_PAYLOAD_OFFSET, 2),
+			nlaU32BE(unix.NFTA_PAYLOAD_LEN, 2),
+			nlaU32BE(unix.NFTA_PAYLOAD_DREG, unix.NFT_REG_1),
+		)),
+		nftCmp(unix.NFT_REG_1, []byte{byte(broker.Port() >> 8), byte(broker.Port())}),
+		nftExpr("immediate", concat(
+			nlaU32BE(unix.NFTA_IMMEDIATE_DREG, unix.NFT_REG_VERDICT),
+			nlaNestedAttr(unix.NFTA_IMMEDIATE_DATA,
+				nlaNestedAttr(unix.NFTA_DATA_VERDICT,
+					nlaU32BE(unix.NFTA_VERDICT_CODE, nfAccept))),
+		)),
+	)
+	netdevAttrs := concat(
+		nlaString(unix.NFTA_RULE_TABLE, netdevTable),
+		nlaString(unix.NFTA_RULE_CHAIN, netdevChain),
+		nlaNestedAttr(unix.NFTA_RULE_EXPRESSIONS, netdevExpressions),
+	)
+	if err := k.nft(ctx, unix.NFT_MSG_NEWRULE, unix.NLM_F_CREATE|unix.NLM_F_APPEND, unix.NFPROTO_NETDEV, netdevAttrs); err != nil {
+		return err
+	}
+	// ARP has to be allowed, and only a netdev chain ever had to care. An inet
+	// output chain never sees ARP because ARP is not IP, so the existing policy
+	// was silently unaffected by it. A netdev chain sees every frame, so a
+	// drop policy that only excepts IPv4 also drops the sandbox's ARP request
+	// for the host's MAC — after which nothing can be delivered at all, and the
+	// symptom is that even the permitted broker is unreachable.
+	//
+	// This is not an egress path. The device is one end of a veth pair whose
+	// only peer is this workspace's host side, so an ARP frame can reach
+	// nothing else, and the IPv4 rule above still constrains everything that
+	// ARP would resolve a route for. IPv6 needs no equivalent: InstallDenyAll
+	// disables it in this namespace outright.
+	arpExpressions := concat(
+		nftExpr("meta", concat(
+			nlaU32BE(unix.NFTA_META_KEY, unix.NFT_META_PROTOCOL),
+			nlaU32BE(unix.NFTA_META_DREG, unix.NFT_REG_1),
+		)),
+		nftCmp(unix.NFT_REG_1, []byte{0x08, 0x06}),
+		nftExpr("immediate", concat(
+			nlaU32BE(unix.NFTA_IMMEDIATE_DREG, unix.NFT_REG_VERDICT),
+			nlaNestedAttr(unix.NFTA_IMMEDIATE_DATA,
+				nlaNestedAttr(unix.NFTA_DATA_VERDICT,
+					nlaU32BE(unix.NFTA_VERDICT_CODE, nfAccept))),
+		)),
+	)
+	arpAttrs := concat(
+		nlaString(unix.NFTA_RULE_TABLE, netdevTable),
+		nlaString(unix.NFTA_RULE_CHAIN, netdevChain),
+		nlaNestedAttr(unix.NFTA_RULE_EXPRESSIONS, arpExpressions),
+	)
+	return k.nft(ctx, unix.NFT_MSG_NEWRULE, unix.NLM_F_CREATE|unix.NLM_F_APPEND, unix.NFPROTO_NETDEV, arpAttrs)
 }
 
 func (k *systemKernel) nft(ctx context.Context, message uint16, flags uint16, family byte, attrs []byte) error {

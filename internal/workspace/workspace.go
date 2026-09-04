@@ -11,6 +11,8 @@ package workspace
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -217,6 +219,21 @@ type Handle interface {
 	SessionPreparer
 	Checkpointer
 	Destroyer
+}
+
+// Detacher is implemented by a backend handle whose backend keeps a registry of
+// live workspaces, so that a caller giving up a handle without destroying it
+// can say so.
+//
+// A node that quarantines a failed materialization deliberately keeps the
+// filesystem: the tree may hold bytes nothing else has. But it does let go of
+// the handle, and a backend that goes on believing the workspace is active will
+// refuse the next Create *and* the next Adopt for it — so the node retries
+// forever against a conflict it caused itself, and the workspace is stuck on
+// that node with an error naming the wrong problem. Detach is how the node says
+// "I am no longer holding this" without saying "destroy it".
+type Detacher interface {
+	Detach()
 }
 
 // NetworkEndpoint identifies the generation-specific broker that an enforced
@@ -477,8 +494,60 @@ func (d *Docker) Available(ctx context.Context) error {
 		d.err = fmt.Errorf("docker daemon unavailable: %s", strings.TrimSpace(string(out)))
 		return d.err
 	}
+	if err := d.probeSharedFilesystem(ctx); err != nil {
+		d.err = err
+		return d.err
+	}
 	return nil
 }
+
+// probeSharedFilesystem proves the daemon can see this node's data directory.
+//
+// The backend bind-mounts a per-workspace directory into the container, which
+// silently assumes the daemon shares a filesystem with the node. When it does
+// not — a daemon in a VM, a forwarded socket, a CI runner with the daemon in a
+// sidecar — nothing fails. The workspace is created, writes are accepted, the
+// session starts and reports the right mount path, and the container sees an
+// empty directory. Observed exactly that way by pointing this backend at a
+// daemon inside a Linux VM: Create succeeded, FS().Write succeeded, and the
+// container could not read the file the node had just written.
+//
+// So the assumption is checked once, by demonstration, in the same spirit as
+// the read-only volume mount probe and the gVisor denial probe: a byte is
+// written on this side and read back from inside a throwaway container. A
+// backend that cannot show it works is refused rather than offered.
+func (d *Docker) probeSharedFilesystem(ctx context.Context) error {
+	dir, err := os.MkdirTemp(d.Dir, ".probe-")
+	if err != nil {
+		return fmt.Errorf("docker filesystem probe: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	// A nonce, so a stale file or a coincidentally present path cannot pass.
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return fmt.Errorf("docker filesystem probe: %w", err)
+	}
+	want := hex.EncodeToString(nonce[:])
+	if err := os.WriteFile(filepath.Join(dir, "probe"), []byte(want), 0o644); err != nil {
+		return fmt.Errorf("docker filesystem probe: %w", err)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, dockerProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, d.Binary, "run", "--rm",
+		"-v", dir+":/probe:ro", d.Image, "cat", "/probe/probe").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker filesystem probe: the daemon could not read this node's data directory %s: %s: %w",
+			d.Dir, strings.TrimSpace(string(out)), err)
+	}
+	if strings.TrimSpace(string(out)) != want {
+		return fmt.Errorf("docker filesystem probe: the daemon bind-mounted %s and saw different content, "+
+			"so it does not share a filesystem with this node; workspaces would start and silently contain none of their data", d.Dir)
+	}
+	return nil
+}
+
+// dockerProbeTimeout bounds the probe, including any image pull it triggers.
+const dockerProbeTimeout = 2 * time.Minute
 
 func (d *Docker) container(id string) string { return "remount-" + strings.ReplaceAll(id, "_", "-") }
 
