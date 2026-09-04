@@ -226,6 +226,12 @@ exclusion and is not reported as passed. A focused run on the verification VM
 passed in 86.5 seconds, confirming that the failure depends on hosted-runner
 load rather than disproving the observed deadline miss.
 
+The Windows follow-up passed every Go package, then the job itself failed
+because its nested public-SDK module step ran `npm ci` in
+`integration/publicsdk`, which contains a Go module and no `package.json`.
+That step now runs the same `go test -count=1 ./...` contract as the Makefile;
+the focused native-Windows run passed.
+
 **A Windows-hosted Docker conformance run selected Windows commands for a
 Linux workspace.** Command selection was compiled from the runner's OS, so
 Docker sessions received `cmd.exe` even though they execute inside Linux. The
