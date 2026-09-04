@@ -134,12 +134,31 @@ With real firecracker + jailer v1.16.1, the Firecracker CI kernel
 "Firecracker requires Linux", and `go test -race -count=10
 ./internal/workspace/firecracker` is green.
 
-**That is a host, not a pass.** Those 31 tests are deterministic ordering proofs
-that finish in 0.00 s and boot no microVM. The gap this section describes is
-unchanged: `.github/workflows/kvm.yml` still fails its last step on purpose
-until the node-owned TAP, the coherent CoW volume, the jailed API and the
-guest-executor adapters are integrated. The value of the above is only that you
-no longer need to find a Linux box to do that work on.
+**The lane now works end to end.** On that host the whole lifecycle was driven
+by hand:
+
+```
+create   -> claimed, backend=firecracker
+exec     -> uname -r = 5.10.223 (host is 6.8.0-117-generic)
+snapshot -> --authoritative: consistency=quiesced, 37 MB
+restore  -> ws create --restore-from <artifact> reaches claimed,
+            and the file written before the checkpoint reads back
+```
+
+Getting there fixed three defects in this backend, all recorded in
+`gvisor-egress-finding-2026-09-04.md`: a guest handshake that raced the boot and
+failed on the first attempt every time; a compatibility fence that could never
+be satisfied because it contained a Firecracker log timestamp, so no checkpoint
+could ever be taken; and a snapshot restore that never remapped the network
+device, so no checkpoint could ever be restored.
+
+**What is still not exercised**, and what B29 is bounded on: the §5 hardening
+list — prepare-abort, stale generation, incompatible CPU or Firecracker version,
+corrupt bundle, disk-full staging, and proving a restored process continues
+*exactly once*. Also `.github/workflows/kvm.yml` still fails its final step on
+purpose; that step's premise is stale, since the adapters it waits for are wired
+in `cmd/remount/build_node.go`, but updating it needs someone who can run the
+workflow.
 
 **The full required-proof list is in `handoff-2026-09-03-codex-wrap.md` §5**
 ("P1 — finish the Firecracker production proof"). In summary: build the guest

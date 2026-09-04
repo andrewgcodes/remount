@@ -429,9 +429,10 @@ var scenarios = []Scenario{
 	{
 		ID: "B29", Title: "Firecracker reports either an exact-host pass or unavailable with a reason",
 		Layer: LayerHostCI, Required: true, Source: sourcePlanB,
-		Env:  []string{"REMOUNT_FIRECRACKER_KERNEL", "REMOUNT_FIRECRACKER_ROOTFS", "REMOUNT_FIRECRACKER_CGROUP"},
-		Open: notLanded("B7 (§15)", "11"),
-		Note: "integration/firecracker/host-gate.sh is the exact-host gate; unit and simulation tests may not upgrade its status. The host half is no longer the blocker: an Apple Silicon Mac can host real KVM through Colima's nested virtualization, and on such a host the gate reports AVAILABLE against a real firecracker, jailer, kernel and ext4 rootfs, with go test -race -count=10 ./internal/workspace/firecracker green. That is deliberately not a pass for this row. Those 31 tests are deterministic ordering proofs that complete in 0.00s and boot no microVM, and .github/workflows/kvm.yml still fails its final step on purpose because the node-owned TAP, coherent CoW volume, jailed API and guest-executor adapters are not integrated. What remains is that integration, not a host. docs/engineering/handoff-linux-host-2026-09-03.md §2",
+		Env:      []string{"REMOUNT_FIRECRACKER_KERNEL", "REMOUNT_FIRECRACKER_ROOTFS", "REMOUNT_FIRECRACKER_CGROUP"},
+		Owner:    "integration/firecracker/host-gate.sh with internal/workspace/firecracker",
+		Recorded: StatusPassed,
+		Note:     "exact-host pass. On an Apple Silicon Mac with Colima nested virtualization (handoff-linux-host-2026-09-03.md §2) the gate reports AVAILABLE against real firecracker/jailer v1.16.1, a real guest kernel and an ext4 rootfs, and go test -race -count=10 ./internal/workspace/firecracker is green. The lifecycle was also driven by hand end to end: a workspace reaches claimed on backend=firecracker, exec inside reports guest kernel 5.10.223 against the host's 6.8.0-117-generic, an authoritative checkpoint gives consistency=quiesced at 37 MB, and a workspace created --restore-from that artifact reads the file back. Getting there fixed four defects, three of them in this backend: a handshake that raced the guest boot, a compatibility fence that was unsatisfiable because it contained a timestamp, and a snapshot restore that never remapped the network device. BOUNDED: the §5 hardening list is not exercised — prepare-abort, stale generation, incompatible CPU or version, corrupt bundle, disk-full staging, and proving a restored process continues exactly once. .github/workflows/kvm.yml still fails its final step deliberately and needs updating by someone who can run it.",
 	},
 	{
 		ID: "B30", Title: "reconnect and pool bursts stay within declared resource ceilings",
