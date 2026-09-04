@@ -46,7 +46,7 @@ func (m *fakeMachine) CreateSnapshot(context.Context) (SnapshotFiles, error) {
 	m.log.add("snapshot")
 	return SnapshotFiles{State: "vm.state", Memory: "vm.mem"}, nil
 }
-func (m *fakeMachine) LoadSnapshot(context.Context, SnapshotFiles, string) error {
+func (m *fakeMachine) LoadSnapshot(context.Context, SnapshotFiles, string, string) error {
 	m.log.add("load")
 	return nil
 }
