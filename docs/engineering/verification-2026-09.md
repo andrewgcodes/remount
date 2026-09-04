@@ -22,7 +22,7 @@ full-suite Docker OpenCode lanes remain known failing and are visible CI
 debt.**
 
 Host: Windows Server 2022 amd64. Go: 1.27.1. Race C toolchain: MinGW-w64
-16.1.0. Final verification integrated `origin/main` at `d938d7b`.
+16.1.0. Final verification integrated `origin/main` at `f61843a`.
 
 ### Final command results
 
