@@ -14,7 +14,7 @@ jobs:
     name: fake provider contracts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
@@ -67,7 +67,7 @@ jobs:
       REMOUNT_SSH_USER: ${{ vars.REMOUNT_SSH_USER }}
       REMOUNT_SSH_REMOTE_HELPER: ${{ vars.REMOUNT_SSH_REMOTE_HELPER }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
