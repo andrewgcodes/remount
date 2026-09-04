@@ -1168,3 +1168,82 @@ go run ./cmd/conformance --build .
 All focused repetitions passed. The complete built-binary run reported 60
 passed, 0 failed and 8 unavailable of 68 requirements in 6.838 seconds; all 53
 required requirements passed and cleanup was verified. **Status: verified.**
+
+### Durable session completion and replacement-attach fencing, 2026-09-04
+
+The repeated E11 restart proof exposed a completion-ordering defect. A session
+published its exit chunk, closed `s.exited`, and let `Session.Wait` and readers
+finish before the node's observer committed the complete durable session-log
+record. A node stop in that interval could close the control connection and
+leave the retained record partial even though the client had observed complete
+success.
+
+The completion callback now runs synchronously in `session.finish`, after the
+terminal spill has been sealed and before active-session accounting, `s.exited`,
+terminal visibility, EOF, or observer callbacks. The final spill reference is
+committed directly by the complete-record callback, avoiding a redundant
+partial commit for the same final segment; earlier partial segment commits are
+unchanged. The terminal chunk remains retained but invisible through
+`Log.Next`, `Log.Read`, and `Cursor.Next` until the complete commit returns.
+Commit failures still invoke `OnRecordError`, retain the lower tiers, and do not
+claim a complete durable record.
+
+The deterministic regression blocks `CompleteSessionLogRecord` and proves that
+`Session.Wait`, the terminal chunk, and cursor EOF all remain blocked. Releasing
+the commit publishes the terminal chunk and EOF in order. The E11 node-restart
+proof then passed 50 focused repetitions.
+
+The first complete non-race suite after this fix repeatedly timed out in
+`TestConsoleE15SimulatedOperatorFlow` while a replacement terminal attachment
+waited for exit. The old WebSocket's delayed `s.close` could arrive after the
+new `s.attach`; because detach named only `(client, session)`, it cancelled the
+replacement cursor. `s.attach` and `s.close` now carry an optional unique
+subscription fence. A matching close detaches only its own cursor; omitted
+fields retain the v0 unconditional behavior. Generated Python, TypeScript and
+JSON schema surfaces were regenerated. Unit, wire-compatibility and simulation
+regressions prove that an old decoder ignores the additive field, a new decoder
+accepts legacy bodies, and a delayed old detach cannot remove the replacement
+attachment.
+
+Focused commands:
+
+```sh
+go test -count=50 \
+  -run '^(TestWaitBlocksUntilDurableCompletionRecordCommits|TestE11TieredSessionRecordSurvivesNodeRestart)$' \
+  -timeout 300s ./internal/session ./internal/sim
+
+go test -count=50 \
+  -run '^(TestSessionSubscriptionFieldIsWireCompatible|TestStaleSessionDetachDoesNotCancelReplacementCursor|TestReplacingSessionCursorDoesNotCancelSharedPeerWrite)$' \
+  -timeout 180s ./internal/proto ./internal/node
+
+go test -count=50 \
+  -run '^(TestStaleDetachDoesNotCancelReplacementAttach|TestConsoleE15SimulatedOperatorFlow)$' \
+  -timeout 600s ./internal/sim
+
+go test -race -count=20 \
+  -run '^(TestSessionSubscriptionFieldIsWireCompatible|TestWaitBlocksUntilDurableCompletionRecordCommits|TestStaleSessionDetachDoesNotCancelReplacementCursor|TestReplacingSessionCursorDoesNotCancelSharedPeerWrite|TestStaleDetachDoesNotCancelReplacementAttach|TestE11TieredSessionRecordSurvivesNodeRestart|TestExecRoundTripCostOfTheDurableSessionTier|TestConsoleE15SimulatedOperatorFlow)$' \
+  -timeout 900s ./internal/proto ./internal/session ./internal/node ./internal/sim
+```
+
+Every focused command passed. The final tree also passed:
+
+```sh
+make
+make lint
+make test
+make race
+make conformance
+make fuzz FUZZTIME=5s
+go mod verify
+go mod tidy -diff
+make dist
+go run ./cmd/protogen --check
+make public-api
+scripts/lint-locks.sh
+```
+
+The complete race run passed every package; `internal/sim` completed in
+383.713 seconds. The conformance race subset passed with `internal/sim` in
+380.879 seconds. Every fuzz target completed without failure. Distribution
+artifacts were built locally only and were not published. No external resource
+was created by these regressions. **Status: verified.**
