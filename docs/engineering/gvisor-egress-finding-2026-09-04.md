@@ -1,12 +1,23 @@
-# The gVisor backend's deny-first egress policy is not enforced — 2026-09-04
+# Four defects from the first real gVisor run — 2026-09-04
 
-**Status:** open, reproduced, with the mechanism identified and the evidence
-below. Not fixed. The fix touches a security boundary and wants review.
+All four are fixed. The document is kept in the order they were found, because
+the reason the first one hid for so long is the useful part: a suite of seven
+checks was passing six of them for a reason unrelated to what they claimed to
+test.
 
-**Severity:** the workspace network boundary does not hold. Containment on the
-host tested here survived only because a *second* boundary — the host's forward
-chain — happened to drop the traffic. `EgressMode: "enforced_gateway"` is
-advertised unconditionally and is currently unearned.
+## 1. The deny-first egress policy was not enforced
+
+**Status: FIXED and verified.** A netdev egress chain on the workspace veth now
+carries the policy; `TestE4DenialConformance` passes, three consecutive runs,
+with no resource left behind. The history below is kept because the way this
+hid for so long is the useful part.
+
+**Severity as found:** the workspace network boundary did not hold at all.
+Containment on the tested host came entirely from Docker's default
+`FORWARD policy drop`. With `FORWARD ACCEPT` — an ordinary configuration on
+routers and many Kubernetes nodes — a sandboxed process reached 8.8.8.8 **and
+was answered**, resolving example.com to real addresses. `EgressMode:
+"enforced_gateway"` was advertised unconditionally and was unearned.
 
 ## How this was found
 
@@ -127,11 +138,24 @@ An `ingress` netdev hook sees frames as they arrive from the peer regardless of
 how the peer produced them, so AF_PACKET injection cannot bypass it. Kernels
 5.16+ also offer `hook egress` for the symmetric direction.
 
-This is deliberately not attempted here. It is a security boundary, the rule
-set has to keep permitting exactly the broker address and port and nothing else,
-and it needs to be proven by the same capture method used above rather than by a
-rule existing. Whoever takes it should also decide whether
-`EgressMode: "enforced_gateway"` may be returned at all before the probe passes.
+**This is what was done**, in `internal/netns/netns_linux.go`, and two details
+cost real time and are worth writing down:
+
+1. **`meta nfproto` does not work in a netdev chain.** That match selects IPv4
+   for the inet family, and a netdev chain sees a frame rather than a routed
+   packet, so it never matches and the broker rule is dead. The equivalent at
+   this layer is the ethertype, `meta protocol == 0x0800`.
+2. **ARP has to be excepted explicitly.** An inet output chain never sees ARP
+   because ARP is not IP, so the original policy was silently unaffected by it.
+   A netdev chain sees every frame, so a drop policy excepting only IPv4 also
+   drops the sandbox's ARP request for the host's MAC — after which nothing can
+   be delivered and the symptom is that even the *permitted* broker is
+   unreachable. Allowing it is not an egress path: the device is one end of a
+   veth pair whose only peer is this workspace's host side.
+
+Verified twice over. The in-test AF_PACKET watcher reports nothing crossing, and
+an independent `tcpdump` during the same run captures zero packets to any
+forbidden destination, where before the fix it captured all of them.
 
 ## Reproducing
 
@@ -163,28 +187,44 @@ reclaims what the backend created:
 
 | Leaked | Symptom on the next run |
 |---|---|
-| the netns bind mount `/run/remount/netns/rm-<pid>-<n>` | `create network namespace: ... file exists` |
-| the veth `rmh<pid>` | `create veth: file exists` |
+| the netns bind mount `/run/remount/netns/rm-<slot>-<gen>` | `create network namespace: ... file exists` |
+| the veth `rmh<slot>` | `create veth: file exists` |
 | the `runsc-sandbox` and `runsc-gofer` processes | none, they simply run forever |
+
+**One part of this is now fixed.** The `nsfs` mount runsc leaves at
+`<state-root>/null-netns` leaked on the *successful* path too, not only after a
+kill: a completed run took the host from 9 such mounts to 10, so a node that
+creates and destroys workspaces accumulated one mount per workspace forever.
+`runsc delete` does not release it and the state root belongs to this backend,
+so `execRuntime.destroy` now unmounts it. Measured after: 0 before a run, 0
+after.
+
+The three rows below still leak when the process is killed:
 
 The orphaned sandboxes are the worst of the three because they are silent. One
 observed here had been running **1733 seconds** after the test that created it
 was killed, holding its memory and its gofer.
 
-The names are derived from the creating process's PID, so this is not merely
-untidy: a later process that happens to get the same PID collides and cannot
-start a workspace at all. On a machine where PIDs recycle quickly, a node that
-crashed once can be unable to create workspaces afterwards, with an error that
-names a file rather than the cause.
+**Correction to an earlier reading of this.** The names look like PIDs and are
+not: `netns.Manager` formats them from an allocator *slot*, `rm-%x-%x` for the
+namespace and `rmh%04x` / `rmg%04x` for the veth pair. The collision is worse
+than PID reuse would be, because it is not a coincidence. The allocator lives in
+memory, so a fresh process starts allocating from the beginning and hands out
+the same slot it used before, which is exactly the slot whose kernel state the
+previous process left behind. A node that was killed once will collide on its
+very next start, deterministically, and report `create veth: file exists` — an
+error naming a file rather than the cause.
 
 A node has no startup reconciliation for these. `docs/engineering/handoff-linux-host-2026-09-03.md`
 §1 asks that "cleanup runs after every failure path"; cleanup does run on the
 error paths inside the process, and does not run when the process is not there
 to run it, which is exactly when it matters.
 
-What a fix needs: a reaper at backend startup that removes netns files and veths
-whose owning PID is gone, and kills sandboxes whose workspace this node does not
-hold. The existing `consistency.orphan_on_node` doctor check covers the control
+What a fix needs: a reaper at backend startup that removes netns files no
+process still inhabits, together with their veths, and kills sandboxes whose
+workspace this node does not hold. "No process inhabits it" is decidable: stat
+the netns file for its inode and compare against the `net:[inode]` link every
+`/proc/<pid>/ns/net` reports. The existing `consistency.orphan_on_node` doctor check covers the control
 plane's view of workspaces, not host resources beneath a dead node.
 
 A cleanup script sufficient for a developer host, used while investigating:
@@ -224,9 +264,23 @@ backend when a bind-mount probe fails, logging `read-only volumes unavailable`.
 There is no equivalent probe for the workspace root itself, which is the more
 important of the two.
 
-What a fix needs: at backend construction, write a known byte into the data
-directory, run a throwaway container with the same bind mount, and read it back.
-If the daemon cannot see it, refuse to offer the docker backend rather than
-offering one that loses data. That is the same shape as the volume probe and the
-same shape as the gVisor denial probe: a capability is earned by demonstrating
-it, not by the code existing.
+**Fixed.** `Docker.Available` now writes a nonce into a temporary directory
+under the node's data root, runs a throwaway container with that directory bind
+mounted, and reads it back. A daemon that cannot see it is refused rather than
+offered a backend that loses data. Same shape as the read-only volume probe and
+the gVisor denial probe: a capability is earned by demonstrating it, not by the
+code existing. The nonce matters — a fixed filename would pass against a stale
+file or a coincidentally present path.
+
+Verified both directions, which is the part that makes it trustworthy. Against
+Docker Desktop, where the daemon does share the filesystem, `TestDockerBackendReal`
+passes as before, so the probe does not break working setups. Against the Colima
+VM's daemon, which does not, it now refuses with
+
+```
+docker filesystem probe: the daemon could not read this node's data directory
+/var/folders/.../TestDockerBackendReal.../d: cat: can't open '/probe/probe'
+```
+
+where the same configuration previously produced a workspace that started,
+accepted writes and silently contained none of them.

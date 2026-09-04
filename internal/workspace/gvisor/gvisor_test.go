@@ -72,6 +72,14 @@ type fakeRuntime struct {
 }
 
 func (r *fakeRuntime) probe(context.Context) error { r.log.add("runsc-probe"); return nil }
+
+// reapStateRoot records the call so ordering is observable: the real one must
+// run before any workspace exists, since that is what makes "everything here is
+// a leftover" true.
+func (r *fakeRuntime) reapStateRoot(context.Context) (int, error) {
+	r.log.add("runsc-reap")
+	return 0, nil
+}
 func (r *fakeRuntime) createStart(context.Context, string, string) error {
 	r.log.add("runsc-create")
 	if r.failCreate {

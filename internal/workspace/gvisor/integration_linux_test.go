@@ -86,7 +86,6 @@ func TestE4DenialConformance(t *testing.T) {
 	denied := map[string]string{
 		"direct IPv4 TCP":         "nc -z -w 2 1.1.1.1 443",
 		"IPv6":                    "nc -z -w 2 2606:4700:4700::1111 443",
-		"UDP":                     "nc -u -z -w 2 8.8.8.8 53",
 		"DNS":                     "nslookup example.com 8.8.8.8",
 		"ICMP":                    "ping -c 1 -W 2 8.8.8.8",
 		"raw socket":              "/rawprobe",
@@ -107,6 +106,21 @@ func TestE4DenialConformance(t *testing.T) {
 			}
 		})
 	}
+
+	// UDP is generated but not asserted on by exit status, and the reason is
+	// worth stating because it is easy to mistake for a weakened test.
+	//
+	// A connectionless send has nothing to fail against: `nc -u -z` reports
+	// success as soon as the local sendto is accepted. Inside a sandbox that
+	// runs its own network stack, the sendto is accepted by that stack no
+	// matter what the host does with the frame afterwards, so no in-sandbox
+	// command can observe the denial. Requiring this command to fail would be
+	// requiring the wrong thing, and for a long time it was the only check
+	// reporting the truth precisely because it could not be satisfied by the
+	// absence of a reply.
+	//
+	// The traffic is still produced, and the watcher below is what judges it.
+	_ = run("nc -u -z -w 2 8.8.8.8 53")
 
 	// The load-bearing assertion. A denial check that passes because no reply
 	// arrived proves nothing about egress, so require that no packet reached

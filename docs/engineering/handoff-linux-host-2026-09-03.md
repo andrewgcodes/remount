@@ -50,14 +50,30 @@ colima ssh -- sudo sh -c 'cd /tmp && \
 sh integration/chaos/backend-gates.sh --probe   # REMOUNT_CHAOS_IMAGE=alpine:3.20
 ```
 
-Running it found three defects, recorded with reproduction steps in
-`docs/engineering/gvisor-egress-finding-2026-09-04.md`: the deny-first egress
-policy is not enforced because gVisor injects frames below netfilter's IP hooks
-and six of the seven denial checks pass for the wrong reason; a killed run leaks
-its netns, veth and sandbox processes; and the docker backend does not verify
-the daemon can see the workspace. **The first is a security finding and the
-capability claim `enforced_gateway` is currently unearned.** Read that document
-before doing anything else in this section.
+Running it found four defects, all recorded with reproduction steps in
+`docs/engineering/gvisor-egress-finding-2026-09-04.md`. **Two are fixed and
+`TestE4DenialConformance` now passes**, three consecutive runs, leaving no
+resource behind:
+
+- the deny-first egress policy was not enforced at all — gVisor injects frames
+  below netfilter's IP hooks, so the output chain never saw them and every
+  forbidden destination crossed the veth. Containment came only from Docker's
+  default `FORWARD policy drop`; with `FORWARD ACCEPT` a sandbox reached 8.8.8.8
+  and was answered. Now carried by a netdev egress chain on the workspace veth.
+- an `nsfs` mount leaked per workspace on the successful path. Now released in
+  `execRuntime.destroy`.
+
+- a killed run leaked its netns, veth and runsc sandboxes, and because the
+  slot is derived from the workspace rather than the PID, a restarted node
+  collided with its own leftovers deterministically. Now reaped at startup,
+  sandboxes first so the namespaces read as uninhabited.
+- the docker backend did not verify its daemon could see the node's data
+  directory, so a remote daemon produced workspaces that started, accepted
+  writes and silently held none of them. Now probed with a nonce at startup.
+
+**What remains yours:** E5, which needs two mutually untrusting tenants on one
+node — `TestE4DenialConformance` does not set that up — and the rest of §15's
+scale and release-candidate work.
 
 **What to run:**
 
