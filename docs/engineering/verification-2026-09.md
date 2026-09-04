@@ -35,7 +35,7 @@ Host: Windows Server 2022 amd64. Go: 1.27.1. Race C toolchain: MinGW-w64
 | `go test -count=1 -timeout 40m -skip '^(TestPlanbPerfMoveIncompressible\|TestPlanBOpenCodeAgentTranscriptApprovalAndResume\|TestPlanBOpenCodeDeterministicModelLane)$' ./...` | passed |
 | `go test -race -count=1 -timeout 60m -skip '^(TestPlanbPerfMoveIncompressible\|TestPlanBOpenCodeAgentTranscriptApprovalAndResume\|TestPlanBOpenCodeDeterministicModelLane)$' ./...` | passed |
 | `go run ./cmd/conformance --build .` | 60 passed, 0 failed, 8 unavailable; all 53 required rows passed; cleanup verified |
-| `remount-windows-amd64.exe version` | `remount v0.0.0-20260904063639-9a7e70b0b7d5+dirty` |
+| `remount-windows-amd64.exe version` | `remount v0.0.0-20260904095415-3e577228074c` |
 | `go run ./cmd/conformance --binary .\remount-windows-amd64.exe` | 60 passed, 0 failed, 8 unavailable; all 53 required rows passed; cleanup verified |
 | `./scripts/lint-locks.sh .` | passed |
 
