@@ -19,7 +19,7 @@
 # It reads the same dist/ binary the release image does, so the node and the
 # control plane are the same build.
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 ARG TARGETOS=linux
 ARG TARGETARCH

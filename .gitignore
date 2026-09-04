@@ -5,8 +5,13 @@ bindings.json
 bindings.*.json
 
 # Local state
-remount-data/
-remount-node/
+#
+# Anchored to the repository root on purpose. Unanchored, `remount-node/`
+# matched deploy/helm/remount-node/ as well, so the Helm chart was invisible to
+# git and would have been silently left out of a commit. These patterns exist
+# for the directories `remount standalone` and `remount up` create here.
+/remount-data/
+/remount-node/
 /remount
 dist/
 
@@ -24,3 +29,6 @@ node_modules/
 
 # stray example binaries
 /agentloop
+
+# OpenTofu / Terraform working directories
+.terraform/

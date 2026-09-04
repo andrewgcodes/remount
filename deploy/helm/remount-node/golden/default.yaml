@@ -1,0 +1,137 @@
+---
+# Source: remount-node/templates/serviceaccount.yaml
+# A service account with no RoleBinding.
+#
+# The node needs no Kubernetes API access at all: it dials the Remount control
+# plane outbound and receives claims over that connection. Granting it RBAC to
+# create or delete objects would be the first step towards Kubernetes owning
+# something Remount already owns.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: remount-nodes
+  labels:
+    helm.sh/chart: remount-node-0.1.0
+    app.kubernetes.io/name: remount-node
+    app.kubernetes.io/instance: remount-nodes
+    app.kubernetes.io/version: "dev"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: remount-node
+automountServiceAccountToken: false
+
+---
+# Source: remount-node/templates/configmap.yaml
+# The capability labels this release advertises, published as data so an
+# operator can read them without decoding a pod's argv.
+#
+# This ConfigMap is descriptive. Editing it changes nothing: the labels a node
+# reports come from the flags it was started with, and the control plane learns
+# them from the node's hello, not from Kubernetes.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: remount-nodes-capabilities
+  labels:
+    helm.sh/chart: remount-node-0.1.0
+    app.kubernetes.io/name: remount-node
+    app.kubernetes.io/instance: remount-nodes
+    app.kubernetes.io/version: "dev"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: remount-node
+data:
+  backend: "process"
+  ownsWorkspaceLifecycle: "false"
+  capabilityLabels: |
+    backend=process
+    tier=general
+    zone=a
+
+---
+# Source: remount-node/templates/daemonset.yaml
+# One Remount node per matching Kubernetes node.
+#
+# A DaemonSet, not a Deployment, because a Remount node is a machine's worth of
+# capacity: it is defined by the host it runs on, and two Remount nodes sharing
+# one host would advertise the same capacity twice. Kubernetes owns the process
+# supervision here and nothing else. It does not know which workspaces exist,
+# where they run, or when they move.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: remount-nodes
+  labels:
+    helm.sh/chart: remount-node-0.1.0
+    app.kubernetes.io/name: remount-node
+    app.kubernetes.io/instance: remount-nodes
+    app.kubernetes.io/version: "dev"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: remount-node
+  annotations:
+    remount.dev/owns-workspace-lifecycle: "false"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: remount-node
+      app.kubernetes.io/instance: remount-nodes
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # One node at a time. Replacing a Remount node is node loss from the
+      # control plane's point of view; it recovers by re-claiming from the last
+      # checkpoint, and doing that to the whole fleet at once is a fleet-wide
+      # restore storm.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: remount-node
+        app.kubernetes.io/instance: remount-nodes
+    spec:
+      serviceAccountName: remount-nodes
+      terminationGracePeriodSeconds: 300
+      containers:
+        - name: remount-node
+          image: ghcr.io/andrewgcodes/remount-node@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          args:
+            - up
+            - --data=/var/lib/remount-node
+            - --backend=process
+            - --label=backend=process
+            - --label=tier=general
+            - --label=zone=a
+            - --label=k8s_node=$(KUBERNETES_NODE_NAME)
+          env:
+            # The endpoint and the token both arrive through the environment.
+            # The token especially: on argv it would be visible in the pod spec
+            # to anyone with get pods, and in the host's process list.
+            - name: REMOUNT_SERVER
+              value: "http://remount-control.remount.svc.cluster.local:7443"
+            - name: REMOUNT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: remount-control-token
+                  key: token
+            - name: KUBERNETES_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            limits:
+              memory: 4Gi
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            runAsNonRoot: false
+          volumeMounts:
+            - name: node-data
+              mountPath: /var/lib/remount-node
+      volumes:
+        - name: node-data
+          emptyDir:
+            sizeLimit: 50Gi

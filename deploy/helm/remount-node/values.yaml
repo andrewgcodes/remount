@@ -1,0 +1,102 @@
+# Values for the remount-node chart.
+#
+# What this chart does: it runs Remount nodes as a DaemonSet and advertises the
+# capability labels those nodes report to the Remount control plane.
+#
+# What this chart deliberately does not do: own workspaces. There is no CRD, no
+# controller, no reconcile loop over workspaces, and nothing here that creates,
+# moves, sleeps, checkpoints or destroys one. A workspace's placement is a lease
+# the control plane grants; if Kubernetes also held it, a rescheduled pod and a
+# live claim would be two answers to one question.
+
+image:
+  repository: ghcr.io/andrewgcodes/remount-node
+  # REQUIRED and intentionally empty. The chart refuses to render without it.
+  #
+  # This must be the node image, which carries a userland: the release image is
+  # FROM scratch and a process-backend workspace in it dies with
+  # `"sh": executable file not found in $PATH`.
+  # See deploy/compose/node.Dockerfile.
+  digest: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+control:
+  # REQUIRED. The control service nodes dial. Nodes connect outbound only.
+  endpoint: ""
+  # The bearer token is read from a Secret into REMOUNT_TOKEN, never passed on
+  # argv, so it does not appear in the pod spec, in `ps`, or in a node's
+  # process listing.
+  tokenSecret:
+    name: remount-control-token
+    key: token
+  # Optional one-time enrollment secret for production identity modes.
+  enrollmentSecret:
+    name: ""
+    key: enrollment
+
+node:
+  # process, docker, gvisor or firecracker. This chart defaults to process:
+  # scheduling a node is not the same as earning stronger isolation, and the
+  # chart will not advertise a capability the pod's runtime has not been shown
+  # to provide.
+  backend: process
+  dataDir: /var/lib/remount-node
+  # Extra flags appended to `remount up`. Runtime workspace operations are not
+  # accepted here; see the policy tests in integration/policy.
+  extraArgs: []
+
+# Capability labels every node in this release advertises. These describe what
+# the node can do, not what is running on it.
+capabilityLabels:
+  backend: process
+
+# Advertise the Kubernetes node name as a Remount label. Useful for correlating
+# a Remount node with a cluster node; it is descriptive, not authoritative.
+advertiseKubernetesNodeName: true
+
+storage:
+  # emptyDir or hostPath. emptyDir keeps node-local state for the pod's
+  # lifetime; losing it is node loss, which the control plane already handles by
+  # re-claiming the workspace from its last checkpoint on another node.
+  # hostPath makes the artifact cache survive a pod restart on the same machine.
+  #
+  # There is no PersistentVolumeClaim option: this is a DaemonSet, so a single
+  # claim would be shared by every pod, and a per-pod claim would tie a machine's
+  # cache to a volume that can be attached elsewhere. Neither is what a node
+  # wants, and both would look like durable workspace storage without being it.
+  kind: emptyDir
+  size: 50Gi
+  hostPath: /var/lib/remount-node
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 4Gi
+
+# A liveness probe is deliberately absent. Restarting a node that is slowly
+# restoring a large checkpoint converts a slow operation into node loss; the
+# control plane's lease expiry is the detector that already knows the
+# difference. Termination grace is long for the same reason.
+terminationGracePeriodSeconds: 300
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+securityContext:
+  runAsNonRoot: false
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL

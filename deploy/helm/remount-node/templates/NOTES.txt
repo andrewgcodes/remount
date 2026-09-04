@@ -1,0 +1,11 @@
+{{ .Chart.Name }} {{ .Chart.Version }} scheduled {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Kubernetes now supervises the node processes. It does not own Remount
+workspaces: their placement, moves, checkpoints and sessions stay with the
+Remount control plane at {{ .Values.control.endpoint }}.
+
+Check the fleet from a machine with the CLI, not from kubectl:
+
+  REMOUNT_SERVER={{ .Values.control.endpoint }} remount nodes
+
+Nodes appear once they have connected outbound and completed their hello.

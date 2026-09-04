@@ -164,26 +164,73 @@ Do not quote the process-backend numbers as isolation-backend performance.
 
 ## 5. Plan B B5: Terraform and Helm validation
 
-`tofu` and `helm` are not installed here, so those items can be authored but
-not validated, and must report `unavailable`.
+**Updated 2026-09-03 (late): the static half is done.** `tofu` (OpenTofu
+v1.12.6) and `helm` (v4.2.4) were installed on the Darwin host, so §13 work
+items 2, 3 and 7 were authored and validated there. See
+`docs/engineering/verification-2026-09.md`, entry "Plan B phase B5 — OpenTofu
+and Helm validation", for the exact commands, the rejection table, and the
+failure injections.
+
+What now exists and is validated:
+
+- `deploy/tofu/` — four modules (network, control, artifact-store, node-pool)
+  and a reference root module. `tofu fmt -check -recursive` and
+  `tofu validate` pass with no cloud credentials and no registry access,
+  because no module declares `required_providers`: the provider seam is
+  `terraform_data`, a builtin.
+- `deploy/helm/remount-node/` — a DaemonSet chart with a committed golden
+  render. `helm lint` and a golden `helm template` diff pass.
+- `integration/policy/` — the §13.7 policy tests. Fourteen bad configurations
+  are refused by `tofu validate` or `helm template`, and four static scanners
+  cover `deploy/**`, `packaging/container/Dockerfile` and
+  `images/workspace/Dockerfile`. Every rule has been watched failing.
+- Every image reference in those surfaces is pinned by digest.
 
 **Already done and proven on this host:** the Docker Compose reference
 deployment in `deploy/compose/` — control plane, two nodes and MinIO, with
 `smoke.sh` proving both nodes join, a workspace runs real work, moves between
-nodes, and keeps its filesystem. `docker compose config` validates.
+nodes, and keeps its filesystem. Re-proven after the MinIO digest pin, with
+cleanup verified.
 
-**Yours:** OpenTofu/Terraform modules (`tofu fmt -check`, `tofu validate`
-without cloud credentials) and a Helm chart or Kustomize reference
-(`helm lint`, golden `helm template` output), plus the policy tests §13.7 asks
-for — configurations with two owners for the same fact must be rejected, such
-as Terraform attempting to move a live workspace.
+### What is still yours
 
-**A packaging finding you will hit immediately:** `packaging/container/Dockerfile`
-is `FROM scratch`. That is correct for the control plane and the CLI, and
-**impossible for a process-backend node** — its workspaces have no userland, so
-a session dies with `"sh": executable file not found in $PATH`. See
-`deploy/compose/node.Dockerfile` for the node image and the comment explaining
-the asymmetry with docker-backend nodes.
+1. **Install the chart against a real cluster.** There is no Kubernetes cluster
+   on the Darwin host, so nothing here has been applied. On a Linux host with
+   kind, k3s or a real cluster:
+
+   ```sh
+   kubectl create secret generic remount-control-token --from-literal=token=...
+   helm install remount-nodes deploy/helm/remount-node \
+     --namespace remount --create-namespace \
+     --set image.digest=sha256:<the digest your build produced> \
+     --set control.endpoint=http://remount-control.remount.svc.cluster.local:7443
+   ```
+
+   The postcondition to assert is the one `deploy/compose/smoke.sh` asserts:
+   every scheduled node appears in `remount nodes` with `ONLINE true`, a
+   workspace runs real work, and it survives a move. Then delete the release and
+   confirm the namespace is empty. Record it as `host-ci`.
+
+   The node image must be the one `deploy/compose/node.Dockerfile` builds. The
+   chart refuses the control-plane image outright, because that image is
+   `FROM scratch` and a process-backend workspace in it dies with
+   `"sh": executable file not found in $PATH`.
+
+2. **Substitute a real provider at a module seam.** Each module's
+   `terraform_data` resource is the seam. Replacing one with, say,
+   `aws_instance` is a local edit inside that module; nothing outside it moves,
+   because consumers read the module's outputs. Doing that needs a cloud
+   account, so it is out of scope for a validation lane and belongs in a
+   separate, credentialed ledger entry. Do not weaken
+   `TestTheModulesDeclareNoProvider` to land it in the main tree: a module with
+   `required_providers` makes the credential-free gate un-runnable.
+
+3. **§13 work items 4, 5 and 6 are untouched.** Private-network examples
+   (VPC-only, relay, Tailscale sidecar), secret-manager adapters through the
+   existing secret-source interface, and Prometheus scrape plus event-export
+   examples. Items 4 and 5 have static-validation halves that could be done on
+   any host; item 6 wants the local receivers the Compose stack does not yet
+   run.
 
 ---
 

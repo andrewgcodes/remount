@@ -1,0 +1,19 @@
+# The capability labels this release advertises, published as data so an
+# operator can read them without decoding a pod's argv.
+#
+# This ConfigMap is descriptive. Editing it changes nothing: the labels a node
+# reports come from the flags it was started with, and the control plane learns
+# them from the node's hello, not from Kubernetes.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "remount-node.fullname" . }}-capabilities
+  labels:
+    {{- include "remount-node.labels" . | nindent 4 }}
+data:
+  backend: {{ .Values.node.backend | quote }}
+  ownsWorkspaceLifecycle: "false"
+  capabilityLabels: |
+    {{- range $k, $v := .Values.capabilityLabels }}
+    {{ $k }}={{ $v }}
+    {{- end }}

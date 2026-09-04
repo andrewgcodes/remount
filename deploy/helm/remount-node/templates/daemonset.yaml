@@ -1,0 +1,121 @@
+{{- include "remount-node.validateOwnership" . -}}
+# One Remount node per matching Kubernetes node.
+#
+# A DaemonSet, not a Deployment, because a Remount node is a machine's worth of
+# capacity: it is defined by the host it runs on, and two Remount nodes sharing
+# one host would advertise the same capacity twice. Kubernetes owns the process
+# supervision here and nothing else. It does not know which workspaces exist,
+# where they run, or when they move.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "remount-node.fullname" . }}
+  labels:
+    {{- include "remount-node.labels" . | nindent 4 }}
+  annotations:
+    remount.dev/owns-workspace-lifecycle: "false"
+spec:
+  selector:
+    matchLabels:
+      {{- include "remount-node.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # One node at a time. Replacing a Remount node is node loss from the
+      # control plane's point of view; it recovers by re-claiming from the last
+      # checkpoint, and doing that to the whole fleet at once is a fleet-wide
+      # restore storm.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "remount-node.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "remount-node.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: remount-node
+          image: {{ include "remount-node.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - up
+            - --data={{ .Values.node.dataDir }}
+            - --backend={{ .Values.node.backend }}
+            {{- include "remount-node.labelArgs" . | trim | nindent 12 }}
+            {{- if .Values.advertiseKubernetesNodeName }}
+            - --label=k8s_node=$(KUBERNETES_NODE_NAME)
+            {{- end }}
+            {{- with .Values.node.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            # The endpoint and the token both arrive through the environment.
+            # The token especially: on argv it would be visible in the pod spec
+            # to anyone with get pods, and in the host's process list.
+            - name: REMOUNT_SERVER
+              value: {{ required "control.endpoint is required: nodes dial the control service outbound" .Values.control.endpoint | quote }}
+            - name: REMOUNT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.control.tokenSecret.name }}
+                  key: {{ .Values.control.tokenSecret.key }}
+            {{- if .Values.control.enrollmentSecret.name }}
+            - name: REMOUNT_ENROLL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.control.enrollmentSecret.name }}
+                  key: {{ .Values.control.enrollmentSecret.key }}
+            {{- end }}
+            - name: KUBERNETES_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: node-data
+              mountPath: {{ .Values.node.dataDir }}
+      volumes:
+        - name: node-data
+          {{- if eq .Values.storage.kind "emptyDir" }}
+          emptyDir:
+            sizeLimit: {{ .Values.storage.size }}
+          {{- else if eq .Values.storage.kind "hostPath" }}
+          hostPath:
+            path: {{ .Values.storage.hostPath }}
+            type: DirectoryOrCreate
+          {{- else }}
+          {{- fail (printf "storage.kind must be emptyDir or hostPath, got %q" .Values.storage.kind) }}
+          {{- end }}
