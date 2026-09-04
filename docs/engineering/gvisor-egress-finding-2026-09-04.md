@@ -195,3 +195,38 @@ for f in /run/remount/netns/*; do umount "$f" 2>/dev/null; rm -f "$f"; done
 ip -o link show | sed -n 's/^[0-9]*: \([^:@]*\).*/\1/p' | grep '^rm' |
   while read -r l; do ip link del "$l"; done
 ```
+
+---
+
+# Third finding: the docker backend does not check that the daemon can see the workspace
+
+Found incidentally, because pointing `docker` at the Colima VM changed which
+daemon the docker backend talked to. `TestDockerBackendReal` then failed like
+this:
+
+```
+"ws_dk\n/work\ncat: can't open 'f.txt': No such file or directory\n"
+```
+
+Read that carefully. `Create` succeeded. `FS().Write("f.txt", ...)` succeeded.
+The container started, reported its workspace id and its `/work` directory
+correctly, and could not see the file the node had just written into it.
+
+The docker backend bind-mounts the node's data directory into the container, so
+it assumes the daemon shares a filesystem with the node. When the daemon is
+remote — a VM, a socket forwarded from another machine, a CI runner with a
+daemon in a sidecar — that assumption is false, and the result is not an error.
+It is a workspace that starts, accepts writes, runs sessions, and silently has
+none of the node's data in it.
+
+The node already probes for a related property: it drops the read-only volume
+backend when a bind-mount probe fails, logging `read-only volumes unavailable`.
+There is no equivalent probe for the workspace root itself, which is the more
+important of the two.
+
+What a fix needs: at backend construction, write a known byte into the data
+directory, run a throwaway container with the same bind mount, and read it back.
+If the daemon cannot see it, refuse to offer the docker backend rather than
+offering one that loses data. That is the same shape as the volume probe and the
+same shape as the gVisor denial probe: a capability is earned by demonstrating
+it, not by the code existing.

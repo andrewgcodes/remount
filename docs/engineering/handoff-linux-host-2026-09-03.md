@@ -36,6 +36,29 @@ gvisor status=unavailable reason=runsc is not registered with Docker
 **What you need:** a Linux host with Docker and `runsc` registered as a
 runtime.
 
+**This is no longer blocked on macOS, and the lane has now been run.** Docker
+Desktop cannot host `runsc` because its daemon lives in a locked-down LinuxKit
+VM, but that is a property of Docker Desktop, not of the machine. Colima
+provides a real Ubuntu VM with its own daemon, and gVisor's `systrap` platform
+needs no KVM:
+
+```sh
+brew install colima && colima start --arch aarch64 --cpu 4 --memory 6 --disk 20
+colima ssh -- sudo sh -c 'cd /tmp && \
+  curl -fsSLO https://storage.googleapis.com/gvisor/releases/release/latest/$(uname -m)/runsc && \
+  chmod 755 runsc && mv runsc /usr/local/bin/ && runsc install && systemctl restart docker'
+sh integration/chaos/backend-gates.sh --probe   # REMOUNT_CHAOS_IMAGE=alpine:3.20
+```
+
+Running it found three defects, recorded with reproduction steps in
+`docs/engineering/gvisor-egress-finding-2026-09-04.md`: the deny-first egress
+policy is not enforced because gVisor injects frames below netfilter's IP hooks
+and six of the seven denial checks pass for the wrong reason; a killed run leaks
+its netns, veth and sandbox processes; and the docker backend does not verify
+the daemon can see the workspace. **The first is a security finding and the
+capability claim `enforced_gateway` is currently unearned.** Read that document
+before doing anything else in this section.
+
 **What to run:**
 
 ```sh
