@@ -44,10 +44,12 @@ vet:
 fmt:
 	gofmt -l -w .
 
-# Every gate CI runs, locally. Prefer this to pushing and waiting: the repo is
-# private, so Actions minutes are metered, and a push that fails CI costs
+# Every gate ci.yml runs, locally. Prefer this to pushing and waiting: the repo
+# is private, so Actions minutes are metered, and a push that fails CI costs
 # minutes without teaching anything. verify-fast drops the race lane and
-# conformance for a quick pre-commit check.
+# conformance for a quick pre-commit check and says so in its verdict; an
+# analyzer that is not installed makes either run incomplete (exit 2), not
+# passed.
 verify:
 	./scripts/verify-local.sh
 
