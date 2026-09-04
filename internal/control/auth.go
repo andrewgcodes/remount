@@ -91,11 +91,24 @@ func (c *Control) Authenticate(ctx context.Context, h *proto.Hello) (string, *pr
 		if id == "" || !strings.HasPrefix(id, "c_") {
 			id = ids.New("c")
 		}
-		ok.Peer = id
-		ok.Subject, ok.Tenant = subject.ID, subject.Tenant
 		c.mu.Lock()
+		// A client picks its own peer id so it can reconnect under it, which
+		// makes that id an address any other client can name. It must stay
+		// bound to the subject holding it: the relay replaces a peer that
+		// reconnects under an existing id, so accepting a claim from a
+		// different subject would evict the holder and deliver replies
+		// addressed to it — across tenants — to the claimant. A node id is
+		// already pinned to its key above; this is the same rule for clients.
+		// The binding is released in PeerGone, so an id is reusable
+		// once its holder is gone.
+		if existing, bound := c.subjects[id]; bound && (existing.ID != subject.ID || existing.Tenant != subject.Tenant) {
+			c.mu.Unlock()
+			return "", nil, proto.Err(proto.CodeUnauthorized, "peer id %s is registered to a different subject", id)
+		}
 		c.subjects[id] = subject
 		c.mu.Unlock()
+		ok.Peer = id
+		ok.Subject, ok.Tenant = subject.ID, subject.Tenant
 		return id, ok, nil
 	default:
 		return "", nil, proto.Err(proto.CodeBadRequest, "unknown role %q", h.Role)

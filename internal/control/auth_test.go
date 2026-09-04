@@ -73,3 +73,59 @@ func TestDynamicNodeEnrollmentRejectsUnenforcedBackend(t *testing.T) {
 		t.Fatal("dynamic enrollment accepted a backend below the deployment floor")
 	}
 }
+
+// tokenSubjects authenticates each token as a distinct subject, so a test can
+// present two different authenticated principals to one control plane.
+type tokenSubjects map[string]Subject
+
+func (a tokenSubjects) Authenticate(_ context.Context, cred Credential) (Subject, error) {
+	subject, ok := a[cred.Token]
+	if !ok {
+		return Subject{}, errors.New("unknown token")
+	}
+	return subject, nil
+}
+
+// A client chooses its own peer id, and the relay replaces a peer that
+// reconnects under an id it already holds. So an id claimed by a second,
+// differently-authenticated subject would evict the holder and take delivery
+// of replies addressed to it — across tenants. The claim must be refused
+// while the id is bound.
+func TestAClaimedClientPeerIDCannotBeReboundToAnotherSubject(t *testing.T) {
+	f := newControlFixture(t, "", func(opts *Options) {
+		opts.Authenticator = tokenSubjects{
+			"tok-alice":   {ID: "alice", Tenant: "tenant-a", Roles: []string{"agent"}},
+			"tok-mallory": {ID: "mallory", Tenant: "tenant-b", Roles: []string{"agent"}},
+			"tok-alice-2": {ID: "alice", Tenant: "tenant-a", Roles: []string{"agent"}},
+		}
+		opts.Token = ""
+	})
+	ctx := context.Background()
+	hello := func(token string) *proto.Hello {
+		return &proto.Hello{Role: proto.RoleClient, Peer: "c_alice", Token: token, Caps: []string{proto.CapabilityV1}}
+	}
+
+	id, _, err := f.c.Authenticate(ctx, hello("tok-alice"))
+	if err != nil || id != "c_alice" {
+		t.Fatalf("alice claim = %q, err=%v", id, err)
+	}
+
+	// A different subject claiming the same live id must be refused.
+	if _, _, err := f.c.Authenticate(ctx, hello("tok-mallory")); err == nil {
+		t.Fatal("a second subject rebound another subject's peer id")
+	}
+	if subject, err := f.c.subjectOf("c_alice"); err != nil || subject.ID != "alice" || subject.Tenant != "tenant-a" {
+		t.Fatalf("peer id now resolves to %+v (err=%v), want alice/tenant-a", subject, err)
+	}
+
+	// The holder reconnecting under its own id must still work.
+	if _, _, err := f.c.Authenticate(ctx, hello("tok-alice-2")); err != nil {
+		t.Fatalf("alice could not reconnect under her own peer id: %v", err)
+	}
+
+	// Once the holder is gone the id is free again.
+	f.c.PeerGone(ctx, "c_alice")
+	if _, _, err := f.c.Authenticate(ctx, hello("tok-mallory")); err != nil {
+		t.Fatalf("a released peer id was not reusable: %v", err)
+	}
+}
