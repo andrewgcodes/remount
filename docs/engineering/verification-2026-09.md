@@ -22,7 +22,7 @@ full-suite Docker OpenCode lanes remain known failing and are visible CI
 debt.**
 
 Host: Windows Server 2022 amd64. Go: 1.27.1. Race C toolchain: MinGW-w64
-16.1.0. Final verification integrated `origin/main` at `c47b4bb`.
+16.1.0. Final verification integrated `origin/main` at `d938d7b`.
 
 ### Final command results
 
@@ -55,6 +55,24 @@ Classification: **confirmed Windows-host performance defect**, not a passed
 benchmark and not a POSIX-only boundary. Windows CI runs every other test and
 names this exact exclusion in the workflow and job summary.
 
+After integrating `d938d7b`, three focused reruns still failed at 7.6, 8.0,
+and 8.3 MB/s against the 20 MB/s gate.
+
+The first post-integration `go run ./cmd/conformance --build .` also exposed
+the same asynchronous audit race in `CONF-BIND-003` that an earlier fix had
+closed for `CONF-BIND-002`:
+
+```text
+failed CONF-BIND-003 the broker refused the request
+(403 remount broker: egress to denied.conformance.invalid:443 is not permitted
+for this workspace) but recorded no egress.denied on the workspace stream
+```
+
+The denied request completes before the canonical event append is necessarily
+visible. `CONF-BIND-003` now polls for the event using the same bounded,
+context-aware rule as `CONF-BIND-002`; five consecutive built-binary
+conformance runs passed all 60 available rows.
+
 ### Confirmed defects found and fixed
 
 | Area | Exact regression or conformance signal | Pre-fix behavior |
@@ -72,6 +90,7 @@ names this exact exclusion in the workflow and job summary.
 | SQLite locking | `internal/control/replicate.TestSQLiteDatabaseMustCloseBeforeWindowsDelete` | no test covered Windows delete-while-open behavior |
 | Broker errors | broker classification tests | Winsock refused/reset errors were not mapped to the stable broker error classes |
 | Conformance audit visibility | `CONF-BIND-002` | an immediate event-tail read could race the canonical audit append; the denied request was observed before its `leak_blocked` event |
+| Conformance unbound-audit visibility | `CONF-BIND-003` | an immediate event-tail read could race the canonical audit append; the denied request was observed before its `egress.denied` event |
 | Race cleanup | `internal/session.TestE11FastProducerReplaysEverySequenceAcrossTiers` | `TempDir RemoveAll cleanup: unlinkat ...\session.log: The process cannot access the file because it is being used by another process.` |
 | Race process registration | `internal/sim.TestHandoffScaleAndControlFailover/real-peers-and-durable-restart` | fast processes could exit while Job Object assignment returned `Access is denied`, surfacing as `contain process tree: Access is denied.` |
 | Job Object descendant test synchronization | `internal/session.TestKillWorkspaceTerminatesWindowsDescendants` | the PID file could be observed after creation but before `WriteAllText` stored the PID, producing `strconv.Atoi: parsing "": invalid syntax` |
