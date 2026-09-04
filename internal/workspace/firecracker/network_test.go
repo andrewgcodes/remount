@@ -39,16 +39,23 @@ func (k *testNetKernel) Configure(context.Context, string, netns.Link) error {
 	k.add("configure")
 	return nil
 }
-func (k *testNetKernel) InstallDenyAll(context.Context, string) error { k.add("deny"); return nil }
-func (k *testNetKernel) PermitBroker(context.Context, string, netip.AddrPort) error {
+func (k *testNetKernel) InstallDenyAll(context.Context, string, netns.Link) error {
+	k.add("deny")
+	return nil
+}
+func (k *testNetKernel) PermitBroker(context.Context, string, netns.Link, netip.AddrPort) error {
 	k.add("permit")
 	return nil
 }
 func (k *testNetKernel) BringUp(context.Context, string, string) error { k.add("up"); return nil }
 func (k *testNetKernel) DeleteVeth(context.Context, string) error      { k.add("delete-veth"); return nil }
 func (k *testNetKernel) CloseNamespace(string) error                   { k.add("close-ns"); return nil }
-func (k *testNetKernel) CreateTap(context.Context, string, string, int, int, netip.Prefix) error {
+func (k *testNetKernel) CreateTap(context.Context, string, string, int, int, netip.Prefix, netns.Link) error {
 	k.add("tap")
+	return nil
+}
+func (k *testNetKernel) RouteTap(context.Context, netip.Prefix, netns.Link) error {
+	k.add("route-tap")
 	return nil
 }
 func (k *testNetKernel) DeleteTap(context.Context, string, string) error {
@@ -77,7 +84,7 @@ func TestSystemNetworkProviderDenyFirstAndSynchronousRevoke(t *testing.T) {
 	if err := lease.Revoke(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := kernel.joined(), "namespace,veth,configure,deny,tap,permit,up,delete-tap,delete-veth,close-ns"; got != want {
+	if got, want := kernel.joined(), "namespace,veth,configure,deny,tap,permit,up,route-tap,delete-veth,delete-tap,close-ns"; got != want {
 		t.Fatalf("network ordering = %s, want %s", got, want)
 	}
 	entries, err := filepath.Glob(filepath.Join(provider.opts.Dir, "*.json"))
@@ -103,7 +110,7 @@ func TestSystemNetworkProviderRecoversCrashLeftJournal(t *testing.T) {
 	if _, err := NewSystemNetworkProvider(t.Context(), NetworkOptions{Dir: dir, Manager: netns.NewManager(kernel), UID: 1000, GID: 1000}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(kernel.joined(), "validate,delete-tap,delete-veth,close-ns") {
+	if !strings.Contains(kernel.joined(), "validate,delete-veth,delete-tap,close-ns") {
 		t.Fatalf("stale boundary was not synchronously recovered: %s", kernel.joined())
 	}
 }

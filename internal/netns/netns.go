@@ -21,8 +21,8 @@ type Kernel interface {
 	CreateNamespace(context.Context, string) (string, error)
 	CreateVeth(context.Context, string, string, string) error
 	Configure(context.Context, string, Link) error
-	InstallDenyAll(context.Context, string) error
-	PermitBroker(context.Context, string, netip.AddrPort) error
+	InstallDenyAll(context.Context, string, Link) error
+	PermitBroker(context.Context, string, Link, netip.AddrPort) error
 	BringUp(context.Context, string, string) error
 	DeleteVeth(context.Context, string) error
 	CloseNamespace(string) error
@@ -31,7 +31,8 @@ type Kernel interface {
 // TapKernel is the optional microVM TAP extension implemented by the Linux
 // kernel adapter and injectable in tests.
 type TapKernel interface {
-	CreateTap(context.Context, string, string, int, int, netip.Prefix) error
+	CreateTap(context.Context, string, string, int, int, netip.Prefix, Link) error
+	RouteTap(context.Context, netip.Prefix, Link) error
 	DeleteTap(context.Context, string, string) error
 }
 
@@ -115,7 +116,7 @@ func (m *Manager) Open(ctx context.Context, workspace string, generation uint64)
 	}
 	// The deny chain precedes both runsc startup and link activation. A partial
 	// setup can therefore never create an unfiltered interval.
-	if err = m.kernel.InstallDenyAll(ctx, nsPath); err != nil {
+	if err = m.kernel.InstallDenyAll(ctx, nsPath, link); err != nil {
 		return nil, fmt.Errorf("install deny-all policy: %w", err)
 	}
 
@@ -191,7 +192,7 @@ func (n *Network) PrepareTap(ctx context.Context, name string, uid, gid int) (ne
 		return netip.Addr{}, errors.New("netns: kernel TAP support unavailable")
 	}
 	tap := tapLinkForSlot(n.slot)
-	if err := kernel.CreateTap(ctx, n.namespace, name, uid, gid, tap.Gateway); err != nil {
+	if err := kernel.CreateTap(ctx, n.namespace, name, uid, gid, tap.Gateway, n.link); err != nil {
 		return netip.Addr{}, err
 	}
 	n.tap = name
@@ -234,11 +235,18 @@ func (n *Network) Apply(ctx context.Context, broker netip.AddrPort) (err error) 
 		}
 		return n.failClosed(ctx, fmt.Errorf("netns: broker endpoint changed from %s to %s", n.broker, broker))
 	}
-	if err = n.kernel.PermitBroker(ctx, n.namespace, broker); err != nil {
+	if err = n.kernel.PermitBroker(ctx, n.namespace, n.link, broker); err != nil {
 		return n.failClosed(ctx, fmt.Errorf("install broker permit: %w", err))
 	}
 	if err = n.kernel.BringUp(ctx, n.namespace, n.link.HostName); err != nil {
 		return n.failClosed(ctx, fmt.Errorf("activate veth: %w", err))
+	}
+	if n.tap != "" {
+		if kernel, ok := n.kernel.(TapKernel); ok {
+			if err = kernel.RouteTap(ctx, tapLinkForSlot(n.slot).Gateway, n.link); err != nil {
+				return n.failClosed(ctx, fmt.Errorf("route TAP subnet: %w", err))
+			}
+		}
 	}
 	n.broker = broker
 	n.active = true
@@ -264,6 +272,9 @@ func (n *Network) revokeLocked(ctx context.Context) error {
 	if n.revoked {
 		return nil
 	}
+	if err := n.kernel.DeleteVeth(ctx, n.link.HostName); err != nil {
+		return fmt.Errorf("delete veth: %w", err)
+	}
 	if n.tap != "" {
 		if kernel, ok := n.kernel.(TapKernel); ok {
 			if err := kernel.DeleteTap(ctx, n.namespace, n.tap); err != nil {
@@ -271,9 +282,6 @@ func (n *Network) revokeLocked(ctx context.Context) error {
 			}
 		}
 		n.tap = ""
-	}
-	if err := n.kernel.DeleteVeth(ctx, n.link.HostName); err != nil {
-		return fmt.Errorf("delete veth: %w", err)
 	}
 	if err := n.kernel.CloseNamespace(n.namespace); err != nil {
 		return fmt.Errorf("close namespace: %w", err)

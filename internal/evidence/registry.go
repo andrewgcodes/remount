@@ -41,9 +41,23 @@ func (s Scenario) Owned() bool { return s.Owner != "" }
 // Wired reports whether the aggregate runner can execute the scenario itself.
 func (s Scenario) Wired() bool { return len(s.Argv) > 0 }
 
+func credentialEnv(names []string) []string {
+	var credentials []string
+	for _, name := range names {
+		for _, part := range strings.Split(name, "_") {
+			switch part {
+			case "CREDENTIAL", "KEY", "PASSWORD", "SECRET", "TOKEN":
+				credentials = append(credentials, name)
+			}
+		}
+	}
+	return credentials
+}
+
 const (
 	sourceHandoff = "docs/engineering/handoff-2026-09-03.md (outcome: docs/engineering/implementation-closure-2026-09-03.md)"
 	sourcePlanB   = "docs/engineering/plan-b-repository-executable-2026-09-03.md"
+	sourceLinux   = "docs/engineering/verification-2026-09.md (Linux host verification 2026-09-04)"
 )
 
 // notLanded is the only honest thing to say about a Plan B row whose ticket
@@ -84,18 +98,20 @@ var scenarios = []Scenario{
 	{
 		ID: "E4", Title: "gVisor enforced egress: unlisted host fails at connect and RevokeNetwork kills an in-flight transfer",
 		Layer: LayerHostCI, Required: true,
-		Owner:    "internal/workspace/gvisor.TestE4DenialConformance",
-		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS"},
-		Recorded: StatusPassed, Source: sourceHandoff,
-		Note: "runs on a Colima-hosted runsc (handoff-linux-host-2026-09-03.md §1) and passes, three consecutive runs, after the egress leak it exposed was fixed: gVisor injects frames below netfilter's IP hooks, so the nftables output chain never saw them and every forbidden destination crossed the veth. A netdev egress chain on the workspace veth now carries the policy, and the suite asserts it with an AF_PACKET watcher rather than inferring denial from a missing reply. docs/engineering/gvisor-egress-finding-2026-09-04.md",
+		Owner:    "internal/workspace/gvisor.TestE4DenialConformance, internal/workspace/gvisor.TestE4FailedSetupCleanupConformance",
+		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS", "REMOUNT_CHAOS_IMAGE"},
+		Argv:     []string{"./scripts/gvisor-conformance.sh", "e4"},
+		Recorded: StatusPassed, Source: sourceLinux,
+		Note: "the exact digest-pinned candidate passed all seven denial checks, the host-veth escape assertion, synchronous in-flight revoke, successful revoke cleanup and failed-setup cleanup",
 	},
 	{
 		ID: "E5", Title: "two mutually untrusting tenants share one gVisor node",
 		Layer: LayerHostCI, Required: true,
-		Owner:    "internal/workspace/gvisor.TestE5SiblingTenantsCannotReachEachOther",
-		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS"},
-		Recorded: StatusPassed, Source: sourceHandoff,
-		Note: "two workspaces on one backend, each proven to reach its own broker so the negatives mean something, and neither able to reach the other's broker, guest address or DNS. Confirmed on the wire rather than by exit status, because that is how the E4 suite fooled everyone: capturing during a run shows 7 frames inside each tenant's own /30 and zero crossing between them. This is what earns SiblingIsolation.",
+		Owner:    "internal/workspace/gvisor.TestE5SiblingTenantsCannotReachEachOther, internal/node.TestE5TenantIsolationConformance",
+		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS", "REMOUNT_CHAOS_IMAGE"},
+		Argv:     []string{"./scripts/gvisor-conformance.sh", "e5"},
+		Recorded: StatusPassed, Source: sourceLinux,
+		Note: "the backend-level host-veth proof observed zero cross-tenant frames after positive broker controls, and the node-level proof kept files disjoint while attributing each denied broker attempt only to its source tenant",
 	},
 	{
 		ID: "E6", Title: "approve-on-first-use parks egress, a decision releases it, timeout denies",
@@ -420,19 +436,26 @@ var scenarios = []Scenario{
 	},
 	{
 		ID: "B28", Title: "the exact gVisor candidate passes isolation and enforced-gateway conformance",
-		Layer: LayerHostCI, Required: true, Source: sourcePlanB,
-		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS"},
-		Owner:    "internal/workspace/gvisor.TestE4DenialConformance and TestE5SiblingTenantsCannotReachEachOther",
+		Layer: LayerHostCI, Required: true, Source: sourceLinux,
+		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS", "REMOUNT_CHAOS_IMAGE"},
+		Owner:    "scripts/gvisor-conformance.sh",
+		Argv:     []string{"./scripts/gvisor-conformance.sh", "all"},
 		Recorded: StatusPassed,
-		Note:     "the enforced-gateway half is E4's seven-check denial suite and the isolation half is E5's two tenants, both run against the exact candidate on a host where runsc is registered (integration/chaos/backend-gates.sh --probe reports available). Both were made honest first: they now assert what leaves the workspace, captured with AF_PACKET, rather than inferring denial from a reply that never arrives. docs/engineering/gvisor-egress-finding-2026-09-04.md",
+		Note:     "the aggregate host lane probes Docker/runsc, runs E4 denial/revoke/cleanup, backend-level host-veth sibling isolation and node-level tenant/event isolation against the exact digest-pinned candidate",
 	},
 	{
 		ID: "B29", Title: "Firecracker reports either an exact-host pass or unavailable with a reason",
-		Layer: LayerHostCI, Required: true, Source: sourcePlanB,
-		Env:      []string{"REMOUNT_FIRECRACKER_KERNEL", "REMOUNT_FIRECRACKER_ROOTFS", "REMOUNT_FIRECRACKER_CGROUP"},
-		Owner:    "integration/firecracker/host-gate.sh with internal/workspace/firecracker",
+		Layer: LayerHostCI, Required: true, Source: sourceLinux,
+		Env: []string{
+			"REMOUNT_FIRECRACKER_DATA_ROOT", "REMOUNT_FIRECRACKER_BINARY",
+			"REMOUNT_FIRECRACKER_JAILER", "REMOUNT_FIRECRACKER_CGROUP_PARENT",
+			"REMOUNT_FIRECRACKER_KERNEL", "REMOUNT_FIRECRACKER_ROOTFS",
+			"REMOUNT_FIRECRACKER_GUEST_MANIFEST",
+		},
+		Owner:    "scripts/firecracker-conformance.sh",
+		Argv:     []string{"./scripts/firecracker-conformance.sh"},
 		Recorded: StatusPassed,
-		Note:     "exact-host pass. On an Apple Silicon Mac with Colima nested virtualization (handoff-linux-host-2026-09-03.md §2) the gate reports AVAILABLE against real firecracker/jailer v1.16.1, a real guest kernel and an ext4 rootfs, and go test -race -count=10 ./internal/workspace/firecracker is green. The lifecycle was also driven by hand end to end: a workspace reaches claimed on backend=firecracker, exec inside reports guest kernel 5.10.223 against the host's 6.8.0-117-generic, an authoritative checkpoint gives consistency=quiesced at 37 MB, and a workspace created --restore-from that artifact reads the file back. Getting there fixed four defects, three of them in this backend: a handshake that raced the guest boot, a compatibility fence that was unsatisfiable because it contained a timestamp, and a snapshot restore that never remapped the network device. The §5 list is covered. prepare-abort, stale generation, incompatible CPU or version, corrupt bundle and disk-full staging have unit tests here. Process continuation and exactly-once were measured on two live Firecracker nodes: `remount ws move` carries the workspace from one node to the other, guest uptime goes 18s before the move to 23s after it rather than resetting, the file written before the move reads back, and exactly one microVM is alive afterwards rather than two. Reaching that took four defects in this backend, each of which made an entire operation impossible: a guest handshake that raced the boot, a compatibility fence that contained a timestamp and so could never be satisfied, a restore that never remapped the network device, and a teardown that reclaimed the network while the VMM still held its TAP. docs/engineering/gvisor-egress-finding-2026-09-04.md. Still open: .github/workflows/kvm.yml fails its final step on a premise that is now stale. .github/workflows/kvm.yml still fails its final step deliberately and needs updating by someone who can run it.",
+		Note:     "the exact Linux/KVM candidate passed real jailer/vsock guest operations, enforced egress, synchronous revoke, full-VM prepare/abort/commit/restore with exact-once continuation, failure-path rejection and cleanup",
 	},
 	{
 		ID: "B30", Title: "reconnect and pool bursts stay within declared resource ceilings",

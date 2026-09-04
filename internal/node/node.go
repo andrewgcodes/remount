@@ -221,10 +221,11 @@ type Node struct {
 // ws is a claimed workspace on this node.
 type ws struct {
 	proto.Workspace
-	handle       workspace.Handle
-	broker       *broker.Broker
-	leases       []proto.BindingLease
-	lastSnapshot time.Time
+	handle           workspace.Handle
+	broker           *broker.Broker
+	leases           []proto.BindingLease
+	lastSnapshot     time.Time
+	restoreProcesses string
 	// treeMu serializes node filesystem mutations/session startup with archive
 	// construction. checkpointing is guarded by Node.mu and rejects newly
 	// authorized work while an authoritative checkpoint fences sessions.
@@ -1609,7 +1610,9 @@ func (n *Node) resync(ctx context.Context) {
 	}
 	for _, w := range held {
 		rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		err := p.Call(rctx, proto.PeerControl, proto.OpWSReady, proto.WSReadyReq{ID: w.ID, Gen: w.Generation}, nil)
+		err := p.Call(rctx, proto.PeerControl, proto.OpWSReady, proto.WSReadyReq{
+			ID: w.ID, Gen: w.Generation, RestoreProcesses: w.restoreProcesses,
+		}, nil)
 		cancel()
 		if err == nil {
 			n.mu.Lock()
@@ -3484,6 +3487,14 @@ func (n *Node) materializeWithReadyHook(ctx context.Context, w proto.Workspace, 
 		}
 	}
 	entry := &ws{Workspace: w, handle: handle}
+	if w.Spec.RestoreFrom != "" && !adopt {
+		entry.restoreProcesses = proto.RestoreProcessesRestarted
+		if w.Spec.RestoreFormat == proto.ArtifactFormatFirecrackerFullV1 {
+			if checkpointer, ok := handle.(workspace.Checkpointer); ok && workspace.KindOf(checkpointer) == workspace.CheckpointFSMem {
+				entry.restoreProcesses = proto.RestoreProcessesPreserved
+			}
+		}
+	}
 	retainOnError := func(err error) error {
 		detachErr := n.detachWorkspaceVolumes(context.WithoutCancel(ctx), entry, entry.Spec.Volumes)
 		if revokeErr := n.revokeWorkspaceNetwork(ctx, entry); revokeErr != nil {
@@ -3689,7 +3700,9 @@ func (n *Node) materializeWithReadyHook(ctx context.Context, w proto.Workspace, 
 		return proto.Err(proto.CodeUnreachable, "control connection lost before ws.ready")
 	}
 	rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	err = p.Call(rctx, proto.PeerControl, proto.OpWSReady, proto.WSReadyReq{ID: w.ID, Gen: w.Generation}, nil)
+	err = p.Call(rctx, proto.PeerControl, proto.OpWSReady, proto.WSReadyReq{
+		ID: w.ID, Gen: w.Generation, RestoreProcesses: entry.restoreProcesses,
+	}, nil)
 	cancel()
 	if err != nil {
 		n.fenceWorkspace(ctx, w.ID, "ws.ready rejected: "+err.Error())

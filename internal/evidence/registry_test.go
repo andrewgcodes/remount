@@ -2,6 +2,7 @@ package evidence
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -51,6 +52,8 @@ func TestAnUnownedScenarioIsOpenNotAbsent(t *testing.T) {
 // without credentials, and actually asserts the row's stated property. This
 // test exists so that claim cannot be made by accident.
 var wiredScenarios = map[string]string{
+	"E4":  "exact gVisor candidate denies every forbidden lane, revokes synchronously, and cleans up",
+	"E5":  "two isolated tenants share a node with cross-tenant denials recorded as tenant-scoped events",
 	"B1":  "real pinned OpenCode against the deterministic local model through the broker",
 	"B2":  "ACP transcript carries the tool call and terminal result",
 	"B3":  "cut mid-stream, replay from seq 0 is byte-identical",
@@ -70,6 +73,8 @@ var wiredScenarios = map[string]string{
 	"B25": "mutation, replay and cross-destination substitution are rejected",
 	"B26": "reconnect rekeys without losing the cursor or idempotency",
 	"B27": "required encryption refuses before any mutation",
+	"B28": "the aggregate exact-candidate gVisor isolation and enforced-gateway host lane",
+	"B29": "the aggregate exact-candidate Firecracker KVM lifecycle, isolation, failure and cleanup lane",
 	"B30": "resource ceilings measured by slope across repeated cycles",
 	"B31": "reproducible builds across a cold cache and a different TMPDIR",
 	"B32": "clean installs of the binary, images, wheel, tarball and module, each with a source-tree control",
@@ -91,9 +96,9 @@ func TestOnlyDeliberatelyWiredScenariosAreWired(t *testing.T) {
 }
 
 // TestAWiredScenarioIsOwnedAndKeyless pins what wiring is allowed to mean. A
-// wired row runs on every candidate, so it may not depend on a credential:
-// a required row that silently needs a key would report failed on a clean
-// checkout instead of unavailable, which inverts the honesty rule.
+// wired row runs on every candidate, so it may not depend on a credential.
+// Non-secret host prerequisites are allowed because the runner reports their
+// absence as unavailable before dispatching the owning command.
 func TestAWiredScenarioIsOwnedAndKeyless(t *testing.T) {
 	for _, s := range Scenarios() {
 		if !s.Wired() {
@@ -102,12 +107,22 @@ func TestAWiredScenarioIsOwnedAndKeyless(t *testing.T) {
 		if !s.Owned() {
 			t.Fatalf("%s is wired but has no owning proof", s.ID)
 		}
-		if s.Required && len(s.Env) != 0 {
-			t.Fatalf("%s is a required wired row that names environment %v; a required row must run without credentials", s.ID, s.Env)
+		if credentials := credentialEnv(s.Env); s.Required && len(credentials) != 0 {
+			t.Fatalf("%s is a required wired row that names credential environment %v; a required row must run without credentials", s.ID, credentials)
 		}
 		if s.Layer == LayerLiveService {
 			t.Fatalf("%s is wired at the live-service layer; those rows are optional supplements, not part of the keyless run", s.ID)
 		}
+	}
+}
+
+func TestCredentialEnvDistinguishesHostPrerequisites(t *testing.T) {
+	got := credentialEnv([]string{
+		"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS", "REMOUNT_CHAOS_IMAGE",
+		"E2B_API_KEY", "REMOUNT_ENROLL_TOKEN",
+	})
+	if !slices.Equal(got, []string{"E2B_API_KEY", "REMOUNT_ENROLL_TOKEN"}) {
+		t.Fatalf("credential environment = %v", got)
 	}
 }
 

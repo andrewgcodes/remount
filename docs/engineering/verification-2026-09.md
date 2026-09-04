@@ -380,6 +380,143 @@ requires the `modal` CLI installed, `modal deploy deploy/modal_app.py` run
 against a disposable environment (`make modal-deploy`), and the same public
 control-plane URL, enrollment token and binary URL as the E2B entry.
 
+## 2026-09-04 — gVisor E4, E5 and B28 on Linux
+
+**Status: verified.** The candidate ran on Ubuntu Linux x86_64, kernel
+`5.15.200`, Docker Server `27.4.1`, and `runsc release-20260817.0`. Docker
+reported the registered runtime name `runsc`. The rootfs and Docker workload
+probe both came from the immutable image
+`alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce`.
+
+The disposable rootfs was built with:
+
+```sh
+sudo rm -rf /tmp/remount-gvisor-rootfs
+mkdir -p /tmp/remount-gvisor-rootfs
+container=$(docker create alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce)
+docker export "$container" | sudo tar -C /tmp/remount-gvisor-rootfs -xf -
+docker rm -f "$container"
+CGO_ENABLED=0 GOOS=linux go build -o /tmp/remount-rawprobe ./internal/workspace/gvisor/testdata/rawprobe
+sudo install -m 0755 /tmp/remount-rawprobe /tmp/remount-gvisor-rootfs/rawprobe
+CGO_ENABLED=0 GOOS=linux go build -o /tmp/remount-udpprobe ./internal/workspace/gvisor/testdata/udpprobe
+sudo install -m 0755 /tmp/remount-udpprobe /tmp/remount-gvisor-rootfs/udpprobe
+```
+
+The owning aggregate command was:
+
+```sh
+REMOUNT_GVISOR_INTEGRATION=1 \
+REMOUNT_GVISOR_ROOTFS=/tmp/remount-gvisor-rootfs \
+REMOUNT_CHAOS_IMAGE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce \
+  ./scripts/gvisor-conformance.sh
+```
+
+The host probe reported Docker and gVisor available against that exact image.
+The mechanism spike then reported broker reachability, a positive UDP echo
+control, denial of direct IPv4 TCP, IPv6, UDP data transfer, DNS to `8.8.8.8`,
+ICMP, a raw socket, and CONNECT to an unlisted host, followed by denial after
+network revoke.
+
+`TestE4DenialConformance` passed all seven denial subtests in 15.88 seconds.
+It also proved that a transfer was advancing before `RevokeNetwork`, that the
+file stopped advancing when synchronous revoke returned, and that the broker
+was no longer connectable. `TestE4FailedSetupCleanupConformance` rejected a
+broker outside the generation link and observed that the namespace, host veth
+and host ingress nftables table were all absent afterward.
+
+`TestE5TenantIsolationConformance` materialized `ws_e5_a` for `tenant-a` and
+`ws_e5_b` for `tenant-b` on one node and one gVisor backend. Each tenant was
+unable to observe the other's workspace file. Each tenant's request toward the
+other tenant's broker endpoint was denied by its own broker, and the node log
+contained exactly one `egress.denied` event attributed to each source
+workspace and tenant. This proves the `isolated` profile and sibling isolation;
+it does **not** advertise gVisor as a `multi_tenant` backend.
+
+**Teardown, verified.** The aggregate script removed its compiled tests and
+spike directory. Both tests destroyed their runsc sandboxes, synchronously
+revoked veths, removed namespaces and host nftables tables, closed brokers, and
+unmounted the disposable `null-netns` mounts. The following postcondition
+command produced empty sections for every resource class:
+
+```sh
+printf '%s\n' namespaces:
+sudo ip netns list | rg '^(rm-|rmspike-)' || true
+printf '%s\n' links:
+ip -o link show | rg 'rm[gh]-|rmh-|rmg-' || true
+printf '%s\n' nftables:
+sudo nft list ruleset | rg 'remount_|rmspike' || true
+printf '%s\n' listeners:
+ps -ef | rg 'socat (TCP4|UDP4)-LISTEN:1744[34],bind=169.254.251.1' | rg -v rg || true
+printf '%s\n' mounts:
+findmnt | rg 'remount-gvisor|runsc' || true
+```
+
+---
+
+## 2026-09-04 — Firecracker 2.3 and B29 on Linux/KVM
+
+**Status: verified on the exact candidate.** Candidate
+`acb3e427ef5b327d805f3434d1f82f69894bd6fd` ran on Linux x86_64, kernel
+`5.15.200`, with KVM and nested virtualization available. The static
+Firecracker and jailer were both v1.16.1. Their SHA-256 digests were
+`2fd0171309af7e24cf8dafc8a6f921c1434c49b5f9349bb996b7ed0a4deb8aa7`
+and `1f3a0c1fe86212d0001819bfe0819071c01208b3ccc939c8b3bc1b84cf21edd`.
+
+The kernel `/mnt/f/vmlinux-6.1.155` had SHA-256
+`e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2`.
+The rootfs `/mnt/f/remount-rootfs.ext4` had SHA-256
+`2aa1b97ed499d804e4113a1300c99d7495e61a916d9a9409f092643e00c9fb80`.
+The manifest `/mnt/f/guest-manifest.json` had SHA-256
+`25cc5440a8683c943775ae345bca637de48531b3d81c8a53ef909ab653658961`
+and identified guest protocol 1, vsock port 10789, workspace `/workspace`,
+and guest binary SHA-256
+`f9ad7fd58b39d4b66213c910e6b36459b34adf79aac205624ccedd9d92a1ac56`.
+
+The owning aggregate command was:
+
+```sh
+REMOUNT_FIRECRACKER_DATA_ROOT=/mnt/f \
+REMOUNT_FIRECRACKER_BINARY=/home/ubuntu/firecracker-v1.16.1/release-v1.16.1-x86_64/firecracker-v1.16.1-x86_64 \
+REMOUNT_FIRECRACKER_JAILER=/home/ubuntu/firecracker-v1.16.1/release-v1.16.1-x86_64/jailer-v1.16.1-x86_64 \
+REMOUNT_FIRECRACKER_CGROUP_PARENT=remount \
+REMOUNT_FIRECRACKER_KERNEL=/mnt/f/vmlinux-6.1.155 \
+REMOUNT_FIRECRACKER_ROOTFS=/mnt/f/remount-rootfs.ext4 \
+REMOUNT_FIRECRACKER_GUEST_MANIFEST=/mnt/f/guest-manifest.json \
+  ./scripts/firecracker-conformance.sh
+```
+
+The real jailer and vsock bridge booted a guest and passed filesystem write
+and read, exec, PTY size/input/output, guest port, broker access and direct
+public-egress denial. An in-flight broker stream advanced before
+`RevokeNetwork`; synchronous revoke killed and joined the VMM, the guest
+request exited nonzero, and the upstream byte count stopped advancing.
+
+A running guest counter was checkpointed under a generation fence. Abort
+resumed it exactly once. A second prepare committed without resuming the source;
+the source was destroyed, and the destination restored disk, VMM state and VMM
+memory. The PID was unchanged and the observed counter sequence was exactly
+1..N with no repeat or gap. Equal and older restore generations were rejected
+before network preparation or VMM launch. `ws.moved` remained
+`restore_pending`; only the successfully restored destination's `ws.ready`
+settled `restore_processes:"preserved"` on `ws.claimed`. A filesystem restore
+claiming preservation was rejected.
+
+The same command ran package proofs for incompatible CPU fingerprint and
+Firecracker version, corrupt/truncated bundles, manifest hashes, prepare
+abort/commit, failed destruction retention and capability honesty. A
+privileged 64 KiB tmpfs forced restore staging to return `ENOSPC`; the staging
+directory and image admission were released, and the same workspace id could
+be created afterward. The descriptor used by node status and doctor exposed
+`microvm`, `fs+mem`, and `enforced_gateway` only after the exact backend probes
+succeeded; an unverified backend remains `none`, `fs`, and `open`.
+
+**Teardown, verified.** The aggregate command found no Firecracker or jailer
+process, `rm-*` cgroup, Remount netns, Remount veth/TAP, or Remount nftables
+table after the success, stale-generation, corrupt-bundle and disk-full paths.
+The runbook output is archived at
+`docs/engineering/evidence/firecracker-kvm-2026-09-04.log`; the optional KVM
+workflow uploads the same exact-host log under the candidate commit SHA.
+
 ---
 
 ## Performance attribution sweep, 2026-09-03 (late)
@@ -683,7 +820,6 @@ deliberate: absence of an entry is not a pass.
 | Temporal Cloud worker restart | no Temporal Cloud credentials |
 | Real Slack signature and delivery | no Slack signing secret or webhook URL |
 | Docker / gVisor scale benchmarks on named hosts | no named benchmark hosts |
-| Firecracker KVM end-to-end | macOS cannot provide `/dev/kvm`; needs a Linux KVM host |
 | E18 signed public release | irreversible public action; requires explicit release authority |
 
 ---

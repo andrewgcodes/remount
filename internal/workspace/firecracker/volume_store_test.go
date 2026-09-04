@@ -91,9 +91,18 @@ func TestFullBundleRoundTripAndCompatibilityFence(t *testing.T) {
 	if !ok || generation != 7 {
 		t.Fatalf("memory snapshot = %+v gen=%d ok=%v", gotFiles, generation, ok)
 	}
-	provider.compat.HostKernel = "different"
-	if err := restored.(*cowVolume).restore(t.Context(), bytes.NewReader(bundle.Bytes())); err == nil {
-		t.Fatal("incompatible host accepted full checkpoint")
+	for name, mutate := range map[string]func(*Compatibility){
+		"cpu":         func(c *Compatibility) { c.CPUFingerprint = "sha256:different" },
+		"firecracker": func(c *Compatibility) { c.Firecracker = "v2" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			compatibility := testCompatibility()
+			mutate(&compatibility)
+			provider.compat = compatibility
+			if err := restored.(*cowVolume).restore(t.Context(), bytes.NewReader(bundle.Bytes())); err == nil {
+				t.Fatal("incompatible host accepted full checkpoint")
+			}
+		})
 	}
 }
 
@@ -105,5 +114,43 @@ func TestFullBundleRejectsUnsupportedExclusion(t *testing.T) {
 	}
 	if err := raw.Checkpoint(t.Context(), []string{"node_modules"}, SnapshotFiles{}, 1, io.Discard); err == nil {
 		t.Fatal("process-preserving checkpoint silently omitted an arbitrary path")
+	}
+}
+
+func TestCorruptFullBundleIsRejectedAndStagingIsReleased(t *testing.T) {
+	provider, base := testVolumeProvider(t)
+	raw, err := provider.Create(t.Context(), "ws_corrupt_source", base, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	volume := raw.(*cowVolume)
+	state := filepath.Join(t.TempDir(), "state")
+	memory := filepath.Join(t.TempDir(), "memory")
+	if err := os.WriteFile(state, []byte("vm-state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(memory, []byte("vm-memory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var bundle bytes.Buffer
+	if err := volume.Checkpoint(t.Context(), nil, SnapshotFiles{
+		State: state, Memory: memory, Compatibility: testCompatibility(),
+	}, 1, &bundle); err != nil {
+		t.Fatal(err)
+	}
+	if err := volume.Destroy(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	corrupt := bundle.Bytes()[:bundle.Len()/2]
+	if _, err := provider.Create(t.Context(), "ws_corrupt_restore", base, bytes.NewReader(corrupt)); err == nil {
+		t.Fatal("truncated full checkpoint was accepted")
+	}
+	restored, err := provider.Create(t.Context(), "ws_corrupt_restore", base, bytes.NewReader(bundle.Bytes()))
+	if err != nil {
+		t.Fatalf("failed restore retained staging or image admission: %v", err)
+	}
+	if err := restored.Destroy(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 }

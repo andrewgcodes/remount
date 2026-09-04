@@ -1753,6 +1753,7 @@ export interface WSQuarantineRes {
 export interface WSReadyReq {
   "id": string;
   "gen": number;
+  "restore_processes"?: string;
 }
 
 export interface WSReleaseCommitReq {

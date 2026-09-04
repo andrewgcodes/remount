@@ -187,7 +187,7 @@ func (v *cowVolume) Checkpoint(ctx context.Context, excludes []string, files Sna
 		return errors.New("firecracker: incomplete full checkpoint inputs")
 	}
 	if files.Compatibility != v.provider.compat {
-		return proto.Err(proto.CodeConflict, "Firecracker snapshot compatibility changed while checkpointing")
+		return proto.Err(proto.CodeConflict, "Firecracker snapshot compatibility changed while checkpointing: machine=%+v volume=%+v", files.Compatibility, v.provider.compat)
 	}
 	sources := map[string]string{"disk.ext4": v.image.Path(), "vm.state": files.State, "vm.mem": files.Memory}
 	manifest := bundleManifest{Format: bundleFormat, Generation: generation, Compatibility: files.Compatibility}

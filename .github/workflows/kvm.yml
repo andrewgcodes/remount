@@ -38,13 +38,32 @@ jobs:
             echo "::error::unavailable: REMOUNT_FIRECRACKER_ROOTFS is not an explicit base rootfs artifact"
             exit 1
           fi
+          if [[ -z ${REMOUNT_FIRECRACKER_GUEST_MANIFEST:-} || ! -f ${REMOUNT_FIRECRACKER_GUEST_MANIFEST} ]]; then
+            echo "::error::unavailable: REMOUNT_FIRECRACKER_GUEST_MANIFEST is not an explicit guest manifest"
+            exit 1
+          fi
+          if [[ -z ${REMOUNT_FIRECRACKER_DATA_ROOT:-} || ! -d ${REMOUNT_FIRECRACKER_DATA_ROOT} ]]; then
+            echo "::error::unavailable: REMOUNT_FIRECRACKER_DATA_ROOT is not an explicit data root"
+            exit 1
+          fi
       - name: Run deterministic lifecycle proofs
         run: |
           set -euo pipefail
           go vet ./internal/workspace/firecracker
           go test -race -count=10 ./internal/workspace/firecracker
-      - name: Require integrated host adapters
+      - name: Run exact-host Firecracker conformance
         shell: bash
         run: |
-          echo "::error::unavailable: enable this lane only after the node-owned TAP, coherent CoW volume, jailed API, and guest-executor adapters are integrated"
-          exit 1
+          set -euo pipefail
+          mkdir -p artifacts
+          REMOUNT_FIRECRACKER_BINARY="$(command -v firecracker)" \
+          REMOUNT_FIRECRACKER_JAILER="$(command -v jailer)" \
+          REMOUNT_FIRECRACKER_CGROUP_PARENT="${REMOUNT_FIRECRACKER_CGROUP_PARENT:-remount}" \
+            ./scripts/firecracker-conformance.sh 2>&1 | tee artifacts/firecracker-conformance.log
+      - name: Archive exact-host evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: firecracker-kvm-${{ github.sha }}
+          path: artifacts/firecracker-conformance.log
+          if-no-files-found: error

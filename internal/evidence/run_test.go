@@ -271,7 +271,7 @@ func TestHostProbesComeFromTheCheckedInGateScripts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write(backendGatesScript, "#!/bin/sh\nprintf 'docker status=available server_version=29.4.1\\n'\nprintf 'gvisor status=unavailable reason=runsc is not registered with Docker\\n'\nexit 4\n")
+	write(backendGatesScript, "#!/bin/sh\n[ \"${1:-}\" = --probe ] || exit 2\nprintf 'docker status=available server_version=29.4.1\\n'\nprintf 'gvisor status=unavailable reason=runsc is not registered with Docker\\n'\nexit 4\n")
 	write(firecrackerGateScript, "#!/bin/sh\necho 'UNAVAILABLE: /dev/kvm is not read-write' >&2\nexit 77\n")
 
 	probes := ProbeBackends(context.Background(), dir)

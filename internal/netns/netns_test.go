@@ -31,8 +31,10 @@ func (f *fakeKernel) CreateNamespace(context.Context, string) (string, error) {
 }
 func (f *fakeKernel) CreateVeth(context.Context, string, string, string) error { return f.call("veth") }
 func (f *fakeKernel) Configure(context.Context, string, Link) error            { return f.call("configure") }
-func (f *fakeKernel) InstallDenyAll(context.Context, string) error             { return f.call("deny") }
-func (f *fakeKernel) PermitBroker(context.Context, string, netip.AddrPort) error {
+func (f *fakeKernel) InstallDenyAll(context.Context, string, Link) error {
+	return f.call("deny")
+}
+func (f *fakeKernel) PermitBroker(context.Context, string, Link, netip.AddrPort) error {
 	return f.call("permit")
 }
 func (f *fakeKernel) BringUp(context.Context, string, string) error { return f.call("up") }
