@@ -663,6 +663,59 @@ func TestNodeUplinkFlapKeepsSessionRunning(t *testing.T) {
 	}
 }
 
+func TestStaleDetachDoesNotCancelReplacementAttach(t *testing.T) {
+	w := newWorld(t)
+	w.node("n1", nil)
+	operator := w.client("operator")
+	browser := w.client("browser")
+	ws := mustWS(t, operator, proto.WorkspaceSpec{})
+	ctx := ctxT(t, 60*time.Second)
+	s, err := operator.Exec(ctx, proto.SOpenReq{
+		WS:      ws.ID,
+		Program: []string{"sh", "-c", "printf first; while [ ! -f go ]; do sleep 0.01; done; printf second"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := browser.Attach(ctx, ws.ID, s.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prefix bytes.Buffer
+	for ch := range first.Chunks() {
+		if ch.Stream == proto.StreamStdout {
+			prefix.Write(ch.Data)
+		}
+		if prefix.String() == "first" {
+			break
+		}
+	}
+
+	replacement, err := browser.Attach(ctx, ws.ID, s.ID, first.Next())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := operator.WriteFile(ctx, ws.ID, "go", nil, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	exit := client.Copy(replacement, &output, nil)
+	if err := replacement.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "second" {
+		t.Fatalf("replacement output = %q", output.String())
+	}
+	if exit == nil || exit.Code != 0 {
+		t.Fatalf("replacement exit = %+v", exit)
+	}
+}
+
 // R5: node dies; its lease expires; another eligible node claims the
 // workspace and restores it from the last snapshot. Also exercises an
 // explicit graceful move first (which is what records LastSnapshot).

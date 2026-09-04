@@ -4321,6 +4321,9 @@
         },
         "s": {
           "type": "string"
+        },
+        "subscription": {
+          "type": "string"
         }
       },
       "required": [
@@ -4346,6 +4349,9 @@
           "type": "boolean"
         },
         "s": {
+          "type": "string"
+        },
+        "subscription": {
           "type": "string"
         }
       },

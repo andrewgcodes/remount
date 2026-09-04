@@ -235,10 +235,11 @@ type ws struct {
 
 // subscriber streams one session's log to one client.
 type subscriber struct {
-	client  string
-	ws      string
-	session string
-	cancel  context.CancelFunc
+	client       string
+	ws           string
+	session      string
+	subscription string
+	cancel       context.CancelFunc
 }
 
 type preparedRelease struct {
@@ -2515,7 +2516,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		n.subscribe(p, f.From, s, req.From)
+		n.subscribe(p, f.From, s, req.From, req.Subscription)
 		return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq()}, nil
 	case proto.OpSInput:
 		req, err := decode[proto.SInputReq](f)
@@ -2565,7 +2566,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
-		n.unsubscribe(f.From, s.ID)
+		n.unsubscribe(f.From, s.ID, req.Subscription)
 		if req.Kill {
 			n.sessions.Remove(s.ID, true)
 		}
@@ -3242,7 +3243,7 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 		}
 	}
 	if !req.NoSubscribe {
-		n.subscribe(p, client, s, 0)
+		n.subscribe(p, client, s, 0, "")
 	}
 	return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq()}, nil
 }
@@ -3285,17 +3286,17 @@ func (n *Node) portOpen(ctx context.Context, p *transport.Peer, client string, c
 		}
 		return nil, proto.Err(proto.CodeUnreachable, "port %d: %s", req.Port, msg)
 	}
-	n.subscribe(p, client, s, 0)
+	n.subscribe(p, client, s, 0, "")
 	return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq()}, nil
 }
 
 // subscribe streams s's log to client from seq `from` until the client
 // detaches, the connection dies, or the log ends. One stream per
 // (client, session): a re-attach replaces the previous cursor.
-func (n *Node) subscribe(p *transport.Peer, client string, s *session.Session, from uint64) {
+func (n *Node) subscribe(p *transport.Peer, client string, s *session.Session, from uint64, subscription string) {
 	key := client + "|" + s.ID
 	ctx, cancel := context.WithCancel(context.Background())
-	sub := &subscriber{client: client, ws: s.WS, session: s.ID, cancel: cancel}
+	sub := &subscriber{client: client, ws: s.WS, session: s.ID, subscription: subscription, cancel: cancel}
 	n.mu.Lock()
 	if old, ok := n.subs[key]; ok {
 		old.cancel()
@@ -3346,11 +3347,14 @@ func (n *Node) subscribe(p *transport.Peer, client string, s *session.Session, f
 	}()
 }
 
-func (n *Node) unsubscribe(client, sid string) {
+func (n *Node) unsubscribe(client, sid, subscription string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	key := client + "|" + sid
 	if s, ok := n.subs[key]; ok {
+		if subscription != "" && s.subscription != subscription {
+			return
+		}
 		s.cancel()
 		delete(n.subs, key)
 	}
