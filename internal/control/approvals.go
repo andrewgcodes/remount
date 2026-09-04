@@ -669,65 +669,86 @@ func (c *Control) approvalDecide(ctx context.Context, subject Subject, req *prot
 		c.mu.Unlock()
 		return nil, proto.Err(proto.CodeInternal, "approval %s has unknown kind %q", ap.ID, kind)
 	}
-	live.Status = proto.ApprovalDecided
-	live.Decision = &decision
-	if live.Kind == proto.ApprovalEgress {
-		live.ExpiresAt = decision.At + c.opts.ApprovalDecisionTTL.Milliseconds()
+	// The decision is a candidate installed under c.mu so the transaction and
+	// the agent's derived status see it; every failure below restores the
+	// pending row and its dirty marker before the lock is released.
+	decided := copyApproval(live)
+	decided.Status = proto.ApprovalDecided
+	decided.Decision = &decision
+	if decided.Kind == proto.ApprovalEgress {
+		decided.ExpiresAt = decision.At + c.opts.ApprovalDecisionTTL.Milliseconds()
 	}
-	c.markApprovalDirty(live)
-	a := c.agents[live.Agent]
-	ws := c.workspaces[live.WS]
+	priorDirty, wasDirty := c.dirtyApprovals[live.ID]
+	c.approvals[live.ID] = decided
+	c.markApprovalDirty(decided)
+	restore := func() {
+		c.approvals[live.ID] = live
+		if wasDirty {
+			c.dirtyApprovals[live.ID] = priorDirty
+		} else {
+			delete(c.dirtyApprovals, live.ID)
+		}
+	}
+	a := c.agents[decided.Agent]
+	ws := c.workspaces[decided.WS]
 	eventType := proto.EvApprovalDecided
-	if live.Kind == proto.ApprovalEgress {
+	if decided.Kind == proto.ApprovalEgress {
 		if decision.Denied {
 			eventType = proto.EvEgressDenied
 		} else {
 			eventType = proto.EvEgressAllowed
 		}
 	}
-	events := []*proto.Event{c.approvalEvent(eventType, live, ws, subject.ID, "", map[string]any{
-		"option": decision.Option, "denied": decision.Denied, "by": subject.ID, "run": live.Run,
-		"approved_by": subject.ID, "decision_id": live.ID, "remember": decision.Remember, "reason": "approval_decision",
+	events := []*proto.Event{c.approvalEvent(eventType, decided, ws, subject.ID, "", map[string]any{
+		"option": decision.Option, "denied": decision.Denied, "by": subject.ID, "run": decided.Run,
+		"approved_by": subject.ID, "decision_id": decided.ID, "remember": decision.Remember, "reason": "approval_decision",
 	})}
 	var send *proto.AgentApprovalDecidedReq
 	node := ""
 	if a != nil {
+		agentBefore := copyAgent(a)
 		a.PendingApprovals = c.pendingApprovalsLocked(a.ID)
 		more, err := c.refreshAgentStatusLocked(a, subject.ID)
 		if err != nil {
+			*a = *agentBefore
+			restore()
 			c.mu.Unlock()
 			return nil, err
 		}
 		events = append(events, more...)
-		if run := findRun(a, live.Run); run != nil && run.State == proto.AgentRunActive && run.Node != "" {
-			send = &proto.AgentApprovalDecidedReq{Agent: a.ID, Run: run.ID, Approval: live.ID, Decision: decision}
+		if run := findRun(a, decided.Run); run != nil && run.State == proto.AgentRunActive && run.Node != "" {
+			send = &proto.AgentApprovalDecidedReq{Agent: a.ID, Run: run.ID, Approval: decided.ID, Decision: decision}
 			node = run.Node
 		}
 		if err := c.persistAgentRows(a, scope, req.IdempotencyKey, proto.OpApprovalDecide, req, struct{}{}, events...); err != nil {
+			*a = *agentBefore
+			restore()
 			c.mu.Unlock()
 			return nil, err
 		}
 	} else {
 		var nextWS *proto.Workspace
-		if live.Kind == proto.ApprovalEgress && !decision.Denied && decision.Remember == proto.ApprovalRememberHost && ws != nil {
+		if decided.Kind == proto.ApprovalEgress && !decision.Denied && decision.Remember == proto.ApprovalRememberHost && ws != nil {
 			next := *ws
 			security, normalizeErr := proto.NormalizeSecurity(ws.Spec.Security)
 			if normalizeErr != nil {
+				restore()
 				c.mu.Unlock()
 				return nil, normalizeErr
 			}
 			next.Spec = ws.Spec
 			next.Spec.Security = security
 			remembered := proto.EgressRule{
-				ID: "approved-" + live.ID, Mode: proto.EgressModeAllow, Protocol: ruleProtocol(next.Spec.Security.Network.Rules, live.Rule), Hosts: []string{live.Host},
+				ID: "approved-" + decided.ID, Mode: proto.EgressModeAllow, Protocol: ruleProtocol(next.Spec.Security.Network.Rules, decided.Rule), Hosts: []string{decided.Host},
 			}
 			next.Spec.Security.Network.Rules = append([]proto.EgressRule{remembered}, next.Spec.Security.Network.Rules...)
 			nextWS = &next
-			events = append(events, c.approvalEvent(proto.EvPolicyUpdated, live, &next, subject.ID, "", map[string]any{
-				"rule": live.Rule, "host": live.Host, "decision_id": live.ID,
+			events = append(events, c.approvalEvent(proto.EvPolicyUpdated, decided, &next, subject.ID, "", map[string]any{
+				"rule": decided.Rule, "host": decided.Host, "decision_id": decided.ID,
 			}))
 		}
 		if err := c.persistEgressDecision(nextWS, scope, req, events); err != nil {
+			restore()
 			c.mu.Unlock()
 			return nil, err
 		}
@@ -735,7 +756,7 @@ func (c *Control) approvalDecide(ctx context.Context, subject Subject, req *prot
 			c.workspaces[nextWS.ID] = nextWS
 		}
 	}
-	cp := copyApproval(live)
+	cp := copyApproval(decided)
 	c.mu.Unlock()
 	metrics.ApprovalsDecided.Inc()
 	if send != nil && c.send != nil {
