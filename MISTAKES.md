@@ -1177,6 +1177,47 @@ This is #45's lesson ("a measurement of the primitive is not a measurement of
 the path") turned around: a measurement of the *path* is not an attribution to
 a *component* either. Both directions need the actual number.
 
+## 48. Giving up one resource while still holding the ones beneath it
+
+Four defects found on 2026-09-04, in two different backends, are the same
+mistake:
+
+| Where | Gave up | Still held |
+|---|---|---|
+| gVisor, killed run | the process | its netns, its veth, its sandbox |
+| gVisor, `runsc delete` | the container | the `nsfs` mount at `<root>/null-netns` |
+| Firecracker, `quarantineMaterialization` | the handle and its filesystem | the backend's live-workspace registration |
+| Firecracker, same path | the network policy | the TAP, because the microVM still had it open |
+
+Each one is a cleanup path that released the thing it was thinking about and
+left the thing underneath it. None of them fails loudly at the moment of the
+mistake. They all fail later, on somebody else's operation, with an error that
+names the wrong problem:
+
+- `create veth: file exists` — the real problem was a sandbox nobody killed.
+- `firecracker workspace is already active` — the real problem was a handle
+  nobody released, and the message actively contradicts the truth, because the
+  workspace was quarantined precisely for being *not* active.
+- `delete TAP: device or resource busy` — the real problem was a VM nobody
+  stopped.
+
+The compounding is what makes this expensive. Fixing the first one only reveals
+the second, because the second was never reachable while the first was in the
+way. The Firecracker lane took three rounds of exactly that: fix the handle
+registry, discover the network lease; and the third is still open.
+
+**Lesson.** A cleanup path is not correct because it releases *a* resource; it
+is correct when it releases everything it acquired, in the reverse order it
+acquired them, including the ones acquired by things it called. When writing
+one, list the acquisitions and walk the list backwards. When reading an error
+that names a file, a device, or a lock as busy or existing, do not treat the
+name as the subject — it is the fingerprint of an owner nobody let go of, and
+the owner is what to look for.
+
+The corollary for a *retry*: a retry that keeps producing the same conflict is
+not a flaky resource, it is the previous attempt still holding it. The node in
+this case retried on a five-second backoff, forever, against itself.
+
 ---
 
 That playbook is also the cross-cutting pattern analysis for mistakes 23-41:

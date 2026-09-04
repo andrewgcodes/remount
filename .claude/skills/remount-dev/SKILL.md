@@ -189,6 +189,19 @@ here against 5 ms unloaded); and `control.(*Control).dispatch` contention is the
 control plane's single state machine lock, which `wsReady`, `wsCreate` and
 `wsClaim` legitimately serialise on.
 
+**An error names a file, device or lock as "busy" or "exists".** The name is not
+the subject. It is the fingerprint of an owner that a cleanup path failed to
+release, and the owner is what to look for. `create veth: file exists` meant a
+sandbox nobody killed; `firecracker workspace is already active` meant a handle
+nobody released, on a workspace that had been quarantined precisely for *not*
+being active; `delete TAP: device or resource busy` meant a microVM nobody
+stopped.
+
+The same shape applies to a retry loop. A retry that keeps hitting the same
+conflict is almost never a flaky resource — it is the previous attempt still
+holding it. In one case a node retried on a five-second backoff, forever,
+against itself. See MISTAKES.md #48.
+
 **A workspace sits pending.** `remount ws get WS` and compare
 `spec.requires` and `spec.placement` against `remount nodes`. Eligibility is
 the intersection of every constraint.
