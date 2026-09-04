@@ -1227,6 +1227,9 @@ func extract(root string, r io.Reader, limits RestoreLimits) error {
 		if err != nil {
 			return err
 		}
+		if err := validatePlatformArchiveName(name); err != nil {
+			return err
+		}
 		if name == "." {
 			continue
 		}
@@ -1317,23 +1320,11 @@ func extract(root string, r io.Reader, limits RestoreLimits) error {
 		if err := rr.Chtimes(dirs[i].name, dirs[i].mtime, dirs[i].mtime); err != nil {
 			return err
 		}
-		f, err := rr.Open(dirs[i].name)
-		if err != nil {
-			return err
-		}
-		err = f.Sync()
-		_ = f.Close()
-		if err != nil {
+		if err := syncRootPath(rr, dirs[i].name); err != nil {
 			return err
 		}
 	}
-	f, err := rr.Open(".")
-	if err != nil {
-		return err
-	}
-	err = f.Sync()
-	_ = f.Close()
-	return err
+	return syncRootPath(rr, ".")
 }
 
 type boundedCompressedReader struct {
@@ -1451,15 +1442,6 @@ func rejectSymlinkParents(root *os.Root, name string) error {
 		}
 	}
 	return nil
-}
-
-func syncDir(name string) error {
-	f, err := os.Open(name)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
 }
 
 // SnapshotToStore snapshots root straight into the store and returns the id.

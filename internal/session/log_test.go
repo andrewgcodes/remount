@@ -21,6 +21,7 @@ func TestLogAppendReadCursor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = l.Release() })
 	if s, _ := l.Append(1, []byte("a")); s != 0 {
 		t.Fatal(s)
 	}
@@ -104,6 +105,7 @@ func TestLogEvictsToSpillAndReplays(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = l.closeLocal() })
 	var want []byte
 	for i := 0; i < 50; i++ {
 		piece := bytes.Repeat([]byte{byte('a' + i%26)}, 10)
@@ -206,6 +208,7 @@ func TestLogSpillRotation(t *testing.T) {
 func TestLogEvictsByChunkCount(t *testing.T) {
 	dir := t.TempDir()
 	l, _ := NewLog(LogOptions{MemBytes: 1 << 20, MaxChunks: 8, SpillBytes: 1 << 20, SpillPath: filepath.Join(dir, "spill")})
+	t.Cleanup(func() { _ = l.Release() })
 	for i := 0; i < 100; i++ {
 		l.Append(1, []byte{byte(i)})
 	}
@@ -234,6 +237,7 @@ func TestSpillFailurePreservesContiguousMemoryAndReturnsError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = l.Release() })
 	for i := 0; i < 3; i++ {
 		if _, err := l.Append(1, bytes.Repeat([]byte{byte(i)}, 10)); err != nil {
 			t.Fatal(err)
@@ -274,6 +278,7 @@ func TestReadSpillHonorsBatchLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = l.closeLocal() })
 	for i := 0; i < 100; i++ {
 		if _, err := l.Append(1, []byte{byte(i)}); err != nil {
 			t.Fatal(err)
@@ -466,6 +471,7 @@ func TestTieredLogRecordFailureRetainsContiguousLocalCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = l.closeLocal() })
 	for i := 0; i < 2; i++ {
 		if _, err := l.Append(1, bytes.Repeat([]byte{byte(i)}, 16)); err != nil {
 			t.Fatal(err)
@@ -509,6 +515,7 @@ func TestTieredLogNamesUnavailableBlobRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = l.closeLocal() })
 	for i := 0; i < 6; i++ {
 		if _, err := l.Append(1, bytes.Repeat([]byte{byte(i)}, 8)); err != nil {
 			t.Fatal(err)
@@ -591,6 +598,7 @@ func TestTieredLogConcurrentAppendAndRemoteReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = l.closeLocal() })
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan error, 1)

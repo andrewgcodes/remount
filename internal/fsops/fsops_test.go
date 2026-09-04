@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -133,12 +134,12 @@ func TestReadWriteListStat(t *testing.T) {
 	os.Chmod(filepath.Join(root, "a/b/c.txt"), 0o600)
 	f.Write("a/b/c.txt", []byte("x"), 0, false, false)
 	st, _ := f.Stat("a/b/c.txt")
-	if st.Mode != 0o600 || st.Size != 1 || st.IsDir {
+	if (runtime.GOOS != "windows" && st.Mode != 0o600) || st.Size != 1 || st.IsDir {
 		t.Fatalf("%+v", st)
 	}
 	f.Write("exe.sh", []byte("#!/bin/sh"), 0o755, false, false)
 	st, _ = f.Stat("exe.sh")
-	if st.Mode != 0o755 {
+	if runtime.GOOS != "windows" && st.Mode != 0o755 {
 		t.Fatalf("%o", st.Mode)
 	}
 	ents, err := f.List("/")
@@ -238,7 +239,7 @@ func TestEditAtomic(t *testing.T) {
 		t.Fatalf("%q", r.Data)
 	}
 	st, _ := f.Stat("m.go")
-	if st.Mode != 0o600 {
+	if runtime.GOOS != "windows" && st.Mode != 0o600 {
 		t.Fatalf("mode not preserved: %o", st.Mode)
 	}
 	// Ambiguous edit: nothing applied.

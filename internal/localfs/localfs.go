@@ -219,7 +219,7 @@ func extraTree(extra ExtraTree) (artifact.Tree, bool, error) {
 
 func dirSize(root *os.Root, rel string) (int64, error) {
 	var total int64
-	err := fs.WalkDir(root.FS(), filepath.FromSlash(rel), func(p string, d fs.DirEntry, err error) error {
+	err := fs.WalkDir(root.FS(), rel, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
