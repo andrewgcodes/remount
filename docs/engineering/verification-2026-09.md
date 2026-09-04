@@ -152,6 +152,18 @@ OpenCode's workspace config directory. The pin probe now uses a temporary
 `HOME`; the actual model run still uses the workspace home and the same
 catalog and isolation assertions.
 
+**The rerun exposed additional failures while heavyweight packages competed
+for the same host.** The ordinary install lane lost its
+standalone node before destroy and reported `workspace source node ... is
+unavailable; destroy remains uncommitted`. The race conformance target
+reported a stale Bob grant in `TestE8PrincipalRevocationComposes`, 200
+post-failover reattach deadlines in `TestHandoffScaleAndControlFailover`, and
+`openat .local/state/opencode/locks/...: permission denied` while the Plan B
+lane snapshotted OpenCode state. Focused race reruns of those three simulation
+tests passed. The ordinary and race-conformance targets now serialize
+packages with `-p 1`, retaining all tests and concurrency within each package
+while removing competition between unrelated heavyweight packages.
+
 **A Windows-hosted Docker conformance run selected Windows commands for a
 Linux workspace.** Command selection was compiled from the runner's OS, so
 Docker sessions received `cmd.exe` even though they execute inside Linux. The
