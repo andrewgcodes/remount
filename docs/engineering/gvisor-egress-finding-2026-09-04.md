@@ -364,7 +364,16 @@ what a quarantined workspace *is*, and it wants deciding rather than patching.
 
 None of these are exotic. They are the first three things that happen when you
 create one workspace, and they were reachable the moment a host with `/dev/kvm`
-existed. `.github/workflows/kvm.yml` fails its last step on purpose "until the
-adapters are integrated" — but the adapters are integrated, in
-`cmd/remount/build_node.go`, and have been. What was missing was a host, and the
-host was available all along behind a flag nobody had tried.
+existed.
+
+`.github/workflows/kvm.yml` fails its last step on purpose "until the node-owned
+TAP, coherent CoW volume, jailed API, and guest-executor adapters are
+integrated". That instruction is stale, and the history says so precisely: the
+four adapters are constructed in `cmd/remount/build_node.go` —
+`NewJailerFactory`, `NewSystemNetworkProvider`, `NewReflinkStore` plus
+`NewCoWVolumeProvider`, and `NewGuestBridge` — and they were wired by `a3b5235`,
+while the workflow's deliberate failure was last touched by the earlier
+`5254695`. Nobody went back to it after the integration landed.
+
+So what was missing was never the adapters. It was a host, and the host was
+available the whole time behind a Colima flag nobody had tried.
