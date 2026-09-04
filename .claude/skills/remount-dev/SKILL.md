@@ -218,6 +218,17 @@ and node enrollment, restart/re-adoption when persistence changed, inspection
 through events/metrics/doctor, and verified cleanup. Do not print or place a
 real credential in an argument, workspace, fixture, log or commit.
 
+**Check that `git status` can see everything you added.** A `.gitignore`
+pattern without a leading slash matches at every depth, not just the repository
+root, so a new directory can be invisible from the moment it is created. This
+happened: `remount-node/`, written for the data directory `remount up` creates,
+also matched `deploy/helm/remount-node/`, and an entire Helm chart was silently
+absent from `git status` and would have been left out of its own commit. After
+adding a directory, confirm `git status --short` lists it, and if it does not,
+`git check-ignore -v <path>` names the pattern and the line responsible. Same
+lesson as the secret scan: a clean result and a broken instrument look
+identical until you make it report something you planted.
+
 `scripts/lint-locks.sh` catches reads of mutex-guarded state after an unlock.
 That class of bug appeared once in this codebase, failed roughly one run in
 four under `-race`, and looked like a false positive because the unlock and
