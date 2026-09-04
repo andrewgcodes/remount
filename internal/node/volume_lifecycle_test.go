@@ -208,7 +208,7 @@ func TestReleasePreparedProofAndCommitTombstoneSurviveRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { n.sessions.Close() })
+	t.Cleanup(func() { closeNodeRuntimeForTest(n) })
 	w, root := releaseTestWorkspace(t, n, "ws_release_restart", nil)
 	req := &proto.WSReleaseReq{WS: w.ID, Gen: w.Generation}
 	prepared, err := n.release(context.Background(), req)
@@ -217,11 +217,12 @@ func TestReleasePreparedProofAndCommitTombstoneSurviveRestart(t *testing.T) {
 	}
 	result := prepared.(proto.WSReleasedReq)
 
+	closeNodeRuntimeForTest(n)
 	restarted, err := New(Options{DataDir: directory})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { restarted.sessions.Close() })
+	t.Cleanup(func() { closeNodeRuntimeForTest(restarted) })
 	if _, err := restarted.release(context.Background(), &proto.WSReleaseReq{
 		WS: w.ID, Gen: w.Generation, Tenant: "other-tenant",
 	}); err == nil {
@@ -260,18 +261,19 @@ func TestReleaseAbortAfterRestartRebuildsRuntimeAndExactPins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { n.sessions.Close() })
+	t.Cleanup(func() { closeNodeRuntimeForTest(n) })
 	mount := proto.VolumeMount{ID: "dataset", Path: "/data", Version: 6, Artifact: lifecycleArtifact(t, n)}
 	w, _ := releaseTestWorkspace(t, n, "ws_release_abort_restart", []proto.VolumeMount{mount})
 	if _, err := n.release(context.Background(), &proto.WSReleaseReq{WS: w.ID, Gen: w.Generation}); err != nil {
 		t.Fatal(err)
 	}
 
+	closeNodeRuntimeForTest(n)
 	restarted, err := New(Options{DataDir: directory, Volumes: volumes})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { restarted.sessions.Close() })
+	t.Cleanup(func() { closeNodeRuntimeForTest(restarted) })
 	record, _ := restarted.releaseRecord(w.ID)
 	commit := &proto.WSReleaseCommitReq{ID: w.ID, Gen: w.Generation, OperationID: record.OperationID}
 	if err := restarted.releaseAbort(context.Background(), commit); err != nil {
@@ -297,11 +299,12 @@ func TestReleaseAbortAfterRestartRebuildsRuntimeAndExactPins(t *testing.T) {
 	// A crash after the durable published tombstone loses the in-memory
 	// runtime. The same handshake must reconstruct it before acknowledging the
 	// control-plane retry; a published journal is not by itself serviceability.
+	closeNodeRuntimeForTest(restarted)
 	again, err := New(Options{DataDir: directory, Volumes: volumes})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { again.sessions.Close() })
+	t.Cleanup(func() { closeNodeRuntimeForTest(again) })
 	if err := again.releaseAbort(context.Background(), commit); err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +395,7 @@ func TestRestartRefusesQuarantineWithoutDurableQuiescenceProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { n.sessions.Close() })
+	t.Cleanup(func() { closeNodeRuntimeForTest(n) })
 	w, root := releaseTestWorkspace(t, n, "ws_quarantine_ambiguous", nil)
 	req := proto.WSQuarantineReq{
 		OperationID: "fleet-ambiguous", WS: w.ID, Gen: w.Generation,
@@ -417,7 +420,7 @@ func TestRestartRefusesQuarantineWithoutDurableQuiescenceProof(t *testing.T) {
 		close(release)
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { restarted.sessions.Close() })
+	t.Cleanup(func() { closeNodeRuntimeForTest(restarted) })
 	if _, err := restarted.quarantine(context.Background(), &req); err == nil {
 		close(release)
 		t.Fatal("restart acknowledged quarantine without durable producer-join proof")
@@ -465,7 +468,7 @@ func TestQuarantineJournalRetainsNonterminalAuthorityAtCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { restarted.sessions.Close() })
+	t.Cleanup(func() { closeNodeRuntimeForTest(restarted) })
 	record, ok := restarted.quarantineRecord(first.OperationID, first.WS)
 	if !ok || record.State != quarantineCheckpointed {
 		t.Fatalf("nonterminal quarantine proof was pruned: %+v present=%v", record, ok)

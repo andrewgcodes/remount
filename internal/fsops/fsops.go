@@ -74,6 +74,9 @@ func cleanName(p string) (string, error) {
 	if strings.IndexByte(p, 0) >= 0 {
 		return "", proto.Err(proto.CodeBadRequest, "path contains NUL")
 	}
+	if err := validatePlatformPath(p); err != nil {
+		return "", err
+	}
 	clean := path.Clean("/" + strings.ReplaceAll(p, "\\", "/"))
 	name := strings.TrimPrefix(clean, "/")
 	if name == "" {

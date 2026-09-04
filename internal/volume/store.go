@@ -131,12 +131,7 @@ func saveState(filename string, state catalogState) error {
 		return err
 	}
 	keep = true
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
+	return syncParentDir(dir)
 }
 
 func cloneState(state catalogState) (catalogState, error) {

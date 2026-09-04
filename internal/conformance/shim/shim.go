@@ -768,6 +768,14 @@ func interpret(program []string) (stdout []byte, code int, interactive bool) {
 		n := 0
 		_, _ = fmt.Sscanf(program[2], "exit %d", &n)
 		return nil, n, false
+	case strings.EqualFold(program[0], "powershell.exe") && strings.Contains(strings.Join(program[1:], " "), "$input"):
+		return nil, 0, true
+	case strings.EqualFold(program[0], "cmd.exe") && len(program) >= 6 && strings.EqualFold(program[4], "echo"):
+		return []byte(strings.Join(program[5:], " ") + "\n"), 0, false
+	case strings.EqualFold(program[0], "cmd.exe") && len(program) == 6 && strings.EqualFold(program[4], "exit"):
+		n := 0
+		_, _ = fmt.Sscanf(program[5], "%d", &n)
+		return nil, n, false
 	default:
 		return nil, 0, false
 	}

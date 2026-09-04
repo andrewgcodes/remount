@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -310,7 +311,9 @@ func TestCredentialFileIsMode0600AndServerScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS == "windows" {
+		t.Log("unavailable: Go file modes do not expose Windows ACL confidentiality")
+	} else if info.Mode().Perm() != 0o600 {
 		t.Fatalf("credential mode=%o", info.Mode().Perm())
 	}
 	t.Setenv("REMOUNT_CREDENTIAL_FILE", path)

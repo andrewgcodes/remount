@@ -12,11 +12,6 @@ import (
 
 // ---- cursor output, input deduplication and gaps -------------------------
 
-// echoProgram is the smallest command every POSIX host can run. A
-// conformance suite that needed a language runtime in the workspace would be
-// testing the host, not the implementation.
-func echoProgram(text string) []string { return []string{"/bin/echo", text} }
-
 func checkSessInfoIsSeqZero(ctx context.Context, s *Session) error {
 	f, err := s.Fixture(ctx)
 	if err != nil {
@@ -110,7 +105,7 @@ func checkSessInputDeduplicated(ctx context.Context, s *Session) error {
 		return err
 	}
 	var res SOpenRes
-	open := SOpenReq{WS: f.WS.ID, Kind: "exec", Program: []string{"/bin/cat"}, Stdin: true, Grant: &f.Grant, Idem: s.Idem("dedup")}
+	open := SOpenReq{WS: f.WS.ID, Kind: "exec", Program: catProgram(), Stdin: true, Grant: &f.Grant, Idem: s.Idem("dedup")}
 	if err := s.CallNode(ctx, f.Node, "s.open", open, &res); err != nil {
 		return err
 	}
@@ -194,7 +189,7 @@ func checkSessWaitReportsExit(ctx context.Context, s *Session) error {
 		return err
 	}
 	var res SOpenRes
-	open := SOpenReq{WS: f.WS.ID, Kind: "exec", Program: []string{"/bin/sh", "-c", "exit 7"}, Grant: &f.Grant, Idem: s.Idem("wait")}
+	open := SOpenReq{WS: f.WS.ID, Kind: "exec", Program: exitProgram(7), Grant: &f.Grant, Idem: s.Idem("wait")}
 	if err := s.CallNode(ctx, f.Node, "s.open", open, &res); err != nil {
 		return err
 	}

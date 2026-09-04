@@ -34,8 +34,32 @@ func newTestNode(t *testing.T, configure func(*Options)) *Node {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { n.sessions.Close() })
+	t.Cleanup(n.shutdown)
 	return n
+}
+
+func closeNodeRuntimeForTest(n *Node) {
+	n.sessions.Close()
+	n.mu.Lock()
+	held := make(map[*ws]struct{}, len(n.workspaces)+len(n.prepared))
+	for _, w := range n.workspaces {
+		held[w] = struct{}{}
+	}
+	for _, prepared := range n.prepared {
+		held[prepared.workspace] = struct{}{}
+	}
+	n.mu.Unlock()
+	for w := range held {
+		if w != nil && w.handle != nil {
+			_ = w.handle.FS().Close()
+		}
+	}
+	if n.volumeRoot != nil {
+		if n.volumes != nil {
+			_ = n.volumes.Close()
+		}
+		_ = n.volumeRoot.Close()
+	}
 }
 
 func nodeDigest(body string) string {
@@ -67,7 +91,7 @@ func TestProvisionedIdentityIsPinnedAndCannotBeReplaced(t *testing.T) {
 	if n.ID() != "n_planned" {
 		t.Fatalf("node id = %q", n.ID())
 	}
-	n.sessions.Close()
+	closeNodeRuntimeForTest(n)
 	if _, err := New(Options{DataDir: dir, ID: "n_other"}); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("identity replacement error = %v", err)
 	}
@@ -125,7 +149,7 @@ func TestNewRemovesOnlyOwnedOrphanSpillFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.sessions.Close()
+	defer closeNodeRuntimeForTest(n)
 	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("orphan spill remains: %v", err)
 	}
@@ -155,7 +179,7 @@ func TestNodeArtifactGCIsReferenceAware(t *testing.T) {
 	for _, item := range []struct {
 		id, body string
 	}{{referenced, "referenced"}, {orphan, "orphan"}} {
-		dir := filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", item.id)
+		dir := filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", volumeArtifactName(item.id))
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -171,10 +195,10 @@ func TestNodeArtifactGCIsReferenceAware(t *testing.T) {
 	if !n.store.Has(referenced) || n.store.Has(orphan) || result.Removed != 1 {
 		t.Fatalf("collection = %+v, referenced=%t orphan=%t", result, n.store.Has(referenced), n.store.Has(orphan))
 	}
-	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", referenced)); err != nil {
+	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", volumeArtifactName(referenced))); err != nil {
 		t.Fatalf("referenced volume source removed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", orphan)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", volumeArtifactName(orphan))); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("orphan volume source remains: %v", err)
 	}
 	delete(n.workspaces, "ws_ref")
@@ -182,7 +206,7 @@ func TestNodeArtifactGCIsReferenceAware(t *testing.T) {
 	if err != nil || n.store.Has(referenced) || result.Removed != 1 {
 		t.Fatalf("post-release collection = %+v, retained=%t, err=%v", result, n.store.Has(referenced), err)
 	}
-	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", referenced)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", volumeArtifactName(referenced))); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("released volume source remains: %v", err)
 	}
 }
@@ -414,7 +438,7 @@ func TestPrepareVolumeArtifactRebuildsIncompleteSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	destination := filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant-a", id)
+	destination := filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant-a", volumeArtifactName(id))
 	if err := os.MkdirAll(destination, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +452,7 @@ func TestPrepareVolumeArtifactRebuildsIncompleteSource(t *testing.T) {
 	if err != nil || string(got) != "verified bytes" {
 		t.Fatalf("rebuilt source = %q, %v", got, err)
 	}
-	markerPath := filepath.Join(filepath.Dir(destination), ".complete-"+id)
+	markerPath := filepath.Join(filepath.Dir(destination), ".complete-"+volumeArtifactName(id))
 	marker, err := os.ReadFile(markerPath)
 	markerLines := strings.Split(strings.TrimSpace(string(marker)), "\n")
 	if err != nil || len(markerLines) != 2 || markerLines[0] != id || markerLines[1] == "" {
@@ -465,7 +489,7 @@ func TestPrepareVolumeArtifactEnforcesExpandedEntryLimit(t *testing.T) {
 	if err := n.prepareVolumeArtifact(context.Background(), "tenant-a", id); err == nil {
 		t.Fatal("expanded volume source exceeded entry limit without rejection")
 	}
-	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant-a", id)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant-a", volumeArtifactName(id))); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("over-limit source was published: %v", err)
 	}
 }
@@ -561,7 +585,7 @@ func (h *failingHandle) ResumeFenced(context.Context) error {
 }
 func (h *failingHandle) Destroy(context.Context) error {
 	h.destroyed.Add(1)
-	return nil
+	return h.fs.Close()
 }
 
 type fixedBackend struct {
@@ -798,6 +822,7 @@ func TestAuthoritativeCheckpointRevalidatesAfterLifecycleRemoval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = fs.Close() })
 	w := &ws{
 		Workspace: proto.Workspace{ID: "ws_checkpoint_race", Generation: 2},
 		handle:    &failingHandle{id: "ws_checkpoint_race", fs: fs},
@@ -1366,6 +1391,7 @@ func TestQuarantineFencesAndDestroyCommitIsIdempotent(t *testing.T) {
 
 	// A restarted node must be able to verify the durable phase-one proof and
 	// complete destruction without re-running the checkpoint.
+	closeNodeRuntimeForTest(n)
 	restarted, err := New(Options{
 		DataDir: n.opts.DataDir,
 		Dialer: transport.DialFunc(func(context.Context) (transport.Conn, error) {
@@ -1375,7 +1401,7 @@ func TestQuarantineFencesAndDestroyCommitIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer restarted.sessions.Close()
+	defer closeNodeRuntimeForTest(restarted)
 	if err := restarted.quarantineCommit(context.Background(), commit); err != nil {
 		t.Fatal(err)
 	}

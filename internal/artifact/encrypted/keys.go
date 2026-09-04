@@ -90,7 +90,7 @@ func NewFileMasterKey(path, keyID string) (*AESMasterKey, error) {
 	if !st.Mode().IsRegular() || st.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("encrypted artifact: master key path must be a regular file")
 	}
-	if st.Mode().Perm()&0o077 != 0 {
+	if err := validateMasterKeyPermissions(st); err != nil {
 		return nil, errors.New("encrypted artifact: master key file must not be group or world accessible")
 	}
 	f, err := os.Open(path)
@@ -102,7 +102,7 @@ func NewFileMasterKey(path, keyID string) (*AESMasterKey, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	if !opened.Mode().IsRegular() || opened.Mode().Perm()&0o077 != 0 || !os.SameFile(st, opened) {
+	if !opened.Mode().IsRegular() || validateMasterKeyPermissions(opened) != nil || !os.SameFile(st, opened) {
 		_ = f.Close()
 		return nil, errors.New("encrypted artifact: master key file changed during open")
 	}
