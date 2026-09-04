@@ -10,7 +10,6 @@ import (
 	"remount.dev/remount/internal/session"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -1013,6 +1012,9 @@ func TestAgentRunCancelInterruptsInstall(t *testing.T) {
 // whose children hold the group open, is killed and then abandoned rather
 // than pinning the run slot for as long as the tree lives.
 func TestHarnessExitIsBounded(t *testing.T) {
+	if !posixProcessGroups {
+		t.Skip("unavailable: this asserts a POSIX process-group property and uses /bin/sh")
+	}
 	cmd := exec.Command("/bin/sh", "-c", "exec >/dev/null 2>&1; trap '' TERM; sleep 60 & wait")
 	session.ConfigureProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
@@ -1032,7 +1034,7 @@ func TestHarnessExitIsBounded(t *testing.T) {
 	// The orphaned child is a zombie until init reaps it; give that a moment.
 	gone := false
 	for i := 0; i < 200 && !gone; i++ {
-		gone = syscall.Kill(-cmd.Process.Pid, 0) != nil
+		gone = !processGroupAlive(cmd.Process.Pid)
 		if !gone {
 			time.Sleep(10 * time.Millisecond)
 		}

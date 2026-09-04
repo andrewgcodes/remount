@@ -3610,7 +3610,14 @@ func (c *Control) wsDestroy(ctx context.Context, principal, id, idem string) err
 	}
 	if ws.State == proto.WSFailed {
 		c.mu.Unlock()
-		return proto.Err(proto.CodeConflict, "workspace requires reconciliation before destroy")
+		// A failed workspace has an unknown physical state, so destroying it
+		// could orphan a running process or a half-written tree. Containment
+		// is the reconciliation path, and naming it here matters: without it
+		// an operator meets a refusal with no next step and no way to learn
+		// one, which is how a recoverable workspace becomes a permanent
+		// resource leak in practice.
+		return proto.Err(proto.CodeConflict,
+			"workspace %s is failed and requires reconciliation before destroy: contain it first with `remount fleet quarantine --action freeze %s`, then destroy", id, id)
 	}
 	if ws.State == proto.WSClaiming && ws.ReleaseOperation != "" {
 		node, generation, operation := ws.Node, ws.Generation, ws.ReleaseOperation

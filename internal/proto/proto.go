@@ -230,6 +230,13 @@ var knownCapabilities = []string{
 	CapabilityIdentityAdmin,
 	CapabilityApprovals,
 	CapabilityEncryptedArtifacts,
+	// Defined but not yet offered: the guard in internal/e2ee negotiates the
+	// suite peer-to-peer inside its key exchange, but the client and node do
+	// not dial through it and the control plane does not issue peer bindings.
+	// Naming it here lets a profile require it and lets MissingCapabilities
+	// report its absence; it joins implementedCapabilities only when a peer
+	// built from this release actually offers it.
+	CapabilityE2EEPayloads,
 }
 
 // implementedCapabilities is what a peer built from this release offers.

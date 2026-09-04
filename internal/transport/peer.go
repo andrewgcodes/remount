@@ -178,7 +178,12 @@ func (p *Peer) Send(ctx context.Context, f *proto.Frame) error {
 		defer cancel()
 	}
 	if err := p.conn.Send(ctx, f); err != nil {
-		if !errors.Is(err, context.Canceled) {
+		// A refusal is not a broken connection. A Conn that declines to
+		// transmit one frame — a policy that will not send it in the clear,
+		// or a caller whose context went away — leaves the connection usable,
+		// and failing the peer here would turn one refused operation into a
+		// reconnect for every other caller sharing it.
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, ErrNotSent) {
 			p.fail(err)
 		}
 		return err

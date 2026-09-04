@@ -162,6 +162,137 @@ Do not invent these identifiers. Record them here when a real run is performed.
 
 ---
 
+## 2026-09-03 — Remount deployed to Modal, live, and judged conformant
+
+**Status: verified.**
+
+This entry supersedes nothing below it: the Modal *pool provisioner* lane
+(`internal/provision/modal`) remains unavailable for the reasons in the next
+section. What was verified here is the repository's own Modal deployment
+(`deploy/modal_app.py`), which is a different thing — a control plane and node
+running on Modal rather than Modal supplying nodes to a control plane.
+
+The `modal` CLI (1.5.5) was installed into a throwaway virtualenv and
+authenticated from the git-ignored root `.env`. No secret was printed.
+
+```sh
+make modal-binary                              # dist/remount-linux-amd64
+modal secret create remount-control REMOUNT_TOKEN=<generated>
+REMOUNT_MODAL_APP=remount-planb make modal-deploy
+```
+
+The deployment came up with a real public HTTPS endpoint:
+
+```
+https://action-dev--remount-planb-control.modal.run
+GET /healthz → 200 {"ok":true,"peers":1,"security_mode":"standalone",
+                    "security_ready":true,"serving":true}
+```
+
+One node attached and reported itself honestly:
+
+```
+linux/amd64  17 CPU  225104 MiB  process  labels map[vendor:modal zone:cloud]
+```
+
+A workspace was created and executed real work on that hardware:
+
+```
+running on: Linux 4.19.0-gvisor x86_64
+cpus: 17
+hello-from-modal
+```
+
+**The black-box conformance suite judged the live deployment over the public
+internet**, in `--endpoint` mode with no source access to the target:
+
+```
+CONFORMANT: https://action-dev--remount-planb-control.modal.run
+  53 passed, 0 failed, 14 unavailable of 67 requirements in 55.88s
+    required         52 passed, 0 failed, 0 unavailable
+    capability-gated  1 passed, 0 failed, 13 unavailable
+```
+
+This is the strongest form the suite supports: an already-running endpoint,
+judged only through public protocol, HTTP and event surfaces.
+
+**Honest limits.** The kernel string says `gvisor` because Modal runs its
+containers under gVisor. That is *Modal's* isolation of the whole node, not
+Remount's `enforced_gateway` backend, and it earns no capability: per Plan B
+§7.2 a provider lane that cannot run the inner gVisor contract "must not claim
+`isolated` or `multi_tenant`". The deployment ran in `standalone` security mode
+with a shared token, which is a development posture, not production. One node
+means placement and movement were not exercised.
+
+**Teardown, verified.** Workspace destroyed; `modal app stop remount-planb`
+(app shows `stopped`); the `remount-control` secret and the
+`remount-planb-data` volume deleted; the public endpoint now answers `404`; the
+local token file removed. The pre-existing `remount-openai` secret,
+`remount-demo-data` volume and `action-evals` app were left untouched.
+
+## 2026-09-03 — a workspace moved between Modal cloud and a laptop, live
+
+**Status: verified.** This is the product's central claim exercised across two
+providers, two operating systems and two CPU architectures.
+
+A control plane was deployed to Modal with a public HTTPS endpoint, and **this
+laptop was enrolled as a second node against it**, giving one fleet spanning
+cloud and local hardware:
+
+```
+n_06g6m8csgjdecnd7zy5yzy7qa0  true  linux/amd64   map[vendor:modal zone:cloud]
+n_06g6m8dfxch40da7s7jy62tbww  true  darwin/arm64  map[vendor:local zone:laptop]
+```
+
+A workspace was created on the cloud node, then moved to the laptop, then moved
+back. Each step appended to one file, and each step read what the previous host
+had written:
+
+| Step | Host | `uname -srm` | Generation |
+|---|---|---|---:|
+| 1 | Modal cloud | `Linux 4.19.0-gvisor x86_64` | 1 |
+| 2 | this laptop | `Darwin 25.3.0 arm64` | 2 |
+| 3 | Modal cloud | `Linux 4.19.0-gvisor x86_64` | 3 |
+
+Final contents of `journal.txt`, read on the cloud node after the round trip:
+
+```
+step-1-on-Linux
+step-2-on-Darwin
+step-3-back-on-Linux
+```
+
+Each move published a real checkpoint (`restored_from=art_sha256:89bd1d93de015…`
+then `art_sha256:a3f8f9248c94c…`) and advanced the generation exactly once. The
+filesystem crossed x86_64 → arm64 → x86_64 and Linux → Darwin → Linux intact.
+
+**Honest limits.** The moves restart processes: these are filesystem
+checkpoints, and `ws.moved` correctly reported `processes: restarted` rather
+than claiming continuity it did not have. No AI harness ran on the cloud node,
+because the deployed demo (`deploy/modal_app.py`) allows egress to
+`api.openai.com` but configures no binding, so it has no credential to broker —
+a real gap recorded below. Security mode was `standalone` with a shared token.
+
+**Teardown, verified.** Workspaces destroyed, local node stopped, app stopped
+and removed, `remount-control` secret and `remount-migrate-data` volume
+deleted. `modal app list` shows no deployed remount app; `modal secret list`
+shows no `remount-control`.
+
+### Gap found: the Modal demo cannot broker a credential
+
+`deploy/modal_app.py` passes `--allow api.openai.com` to the node but no
+`--bindings` to the server, so a workspace there can reach the provider and has
+nothing to send. A harness therefore cannot run on the deployed demo at all.
+
+A change adding a `b_openai` binding sourced from the existing `remount-openai`
+Modal secret was written and deployed, and the container did not come back
+healthy within ten minutes. Rather than push deployment code that had not been
+proven, the change was **reverted**. Closing this properly means adding the
+binding, confirming the container boots, and proving a brokered call from a
+Modal workspace with the key absent from every workspace path — the same scan
+the local E1 entry above performs. It is the prerequisite for running an agent
+on Modal and moving it, which remains unproven.
+
 ## 2026-09-03 — Modal pool lifecycle
 
 **Status: unavailable (externally gated). Credential verified.**

@@ -106,6 +106,16 @@ func protocolConstants(t *testing.T) []string {
 			return true
 		})
 	}
+	// Transport-layer ops are deliberately absent from the manifest. A sealed
+	// frame and a key exchange are consumed by the layer that produced them;
+	// they are not operations a harness can invoke, and advertising a tool
+	// that can never work is worse than not advertising one at all.
+	for _, transportOnly := range []string{proto.OpE2EEKeyExchange, proto.OpE2EESealed} {
+		if !values[transportOnly] {
+			t.Fatalf("%s is excluded from the MCP manifest but no longer exists; drop the exclusion", transportOnly)
+		}
+		delete(values, transportOnly)
+	}
 	out := make([]string, 0, len(values))
 	for value := range values {
 		out = append(out, value)

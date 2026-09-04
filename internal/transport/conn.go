@@ -19,6 +19,12 @@ import (
 // ErrClosed is returned once a Conn is closed, by either side or by a fault.
 var ErrClosed = errors.New("transport: connection closed")
 
+// ErrNotSent reports that a Conn refused to transmit one frame while the
+// connection itself stays usable: the frame never reached the wire, so
+// nothing downstream can have acted on it, and the peer is not torn down.
+// A Conn that layers policy over the wire (see internal/e2ee) wraps it.
+var ErrNotSent = errors.New("transport: frame not transmitted")
+
 // MaxFrameBytes bounds a single frame. Chunks are split well below this.
 const MaxFrameBytes = 4 << 20
 

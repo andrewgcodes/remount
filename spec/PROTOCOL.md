@@ -60,6 +60,27 @@ Error codes are stable: `bad_request`, `not_found`, `unsupported`,
 `unauthorized`, `conflict`, `evicted`, `unreachable`, `internal`, `timeout`,
 `closed`, `denied`, and `resource_exhausted`.
 
+When two peers negotiate `e2ee-payloads` (§3.1), every frame between them
+carries `op: "e2ee.sealed"` and a body of:
+
+```
+E2EESealed { sid: bytes(16), n: uint64, ct: bytes }
+```
+
+`ct` is AES-256-GCM over the deterministic CBOR of:
+
+```
+E2EEPayload { op, s, ws, seq, body, err }
+```
+
+`v`, `t`, `id`, `to`, `from` and `controller_epoch` stay in the clear because
+the relay routes on them. A receiver MUST refuse a sealed frame whose
+associated data does not match the frame it arrived in. The associated data is
+specified in ADR 0081 and binds the protocol version, the cipher suite, the
+direction, the session id, the record counter, the frame kind, the source and
+destination peer ids, and the correlation id — so a replayed, mutated or
+re-addressed frame fails to open rather than being interpreted.
+
 ## 3. Hello
 
 The first frame on every connection is `t: hello`. No other frame may precede
@@ -117,6 +138,7 @@ in the canonical order of the table below, `v1` first.
 | `identity-admin` | production tenant/principal onboarding operations | assume an unavailable management API exists |
 | `approvals` | held operations awaiting a decision | proceed while an approval is pending |
 | `encrypted-artifacts` | artifacts encrypted at rest | write or read a plaintext snapshot |
+| `e2ee-payloads` | end-to-end sealed operation payloads between peers | hand the relay every operation body and response in plaintext |
 
 A security profile requires the capabilities whose absence would break the
 promise the profile makes. `local` requires none, so an older node keeps
@@ -211,6 +233,27 @@ that has not renewed within the lease is fenced anyway, so no revoked grant
 outlives the lease. An old node that ignores these fields is exactly the
 failure the capability names, which is why `isolated` and `multi_tenant`
 require it (§3.1).
+
+### 4.2 Peer bindings (`e2ee-payloads`)
+
+A peer binding says which key answers for a peer id. It confers no authority:
+authorization remains the grant, unchanged.
+
+```
+PeerBinding { peer, key: bytes (ed25519), tenant, issued: int64,
+              exp: int64, sig: bytes }
+```
+
+`sig` is ed25519 over the deterministic CBOR encoding of the binding with `sig`
+omitted, made with the same control-plane key `HelloOK.pubkey` carries and
+grants are signed with, so a peer that can already verify a grant can verify a
+binding.
+
+A peer MUST refuse a binding whose `peer` does not match the peer the frame
+came from, whose `exp` has passed, or whose signature fails. A peer MUST NOT
+accept a binding from any source other than the control plane's signature — in
+particular, never from the relay's view of who is connected, because the relay
+is precisely the party the capability exists to distrust.
 
 ## 5. Workspaces and the claim queue
 
@@ -465,6 +508,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `diag` | C | `DiagReq{verify}` → control diagnostics |
 | `audit.export` | C | `AuditExportReq{tenant?, from, to}` → `AuditExportRes{manifest, signature, bundle}`; the range is INCLUSIVE of both endpoints and `from` must be at least 1. The tenant is resolved from the authenticated subject; a caller whose tenant is not `*` may not name another, `*` is never a valid export subject, and administrative authority is required. A range the log can no longer serve completely is `evicted` carrying the oldest retained sequence, never a shorter bundle. One bundle is bounded at 16 MiB and one range at 1,048,576 sequences (§11.1) |
 | `audit.key` | C | `AuditKeyReq{}` → `AuditKeyRes{key_id, algorithm, public_key}`; publishes only the verification half of the control plane's durable Ed25519 audit signing key, so a bundle can be verified without reaching the control plane |
+| `e2ee.bind` | C N | `E2EEBindReq{key}` → `E2EEBindRes{binding}`; issues a `PeerBinding` for the calling peer's own id and tenant. The control plane never signs a binding for another peer id, and a binding confers no authority: authorization remains the grant (§4.2) |
 
 Every mutating request carries an `idem` key. Replaying a request with the same
 key is a no-op that returns the original result. This is what makes a retry
