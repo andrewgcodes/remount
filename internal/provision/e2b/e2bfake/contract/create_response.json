@@ -1,0 +1,12 @@
+{
+  "_comment": "Canonical POST /sandboxes 201 body, captured from the real api.e2b.app on 2026-09-03. Note what is ABSENT: no metadata, no startedAt, no state. Only the list endpoint carries those. A driver that reads them here works against a generous fake and fails against the real service, so the fake must serve exactly this and no more.",
+  "_secret_fields": {
+    "_comment": "envdAccessToken is a live credential for the created sandbox. The driver must never read, log, or propagate it; it is listed here so its presence is a known part of the contract rather than a surprise.",
+    "fields": ["envdAccessToken"]
+  },
+  "sandboxID": "ilxua0yp34lgqd89vf3nq",
+  "templateID": "rki5dems9wqfm4r03t7g",
+  "alias": "base",
+  "clientID": "6532622b",
+  "envdVersion": "0.6.10"
+}

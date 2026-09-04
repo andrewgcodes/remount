@@ -20,18 +20,22 @@ import (
 	"remount.dev/remount/internal/workspace"
 )
 
-// TestRunOpenCodeDockerIntegration is the E1 integration lane: the real
-// OpenCode harness installed and run inside a docker workspace, talking to
-// the real OpenAI API through the broker with a key the container never
-// holds. The docker backend cooperates rather than enforces egress, so the
-// profile is local and the recipe's hosts come from the node allow list, as
-// they would under `remount standalone --allow`. It runs only when a daemon
-// is up and REMOUNT_INTEGRATION_OPENAI_KEY is set; everything else about the
-// run path is covered by the in-process tests.
+// TestRunOpenCodeDockerIntegration is the E1 integration lane and Plan B B7:
+// the real OpenCode harness installed and run inside a docker workspace,
+// talking to the real OpenAI API through the broker with a key the container
+// never holds. The docker backend cooperates rather than enforces egress, so
+// the profile is local and the recipe's hosts come from the node allow list,
+// as they would under `remount standalone --allow`.
+//
+// It is a supplement, not the required proof. The required proof is
+// TestPlanBOpenCodeDeterministicModelLane, which runs the same scenario and
+// the same broker path against a local model and needs no credential. When
+// the key is absent this lane is `unavailable` and is reported as such by the
+// evidence ledger; a lane that could not run is never a pass.
 func TestRunOpenCodeDockerIntegration(t *testing.T) {
 	key := os.Getenv("REMOUNT_INTEGRATION_OPENAI_KEY")
 	if key == "" {
-		t.Skip("REMOUNT_INTEGRATION_OPENAI_KEY not set")
+		t.Skip("B7 unavailable: REMOUNT_INTEGRATION_OPENAI_KEY is not set; the required deterministic lane is TestPlanBOpenCodeDeterministicModelLane")
 	}
 	image := os.Getenv("REMOUNT_INTEGRATION_IMAGE")
 	if image == "" {
@@ -47,7 +51,7 @@ func TestRunOpenCodeDockerIntegration(t *testing.T) {
 	}
 	w := newWorld(t, control.Binding{ID: "b_openai", Secret: key, Destinations: []string{"api.openai.com"}, TTLSec: 600})
 	pb, _ := workspace.NewProcess(filepath.Join(t.TempDir(), "p"))
-	w.nodeWith("dn", func(o *node.Options) {
+	n := w.nodeWith("dn", func(o *node.Options) {
 		o.Backends = workspace.NewRegistry(pb, d)
 		o.Allow = append(o.Allow, recipe.Hosts...)
 	})
@@ -59,7 +63,7 @@ func TestRunOpenCodeDockerIntegration(t *testing.T) {
 	}
 	res, err := launch.Start(ctx, c, launch.Options{
 		Recipe:   recipe,
-		Task:     "Create a file named GREETING.txt containing exactly the word hello. Do nothing else.",
+		Task:     planBTask,
 		Backend:  "docker",
 		Image:    image,
 		Bindings: []launch.Binding{binding},
@@ -111,71 +115,10 @@ func TestRunOpenCodeDockerIntegration(t *testing.T) {
 	if _, err := c.ReadFile(ctx, ws.ID, "opencode.json"); err == nil {
 		t.Fatal("recipe wrote opencode.json into the project root")
 	}
-	// The key is in zero workspace files, including the harness's own state
-	// and .remount/env; the planted canary proves the scan reads them. The
-	// container wrote as root, so the tree is scanned after the snapshot
-	// pass that re-owns it to the node, exactly as it would travel.
-	if _, err := c.Snapshot(ctx, ws.ID, false); err != nil {
-		t.Fatal(err)
-	}
-	info, err := c.WorkspaceInfo(ctx, ws.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// ws.info reports MountPathOf: the root the *workspace* sees, which under
-	// docker is the in-container mount, not a host directory. Scanning it as a
-	// local path is exactly the confusion HostFileSystem warns against, so the
-	// host tree is reached through the backend's own layout instead.
-	if info.Root != proto.DefaultMountPath {
-		t.Fatalf("docker ws.info root = %q, want the in-container mount path %q", info.Root, proto.DefaultMountPath)
-	}
-	hostRoot := filepath.Join(d.Dir, ws.ID)
-	if _, err := os.Stat(hostRoot); err != nil {
-		t.Fatalf("docker workspace host tree: %v", err)
-	}
-	assertTokenAbsent(t, hostRoot, key)
-	// Scanner self-validation must never write the provider credential merely
-	// to prove the scan works. This synthetic value is unique to the temporary
-	// workspace and has no authority outside the test.
-	scanCanary := "remount-nonsecret-scan-canary-" + ws.ID
-	if err := c.WriteFile(ctx, ws.ID, "canary.txt", []byte("x "+scanCanary+" y\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if hits := scanForToken(t, hostRoot, scanCanary); len(hits) != 1 || filepath.Base(hits[0]) != "canary.txt" {
-		t.Fatalf("scan did not find the planted canary: %v", hits)
-	}
-	assertTokenAbsent(t, hostRoot, key)
-
-	time.Sleep(300 * time.Millisecond)
-	evs, err := c.ReadEvents(ctx, 1, ws.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var started, finished, used, denied int
-	for _, e := range evs {
-		if strings.Contains(string(e.Payload), key) {
-			t.Fatalf("event %s carries the provider secret", e.Type)
-		}
-		switch e.Type {
-		case proto.EvRunStarted:
-			started++
-		case proto.EvRunFinished:
-			finished++
-		case proto.EvCredUsed:
-			if strings.Contains(string(e.Payload), "api.openai.com") {
-				used++
-			}
-		case proto.EvEgressDenied:
-			// A denial naming the provider would mean the placeholder went
-			// somewhere its binding does not cover.
-			if strings.Contains(string(e.Payload), "api.openai.com") {
-				denied++
-			}
-		}
-	}
-	if started != 1 || finished != 1 || used == 0 || denied != 0 {
-		t.Fatalf("events: run.started=%d run.finished=%d cred.used(openai)=%d egress.denied(openai)=%d\n%s", started, finished, used, denied, egressLog(t, c, ws.ID, key))
-	}
+	// B7: the same leak scan the deterministic lane runs, over the same
+	// surfaces, with the same planted-canary positive control. The canary is
+	// synthetic; the provider key is never written to prove a scan works.
+	planBLeakScan(t, ctx, c, d, n.ID(), ws.ID, "api.openai.com", key)
 }
 
 func fatalWithoutToken(t *testing.T, err error, token string) {

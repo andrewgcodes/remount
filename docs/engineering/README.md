@@ -14,6 +14,14 @@ acceptance scenario, the gates that were run, the defects found and fixed, and
 the residual gaps with a named owner and exact next proof for each. Read the
 two handoffs below for the requirements it dispositions.
 
+### [Plan B evidence model and aggregate gate](./plan-b-evidence.md)
+
+How `make plan-b` decides what a candidate has actually proven: the evidence
+record schema, the scenario registry, the three outcomes (`passed`, `failed`,
+`unavailable` — there is no `skipped-success`), and why a recorded outcome from
+a document is provenance rather than a pass. `go run ./cmd/evidence list` shows
+every registered scenario, its owning proof and what is still open.
+
 ### [Repository-executable Plan B — 2026-09-03](./plan-b-repository-executable-2026-09-03.md)
 
 The proposed next implementation plan. It replaces people-, customer-, and
@@ -38,6 +46,13 @@ scenario), the reconnect fix merged in PR #6, and Phases 2–6 with their
 verification lanes, secret-name inventory and safe parallel-work contracts. It
 defines the numbered items; the closure document above records what each one's
 status now is.
+
+### [Plan B B1: the deterministic model lane](./plan-b-b1-model-lane.md)
+
+How the keyless OpenCode lane works: a bounded local OpenAI-compatible server,
+a real pinned harness in a docker workspace, and the broker path that keeps the
+workspace holding a placeholder. Read it before changing the harness pin or the
+model fake's script.
 
 ### [External and live verification ledger — 2026-09](./verification-2026-09.md)
 

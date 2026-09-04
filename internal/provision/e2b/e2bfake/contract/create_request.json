@@ -1,0 +1,21 @@
+{
+  "_comment": "Canonical POST /sandboxes request body. This is the contract the driver must emit. Field names here are the drift surface: if E2B renames one, change it here and both the fake service and the driver's contract test move together.",
+  "templateID": "remount-node",
+  "timeout": 3600,
+  "secure": true,
+  "metadata": {
+    "remount_managed": "true",
+    "remount_name": "remount-ci-1",
+    "remount_tenant": "tenant-a",
+    "remount_pool": "iad",
+    "remount_label_region": "iad"
+  },
+  "envVars": {
+    "REMOUNT_ENROLL_TOKEN": "",
+    "REMOUNT_SERVER": "https://control.example",
+    "REMOUNT_BINARY_URL": "https://control.example/remount",
+    "REMOUNT_BACKEND": "process",
+    "REMOUNT_DATA_DIR": "/var/lib/remount",
+    "REMOUNT_NODE_ID": ""
+  }
+}
