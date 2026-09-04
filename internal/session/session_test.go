@@ -886,3 +886,64 @@ func TestTerminateRecordsReasonInExitChunk(t *testing.T) {
 		t.Fatalf("plain exit=%+v", exit)
 	}
 }
+
+// A port session whose peer has gone must still accept EOF. The close returns
+// "use of closed network connection", which is net.ErrClosed and not
+// os.ErrClosed; treating only the latter as benign turned an ordinary EOF into
+// a CodeClosed failure, which is how TestPortForward failed on Windows.
+func TestPortSessionAcceptsEOFAfterTheConnectionIsGone(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- c
+	}()
+	m := newMgr(t)
+	s, err := m.Open(Spec{WS: "ws_1", Kind: proto.SessionPort, Port: ln.Addr().(*net.TCPAddr).Port})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case c := <-accepted:
+		_ = c.Close()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the port session never connected")
+	}
+	// Close the session's own end, so the EOF below closes what is already closed.
+	s.mu.Lock()
+	conn := s.conn
+	s.mu.Unlock()
+	if conn == nil {
+		t.Fatal("port session has no connection")
+	}
+	_ = conn.Close()
+
+	if err := s.Input(1, nil, true); err != nil {
+		t.Fatalf("EOF on a closed port session = %v, want nil", err)
+	}
+}
+
+func TestAlreadyClosedRecognizesBothRuntimeSentinels(t *testing.T) {
+	if !alreadyClosed(nil) {
+		t.Error("nil is not a failure")
+	}
+	if !alreadyClosed(os.ErrClosed) {
+		t.Error("os.ErrClosed must be benign")
+	}
+	if !alreadyClosed(net.ErrClosed) {
+		t.Error("net.ErrClosed must be benign")
+	}
+	if !alreadyClosed(&net.OpError{Op: "close", Err: net.ErrClosed}) {
+		t.Error("a wrapped net.ErrClosed must be benign")
+	}
+	if alreadyClosed(errors.New("disk exploded")) {
+		t.Error("an unrelated error must not be treated as already closed")
+	}
+}

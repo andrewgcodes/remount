@@ -191,3 +191,78 @@ func TestNodeCallWaitsForAuthorizationPush(t *testing.T) {
 		t.Fatalf("node calls = %d", calls)
 	}
 }
+
+// A destroy that control declined to commit because the node's uplink was
+// reconnecting must be retried, not surfaced. Control says "remains
+// uncommitted" in that refusal, so nothing was applied and the retry is safe.
+func TestDestroyWorkspaceRetriesWhileTheNodeUplinkReconnects(t *testing.T) {
+	clientConn, serverConn := transport.Pipe(8)
+	clientPeer := transport.NewPeer(clientConn, nil)
+	var destroys atomic.Int64
+	serverPeer := transport.NewPeer(serverConn, transport.HandlerFunc(func(ctx context.Context, peer *transport.Peer, frame *proto.Frame) {
+		if frame.Op != proto.OpWSDestroy {
+			_ = peer.RespondErr(ctx, frame, proto.Err(proto.CodeUnsupported, "unexpected operation"))
+			return
+		}
+		if destroys.Add(1) < 3 {
+			_ = peer.RespondErr(ctx, frame, proto.Err(proto.CodeUnreachable,
+				"workspace source node n_test is unavailable; destroy remains uncommitted"))
+			return
+		}
+		_ = peer.Respond(ctx, frame, struct{}{})
+	}))
+	t.Cleanup(func() {
+		_ = clientPeer.Close()
+		_ = serverPeer.Close()
+	})
+	c := New(Options{Retries: 1})
+	c.mu.Lock()
+	c.peer = clientPeer
+	c.id = "c_test"
+	c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.DestroyWorkspace(ctx, "ws_test"); err != nil {
+		t.Fatal(err)
+	}
+	if got := destroys.Load(); got != 3 {
+		t.Fatalf("destroy attempts = %d, want 3", got)
+	}
+}
+
+// A node that is genuinely gone must not hold the caller past the budget.
+func TestDestroyWorkspaceGivesUpOnAPermanentlyUnreachableNode(t *testing.T) {
+	clientConn, serverConn := transport.Pipe(8)
+	clientPeer := transport.NewPeer(clientConn, nil)
+	var destroys atomic.Int64
+	serverPeer := transport.NewPeer(serverConn, transport.HandlerFunc(func(ctx context.Context, peer *transport.Peer, frame *proto.Frame) {
+		destroys.Add(1)
+		_ = peer.RespondErr(ctx, frame, proto.Err(proto.CodeUnreachable,
+			"workspace source node n_test is unavailable; destroy remains uncommitted"))
+	}))
+	t.Cleanup(func() {
+		_ = clientPeer.Close()
+		_ = serverPeer.Close()
+	})
+	c := New(Options{Retries: 1})
+	c.mu.Lock()
+	c.peer = clientPeer
+	c.id = "c_test"
+	c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := c.DestroyWorkspace(ctx, "ws_test")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("destroy against a permanently unreachable node returned nil")
+	}
+	if elapsed > nodeCallRetryBudget+2*time.Second {
+		t.Fatalf("destroy held the caller for %s, past the %s budget", elapsed, nodeCallRetryBudget)
+	}
+	if destroys.Load() < 2 {
+		t.Fatalf("destroy attempts = %d, want more than one", destroys.Load())
+	}
+}

@@ -164,6 +164,15 @@ func (s *Session) Wait(ctx context.Context) (*proto.ExitInfo, error) {
 	}
 }
 
+// alreadyClosed reports whether err is the close of something already closed.
+// Delivering EOF twice is not a failure: the second close means the first took
+// effect. The two runtimes disagree about which sentinel says so — a pipe
+// reports os.ErrClosed, a socket net.ErrClosed — and errors.Is does not relate
+// them, so a port session that had lost its peer used to fail an ordinary EOF.
+func alreadyClosed(err error) bool {
+	return err == nil || errors.Is(err, os.ErrClosed) || errors.Is(err, net.ErrClosed)
+}
+
 // Input writes to the process. Inputs carry a client-side sequence; an iseq
 // at or below the last applied one is a retry and is dropped (idempotent).
 func (s *Session) Input(iseq uint64, data []byte, eof bool) error {
@@ -192,16 +201,16 @@ func (s *Session) Input(iseq uint64, data []byte, eof bool) error {
 	}
 	if eof {
 		if running != nil {
-			if err := running.CloseWrite(); err != nil && !errors.Is(err, os.ErrClosed) {
+			if err := running.CloseWrite(); !alreadyClosed(err) {
 				return proto.Err(proto.CodeClosed, "stdin close: %v", err)
 			}
 		} else if kind == proto.SessionExec {
-			if err := stdin.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			if err := stdin.Close(); !alreadyClosed(err) {
 				return proto.Err(proto.CodeClosed, "stdin close: %v", err)
 			}
 		} else if kind == proto.SessionPort {
 			if cw, ok := conn.(interface{ CloseWrite() error }); ok {
-				if err := cw.CloseWrite(); err != nil && !errors.Is(err, os.ErrClosed) {
+				if err := cw.CloseWrite(); !alreadyClosed(err) {
 					return proto.Err(proto.CodeClosed, "stdin close: %v", err)
 				}
 			}

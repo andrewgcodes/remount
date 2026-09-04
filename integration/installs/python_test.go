@@ -131,10 +131,15 @@ func TestB32ThePythonWheelInstallsIntoAFreshVenvAndDrivesTheInstalledServer(t *t
 	if !ok {
 		t.Fatalf("the smoke printed no output beyond %q", out)
 	}
-	if strings.HasPrefix(location, root+string(os.PathSeparator)) {
+	// Canonicalise every side before comparing paths as strings. On Windows
+	// the interpreter can report an 8.3 short path — C:\Users\RUNNER~1\... for
+	// the directory the test knows as C:\Users\runneradmin\... — and the two
+	// names for one directory share no common prefix.
+	resolvedLocation := realPath(t, location)
+	if strings.HasPrefix(resolvedLocation, realPath(t, root)+string(os.PathSeparator)) {
 		t.Fatalf("the installed package resolved to %s, inside the checkout", location)
 	}
-	if !strings.HasPrefix(location, realPath(t, sandbox)) {
+	if !strings.HasPrefix(resolvedLocation, realPath(t, sandbox)) {
 		t.Fatalf("the installed package resolved to %s, outside the environment it was installed into", location)
 	}
 	if strings.TrimSpace(echoed) != "installed-from-the-wheel" {
