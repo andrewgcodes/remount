@@ -436,3 +436,71 @@ entries to `acquireSnapshot` with the value of `w.lastSnapshot` and whether
 `explicit` is set, and confirm how many requests the node actually receives for
 one CLI invocation. If it is one, the retry hypothesis is dead and the timestamp
 is being set by something not yet identified.
+
+
+---
+
+# The TAP defect, properly understood — and why the obvious fix is wrong
+
+Recorded earlier as "quarantine revokes the network while the microVM still
+holds the TAP". Driving a real `remount ws move` between two Firecracker nodes
+showed it is broader than quarantine and blocks the operation Remount exists
+for:
+
+```
+$ remount ws move $WS --node $OTHER
+unreachable: released workspace source cleanup is pending:
+  internal: delete TAP: device or resource busy
+```
+
+`handle.Destroy` revokes the network before killing the VMM, and
+`systemNetworkLease.Revoke` both removes the policy and deletes the devices. The
+VMM holds the TAP open for as long as it lives, so the delete fails, the revoke
+fails, and destroy stops there — taking move and quarantine with it.
+
+## The obvious fix is wrong
+
+Killing the machine first makes the kernel happy and was tried. It fails
+`TestDestroyRetainsLaterResourcesUntilEachPriorBoundarySucceeds`, and that test
+is right: it asserts that if the network revoke fails, *neither* the volume nor
+the machine has been touched. The property is that nothing is dismantled while
+the workspace can still carry traffic, so a failed teardown never leaves a
+half-destroyed workspace that is still reachable.
+
+So this is not a case of a stale test blocking a fix. Reordering buys a working
+`move` by giving up a safety property, and the change was reverted rather than
+shipped with the test edited to match.
+
+## What it actually is
+
+The invariant is sound and, on real hardware, currently **unsatisfiable** — the
+same shape as the compatibility fence fixed above, which could never be equal to
+itself. `Revoke` conflates two things that have opposite ordering requirements:
+
+| Phase | Must happen | Can it run while the VMM lives? |
+|---|---|---|
+| deny traffic (policy) | before anything is dismantled | yes |
+| delete devices (TAP, veth, netns) | after the VMM exits | no |
+
+The resolution is to split them: `NetworkLease` grows a deny phase that runs
+first and synchronously stops traffic, and the existing device teardown moves
+after `machine.Kill`. Then the invariant the test protects — nothing dismantled
+while traffic can flow — holds, *and* destroy can complete.
+
+That is an interface change across `NetworkLease`, its system implementation,
+the fakes, and the ordering tests, on the boundary that enforces egress. It is
+left for someone with the time to do it carefully rather than done at the end of
+a long night; the note exists so the next person starts from the right design
+instead of the reordering that looks obvious and quietly costs a guarantee.
+
+## What this blocks
+
+`remount ws move` between two Firecracker nodes, and therefore the "process
+continues exactly once" half of §5. What *is* proven, on two live nodes:
+
+- a restored guest **continues rather than reboots** — guest uptime read through
+  the workspace goes 41 s before the checkpoint to 42 s after the restore, so the
+  VM resumed from its memory image
+- `--restore-from` produces an independent working clone, which is the correct
+  behaviour for a clone; exactly-once is a property of *move*, and move is
+  blocked by the defect above
