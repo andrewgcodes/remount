@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // ---- binding placeholders, destination scoping and leak blocking ---------
@@ -99,7 +100,16 @@ func checkBindLeakBlocked(ctx context.Context, s *Session) error {
 	if status >= 200 && status < 400 {
 		return failf("the broker answered %d for a placeholder aimed at %s, a host its binding does not cover; §9 rule 1 blocks the request", status, b.UnboundHost)
 	}
-	events, err := s.Tail(ctx, from+1, f.WS.ID)
+	events, err := waitForEvents(ctx, func(ctx context.Context) ([]Event, error) {
+		return s.Tail(ctx, from+1, f.WS.ID)
+	}, func(events []Event) bool {
+		for _, e := range events {
+			if e.Type == "egress.denied" && payloadContains(e.Payload, "leak_blocked") {
+				return true
+			}
+		}
+		return false
+	})
 	if err != nil {
 		return err
 	}
@@ -132,7 +142,16 @@ func checkBindUnboundDestinationDenied(ctx context.Context, s *Session) error {
 	if status >= 200 && status < 400 {
 		return failf("the broker answered %d for a destination no rule and no binding covers", status)
 	}
-	events, err := s.Tail(ctx, from+1, f.WS.ID)
+	events, err := waitForEvents(ctx, func(ctx context.Context) ([]Event, error) {
+		return s.Tail(ctx, from+1, f.WS.ID)
+	}, func(events []Event) bool {
+		for _, e := range events {
+			if e.Type == "egress.denied" {
+				return true
+			}
+		}
+		return false
+	})
 	if err != nil {
 		return err
 	}
@@ -181,7 +200,17 @@ func checkBindNoSecretInEvents(ctx context.Context, s *Session) error {
 	if _, _, err := s.brokerGet(ctx, base, "denied.conformance.invalid", "/", ""); err != nil {
 		return err
 	}
-	events, err := s.Tail(ctx, from+1, f.WS.ID)
+	events, err := waitForEvents(ctx, func(ctx context.Context) ([]Event, error) {
+		return s.Tail(ctx, from+1, f.WS.ID)
+	}, func(events []Event) bool {
+		var denied int
+		for _, e := range events {
+			if e.Type == "egress.denied" {
+				denied++
+			}
+		}
+		return denied >= 2
+	})
 	if err != nil {
 		return err
 	}
@@ -201,6 +230,28 @@ func checkBindNoSecretInEvents(ctx context.Context, s *Session) error {
 // bytes: a secret encoded anywhere inside is still a leak.
 func payloadContains(payload []byte, needle string) bool {
 	return bytes.Contains(payload, []byte(needle))
+}
+
+func waitForEvents(ctx context.Context, fetch func(context.Context) ([]Event, error), ready func([]Event) bool) ([]Event, error) {
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	var events []Event
+	for {
+		var err error
+		events, err = fetch(ctx)
+		if err != nil || ready(events) {
+			return events, err
+		}
+		select {
+		case <-ctx.Done():
+			return events, ctx.Err()
+		case <-timer.C:
+			return events, nil
+		case <-ticker.C:
+		}
+	}
 }
 
 // ---- approval durability and request fingerprinting ----------------------
