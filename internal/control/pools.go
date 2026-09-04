@@ -184,11 +184,18 @@ func (c *Control) poolRemove(ctx context.Context, subject Subject, req *proto.Po
 		c.mu.Unlock()
 		return proto.Err(proto.CodeConflict, "pool %q still owns %d machines", req.Name, current.Current)
 	}
+	// A retirement fence outlives its destroy until inventory no longer lists
+	// the machine. Removing the pool would remove the only reconciler that can
+	// confirm that, so the fence must resolve first; the node stays unclaimable
+	// meanwhile and the removal is retryable.
+	for node, fence := range c.poolRetiring {
+		if fence.Pool == key {
+			c.mu.Unlock()
+			return proto.Err(proto.CodeConflict, "pool %q is still retiring node %s; retry after its machine leaves provider inventory", req.Name, node)
+		}
+	}
 	if err := c.transact(func(tx *eventlog.Tx) error {
 		if _, err := tx.Exec(`DELETE FROM pools WHERE tenant=? AND name=?`, pool.Tenant, pool.Spec.Name); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`DELETE FROM pool_retirements WHERE tenant=? AND pool=?`, pool.Tenant, pool.Spec.Name); err != nil {
 			return err
 		}
 		return c.insertMutationTx(tx.Tx, scope, req.IdempotencyKey, proto.OpPoolRemove, req, struct{}{})
@@ -197,11 +204,6 @@ func (c *Control) poolRemove(ctx context.Context, subject Subject, req *proto.Po
 		return err
 	}
 	delete(c.pools, key)
-	for node, fence := range c.poolRetiring {
-		if fence.Pool == key {
-			delete(c.poolRetiring, node)
-		}
-	}
 	c.mu.Unlock()
 	if c.opts.PoolReconciler != nil {
 		c.opts.PoolReconciler.Forget(c.poolSpec(pool))

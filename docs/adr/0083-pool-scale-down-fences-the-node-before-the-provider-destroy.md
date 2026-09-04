@@ -42,10 +42,12 @@ or was cancelled, or the error wraps a deadline or cancellation — keeps the
 fence, because the machine may be half gone; the next reconcile re-fences the
 same node idempotently and retries. A successful destroy keeps the fence too:
 the node may still be connected, and only the next inventory that no longer
-lists the machine releases the fence. On restart the rows are loaded before
-the first reconcile, so a destroy that was in flight when the controller died
-cannot be raced by a claim. Removing a pool deletes its fences in the same
-transaction as the spec.
+lists the machine releases the fence, with a `pool.retired` event in the same
+transaction as the row deletion. On restart the rows are loaded before the
+first reconcile, so a destroy that was in flight when the controller died
+cannot be raced by a claim. A pool with an unresolved fence refuses removal
+with `conflict`: its reconciler is the only authority that can observe the
+machine leave inventory, and a zero machine count is not that observation.
 
 ## Consequences
 
@@ -54,7 +56,8 @@ transaction as the spec.
   provider destroy. Durable commit: the fence row and `pool.retiring` before
   the destroy. Observable postcondition: no `pool.scaled` with reason `idle`
   for a node that has a held workspace, and a claim on a fenced node returns
-  `denied`.
+  `denied`. Every fence ends in exactly one of `pool.retire_aborted` or
+  `pool.retired`.
 - A `Retire` takes `control.mu` briefly between two provider calls; that is
   the same lock discipline every workspace claim already follows, and the
   provider call itself still runs unlocked. The existing authority test that
