@@ -3,7 +3,7 @@ VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev
 LDFLAGS  := -s -w -X main.version=$(VERSION)
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 
-.PHONY: all build test race fuzz cover vet fmt lint docs acpgen clean dist install demo conformance public-api modal-binary modal-deploy modal-smoke
+.PHONY: all build test race fuzz cover vet fmt lint docs acpgen clean dist install demo conformance public-api modal-binary modal-deploy modal-smoke verify verify-fast
 
 FUZZTIME ?= 5s
 
@@ -43,6 +43,16 @@ vet:
 
 fmt:
 	gofmt -l -w .
+
+# Every gate CI runs, locally. Prefer this to pushing and waiting: the repo is
+# private, so Actions minutes are metered, and a push that fails CI costs
+# minutes without teaching anything. verify-fast drops the race lane and
+# conformance for a quick pre-commit check.
+verify:
+	./scripts/verify-local.sh
+
+verify-fast:
+	./scripts/verify-local.sh fast
 
 lint: vet
 	@gofmt -l . | grep -v '^$$' && { echo "gofmt needed on the files above"; exit 1; } || echo "gofmt clean"

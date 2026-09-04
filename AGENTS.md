@@ -21,7 +21,24 @@ make race     # the suite under the race detector
 make cover    # coverage summary
 make dist     # linux/darwin × amd64/arm64 static binaries in dist/
 make demo     # remount standalone on 127.0.0.1:7443
+
+make verify       # every gate CI runs, locally — run this before pushing
+make verify-fast  # the same without the race lane and conformance
 ```
+
+**Verify locally before you push.** This repository is private, so Actions
+minutes are metered, and it is expensive per push: ten workflows fire on every
+push to `main`, `ci.yml`'s matrix includes macOS at 10x billing and a Windows
+job at 2x. A push that fails CI costs minutes and teaches nothing that
+`make verify` would not have told you for free. It runs gofmt, `go vet` for
+darwin, linux and windows, the lock-discipline lint, the suite, `make dist`,
+`go mod verify`/`tidy -diff`, staticcheck, govulncheck, the seeded fuzz corpus,
+the race lane and conformance — reporting every gate rather than stopping at
+the first, so one run replaces a bisect through six pushes.
+
+Cross-vetting all three `GOOS` values matters more than it looks: the Windows
+lane has caught defects a darwin-only vet cannot see, including tests that
+shell out to POSIX scripts and a comparison that only fails on CRLF.
 
 **Tests must pass under `-race`.** Three real bugs in this codebase were only
 visible there: a live pointer escaping the control-plane mutex, a lease
