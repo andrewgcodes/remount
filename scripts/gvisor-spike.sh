@@ -59,6 +59,9 @@ ip link add "$host_if" type veth peer name "$guest_if"
 ip link set "$guest_if" netns "$namespace"
 ip addr add 169.254.251.1/30 dev "$host_if"
 ip netns exec "$namespace" ip addr add 169.254.251.2/30 dev "$guest_if"
+ip netns exec "$namespace" ip link set lo up
+ip netns exec "$namespace" ip link set "$guest_if" up
+ip netns exec "$namespace" ip route add default via 169.254.251.1
 ip netns exec "$namespace" sh -c 'echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6'
 ip netns exec "$namespace" nft -f - <<'NFT'
 table inet remount {
@@ -68,7 +71,8 @@ table inet remount {
   }
 }
 NFT
-ip netns exec "$namespace" nft -f - <<NFT
+policy=guest-egress
+if ! ip netns exec "$namespace" nft -f - <<NFT
 table netdev remount {
   chain egress {
     type filter hook egress device "$guest_if" priority 0; policy drop;
@@ -78,11 +82,19 @@ table netdev remount {
   }
 }
 NFT
-
-# The guest endpoint must be up before Linux accepts its gateway. The host
-# endpoint stays down until the sandbox is running, so no traffic can cross.
-ip netns exec "$namespace" ip link set "$guest_if" up
-ip netns exec "$namespace" ip route add default via 169.254.251.1
+then
+  policy=host-ingress
+  nft -f - <<NFT
+table netdev $host_table {
+  chain ingress {
+    type filter hook ingress device "$host_if" priority filter; policy drop;
+    ether type arp accept
+    ip daddr 169.254.251.1 tcp dport 17443 accept
+    counter drop
+  }
+}
+NFT
+fi
 
 setsid socat TCP4-LISTEN:17443,bind=169.254.251.1,reuseaddr,fork EXEC:/bin/cat >/dev/null 2>&1 &
 broker_pid=$!
@@ -119,7 +131,6 @@ JSON
 runsc --root="$state" --network=sandbox --net-raw=false --allow-packet-socket-write=false create --bundle="$bundle" "$container" >"$state/create.log" 2>&1
 runsc --root="$state" start "$container" >"$state/start.log" 2>&1
 ip link set "$host_if" up
-ip netns exec "$namespace" ip link set lo up
 
 inside() { runsc --root="$state" exec "$container" /bin/sh -c "$1"; }
 deny() {
@@ -131,8 +142,13 @@ deny() {
   echo "PASS: $name denied"
 }
 drop_packets() {
-  ip netns exec "$namespace" nft list chain netdev remount egress |
-    awk '/counter packets/ { print $3; exit }'
+  if [[ $policy == guest-egress ]]; then
+    ip netns exec "$namespace" nft list chain netdev remount egress |
+      awk '/counter packets/ { print $3; exit }'
+  else
+    nft list chain netdev "$host_table" ingress |
+      awk '/counter packets/ { print $3; exit }'
+  fi
 }
 deny_connectionless() {
   local name=$1 command=$2 before after
