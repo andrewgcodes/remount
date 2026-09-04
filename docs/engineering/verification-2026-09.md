@@ -1812,3 +1812,69 @@ No public output was published. **Status: implementation and post-upstream
 race/conformance compatibility verification complete; committed-candidate
 aggregate and built-binary conformance remain to be rerun after the final
 commit.**
+
+### 2026-09-04 — release-matrix node inventory propagation
+
+The Ubuntu test job failed `TestReleaseMatrixUnderLocalProfile` because the
+test queried control-plane node inventory immediately after both node-local
+`Online` signals. One node had completed its local handshake but had not yet
+become visible to the subsequent client list request. The test now waits,
+within its existing 30-second context, until both exact node identities are
+listed before asserting their negotiated protocols. The protocol and placement
+assertions are unchanged.
+
+Verification:
+
+```sh
+go test -race -count=20 \
+  -run '^TestReleaseMatrixUnderLocalProfile$' \
+  -timeout 300s ./internal/sim
+go test -count=1 -timeout 1200s ./internal/sim
+staticcheck ./internal/sim
+go vet ./internal/sim
+```
+
+All commands passed. The repeated race proof completed in 19.219 seconds and
+the complete simulation package completed in 251.767 seconds.
+
+### 2026-09-04 — Windows-main integration after the Ubuntu CI fix
+
+The Linux branch merged `origin/main` at
+`51185ddeda5c4451c024a1fd7c660e4cc271a52b`, retaining the upstream
+cross-platform split files, serialized heavy test gates, bounded concurrent
+cursor detach, and local workspace cleanup. The merge also retained the Linux
+branch's durable session completion ordering, exact stale-grant handling,
+durable event polling, filesystem-access preparation, and deny-first gVisor
+proof.
+
+Verification:
+
+```sh
+make lint
+make test
+make race
+make conformance
+go test -race -count=20 \
+  -run '^TestReleaseMatrixUnderLocalProfile$' \
+  -timeout 300s ./internal/sim
+staticcheck ./internal/sim
+go vet ./internal/sim
+go test -count=1 -timeout 1200s ./internal/sim
+go run ./cmd/conformance --build .
+sudo -n env \
+  REMOUNT_GVISOR_ROOTFS=/home/ubuntu/firecracker-artifacts/gvisor-rootfs-alpine-3.22 \
+  scripts/gvisor-spike.sh
+```
+
+All commands passed. The repeated release-matrix race proof completed in
+19.063 seconds and the complete simulation package completed in 254.963
+seconds. The complete race suite and serialized conformance suite passed. The
+built-binary conformance run reported 60 passed, 0 failed, and 8 unavailable;
+all 53 required requirements passed and cleanup was verified.
+
+Linux 5.15 rejected the upstream netdev egress hook with `Operation not
+supported`; the spike installed its deny-first host-ingress fallback and
+passed broker reachability, IPv4 TCP, IPv6, UDP, DNS, ICMP, raw-socket, unlisted
+CONNECT, and post-revoke denial checks. Its exit trap deleted the runsc
+sandbox, veth, nftables table, network namespace, bind mount, and temporary
+directory. **Status: verified.**
