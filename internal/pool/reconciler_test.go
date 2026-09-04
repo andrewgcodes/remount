@@ -28,6 +28,7 @@ type fakeDriver struct {
 	destroys    []string
 	createErr   error
 	destroyErr  error
+	destroyHook func(string) error
 	createBlock chan struct{}
 	inventory   []provision.Machine
 }
@@ -49,6 +50,9 @@ func (f *fakeDriver) Destroy(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.destroys = append(f.destroys, id)
+	if f.destroyHook != nil {
+		return f.destroyHook(id)
+	}
 	return f.destroyErr
 }
 func (f *fakeDriver) List(context.Context, provision.ListOptions) ([]provision.Machine, error) {
@@ -223,7 +227,7 @@ func TestIdleScaleDownSkipsANodeTheFenceRefuses(t *testing.T) {
 	}
 }
 
-func TestDefiniteDestroyFailureReleasesTheFenceButATimeoutKeepsIt(t *testing.T) {
+func TestOnlyAuthoritativeDestroyRejectionReleasesTheFence(t *testing.T) {
 	now := time.Unix(1000, 0)
 	for _, tc := range []struct {
 		name   string
@@ -231,8 +235,9 @@ func TestDefiniteDestroyFailureReleasesTheFenceButATimeoutKeepsIt(t *testing.T) 
 		fenced bool
 		calls  []string
 	}{
-		{"definite", errors.New("quota exceeded"), false, []string{"retire", "release"}},
-		{"ambiguous", errors.Join(errors.New("gateway timeout"), context.DeadlineExceeded), true, []string{"retire"}},
+		{"authoritative rejection", provision.MarkDestroyNotApplied(errors.New("quota exceeded")), false, []string{"retire", "release"}},
+		{"unclassified failure", errors.New("provider failed"), true, []string{"retire"}},
+		{"timeout", errors.Join(errors.New("gateway timeout"), context.DeadlineExceeded), true, []string{"retire"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			driver, tokens := &fakeDriver{destroyErr: tc.err}, &fakeTokens{}
@@ -253,6 +258,29 @@ func TestDefiniteDestroyFailureReleasesTheFenceButATimeoutKeepsIt(t *testing.T) 
 				}
 			}
 		})
+	}
+}
+
+func TestLostDestroyResponseKeepsTheRetirementFence(t *testing.T) {
+	now := time.Unix(1000, 0)
+	deleted := false
+	driver := &fakeDriver{destroyHook: func(string) error {
+		deleted = true
+		return errors.New("provider transport failed")
+	}}
+	r, _ := New([]provision.Driver{driver}, &fakeTokens{}, Options{Now: func() time.Time { return now }})
+	fence := &fakeFence{retireOK: true}
+	nodes := []Node{{Machine: ownedMachine("idle"), IdleSince: now.Add(-time.Hour), Retirement: fence}}
+
+	actions, err := r.Reconcile(context.Background(), testSpec(), nodes, 0)
+	if err == nil || len(actions) != 1 || actions[0].Kind != ActionDestroyFailed {
+		t.Fatalf("actions=%#v err=%v", actions, err)
+	}
+	if !deleted {
+		t.Fatal("destroy did not take effect before its response was lost")
+	}
+	if fenced, calls := fence.snapshot(); !fenced || len(calls) != 1 || calls[0] != "retire" {
+		t.Fatalf("fenced=%v calls=%v, want the retirement fence retained", fenced, calls)
 	}
 }
 

@@ -1309,10 +1309,12 @@ carries a credential, enrollment token, provider response body or bootstrap
 environment. `pool.retiring` carries `pool`, `machine` and `node`: the node
 is durably fenced from new claims and the provider destroy follows. A
 `pool.retire_aborted` with the same payload records that a definite provider
-failure lifted the fence; an ambiguous result (timeout, cancellation) keeps
-it until inventory shows whether the machine survived. `pool.retired`, same
-payload, records that provider inventory no longer lists the machine and the
-fence was lifted; it is the only way a fence ends after a successful destroy.
+rejection, explicitly classified as proving the destroy was not applied,
+lifted the fence. Every unclassified failure, including a timeout,
+cancellation, transport failure or lost response, keeps it until inventory
+shows whether the machine survived. `pool.retired`, same payload, records
+that provider inventory no longer lists the machine and the fence was lifted;
+it is the only way a fence ends after a successful destroy.
 
 `export.cursor.advanced` carries a destination name, previous/next sequence
 and revision. It commits with the tenant-scoped cursor row only after the

@@ -35,12 +35,14 @@ authority already lives. A `Retire` that finds a held workspace, a changed
 identity, or a replaced pool returns false and the reconciler skips the node;
 a node without a `Retirement` is never destroyed.
 
-The fence outlives the destroy call. A definite provider error (`Release`)
-deletes the row with a `pool.retire_aborted` event, because the machine is
-still there and should take work. An ambiguous result — the context expired
-or was cancelled, or the error wraps a deadline or cancellation — keeps the
-fence, because the machine may be half gone; the next reconcile re-fences the
-same node idempotently and retries. A successful destroy keeps the fence too:
+The fence outlives the destroy call. Only an explicitly classified
+`DestroyNotApplied` error (`Release`) deletes the row with a
+`pool.retire_aborted` event, because the provider authoritatively proved the
+machine is still there and should take work. Every unclassified failure keeps
+the fence: a timeout, cancellation, transport failure, lost response, or
+helper error may follow a deletion that already took effect. The next
+reconcile re-fences the same node idempotently and retries. A successful
+destroy keeps the fence too:
 the node may still be connected, and only the next inventory that no longer
 lists the machine releases the fence, with a `pool.retired` event in the same
 transaction as the row deletion. On restart the rows are loaded before the

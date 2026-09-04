@@ -318,7 +318,7 @@ func (r *Reconciler) scaleDown(ctx context.Context, driver provision.Driver, spe
 		}
 		err = driver.Destroy(ctx, victim.Machine.ID)
 		if err != nil && !errors.Is(err, provision.ErrNotFound) {
-			if ambiguous(ctx, err) {
+			if !provision.IsDestroyNotApplied(err) {
 				return r.failed(st, ActionDestroyFailed, len(nodes), "idle", err)
 			}
 			if releaseErr := victim.Retirement.Release(ctx); releaseErr != nil {
@@ -331,13 +331,6 @@ func (r *Reconciler) scaleDown(ctx context.Context, driver provision.Driver, spe
 	}
 	st.failures, st.retryAt = 0, time.Time{}
 	return nil, nil
-}
-
-// ambiguous reports whether a failed provider call may nonetheless have taken
-// effect. A timeout or cancellation says nothing about the machine, so the
-// fence has to outlive it; a definite provider error says the machine stayed.
-func ambiguous(ctx context.Context, err error) bool {
-	return ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
 func (r *Reconciler) failed(st *state, kind string, count int, reason string, err error) ([]Action, error) {
