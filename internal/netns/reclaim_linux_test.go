@@ -4,10 +4,12 @@ package netns
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestReclaimOrphansRemovesOnlyUninhabitedNamespaces is the whole contract, and
@@ -46,6 +48,7 @@ func TestReclaimOrphansRemovesOnlyUninhabitedNamespaces(t *testing.T) {
 		_, _ = hold.Process.Wait()
 		cleanupNamespace(live)
 	}()
+	waitForProcessNamespace(t, hold.Process.Pid, live)
 
 	// The count is deliberately not asserted. Anything else on the host may
 	// have left its own orphan, and a test that fails because an unrelated one
@@ -60,6 +63,23 @@ func TestReclaimOrphansRemovesOnlyUninhabitedNamespaces(t *testing.T) {
 	if _, statErr := os.Stat(live); statErr != nil {
 		t.Errorf("a namespace with a live process in it was reclaimed, which would cut the network out from under a running workspace: %v", statErr)
 	}
+}
+
+func waitForProcessNamespace(t *testing.T, pid int, namespace string) {
+	t.Helper()
+	want, err := os.Stat(namespace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	procNamespace := filepath.Join("/proc", fmt.Sprint(pid), "ns", "net")
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		got, statErr := os.Stat(procNamespace)
+		if statErr == nil && os.SameFile(want, got) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("process %d did not enter %s", pid, namespace)
 }
 
 func makeNamespace(t *testing.T, path string) {

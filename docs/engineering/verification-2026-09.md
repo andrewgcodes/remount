@@ -481,14 +481,28 @@ REMOUNT_CHAOS_IMAGE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99
 ```
 
 The spike passed both positive controls, all seven denial checks and
-post-revoke denial. `TestE4DenialConformance` passed in 21.25 seconds with no
+post-revoke denial. `TestE4DenialConformance` passed in 21.50 seconds with no
 forbidden destination observed on the host-side veth; the in-flight transfer
 stopped when synchronous revoke returned.
-`TestE4FailedSetupCleanupConformance` passed in 0.19 seconds, and
-`TestE5TenantIsolationConformance` passed in 0.58 seconds. A post-run audit
+`TestE4FailedSetupCleanupConformance` passed in 0.23 seconds, and
+`TestE5TenantIsolationConformance` passed in 0.59 seconds. A post-run audit
 found zero `rmh*` links, zero `remount_rmh*` nftables tables, zero
 `/run/remount/netns/rm-*` mounts and zero runsc sandbox/gofer processes.
 **Status: verified on the exact final candidate.**
+
+The startup crash-reclamation boundary was exercised separately:
+
+```sh
+sudo env PATH="$PATH" HOME="$HOME" GOCACHE="$HOME/.cache/go-build" \
+  go test -count=10 \
+  -run '^TestReclaimOrphansRemovesOnlyUninhabitedNamespaces$' \
+  -v ./internal/netns
+```
+
+All ten repetitions removed the uninhabited namespace and retained the one
+whose holder had demonstrably entered it. The adoption regression also proved
+that retained generation and mount metadata construct a new deny-first network
+boundary after startup reclamation instead of requiring the deleted veth.
 
 ---
 
