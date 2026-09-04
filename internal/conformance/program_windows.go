@@ -5,7 +5,7 @@ package conformance
 import "strconv"
 
 func echoProgram(text string) []string {
-	return []string{"cmd.exe", "/d", "/s", "/c", "echo", text}
+	return []string{"cmd.exe", "/d", "/s", "/c", "echo " + text}
 }
 
 func catProgram() []string {

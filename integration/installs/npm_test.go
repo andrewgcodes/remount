@@ -42,7 +42,14 @@ func copyTree(t *testing.T, from, to string, skip map[string]bool) {
 // question "did the tarball carry the code, or is the checkout still here".
 func installedPackageDir(t *testing.T, installDir string) string {
 	t.Helper()
-	return realPath(t, filepath.Join(installDir, "node_modules", "@remount", "sdk"))
+	installed := filepath.Join(installDir, "node_modules", "@remount", "sdk")
+	if target, err := os.Readlink(installed); err == nil {
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(installed), target)
+		}
+		return realPath(t, target)
+	}
+	return realPath(t, installed)
 }
 
 // npmSmoke reports where the runtime resolved the package from, then uses it
@@ -62,7 +69,10 @@ for (;;) {
   if (current.state === "failed" || current.state === "destroyed") throw new Error("workspace reached " + current.state);
   await new Promise((resolve) => setTimeout(resolve, 100));
 }
-const session = await client.exec(ws.id, ["/bin/echo", "installed-from-the-tarball"]);
+const program = process.platform === "win32"
+  ? ["cmd.exe", "/d", "/s", "/c", "echo installed-from-the-tarball"]
+  : ["/bin/echo", "installed-from-the-tarball"];
+const session = await client.exec(ws.id, program);
 let out = "";
 for await (const chunk of session) {
   if (chunk.stream === 1) out += Buffer.from(chunk.data).toString();
@@ -167,9 +177,9 @@ func TestB32ALinkedNpmInstallIsCaught(t *testing.T) {
 		[]byte(`{"name":"b32-linked","version":"0.0.0","private":true,"type":"module"}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out, err := runCleanErr(t, install, cleanEnv(t), npm, "install", "--no-audit", "--no-fund", "--omit=dev",
+	out, err := runCleanErr(t, install, cleanEnv(t), npm, "link", "--no-audit", "--no-fund", "--omit=dev",
 		filepath.Join(root, "sdk", "typescript"))
-	skipIfOffline(t, "npm install of the package directory", out, err)
+	skipIfOffline(t, "npm link of the package directory", out, err)
 
 	if dir := installedPackageDir(t, install); !strings.HasPrefix(dir, root+string(os.PathSeparator)) {
 		t.Fatalf("a directory install resolved to %s, outside the checkout %s; the detector cannot tell a tarball from a link", dir, root)

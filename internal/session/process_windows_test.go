@@ -36,17 +36,16 @@ func TestKillWorkspaceTerminatesWindowsDescendants(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		body, readErr := os.ReadFile(pidFile)
-		if readErr == nil {
+		if readErr == nil && len(strings.TrimSpace(string(body))) > 0 {
 			pid, err = strconv.Atoi(strings.TrimSpace(string(body)))
-			if err != nil {
-				t.Fatal(err)
+			if err == nil {
+				break
 			}
-			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	if pid == 0 {
-		t.Fatal("child pid was not reported")
+		t.Fatalf("child pid was not reported: %v", err)
 	}
 	if err := m.KillWorkspace("ws_windows_job"); err != nil {
 		t.Fatal(err)
