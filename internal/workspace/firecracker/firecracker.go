@@ -327,6 +327,15 @@ type handle struct {
 	release            func(string, *handle)
 }
 
+// Detach drops this workspace from the backend's live registry without
+// touching the volume, the snapshot or anything else on disk. It exists for the
+// node's quarantine path; see workspace.Detacher.
+func (h *handle) Detach() {
+	if h.release != nil {
+		h.release(h.id, h)
+	}
+}
+
 func (h *handle) ID() string               { return h.id }
 func (h *handle) Backend() string          { return "firecracker" }
 func (h *handle) FS() workspace.FileSystem { return h.filesystem }

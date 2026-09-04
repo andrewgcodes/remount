@@ -221,6 +221,21 @@ type Handle interface {
 	Destroyer
 }
 
+// Detacher is implemented by a backend handle whose backend keeps a registry of
+// live workspaces, so that a caller giving up a handle without destroying it
+// can say so.
+//
+// A node that quarantines a failed materialization deliberately keeps the
+// filesystem: the tree may hold bytes nothing else has. But it does let go of
+// the handle, and a backend that goes on believing the workspace is active will
+// refuse the next Create *and* the next Adopt for it — so the node retries
+// forever against a conflict it caused itself, and the workspace is stuck on
+// that node with an error naming the wrong problem. Detach is how the node says
+// "I am no longer holding this" without saying "destroy it".
+type Detacher interface {
+	Detach()
+}
+
 // NetworkEndpoint identifies the generation-specific broker that an enforced
 // workspace network must use as its only egress path.
 type NetworkEndpoint struct {
