@@ -146,6 +146,13 @@ type Filesystem interface {
 	FS() FileSystem
 }
 
+// FilesystemAccessPreparer makes a backend-owned tree accessible to host-side
+// filesystem operations. Container processes may create files under a uid the
+// node does not run as, so the node invokes this while holding the tree lock.
+type FilesystemAccessPreparer interface {
+	PrepareFilesystemAccess(context.Context) error
+}
+
 // SessionPreparer turns a portable session request into a backend-specific
 // process specification.
 type SessionPreparer interface {
@@ -717,6 +724,10 @@ func (h *dockerHandle) reown(ctx context.Context) error {
 		return proto.Err(proto.CodeInternal, "docker exec chown: %s", strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func (h *dockerHandle) PrepareFilesystemAccess(ctx context.Context) error {
+	return h.reown(ctx)
 }
 
 func (h *dockerHandle) Snapshot(ctx context.Context, excludes []string, w io.Writer) error {

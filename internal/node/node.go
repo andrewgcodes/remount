@@ -2317,6 +2317,13 @@ func cloneGrant(g *proto.Grant) *proto.Grant {
 	return &cp
 }
 
+func prepareFilesystemAccess(ctx context.Context, w *ws) error {
+	if preparer, ok := w.handle.(workspace.FilesystemAccessPreparer); ok {
+		return preparer.PrepareFilesystemAccess(ctx)
+	}
+	return nil
+}
+
 // lockWorkspaceTree closes the authorization-to-operation race. A lifecycle
 // transition can remove or checkpoint a workspace after authorize returns but
 // before an operation reaches treeMu. Revalidate only after acquiring the tree
@@ -2617,6 +2624,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		defer unlock()
+		if err := prepareFilesystemAccess(ctx, w); err != nil {
+			return nil, err
+		}
 		return w.handle.FS().Read(req.Path, req.Offset, req.Limit)
 	case proto.OpFSWrite:
 		req, err := decode[proto.FSWriteReq](f)
@@ -2636,6 +2646,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 				return nil, err
 			}
 			defer unlock()
+			if err := prepareFilesystemAccess(ctx, w); err != nil {
+				return nil, err
+			}
 			if err := w.handle.FS().Write(req.Path, req.Data, req.Mode, req.Append, req.MkdirP); err != nil {
 				return nil, err
 			}
@@ -2657,6 +2670,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		defer unlock()
+		if err := prepareFilesystemAccess(ctx, w); err != nil {
+			return nil, err
+		}
 		ents, err := w.handle.FS().List(req.Path)
 		if err != nil {
 			return nil, err
@@ -2676,6 +2692,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		defer unlock()
+		if err := prepareFilesystemAccess(ctx, w); err != nil {
+			return nil, err
+		}
 		e, err := w.handle.FS().Stat(req.Path)
 		if err != nil {
 			return nil, err
@@ -2699,6 +2718,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 				return nil, err
 			}
 			defer unlock()
+			if err := prepareFilesystemAccess(ctx, w); err != nil {
+				return nil, err
+			}
 			if err := w.handle.FS().Mkdir(req.Path); err != nil {
 				return nil, err
 			}
@@ -2724,6 +2746,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 				return nil, err
 			}
 			defer unlock()
+			if err := prepareFilesystemAccess(ctx, w); err != nil {
+				return nil, err
+			}
 			if err := w.handle.FS().Remove(req.Path, req.Recursive); err != nil {
 				return nil, err
 			}
@@ -2749,6 +2774,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 				return nil, err
 			}
 			defer unlock()
+			if err := prepareFilesystemAccess(ctx, w); err != nil {
+				return nil, err
+			}
 			if err := w.handle.FS().Rename(req.From, req.To); err != nil {
 				return nil, err
 			}
@@ -2771,6 +2799,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		defer unlock()
+		if err := prepareFilesystemAccess(ctx, w); err != nil {
+			return nil, err
+		}
 		return w.handle.FS().Search(req.Path, req.Pattern, req.Glob, req.MaxResults)
 	case proto.OpFSEdit:
 		req, err := decode[proto.FSEditReq](f)
@@ -2790,6 +2821,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 				return nil, err
 			}
 			defer unlock()
+			if err := prepareFilesystemAccess(ctx, w); err != nil {
+				return nil, err
+			}
 			nrep, err := w.handle.FS().Edit(req.Path, req.Edits)
 			if err != nil {
 				return nil, err
