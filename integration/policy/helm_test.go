@@ -44,14 +44,25 @@ func TestHelmGoldenTemplateIsCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Compare documents, not bytes, and not line endings either.
+	//
+	// Two different machine differences reach this comparison and neither is a
+	// property of the chart. Helm 3 and 4 disagree about where a `---`
+	// separator goes and whether a trailing empty document is emitted, so a
+	// byte comparison is really a comparison against whichever helm the runner
+	// ships. And a Windows checkout stores the golden with CRLF, which helm
+	// never emits.
+	//
+	// Everything this test exists to catch survives both normalisations: chart
+	// drift changes a document's content, and any such change still shows up.
 	goldenText := strings.ReplaceAll(string(golden), "\r\n", "\n")
-	if rendered == goldenText {
+	if sameDocuments(rendered, goldenText) {
 		return
 	}
 	t.Errorf("the chart no longer renders %s. Regenerate it and review the diff:\n"+
 		"  helm template %s %s --namespace %s -f %s > %s",
 		goldenPath, releaseName, chartPath, namespace, valuesPath, goldenPath)
-	for _, line := range firstDifference(goldenText, rendered) {
+	for _, line := range firstDifference(strings.Join(documents(goldenText), "\n---\n"), strings.Join(documents(rendered), "\n---\n")) {
 		t.Log(line)
 	}
 }
@@ -181,4 +192,33 @@ func TestTheChartOwnsNoWorkspaceLifecycle(t *testing.T) {
 			t.Error("the rendered service account still mounts its API token")
 		}
 	}
+}
+
+// documents splits a multi-document YAML stream into its non-empty documents,
+// with each one trimmed of the blank lines that surround a separator. It is
+// deliberately textual: the point is to ignore how helm punctuated the stream,
+// not to interpret the YAML.
+func documents(stream string) []string {
+	var out []string
+	for _, doc := range strings.Split(stream, "\n---") {
+		if trimmed := strings.TrimSpace(doc); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+// sameDocuments reports whether two rendered streams carry the same documents
+// in the same order.
+func sameDocuments(a, b string) bool {
+	da, db := documents(a), documents(b)
+	if len(da) != len(db) {
+		return false
+	}
+	for i := range da {
+		if da[i] != db[i] {
+			return false
+		}
+	}
+	return true
 }
