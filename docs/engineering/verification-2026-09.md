@@ -403,6 +403,8 @@ in `sealSpillLocked`. What remains open, and why each was deliberately not
 changed, is in `docs/engineering/performance-regressions-2026-09.md` under
 "Regression 3, re-diagnosed".
 
+---
+
 ## Plan B B32 — clean installs of every shipped artifact, 2026-09-03 (late)
 
 **Status: verified, with two named unavailable sub-lanes.**
