@@ -1791,6 +1791,7 @@ const (
 	EvPoolFailed        = "pool.provision_failed"        // payload {pool, reason, retry_at}; no credentials
 	EvPoolRetiring      = "pool.retiring"                // payload {pool, machine, node}; the node is fenced from new claims before its provider destroy
 	EvPoolRetireAborted = "pool.retire_aborted"          // payload {pool, machine, node}; a definite provider failure lifted the fence
+	EvPoolRetired       = "pool.retired"                 // payload {pool, machine, node}; inventory no longer lists the machine and the fence is lifted
 	EvExportAdvanced    = "export.cursor.advanced"       // a durable destination cursor advanced after accepting a batch
 	EvNotifyUnavailable = "notifier.unavailable"         // delivery or its durable fallback is unavailable; payload is sanitized
 	EvNotifyDeadLetter  = "notifier.dead_lettered"       // failed delivery metadata was durably retained

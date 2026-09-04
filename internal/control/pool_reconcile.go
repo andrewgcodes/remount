@@ -306,10 +306,11 @@ func (c *Control) prunePoolRetirementsLocked(work poolWork, visible map[string]s
 		if _, ok := visible[fence.Machine]; ok {
 			continue
 		}
+		payload := map[string]any{"pool": work.pool.Spec.Name, "machine": fence.Machine, "node": node}
 		if err := c.transact(func(tx *eventlog.Tx) error {
 			_, err := tx.Exec(`DELETE FROM pool_retirements WHERE node=?`, node)
 			return err
-		}, nil); err != nil {
+		}, []*proto.Event{c.poolEvent(proto.EvPoolRetired, work.pool, "", payload)}); err != nil {
 			c.logger.Error("release pool retirement", "pool", work.pool.Spec.Name, "node", node, "err", err)
 			continue
 		}
