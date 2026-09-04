@@ -472,6 +472,9 @@ func newFakeStore(t *testing.T, overrides Config) (*fakeS3, *Store) {
 	if overrides.StagingTTL != 0 {
 		cfg.StagingTTL = overrides.StagingTTL
 	}
+	if overrides.HTTPClient != nil {
+		cfg.HTTPClient = overrides.HTTPClient
+	}
 	store, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -801,4 +804,46 @@ func fakeError(w http.ResponseWriter, status int, code string) {
 func writeXML(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/xml")
 	_ = xml.NewEncoder(w).Encode(value)
+}
+
+// TestIdleConnectionsExpireBeforeAServerWouldCloseThem pins the remedy for a
+// failure that has nothing to do with the request being made.
+//
+// net/http reuses keep-alive connections, and Request.isReplayable replays only
+// GET, HEAD, OPTIONS and TRACE. So when an endpoint closes an idle connection
+// and this client then hands the next request to it, a PUT fails with "server
+// closed idle connection" and is not retried. TestMinIOIntegration failed in CI
+// exactly that way, on the first upload after an idle gap.
+//
+// Retrying is not the remedy: a conditional PUT retried after a lost response
+// can return 412 and be read as a conflict that never occurred. So the client
+// expires idle connections before a server would, and this test fails if that
+// default is ever dropped or raised past the shortest idle timeout endpoints
+// commonly use.
+func TestIdleConnectionsExpireBeforeAServerWouldCloseThem(t *testing.T) {
+	_, store := newFakeStore(t, Config{})
+	transport, ok := store.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("the default client has transport %T; it must own one so its idle timeout is not net/http's 90s default", store.httpClient.Transport)
+	}
+	if transport.IdleConnTimeout <= 0 {
+		t.Fatal("idle connections never expire, so this client will eventually hand a request to a connection the server has already closed")
+	}
+	// 60s is what AWS ELB, MinIO and most reverse proxies use. Anything at or
+	// above it reintroduces the race this exists to close.
+	if transport.IdleConnTimeout >= 60*time.Second {
+		t.Errorf("IdleConnTimeout is %v, which is not inside the 60s idle timeout endpoints commonly use", transport.IdleConnTimeout)
+	}
+}
+
+// TestACallerSuppliedHTTPClientIsNotRewritten is the other half. A caller that
+// brings its own client has usually done so to install a proxy, a custom TLS
+// config or an instrumented transport, and silently replacing it would break
+// exactly the thing they configured.
+func TestACallerSuppliedHTTPClientIsNotRewritten(t *testing.T) {
+	marker := &http.Transport{IdleConnTimeout: 3 * time.Minute}
+	_, store := newFakeStore(t, Config{HTTPClient: &http.Client{Transport: marker}})
+	if store.httpClient.Transport != marker {
+		t.Fatalf("a caller-supplied transport was replaced with %T", store.httpClient.Transport)
+	}
 }
