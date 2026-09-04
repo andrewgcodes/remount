@@ -451,6 +451,45 @@ printf '%s\n' mounts:
 findmnt | rg 'remount-gvisor|runsc' || true
 ```
 
+### Post-rebase host-veth proof
+
+The final candidate incorporated the stronger AF_PACKET assertion from
+`origin/main`. A clean-host rerun first showed that the host-side netdev
+ingress rule stopped forwarding but did not stop forbidden frames from
+reaching the host veth:
+
+```text
+packets reached rmh1536 for [1.1.1.1 169.254.84.218]
+```
+
+The boundary now installs a `clsact` flower policy on the guest veth egress
+before runsc starts: ARP and the exact broker IPv4/TCP tuple pass, and a lower
+priority all-protocol rule drops everything else. This uses the traffic-control
+egress hook because Linux 5.15 does not support nftables' `netdev` egress hook.
+The host nftables ingress rule remains as a second boundary. The AF_PACKET
+observer was also made direction-aware so broker replies transmitted from the
+host are not misclassified as workspace egress.
+
+The exact final command used a rootfs exported from the immutable Alpine image
+above, with the two static probe binaries installed:
+
+```sh
+REMOUNT_GVISOR_INTEGRATION=1 \
+REMOUNT_GVISOR_ROOTFS=/home/ubuntu/firecracker-artifacts/gvisor-rootfs-alpine-3.22 \
+REMOUNT_CHAOS_IMAGE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce \
+  ./scripts/gvisor-conformance.sh
+```
+
+The spike passed both positive controls, all seven denial checks and
+post-revoke denial. `TestE4DenialConformance` passed in 21.25 seconds with no
+forbidden destination observed on the host-side veth; the in-flight transfer
+stopped when synchronous revoke returned.
+`TestE4FailedSetupCleanupConformance` passed in 0.19 seconds, and
+`TestE5TenantIsolationConformance` passed in 0.58 seconds. A post-run audit
+found zero `rmh*` links, zero `remount_rmh*` nftables tables, zero
+`/run/remount/netns/rm-*` mounts and zero runsc sandbox/gofer processes.
+**Status: verified on the exact final candidate.**
+
 ---
 
 ## 2026-09-04 — Firecracker 2.3 and B29 on Linux/KVM
@@ -982,6 +1021,17 @@ on `devin-box` because the named host lacks RAM for 2,000 runsc sandboxes.**
 Cleanup deleted all 1,060 runsc containers, verified no sandbox or gofer
 process remained, unmounted 197 backend `null-netns` mountpoints, verified no
 mount below the test root remained, and removed the temporary scale tree.
+
+A later preflight before the final E4 rerun corrected that teardown claim:
+1,145 `rmh*` links, 1,061 `remount_rmh*` netdev tables and matching
+`/run/remount/netns/rm-*` mounts from terminated scale attempts still existed.
+They were removed by exact Remount-owned prefixes before rerunning any provider
+proof; the subsequent audit reported zero for every class. The 2,000-workspace
+scale result remains unavailable. The integrated startup reaper now destroys
+containers recorded in the backend's runsc state root and removes only network
+namespaces whose inode is not inhabited by any process, together with their
+veths; the live-namespace regression ensures restart cleanup does not cut the
+network out from under a running workspace.
 
 ### B32 reconnect race and final repository gates
 
