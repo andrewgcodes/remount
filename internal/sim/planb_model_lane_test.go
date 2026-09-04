@@ -215,8 +215,24 @@ func planBWriteCatalog(t *testing.T, ctx context.Context, c *client.Client, ws s
   "provider": { "openai": { "models": { %q: { "name": "Plan B" }, %q: { "name": "Plan B Aux" } } } }
 }
 `, planBSmallModel, planBModel, planBSmallModel)
-	if err := c.WriteFile(ctx, ws, ".config/opencode/opencode.json", []byte(catalog), 0o644); err != nil {
-		t.Fatal(err)
+	// Written from inside the container rather than through the node's
+	// filesystem API, because the directory belongs to the container's user.
+	// `npm i -g opencode` runs as root and leaves .config/opencode owned by
+	// root; a host-side write then fails with "permission denied" on the
+	// atomic temp file. That does not reproduce on Docker Desktop for macOS,
+	// whose bind mounts present every file as owned by the mounting user, so
+	// this passed locally and failed on Linux CI — the difference was the
+	// daemon, not the code.
+	script := fmt.Sprintf(`set -eu
+mkdir -p .config/opencode
+cat > .config/opencode/opencode.json <<'REMOUNT_CATALOG_EOF'
+%s
+REMOUNT_CATALOG_EOF
+test -s .config/opencode/opencode.json
+`, catalog)
+	out, errOut, exit, err := c.Run(ctx, ws, "/bin/sh", "-c", script)
+	if err != nil || exit == nil || exit.Code != 0 {
+		t.Fatalf("write model catalog: err=%v exit=%+v\n%s\n%s", err, exit, out, errOut)
 	}
 }
 
