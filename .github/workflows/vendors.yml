@@ -38,7 +38,7 @@ jobs:
       E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-      IX_DEV_API_KEY: ${{ secrets.IX_DEV_API_KEY }}
+      IX_TOKEN: ${{ secrets.IX_TOKEN }}
       REMOUNT_VENDOR_ENROLL_TOKEN: ${{ secrets.REMOUNT_VENDOR_ENROLL_TOKEN }}
       REMOUNT_SSH_PRIVATE_KEY: ${{ secrets.REMOUNT_SSH_PRIVATE_KEY }}
       REMOUNT_SSH_KNOWN_HOSTS: ${{ secrets.REMOUNT_SSH_KNOWN_HOSTS }}
@@ -60,8 +60,7 @@ jobs:
       REMOUNT_MODAL_SIZE: ${{ vars.REMOUNT_MODAL_SIZE }}
       MODAL_ENVIRONMENT: ${{ vars.MODAL_ENVIRONMENT }}
       REMOUNT_IX_HELPER: ${{ vars.REMOUNT_IX_HELPER }}
-      REMOUNT_IX_PLAYGROUND: ${{ vars.REMOUNT_IX_PLAYGROUND }}
-      REMOUNT_IX_ACCOUNT: ${{ vars.REMOUNT_IX_ACCOUNT }}
+      REMOUNT_IX_REGION: ${{ vars.REMOUNT_IX_REGION }}
       REMOUNT_SSH_HOST: ${{ vars.REMOUNT_SSH_HOST }}
       REMOUNT_SSH_PORT: ${{ vars.REMOUNT_SSH_PORT }}
       REMOUNT_SSH_USER: ${{ vars.REMOUNT_SSH_USER }}
@@ -94,7 +93,7 @@ jobs:
             fly) require FLY_IO_2026_CORRECT_KEY; require REMOUNT_FLY_APP; require REMOUNT_FLY_IMAGE ;;
             e2b) require E2B_API_KEY; require REMOUNT_E2B_TEMPLATE ;;
             modal) require MODAL_TOKEN_ID; require MODAL_TOKEN_SECRET; require REMOUNT_MODAL_HELPER; require REMOUNT_MODAL_APP; require REMOUNT_MODAL_IMAGE ;;
-            ix) require IX_DEV_API_KEY; require REMOUNT_IX_HELPER; require REMOUNT_IX_PLAYGROUND; require REMOUNT_IX_ACCOUNT ;;
+            ix) require IX_TOKEN; require REMOUNT_IX_HELPER ;;
             ssh) require REMOUNT_SSH_HOST; require REMOUNT_SSH_USER; require REMOUNT_SSH_PRIVATE_KEY; require REMOUNT_SSH_KNOWN_HOSTS ;;
           esac
           if [ -n "$missing" ]; then

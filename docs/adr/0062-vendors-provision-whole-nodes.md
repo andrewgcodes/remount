@@ -74,13 +74,25 @@ the driver does not infer success or invent an undocumented request.
   versioned `remount-modal-provisioner` helper built against a supported Modal
   SDK instead of guessing private HTTP. Missing helper or Modal credentials is
   unavailable.
-- **iximiuz Labs:** the official [labctl
-  contract](https://github.com/iximiuz/labctl) documents playground start,
-  list, SSH, stop/restart, and destroy, but does not publish a stable
-  machine-JSON/metadata API suitable for tenant-pool reconciliation. Remount
-  requires a versioned helper around that CLI and pins it to a dedicated
-  account, tenant, and pool. Region and size are unavailable. Missing helper or
-  API credential is unavailable.
+- **ix.dev:** publishes a CLI and per-language SDKs
+  ([docs](https://ix.dev/docs)) but no REST contract. The CLI does cover the
+  lifecycle a pool needs — `ix new --name --region --no-shell`, `ix ls
+  --output json`, `ix rm`, and `ix secret set`, which reads a value from stdin
+  and documents that it "is never taken on the command line". That is enough
+  to drive natively, the way `fly` is driven, and a native driver is the
+  intended end state.
+
+  Remount ships the helper protocol for it today because the shape of `ix ls
+  --output json` has not been observed: the account used for verification had
+  no VMs, so the call returned `[]`, and the create needed to produce one was
+  refused by the server (`unsupported method: vm.build_commit_from_oci`)
+  against a 2026-06-28 CLI. Writing a parser for field names nobody has seen
+  is the guessing this ADR exists to prevent, so the helper keeps that mapping
+  behind a versioned contract until the schema is observed on a supported CLI.
+  The driver pins to a tenant and pool. Region is placement the vendor
+  supports and is passed through; an unset region leaves the vendor's own
+  default in force. Size is not part of that surface and is unavailable.
+  Missing helper or API credential is unavailable.
 - **BYO SSH:** OpenSSH documents that remote arguments are joined into one
   command string before transmission ([`ssh(1)`](https://man.openbsd.org/ssh.1)),
   and [RFC 4254 section 6.5](https://www.rfc-editor.org/rfc/rfc4254#section-6.5)
@@ -100,7 +112,8 @@ and never include helper output in an error. `create` returns one non-secret
 `{"machines":[...]}` (SSH returns `{"present":bool,"machine":...}`); and
 `destroy` returns no body and treats an absent provider object as success. The
 Modal helper receives credentials only through `MODAL_TOKEN_ID` and
-`MODAL_TOKEN_SECRET`; the ix helper receives `IX_DEV_API_KEY`. Neither helper
+`MODAL_TOKEN_SECRET`; the ix helper receives `IX_TOKEN`, the vendor's own
+variable. Neither helper
 may copy those credentials or the enrollment value into argv, tags, stdout,
 stderr, a reusable image, or provider inventory.
 
