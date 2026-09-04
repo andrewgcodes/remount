@@ -382,6 +382,84 @@ control-plane URL, enrollment token and binary URL as the E2B entry.
 
 ---
 
+## Performance attribution sweep, 2026-09-03 (late)
+
+Host: Darwin 25.3.0 arm64, 18 cores, shared with other suites. Backend:
+`process`. All commands run from the repository root.
+
+| Command | Result | Status |
+|---|---|---|
+| `go test ./internal/sim -run '^TestHandoffScaleAndControlFailover$' -count=1 -mutexprofile=... -blockprofile=...` | PASS in 23.68 s; claim p50 425 ms / p99 668 ms, exec_round_trip p50 2.78 s, move p50 4.84 s, reattach p50 4.74 s | verified |
+| `go tool pprof -peek` on each suspect symbol | dispatch 26.5%, artifact publish 9.7%, forkExec 9.4%, sessionLogCommit 1.4% | verified — corrects the earlier claim of 47% for the session-log path |
+| `go test ./internal/sim -run '^TestExecRoundTripCostOfTheDurableSessionTier$'` | tier off 11 ms, on 29-30 ms, ratio 2.47-2.66x over four runs | verified |
+| Same lane with the tier disabled in *both* arms (deliberate fault injection) | FAILS with "the artifact tier cost nothing (1.02x)" | verified — the lane detects its own irrelevance |
+| Phase instrumentation of `sealSpillLocked` and `artifact.Store.put` | 2 puts per seal, one per store, each `tmp.Sync()` + `syncDir()`; spill sync 3.4 ms, put 14.5 ms, head 0.12 ms, commit 0.6 ms | verified; instrumentation removed afterwards |
+| 200 concurrent `sh -c printf` from one Go process | 436 ms wall, p50 247 ms, against 5 ms unloaded | verified — `ForkLock` floor, a simulation artifact |
+| `go test ./... -count=1 -timeout=40m` | 0 failures | verified |
+| `gofmt -l`, `go vet ./...`, `staticcheck ./...`, `scripts/lint-locks.sh` | all clean | verified |
+
+The one code change from this sweep is the removal of the redundant spill fsync
+in `sealSpillLocked`. What remains open, and why each was deliberately not
+changed, is in `docs/engineering/performance-regressions-2026-09.md` under
+"Regression 3, re-diagnosed".
+
+## Plan B B32 — clean installs of every shipped artifact, 2026-09-03 (late)
+
+**Status: verified, with two named unavailable sub-lanes.**
+
+Host: Darwin 25.3.0 arm64; Docker Desktop 29.4.1 serving `linux/aarch64`;
+Python 3.14.5 (`pip` is not on PATH, `python3 -m pip` and `python3 -m venv`
+are); npm 11.12.1 with node 25.9.0; Go 1.27.1; no `syft`. Candidate
+`c89e413` with this suite as the working-tree change. Every artifact comes
+from `make dist`; nothing was published, tagged, pushed or signed.
+
+| Command | Result | Status |
+|---|---|---|
+| `go test -count=1 -timeout 30m ./integration/installs/...` | ok, 52.8 s, one skip (`syft`) | verified |
+| `TestB32TheStaticBinaryInstallsAndPassesTheBlackBoxSmoke` — `dist/remount-darwin-arm64` copied to a temp prefix, started there with an allow-listed environment, judged by `go run ./cmd/conformance --endpoint URL --external` | `CONFORMANT`, required 52 passed / 0 failed / 0 unavailable, cleanup verified | verified |
+| `TestB32TheOCIArchivesInstallAndPassTheBlackBoxSmoke` — both release images built from a context holding only the linux binary and the two Dockerfiles, `docker save`, `docker rmi`, `docker load`, run on a private network, judged over `--endpoint … --external --token` | `CONFORMANT`, required 52 passed / 0 failed / 0 unavailable; containers, network and images removed and their removal re-checked | verified |
+| `TestB32ThePythonWheelInstallsIntoAFreshVenvAndDrivesTheInstalledServer` — `python3 -m pip wheel` then install into a second fresh venv | `remount.__file__` under the venv; workspace created, `/bin/echo` run, workspace destroyed | verified |
+| `TestB32TheNpmTarballInstallsIntoAnEmptyDirAndDrivesTheInstalledServer` — `npm ci`, `npm run build`, `npm pack`, `npm install <tarball> --omit=dev` into an empty directory | `@remount/sdk` resolves inside the install directory; same workspace lifecycle | verified |
+| `TestB32AGoModuleConsumerBuildsFromTheArtifactAndDrivesTheInstalledServer` — module zip served from a `file://` proxy, consumer module outside the repository, no `replace` | `go list -m` resolves to the consumer's own module cache; the compiled consumer contains no byte of the checkout path | verified |
+| `TestB32AChecksumManifestTravelsWithTheArtifactsAndCatchesDamage` | six artifacts verify against the manifest that travelled with them; a byte flip is rejected | verified |
+| `TestB32TheInstalledBinaryCarriesItsOwnComponentInventory` — `go version -m` on the installed file | main module `remount.dev/remount`, 15 modules, every direct `go.mod` requirement present at the pinned version | verified but bounded — module components only, not a full SPDX document |
+| `TestB32TheLinuxArtifactsAreStaticallyLinked` | neither linux ELF names a dynamic loader or a shared library | verified |
+| `TestB32TheSPDXSBOMLaneNeedsSyft` | `unavailable: syft is not on PATH` | unavailable (host) |
+| Homebrew formula install | the formula's URLs and digests come from a published release manifest (`packaging/homebrew/README.md`); installing one locally would need the publish action Plan B §18 cuts | unavailable (release-gated) |
+| `install.sh` against real release assets | same gate; its decision logic is covered hermetically by `scripts/release/test_install.sh` | unavailable (release-gated) |
+| `dist/remount-linux-amd64`, both windows artifacts | this host can execute neither; the linux/arm64 artifact is the one the image lane runs | unavailable (host) |
+| `gofmt -l`, `go vet ./...`, `staticcheck ./...` | clean | verified |
+
+What "clean" means here, and how it is enforced: every lane installs into a
+`t.TempDir()`, runs from a directory that is not the checkout, and gets an
+environment built from an allow list (`PATH`, `HOME`, `TMPDIR`, `LANG`) rather
+than a scrub list, so `GOPATH`, `GOFLAGS`, `PYTHONPATH`, `NODE_PATH`,
+`VIRTUAL_ENV`, `REMOUNT_SERVER` and the rest cannot survive. The Go consumer
+gets its own `GOMODCACHE`, `GOCACHE` and an empty `GOENV`.
+
+**Failure injection.** Each detector has a permanent control, and the main Go
+lane was additionally broken by hand:
+
+| Injected defect | What caught it |
+|---|---|
+| `replace remount.dev/remount => <checkout>` added to the consumer built by the passing lane | `the consumer acquired a replace directive`, then, with that check removed, ``remount.dev/remount was replaced by &{Path:/Users/…/remount Dir:/Users/…/remount}; the build did not use the artifact`` |
+| the same replace, as the permanent control `TestB32AReplaceIntoTheCheckoutIsCaught` | asserts `go list -m` reports the replacement, that it resolves to the checkout, and that the compiled binary then does contain the checkout path |
+| a binary built without `-trimpath` (`TestB32TheSourceTreeScanCatchesAnUntrimmedBinary`) | the same byte scan that passes on the dist artifact finds the checkout path |
+| `pip install -e sdk/python` (`TestB32AnEditablePythonInstallIsCaught`) | the package location check reports a path inside the checkout |
+| `npm install <checkout>/sdk/typescript` (`TestB32ALinkedNpmInstallIsCaught`) | npm links rather than copies, and the realpath check reports the checkout |
+| a byte flipped in one installed artifact | the checksum verifier rejects it |
+| `PYTHONPATH`, `GOFLAGS`, `NODE_PATH` set in the parent process (`TestCleanEnvDropsInheritedPaths`) | `cleanEnv` drops all three |
+
+**A packaging fact this lane pins.** The image lane loads two images, not one.
+`packaging/container/Dockerfile` is `FROM scratch`, which is right for the
+control plane and the CLI and impossible for a process-backend node: judged
+alone it fails `CONF-SESS-004` and `CONF-SESS-006` with `/bin/cat` and
+`/bin/sh` missing, observed here as `NOT CONFORMANT … required 50 passed, 2
+failed`. `deploy/compose/node.Dockerfile` exists for exactly that asymmetry.
+Paired, the stack is `CONFORMANT` on all 52 required rows.
+
+---
+
 ## Still not attempted
 
 These remain open with no evidence in this file. Listing them here is

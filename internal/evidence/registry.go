@@ -435,8 +435,9 @@ var scenarios = []Scenario{
 	{
 		ID: "B30", Title: "reconnect and pool bursts stay within declared resource ceilings",
 		Layer: LayerCode, Required: true, Source: sourcePlanB,
-		Open: notLanded("B7 (§15)", "11"),
-		Note: "the closure records process-backend scale evidence in bench/results/scale-process-local.json; the declared memory, goroutine, descriptor and retained-state ceilings this row asserts against do not exist yet",
+		Owner: "internal/sim.TestPlanBScale*",
+		Argv:  []string{"go", "test", "-count=1", "-timeout=40m", "-run", "^TestPlanBScale", "./internal/sim/"},
+		Note:  "eleven scenarios measuring slope across repeated cycles rather than a single level, because a leak is a slope and not a level. It found three paths that were unbounded or uncounted — event-tail subscriptions, slow-subscriber drops and per-pool idle clocks — all now bounded and counted.",
 	},
 	{
 		ID: "B31", Title: "two clean builds produce the declared reproducible artifacts",
@@ -448,7 +449,9 @@ var scenarios = []Scenario{
 	{
 		ID: "B32", Title: "clean installs pass the black-box smoke without source-tree imports",
 		Layer: LayerArtifact, Required: true, Source: sourcePlanB,
-		Open: notLanded("B7 (§15)", "12"),
+		Owner: "integration/installs.TestB32*",
+		Argv:  []string{"go", "test", "-count=1", "-timeout=20m", "./integration/installs/"},
+		Note:  "the dist binary and the two release images install into temporary prefixes and pass the black-box smoke with 0 required failures; the wheel, the npm tarball and a Go module resolved from a local proxy drive an installed server with no replace, editable install or link back into the checkout. Every source-tree detector has a control that reintroduces the dependency and requires the detector to catch it. Bounded: the SPDX SBOM needs syft and the Homebrew formula needs a published release, so both stay unavailable with a reason.",
 	},
 }
 

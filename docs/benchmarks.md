@@ -88,6 +88,30 @@ performance claims.
 | move | 200 | 6.695 s | 8.196 s |
 | reattach after control restart | 200 | 5.686 s | 5.705 s |
 
+### Cost of the durable session-log tier, per exec
+
+`internal/sim.TestExecRoundTripCostOfTheDurableSessionTier` measures one
+trivial exec with the artifact tier live against the same exec without it,
+back to back on the same host, and reports the ratio. It exists because the
+2026-09 regression sweep found nothing in `bench/run.py` that would have caught
+the exec regression at `a3b5235`, and named this as the lane that would have.
+
+The ratio is what to watch; the absolute numbers are a property of the host.
+
+| Configuration | p50 (n=24) |
+|---|---:|
+| artifact tier off | 11-12 ms |
+| artifact tier on | 29 ms |
+| **ratio** | **2.47-2.66x** (three runs) |
+
+Sealing a ~195-byte segment writes it to the node's own artifact store (two
+fsyncs), uploads it to the control plane's store (two more, plus HTTP), and
+commits a record: about 15 ms. That is the price of spec §8.2 — an exited
+session replays byte-exactly after node loss — paid synchronously on every
+exec. The test's gate is set at 5x rather than at the observed value so that a
+loaded host does not fail the suite; see
+`docs/engineering/performance-regressions-2026-09.md` for what remains open.
+
 
 ## Unavailable evidence
 
