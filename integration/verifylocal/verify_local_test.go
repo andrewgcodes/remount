@@ -205,6 +205,27 @@ func TestSuiteGateRunsThePublicSDKModule(t *testing.T) {
 	}
 }
 
+func TestInvalidArgumentsRunNothing(t *testing.T) {
+	root := repoRoot(t)
+	// A mistyped invocation must not degrade into a run that can say "safe
+	// to push": `all typo` is not the full set, `fast vet` is not fast, and a
+	// misspelled gate name is not the gate. Each is a usage error before any
+	// gate executes.
+	for _, args := range [][]string{{"all", "typo"}, {"fast", "vet"}, {"vet", "typo"}, {"typo"}} {
+		s := newStubs(t, nil, "staticcheck", "govulncheck")
+		out, code, calls := s.run(t, root, args...)
+		if code != 64 {
+			t.Errorf("%v exited %d, want 64 (usage)\n%s", args, code, out)
+		}
+		if claimsFullPass(out) {
+			t.Errorf("%v was reported as a pass\n%s", args, out)
+		}
+		if len(calls) != 0 {
+			t.Errorf("%v ran gates before rejecting the arguments:\n%s", args, strings.Join(calls, "\n"))
+		}
+	}
+}
+
 // claimsFullPass recognises the one verdict that licenses a push. Only a run
 // of the complete gate set in which every gate executed and passed may say it.
 func claimsFullPass(out string) bool {

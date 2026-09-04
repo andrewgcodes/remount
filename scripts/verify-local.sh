@@ -163,8 +163,13 @@ run_fast() {
 # ci.yml gate set; the others are named as the subset they are.
 gate_set="${1:-all}"
 case "$gate_set" in
-  all)  run_all ;;
-  fast) run_fast ;;
+  all|fast)
+    if [ "$#" -gt 1 ]; then
+      echo "usage: $0 [fast | <gate>...]; '$gate_set' takes no further arguments (got: $*)" >&2
+      exit 64
+    fi
+    "run_$gate_set"
+    ;;
   *)
     gate_set="selected"
     for name in "$@"; do
