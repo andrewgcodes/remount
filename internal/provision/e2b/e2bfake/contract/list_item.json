@@ -1,0 +1,26 @@
+{
+  "_comment": "Canonical element of the GET /v2/sandboxes 200 array, captured from the real api.e2b.app on 2026-09-03. The driver reads sandboxID, startedAt, state and metadata; every other field must remain ignorable. startedAt is RFC3339 with nanoseconds.",
+  "_driver_reads": ["sandboxID", "startedAt", "state", "metadata"],
+  "sandboxID": "ioky4hzepqikp1llab23z",
+  "startedAt": "2026-09-03T23:43:03.489235654Z",
+  "state": "running",
+  "metadata": {
+    "remount_managed": "true",
+    "remount_name": "shape-probe",
+    "remount_tenant": "probe-tenant",
+    "remount_pool": "probe-pool",
+    "remount_label_region": "iad"
+  },
+  "_ignorable": {
+    "_comment": "Real provider fields the driver must tolerate without changing behavior.",
+    "alias": "base",
+    "clientID": "6532622b",
+    "cpuCount": 2,
+    "diskSizeMB": 1024,
+    "endAt": "2026-09-03T23:44:03.489235654Z",
+    "envdVersion": "0.6.10",
+    "memoryMB": 512,
+    "templateID": "rki5dems9wqfm4r03t7g",
+    "volumeMounts": []
+  }
+}

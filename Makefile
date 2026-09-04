@@ -106,3 +106,19 @@ demo: build
 
 clean:
 	rm -rf $(BINARY) dist coverage.txt remount-data remount-node
+
+.PHONY: plan-b plan-b-list
+
+PLAN_B_OUT ?= dist/plan-b
+
+# The Plan B aggregate completion gate (docs/engineering/plan-b-evidence.md).
+# It refuses a dirty tree, records the exact commit, runs the B0 gates, and
+# reports every lane it could not run instead of omitting it. Pass --dev,
+# --gates or --require-complete through PLAN_B_ARGS.
+plan-b:
+	go run ./cmd/evidence run --out $(PLAN_B_OUT) $(PLAN_B_ARGS)
+
+# Enumerate the acceptance scenarios, their owning proof, required environment
+# and latest recorded outcome without running anything.
+plan-b-list:
+	@go run ./cmd/evidence list $(PLAN_B_ARGS)

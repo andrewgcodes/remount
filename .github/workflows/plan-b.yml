@@ -1,0 +1,36 @@
+name: plan-b
+
+permissions:
+  contents: read
+
+# The Plan B aggregate gate. It is a status report, not a completion claim: the
+# run succeeds while required scenarios are still open, and the uploaded
+# summary lists every one of them with its missing prerequisite. Add
+# --require-complete when the registry is actually wired.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * 1'
+
+jobs:
+  plan-b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+      # A checkout is clean, so the gate runs without developer mode and the
+      # recorded candidate is the commit it actually tested.
+      - name: aggregate gate
+        run: make plan-b
+      - name: summary
+        if: always()
+        run: cat dist/plan-b/summary.md >> "$GITHUB_STEP_SUMMARY"
+      # Runtime evidence is candidate-scoped, never committed as evergreen proof.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: plan-b-evidence
+          path: dist/plan-b/
