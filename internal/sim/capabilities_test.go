@@ -95,9 +95,28 @@ func TestReleaseMatrixUnderLocalProfile(t *testing.T) {
 	c := w.client("c1")
 	ctx := ctxT(t, 30*time.Second)
 
-	statuses, err := c.ListNodes(ctx)
-	if err != nil {
-		t.Fatal(err)
+	var (
+		statuses []proto.NodeStatus
+		err      error
+	)
+	for {
+		statuses, err = c.ListNodes(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var oldListed, freshListed bool
+		for _, status := range statuses {
+			oldListed = oldListed || status.ID == old.ID()
+			freshListed = freshListed || status.ID == fresh.ID()
+		}
+		if oldListed && freshListed {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("nodes %s and %s were not both listed: %+v", old.ID(), fresh.ID(), statuses)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 	if got := nodeStatus(t, statuses, old.ID()).Protocol; !reflect.DeepEqual(got, []string{proto.CapabilityV1}) {
 		t.Fatalf("old node negotiated %v", got)
