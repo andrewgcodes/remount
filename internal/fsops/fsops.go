@@ -369,6 +369,17 @@ func (f *FS) Search(p, pattern, glob string, max int) (*proto.FSSearchRes, error
 	// unreadable entries by design, so an unusable root would otherwise return
 	// "no matches" -- a wrong answer that reads exactly like a real one.
 	if _, err := f.handle.Stat(name); err != nil {
+		parts := strings.Split(filepath.ToSlash(name), "/")
+		for i := 1; i < len(parts); i++ {
+			parent := path.Join(parts[:i]...)
+			info, parentErr := f.handle.Stat(filepath.FromSlash(parent))
+			if parentErr != nil {
+				break
+			}
+			if !info.IsDir() {
+				return nil, proto.Err(proto.CodeBadRequest, "search root crosses non-directory %q", parent)
+			}
+		}
 		return nil, mapErr(err)
 	}
 	res := &proto.FSSearchRes{}

@@ -7,7 +7,7 @@ import (
 	"os"
 )
 
-func validateMasterKeyPermissions(info os.FileInfo) error {
+func validateMasterKeyPermissions(_ string, info os.FileInfo) error {
 	if info.Mode().Perm()&0o077 != 0 {
 		return errors.New("master key is accessible to group or world")
 	}

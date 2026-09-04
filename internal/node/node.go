@@ -4116,7 +4116,7 @@ func (n *Node) prepareVolumeArtifactForWorkspace(ctx context.Context, w *proto.W
 		return err
 	}
 	artifactName := volumeArtifactName(artifactID)
-	destination := filepath.Join(n.opts.DataDir, "volumes", "sources", tenant, artifactName)
+	destination := filepath.Join(n.opts.DataDir, "volumes", "sources", volume.SourceRelativePath(tenant, artifactID))
 	tenantPath := filepath.Dir(destination)
 	completeMarker := filepath.Join(tenantPath, ".complete-"+artifactName)
 	if err := os.MkdirAll(tenantPath, 0o700); err != nil {

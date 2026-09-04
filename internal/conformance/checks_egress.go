@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // ---- binding placeholders, destination scoping and leak blocking ---------
@@ -99,16 +100,21 @@ func checkBindLeakBlocked(ctx context.Context, s *Session) error {
 	if status >= 200 && status < 400 {
 		return failf("the broker answered %d for a placeholder aimed at %s, a host its binding does not cover; §9 rule 1 blocks the request", status, b.UnboundHost)
 	}
-	events, err := s.Tail(ctx, from+1, f.WS.ID)
-	if err != nil {
-		return err
-	}
-	for _, e := range events {
-		if e.Type != "egress.denied" {
-			continue
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		events, err := s.Tail(ctx, from+1, f.WS.ID)
+		if err != nil {
+			return err
 		}
-		if payloadContains(e.Payload, "leak_blocked") {
-			return nil
+		for _, e := range events {
+			if e.Type == "egress.denied" && payloadContains(e.Payload, "leak_blocked") {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 	return failf("the broker refused the request (%d %s) but recorded no egress.denied with decision leak_blocked on %s's stream", status, strings.TrimSpace(string(body)), f.WS.ID)

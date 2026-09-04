@@ -19,6 +19,7 @@ import (
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/session"
 	"remount.dev/remount/internal/transport"
+	"remount.dev/remount/internal/volume"
 	"remount.dev/remount/internal/workspace"
 )
 
@@ -179,7 +180,7 @@ func TestNodeArtifactGCIsReferenceAware(t *testing.T) {
 	for _, item := range []struct {
 		id, body string
 	}{{referenced, "referenced"}, {orphan, "orphan"}} {
-		dir := filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", volumeArtifactName(item.id))
+		dir := filepath.Join(n.opts.DataDir, "volumes", "sources", volume.SourceRelativePath("tenant", item.id))
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -195,10 +196,10 @@ func TestNodeArtifactGCIsReferenceAware(t *testing.T) {
 	if !n.store.Has(referenced) || n.store.Has(orphan) || result.Removed != 1 {
 		t.Fatalf("collection = %+v, referenced=%t orphan=%t", result, n.store.Has(referenced), n.store.Has(orphan))
 	}
-	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", volumeArtifactName(referenced))); err != nil {
+	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", volume.SourceRelativePath("tenant", referenced))); err != nil {
 		t.Fatalf("referenced volume source removed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", volumeArtifactName(orphan))); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", volume.SourceRelativePath("tenant", orphan))); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("orphan volume source remains: %v", err)
 	}
 	delete(n.workspaces, "ws_ref")
@@ -206,7 +207,7 @@ func TestNodeArtifactGCIsReferenceAware(t *testing.T) {
 	if err != nil || n.store.Has(referenced) || result.Removed != 1 {
 		t.Fatalf("post-release collection = %+v, retained=%t, err=%v", result, n.store.Has(referenced), err)
 	}
-	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant", volumeArtifactName(referenced))); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", volume.SourceRelativePath("tenant", referenced))); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("released volume source remains: %v", err)
 	}
 }
@@ -438,7 +439,7 @@ func TestPrepareVolumeArtifactRebuildsIncompleteSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	destination := filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant-a", volumeArtifactName(id))
+	destination := filepath.Join(n.opts.DataDir, "volumes", "sources", volume.SourceRelativePath("tenant-a", id))
 	if err := os.MkdirAll(destination, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +490,7 @@ func TestPrepareVolumeArtifactEnforcesExpandedEntryLimit(t *testing.T) {
 	if err := n.prepareVolumeArtifact(context.Background(), "tenant-a", id); err == nil {
 		t.Fatal("expanded volume source exceeded entry limit without rejection")
 	}
-	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", "tenant-a", volumeArtifactName(id))); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(n.opts.DataDir, "volumes", "sources", volume.SourceRelativePath("tenant-a", id))); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("over-limit source was published: %v", err)
 	}
 }

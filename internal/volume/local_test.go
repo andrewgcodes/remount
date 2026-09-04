@@ -113,12 +113,16 @@ func newFixture(t *testing.T, opts Options) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		_ = backend.Close()
+		_ = resolver.Close()
+	})
 	return &fixture{backend: backend, resolver: resolver, mounter: mounter, state: state, sources: sources, root: root}
 }
 
 func (f *fixture) source(t *testing.T, tenant, artifact string) {
 	t.Helper()
-	dir := filepath.Join(f.sources, tenant, artifact)
+	dir := filepath.Join(f.sources, SourceRelativePath(tenant, artifact))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -660,10 +664,11 @@ func TestPathAndSourceSymlinkEscapesAreRejected(t *testing.T) {
 
 	sources := t.TempDir()
 	resolverRoot := filepath.Join(t.TempDir(), "resolver")
-	if err := os.MkdirAll(filepath.Join(resolverRoot, "tenant1"), 0o700); err != nil {
+	tenantName, artifactName := sourcePathComponents("tenant1", id)
+	if err := os.MkdirAll(filepath.Join(resolverRoot, tenantName), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(sources, filepath.Join(resolverRoot, "tenant1", id)); err != nil {
+	if err := os.Symlink(sources, filepath.Join(resolverRoot, tenantName, artifactName)); err != nil {
 		t.Fatal(err)
 	}
 	resolver, err := OpenDirectoryResolver(resolverRoot)

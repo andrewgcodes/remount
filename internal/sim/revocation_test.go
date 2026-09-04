@@ -2,6 +2,7 @@ package sim
 
 import (
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 
@@ -31,17 +32,23 @@ func TestRevocationClosesSessionsWithinOneRenew(t *testing.T) {
 	ctx := ctxT(t, 60*time.Second)
 
 	ws := mustWS(t, owner, proto.WorkspaceSpec{ACL: proto.WorkspaceACL{Writers: []string{"guest", "other"}}})
-	guestPTY, err := guest.Exec(ctx, proto.SOpenReq{WS: ws.ID, Kind: proto.SessionPTY, Program: []string{"sleep", "60"}, Rows: 20, Cols: 80})
+	kind := proto.SessionPTY
+	program := []string{"sleep", "60"}
+	if runtime.GOOS == "windows" {
+		kind = proto.SessionExec
+		program = []string{"ping.exe", "-n", "60", "127.0.0.1"}
+	}
+	guestPTY, err := guest.Exec(ctx, proto.SOpenReq{WS: ws.ID, Kind: kind, Program: program, Rows: 20, Cols: 80})
 	if err != nil {
 		t.Fatalf("guest exec: %v", err)
 	}
-	otherPTY, err := other.Exec(ctx, proto.SOpenReq{WS: ws.ID, Kind: proto.SessionPTY, Program: []string{"sleep", "60"}, Rows: 20, Cols: 80})
+	otherPTY, err := other.Exec(ctx, proto.SOpenReq{WS: ws.ID, Kind: kind, Program: program, Rows: 20, Cols: 80})
 	if err != nil {
 		t.Fatalf("other exec: %v", err)
 	}
 	// A plain exec session by the revoked principal must go too: closure is
 	// per principal, not per session kind.
-	guestExec, err := guest.Exec(ctx, proto.SOpenReq{WS: ws.ID, Program: []string{"sleep", "60"}})
+	guestExec, err := guest.Exec(ctx, proto.SOpenReq{WS: ws.ID, Program: program})
 	if err != nil {
 		t.Fatalf("guest exec: %v", err)
 	}

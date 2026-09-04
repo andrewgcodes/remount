@@ -15,6 +15,96 @@ in this file, and no run below printed one.
 
 ---
 
+## 2026-09-04 - native Windows host verification
+
+**Status: required conformance verified; one performance gate remains known
+failing and is visible CI debt.**
+
+Host: Windows Server 2022 amd64. Go: 1.27.1. Race C toolchain: MinGW-w64
+16.1.0. The tested working tree was based on `533088b` after rebasing onto
+`origin/main` at `99e5adb`.
+
+### Final command results
+
+| Command | Result |
+|---|---|
+| `go build ./...` | passed |
+| `go vet ./...` | passed |
+| `go test -count=1 -timeout 40m ./...` | failed only `remount.dev/remount/internal/sim.TestPlanbPerfMoveIncompressible` |
+| `go test -race -count=1 -timeout 60m ./...` | exposed the same performance failure plus two Windows handle/process races recorded below |
+| `go run ./cmd/conformance --build .` | 59 passed, 0 failed, 8 unavailable; all 52 required rows passed; cleanup verified |
+| `remount-windows-amd64.exe version` | `remount v0.0.0-20260904051749-533088b1506c+dirty` |
+| `go run ./cmd/conformance --binary .\remount-windows-amd64.exe` | 59 passed, 0 failed, 8 unavailable; all 52 required rows passed; cleanup verified |
+| `./scripts/lint-locks.sh .` | passed |
+
+The raw ordinary-suite failure is retained exactly:
+
+```text
+--- FAIL: TestPlanbPerfMoveIncompressible (8.45s)
+    planb_perf_move_test.go:114: incompressible: checkpoint phase 3.444s
+    planb_perf_move_test.go:114: incompressible: restore phase 3.251s
+    planb_perf_move_test.go:114: incompressible: chunks=0 uploaded_chunks=0 uploaded_bytes=0
+    planb_perf_move_test.go:114: incompressible: 64 MiB moved in 6.818s (9.4 MB/s), format=tar
+    planb_perf_move_test.go:116: incompressible move ran at 9.4 MB/s, want at least 20 MB/s
+FAIL remount.dev/remount/internal/sim 465.965s
+```
+
+Classification: **confirmed Windows-host performance defect**, not a passed
+benchmark and not a POSIX-only boundary. Windows CI runs every other test and
+names this exact exclusion in the workflow and job summary.
+
+### Confirmed defects found and fixed
+
+| Area | Exact regression or conformance signal | Pre-fix behavior |
+|---|---|---|
+| Conformance launcher | `internal/conformance.TestLocalExecutableNameUsesWindowsSuffix` | temporary binaries were started without `.exe` |
+| Required session semantics | `CONF-SESS-004`, `CONF-SESS-006` | the runner attempted `/bin/cat` and `/bin/sh`, which do not exist on Windows |
+| Filesystem jail | `internal/fsops.TestWindowsHostilePathsAreRejectedBeforeFilesystemAccess` | drive, UNC, device, ADS, reserved-name, and trailing-dot/space inputs were not rejected as Windows path aliases before access |
+| Junction containment | `internal/fsops.TestWindowsJunctionParentCannotEscapeRoot` | no native regression proved a reparse-point parent could not escape the workspace |
+| Artifact namespace | `integration/storage.TestTenantArtifactPhysicalPath` and volume/encrypted-store tests | logical IDs containing `:` produced `The filename, directory name, or volume label syntax is incorrect.` |
+| Key confidentiality | `internal/artifact/encrypted.TestFileMasterKeyRejectsWindowsEveryoneReadACL` | Windows key permission validation was a no-op and accepted an Everyone-readable DACL |
+| Process containment | `internal/session.TestKillWorkspaceTerminatesWindowsDescendants` | native sessions had no Job Object descendant containment |
+| Git byte identity | repository materialization tests | managed checkouts returned `hello\r\n`, `yes\r\n`, and `1\r\n` instead of the committed LF bytes |
+| Volume retarget defense | `internal/volume.TestDetachRefusesRetargetedMountPathAndRetainsProof` | the generic non-Unix directory identity returned `(0, 0, nil)`, so a retarget was not detected |
+| SQLite locking | `internal/control/replicate.TestSQLiteDatabaseMustCloseBeforeWindowsDelete` | no test covered Windows delete-while-open behavior |
+| Broker errors | broker classification tests | Winsock refused/reset errors were not mapped to the stable broker error classes |
+| Conformance audit visibility | `CONF-BIND-002` | an immediate event-tail read could race the canonical audit append; the denied request was observed before its `leak_blocked` event |
+| Race cleanup | `internal/session.TestE11FastProducerReplaysEverySequenceAcrossTiers` | `TempDir RemoveAll cleanup: unlinkat ...\session.log: The process cannot access the file because it is being used by another process.` |
+| Race process registration | `internal/sim.TestHandoffScaleAndControlFailover/real-peers-and-durable-restart` | fast processes could exit while Job Object assignment returned `Access is denied`, surfacing as `contain process tree: Access is denied.` |
+
+The path-jail suite now covers both separators, `..`, drive-relative and
+drive-absolute paths, UNC and device paths, `CON`/`NUL`/`AUX`, ADS syntax,
+case aliases, trailing dots/spaces, junction escapes, symlink escapes, and 8.3
+aliases when the host generates them. The 8.3 row reports a named skip when
+short-name generation is disabled.
+
+Artifact regressions cover rename-over-open behavior, read-only destinations,
+byte-exact LF snapshots, Windows-safe physical names, deterministic slash-form
+archive names, and parent symlink/reparse-point containment. No hostile input
+escaped the disposable workspace.
+
+### Unavailable native Windows boundaries
+
+- Unix PTYs are unavailable because the process backend has no ConPTY
+  implementation. `TestPTYAndStdin` skips with that named reason.
+- Native process-workspace recipe and ACP launcher scripts requiring a POSIX
+  shell are unavailable; Linux Docker workspaces still use `/bin/sh`.
+- Firecracker and gVisor are Linux-kernel backends and were not attempted.
+- Portable Go exposes no Windows equivalent to parent-directory fsync. The
+  Windows directory-sync implementation is an explicit no-op, not a durability
+  claim.
+- Read-only mounted volumes are unavailable in the native process backend.
+- Conformance reported eight unavailable rows:
+  `CONF-AUTH-007`, `CONF-SESS-007`, `CONF-APP-003`, `CONF-APP-004`,
+  `CONF-APP-005`, `CONF-AGT-005`, `CONF-EVT-009`, and `CONF-EVT-010`.
+
+**Teardown, verified.** Both conformance runs reported `cleanup: verified`.
+All standalone processes exited, Job Objects terminated descendants, and all
+disposable workspace, volume, SQLite, artifact, and session-log handles were
+closed before temporary-directory removal.
+
+---
+
 ## 2026-09-03 — E1 live broker substitution and leak blocking (OpenAI)
 
 **Status: verified.**

@@ -43,7 +43,7 @@ func registerProcessGroup(cmd *exec.Cmd) error {
 		return err
 	}
 	process, err := windows.OpenProcess(
-		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE,
+		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.SYNCHRONIZE,
 		false,
 		uint32(cmd.Process.Pid),
 	)
@@ -52,6 +52,13 @@ func registerProcessGroup(cmd *exec.Cmd) error {
 		return err
 	}
 	err = windows.AssignProcessToJobObject(job, process)
+	if err != nil {
+		if state, waitErr := windows.WaitForSingleObject(process, 1000); waitErr == nil && state == windows.WAIT_OBJECT_0 {
+			windows.CloseHandle(process)
+			windows.CloseHandle(job)
+			return nil
+		}
+	}
 	windows.CloseHandle(process)
 	if err != nil {
 		windows.CloseHandle(job)

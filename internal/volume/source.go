@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"remount.dev/remount/internal/artifact"
@@ -35,19 +36,20 @@ func (r *DirectoryResolver) OpenArtifact(_ context.Context, tenant, id string) (
 	if _, err := artifact.Digest(id); err != nil {
 		return nil, fmt.Errorf("volume: invalid artifact: %w", err)
 	}
-	tenantRoot, err := openRealRoot(r.root, tenant)
+	tenantName, artifactName := sourcePathComponents(tenant, id)
+	tenantRoot, err := openRealRoot(r.root, tenantName)
 	if err != nil {
 		return nil, err
 	}
 	defer tenantRoot.Close()
-	before, err := tenantRoot.Lstat(id)
+	before, err := tenantRoot.Lstat(artifactName)
 	if err != nil {
 		return nil, err
 	}
 	if before.Mode()&os.ModeSymlink != 0 || !before.IsDir() {
 		return nil, errors.Join(ErrUnsafePath, errors.New("volume: artifact source must be a real directory"))
 	}
-	f, err := tenantRoot.Open(id)
+	f, err := tenantRoot.Open(artifactName)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +58,7 @@ func (r *DirectoryResolver) OpenArtifact(_ context.Context, tenant, id string) (
 		f.Close()
 		return nil, err
 	}
-	after, lstatErr := tenantRoot.Lstat(id)
+	after, lstatErr := tenantRoot.Lstat(artifactName)
 	if lstatErr != nil || after.Mode()&os.ModeSymlink != 0 || !after.IsDir() || !os.SameFile(before, after) || !os.SameFile(after, info) {
 		f.Close()
 		return nil, errors.Join(ErrUnsafePath, lstatErr, errors.New("volume: artifact source changed or traversed a symlink"))
@@ -87,6 +89,13 @@ func openRealRoot(parent *os.Root, name string) (*os.Root, error) {
 
 // Close releases the resolver root descriptor.
 func (r *DirectoryResolver) Close() error { return r.root.Close() }
+
+// SourceRelativePath returns the host path below a volume source root for a
+// logical tenant and artifact ID.
+func SourceRelativePath(tenant, id string) string {
+	tenantName, artifactName := sourcePathComponents(tenant, id)
+	return filepath.Join(tenantName, artifactName)
+}
 
 func validateSegment(name, value string) error {
 	if value == "" || len(value) > 255 || value == "." || value == ".." {

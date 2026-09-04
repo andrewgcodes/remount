@@ -120,10 +120,10 @@ func TestEncryptedTenantArtifactsRestartIsolationAndRotation(t *testing.T) {
 	}
 	var tenantA, tenantB []byte
 	for path, body := range files {
-		if strings.HasPrefix(path, "tenants/tenant-a/") && strings.HasSuffix(path, sharedID) {
+		if strings.HasPrefix(path, "tenants/tenant-a/") && strings.HasSuffix(path, physicalArtifactSuffix(sharedID)) {
 			tenantA = body
 		}
-		if strings.HasPrefix(path, "tenants/tenant-b/") && strings.HasSuffix(path, sharedID) {
+		if strings.HasPrefix(path, "tenants/tenant-b/") && strings.HasSuffix(path, physicalArtifactSuffix(sharedID)) {
 			tenantB = body
 		}
 	}

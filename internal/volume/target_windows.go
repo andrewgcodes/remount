@@ -1,4 +1,4 @@
-//go:build !linux && !darwin && !windows
+//go:build windows
 
 package volume
 
@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/sys/windows"
 )
 
 func openDirectoryNoSymlink(rootPath, rel string, create bool) (*os.File, error) {
@@ -43,5 +45,10 @@ func directoryIdentity(file *os.File) (uint64, uint64, error) {
 	if !info.IsDir() {
 		return 0, 0, ErrUnsafePath
 	}
-	return 0, 0, nil
+	var identity windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(file.Fd()), &identity); err != nil {
+		return 0, 0, err
+	}
+	index := uint64(identity.FileIndexHigh)<<32 | uint64(identity.FileIndexLow)
+	return uint64(identity.VolumeSerialNumber), index, nil
 }
