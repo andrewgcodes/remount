@@ -476,6 +476,7 @@ var CanonicalEventTypes = []string{
 	"run.started", "run.finished", "auth.workspace_resident",
 	"queue.created", "queue.advanced",
 	"pool.created", "pool.removed", "pool.scaled", "pool.provision_failed",
+	"pool.retiring", "pool.retire_aborted",
 	"repo.cloned",
 	"agent.created", "agent.message", "agent.run.started",
 	"agent.run.finished", "agent.session", "agent.turn", "agent.tool_call",
