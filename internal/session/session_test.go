@@ -156,6 +156,101 @@ func TestStartFailureAlwaysCallsOnExit(t *testing.T) {
 	}
 }
 
+func TestWaitBlocksUntilDurableCompletionRecordCommits(t *testing.T) {
+	store, err := artifact.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	completionStarted := make(chan struct{})
+	allowCompletion := make(chan struct{})
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(allowCompletion) }) })
+	m := NewManager(ManagerOptions{
+		SpillDir: t.TempDir(), MemBytes: 1 << 20, SpillBytes: 1 << 20, Retention: time.Hour,
+		BlobStoreForTenant: func(string) (artifact.BlobStore, error) { return store, nil },
+		CommitSessionLogRecord: func(string, Spec, LogRecord) error {
+			return nil
+		},
+		CompleteSessionLogRecord: func(string, Spec, proto.SessionInfo, proto.ExitInfo, LogRecord) error {
+			close(completionStarted)
+			<-allowCompletion
+			return nil
+		},
+	})
+	t.Cleanup(m.Close)
+	s, err := m.Open(Spec{
+		WS: "ws_durable", Tenant: "tenant", Principal: "principal",
+		Kind: proto.SessionExec, Program: []string{"sh", "-c", "printf durable"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-completionStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("durable completion callback did not start")
+	}
+	terminalObserved := make(chan struct{})
+	cursorDone := make(chan error, 1)
+	go func() {
+		cursor := s.Log.CursorAt(0)
+		terminal := false
+		for {
+			chunks, err := cursor.Next(context.Background(), 0)
+			if errors.Is(err, io.EOF) {
+				cursorDone <- nil
+				return
+			}
+			if err != nil {
+				cursorDone <- err
+				return
+			}
+			for _, chunk := range chunks {
+				if chunk.Stream == proto.StreamExit && !terminal {
+					terminal = true
+					close(terminalObserved)
+				}
+			}
+		}
+	}()
+	waited := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := s.Wait(ctx)
+		waited <- err
+	}()
+	select {
+	case err := <-waited:
+		t.Fatalf("Wait returned before durable completion committed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case <-terminalObserved:
+		t.Fatal("terminal chunk became observable before durable completion committed")
+	case err := <-cursorDone:
+		t.Fatalf("cursor reached EOF before durable completion committed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	release.Do(func() { close(allowCompletion) })
+	if err := <-waited; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-terminalObserved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal chunk was not published after durable completion committed")
+	}
+	select {
+	case err := <-cursorDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cursor did not reach EOF after durable completion committed")
+	}
+}
+
 func TestImmediateOutputStillFollowsInfo(t *testing.T) {
 	m := newMgr(t)
 	for i := 0; i < 100; i++ {
