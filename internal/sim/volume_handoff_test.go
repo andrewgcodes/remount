@@ -53,7 +53,7 @@ func (r *recordingVolumes) Attach(_ context.Context, req volume.AttachRequest) (
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		return volume.Attachment{}, err
 	}
-	data, err := os.ReadFile(filepath.Join(r.sourceRoot, req.Tenant, req.Artifact, "dataset.txt"))
+	data, err := os.ReadFile(filepath.Join(r.sourceRoot, volume.SourceRelativePath(req.Tenant, req.Artifact), "dataset.txt"))
 	if err != nil {
 		return volume.Attachment{}, err
 	}

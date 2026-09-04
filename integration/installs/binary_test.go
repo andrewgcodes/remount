@@ -5,9 +5,25 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func TestInstalledBinaryNameMatchesPlatform(t *testing.T) {
+	for _, test := range []struct {
+		goos string
+		want string
+	}{
+		{goos: "linux", want: "remount"},
+		{goos: "darwin", want: "remount"},
+		{goos: "windows", want: "remount.exe"},
+	} {
+		if got := installedBinaryName(test.goos); got != test.want {
+			t.Errorf("installedBinaryName(%q) = %q, want %q", test.goos, got, test.want)
+		}
+	}
+}
 
 // TestB32TheStaticBinaryInstallsAndPassesTheBlackBoxSmoke installs the file
 // `make dist` produced onto a prefix of its own and judges it there.
@@ -43,6 +59,9 @@ func TestB32TheSourceTreeScanCatchesAnUntrimmedBinary(t *testing.T) {
 	}
 	root := repoRoot(t)
 	untrimmed := filepath.Join(t.TempDir(), "remount-untrimmed")
+	if runtime.GOOS == "windows" {
+		untrimmed += ".exe"
+	}
 	cmd := exec.Command("go", "build", "-o", untrimmed, "./cmd/remount")
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")

@@ -188,7 +188,7 @@ func planBInstallOpenCode(t *testing.T, ctx context.Context, c *client.Client, w
 	if err := c.WriteFile(ctx, ws, planBShimDir+"/opencode", []byte(shim), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	out, errOut, exit, err := c.Run(ctx, ws, "/bin/sh", "-c", `command -v opencode && opencode --version`)
+	out, errOut, exit, err := c.Run(ctx, ws, "/bin/sh", "-c", `command -v opencode && HOME=/tmp/remount-planb-home opencode --version`)
 	if err != nil || exit == nil || exit.Code != 0 {
 		t.Fatalf("pin opencode %s: err=%v exit=%+v\n%s\n%s", planBOpenCodeVersion, err, exit, out, errOut)
 	}
@@ -373,16 +373,25 @@ func TestPlanBOpenCodeDeterministicModelLane(t *testing.T) {
 	// live stream, so it is driven by arriving bytes rather than by a timer.
 	var out bytes.Buffer
 	cuts := 0
-	for ch := range res.Session.Chunks() {
-		switch ch.Stream {
-		case proto.StreamStdout, proto.StreamStderr:
-			out.Write(ch.Data)
-		case proto.StreamGap:
-			t.Fatal("session reported a gap")
-		}
-		if out.Len() > 256*(cuts+1) && cuts < 3 {
-			cuts++
-			w.cut("c1")
+stream:
+	for {
+		select {
+		case ch, ok := <-res.Session.Chunks():
+			if !ok {
+				break stream
+			}
+			switch ch.Stream {
+			case proto.StreamStdout, proto.StreamStderr:
+				out.Write(ch.Data)
+			case proto.StreamGap:
+				t.Fatal("session reported a gap")
+			}
+			if out.Len() > 256*(cuts+1) && cuts < 3 {
+				cuts++
+				w.cut("c1")
+			}
+		case <-ctx.Done():
+			t.Fatalf("session stream did not close: %v\n%s", ctx.Err(), out.String())
 		}
 	}
 	if err := res.Session.Err(); err != nil {
@@ -393,6 +402,9 @@ func TestPlanBOpenCodeDeterministicModelLane(t *testing.T) {
 	}
 	if exit := res.Session.Exit(); exit == nil || exit.Code != 0 {
 		t.Fatalf("opencode exit = %+v\n%s\n%s", exit, out.String(), egressLog(t, c, ws.ID, planBUpstream))
+	}
+	if _, err := c.Stat(ctx, ws.ID, ".local/state/opencode"); err == nil || codeOf(err) != proto.CodeNotFound {
+		t.Fatalf("transient OpenCode state entered workspace: %v", err)
 	}
 	// B1: the harness did the work the script asked for, and said so.
 	greeting, err := c.ReadFile(ctx, ws.ID, "GREETING.txt")

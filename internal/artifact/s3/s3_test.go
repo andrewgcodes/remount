@@ -828,3 +828,102 @@ func TestACallerSuppliedHTTPClientIsNotRewritten(t *testing.T) {
 		t.Fatalf("a caller-supplied transport was replaced with %T", store.httpClient.Transport)
 	}
 }
+
+// staleOnceTransport fails the first request the way net/http does when it
+// hands a request to a pooled connection the server has already closed, then
+// behaves normally. The real condition is a race against the server's idle
+// timeout and cannot be scheduled; the error it produces can.
+type staleOnceTransport struct {
+	inner  http.RoundTripper
+	failed bool
+	bodies []int64 // bytes the server received per attempt
+}
+
+func (t *staleOnceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if !t.failed {
+		t.failed = true
+		return nil, &url.Error{Op: r.Method, URL: r.URL.String(), Err: errors.New("http: server closed idle connection")}
+	}
+	return t.inner.RoundTrip(r)
+}
+
+// TestAPutIsRetriedWhenTheConnectionWasNeverUsed is the regression for a
+// failure that broke every upload rather than one.
+//
+// net/http replays only GET, HEAD, OPTIONS and TRACE, so when a pooled
+// connection turns out to be closed it reports "server closed idle connection"
+// and a PUT simply fails. Nothing was written, so there is no double-write to
+// fear and no reason for the caller to see an error at all — and it is not a
+// rare condition: MinIO closed a twenty-millisecond-old connection in CI and
+// broke the run on its first conditional write, on every commit for a day.
+//
+// The body must arrive whole. A retry that replayed a partially consumed reader
+// would turn a visible failure into a corrupt object, which is worse than the
+// bug it fixes, so the payload is checked rather than just the status.
+func TestAPutIsRetriedWhenTheConnectionWasNeverUsed(t *testing.T) {
+	fake, store := newFakeStore(t, Config{})
+	stale := &staleOnceTransport{inner: store.httpClient.Transport}
+	if stale.inner == nil {
+		stale.inner = http.DefaultTransport
+	}
+	store.httpClient = &http.Client{Transport: stale, CheckRedirect: store.httpClient.CheckRedirect}
+
+	payload := bytes.Repeat([]byte("retry-me"), 512)
+	if _, err := store.PutObject(context.Background(), "retried", bytes.NewReader(payload), int64(len(payload)), PutOptions{}); err != nil {
+		t.Fatalf("a PUT whose connection was never used should have been retried: %v", err)
+	}
+	if !stale.failed {
+		t.Fatal("the transport never produced the stale-connection error, so this test proved nothing")
+	}
+	fake.mu.Lock()
+	stored, ok := fake.objects["scope/retried"]
+	fake.mu.Unlock()
+	if !ok {
+		t.Fatal("the object is absent after a successful PUT")
+	}
+	if !bytes.Equal(stored.data, payload) {
+		t.Fatalf("the retried body was %d bytes, want %d: a rewind was missed", len(stored.data), len(payload))
+	}
+}
+
+func TestConditionalWritesDoNotReuseConnections(t *testing.T) {
+	tests := []struct {
+		name string
+		opts PutOptions
+	}{
+		{name: "If-None-Match", opts: PutOptions{IfNoneMatch: "*"}},
+		{name: "If-Match", opts: PutOptions{IfMatch: "etag"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transport := &preconditionTransport{}
+			store, err := New(Config{
+				Endpoint: "http://s3.test", Region: "us-east-1", Bucket: "bucket",
+				AccessKeyID: "access", SecretAccessKey: "secret",
+				HTTPClient: &http.Client{Transport: transport},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.PutObject(context.Background(), "object", strings.NewReader("body"), 4, test.opts); !errors.Is(err, ErrPreconditionFailed) {
+				t.Fatalf("PutObject error = %v, want ErrPreconditionFailed", err)
+			}
+			if !transport.requestClose {
+				t.Fatal("conditional PUT allowed its connection to return to the idle pool")
+			}
+		})
+	}
+}
+
+type preconditionTransport struct {
+	requestClose bool
+}
+
+func (t *preconditionTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.requestClose = req.Close
+	return &http.Response{
+		StatusCode: http.StatusPreconditionFailed,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("<Error><Code>PreconditionFailed</Code></Error>")),
+	}, nil
+}

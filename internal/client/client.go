@@ -918,9 +918,16 @@ func (c *Client) forgetGrant(wsID string) {
 	c.mu.Unlock()
 }
 
+// nodeCallRetryAttempts bounds retries for a node that reports a conflict or is
+// unreachable. A node that is simply gone must fail fast; only an authorization
+// revision that has not converged earns the longer deadline inside nodeCall.
+const nodeCallRetryAttempts = 5
+
 // nodeCall performs a request against the node holding wsID, attaching a
 // grant. A stale grant is refreshed, and a node that has not yet adopted the
-// grant's authorization revision gets a bounded interval to converge.
+// grant's authorization revision gets a bounded interval to converge. A
+// conflict from an authorization push still in flight is retried the same way,
+// but only nodeCallRetryAttempts times.
 func (c *Client) nodeCall(ctx context.Context, wsID, op string, body func(g *proto.Grant) any, out any) error {
 	deadline := time.Now().Add(15 * time.Second)
 	backoff := 25 * time.Millisecond
@@ -936,33 +943,38 @@ func (c *Client) nodeCall(ctx context.Context, wsID, op string, body func(g *pro
 		}
 		switch pe.Code {
 		case proto.CodeConflict, proto.CodeUnreachable:
-			if attempt == 0 {
-				c.forgetGrant(wsID)
-				continue
+			// A node that is simply gone must not hold the caller for the whole
+			// convergence interval, so these get a bounded number of attempts
+			// rather than the deadline below.
+			if attempt+1 >= nodeCallRetryAttempts {
+				return err
 			}
 		case proto.CodeUnauthorized:
 			if !staleGrantAuthority(pe) {
 				return err
 			}
-			c.forgetGrant(wsID)
-			if attempt == 0 {
-				continue
-			}
-			if time.Now().Before(deadline) {
-				timer := time.NewTimer(backoff)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return ctx.Err()
-				case <-timer.C:
-				}
-				if backoff < 500*time.Millisecond {
-					backoff *= 2
-				}
-				continue
-			}
+		default:
+			return err
 		}
-		return err
+		// Retryable. Drop the grant so the next attempt fetches one that
+		// reflects whatever the node has since adopted.
+		c.forgetGrant(wsID)
+		if attempt == 0 {
+			continue
+		}
+		if !time.Now().Before(deadline) {
+			return err
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if backoff < 500*time.Millisecond {
+			backoff *= 2
+		}
 	}
 }
 

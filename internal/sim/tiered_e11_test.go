@@ -43,6 +43,34 @@ func sameReplay(got, want []client.Chunk) bool {
 	return true
 }
 
+func waitSessionLogComplete(t *testing.T, ctx context.Context, c *client.Client, session string) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		events, err := c.ReadEvents(ctx, 0, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			if event.Type != proto.EvSessionLogCommitted || event.Stream != session {
+				continue
+			}
+			var payload struct {
+				Complete bool `cbor:"complete"`
+			}
+			if err := proto.Unmarshal(event.Payload, &payload); err != nil {
+				t.Fatalf("decode %s at seq %d: %v", event.Type, event.Seq, err)
+			}
+			if payload.Complete {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session log %s was not durably completed", session)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // TestE11TieredSessionReplayCrossesNodeAndNamesUnavailableBlob composes the
 // process producer, node/session manager, authorized artifact HTTP transfers,
 // control-owned durable record, workspace handoff, and public client cursors.
@@ -168,6 +196,7 @@ func TestE11TieredSessionRecordSurvivesNodeRestart(t *testing.T) {
 	if len(original) < 16 {
 		t.Fatalf("restart fixture traversed too few chunks: %d", len(original))
 	}
+	waitSessionLogComplete(t, ctx, c, s.ID)
 
 	w.stopNode("e11-restart")
 	restarted := w.nodeWith("e11-restart", configure)

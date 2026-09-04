@@ -7,6 +7,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -395,7 +397,11 @@ func TestExecTimeoutKillsProcessGroup(t *testing.T) {
 
 func TestExecSignalTERM(t *testing.T) {
 	m := newMgr(t)
-	s, _ := m.Open(Spec{WS: "ws_1", Kind: proto.SessionExec, Program: []string{"sleep", "30"}})
+	program := []string{"sleep", "30"}
+	if runtime.GOOS == "windows" {
+		program = []string{"ping.exe", "-n", "30", "127.0.0.1"}
+	}
+	s, _ := m.Open(Spec{WS: "ws_1", Kind: proto.SessionExec, Program: program})
 	time.Sleep(50 * time.Millisecond)
 	if err := s.Signal("TERM"); err != nil {
 		t.Fatal(err)
@@ -403,7 +409,11 @@ func TestExecSignalTERM(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	info, err := s.Wait(ctx)
-	if err != nil || !strings.Contains(info.Signal, "terminated") {
+	if runtime.GOOS == "windows" {
+		if err != nil || info.Signal != "" || info.Code != 1 {
+			t.Fatalf("%v %+v", err, info)
+		}
+	} else if err != nil || !strings.Contains(info.Signal, "terminated") {
 		t.Fatalf("%v %+v", err, info)
 	}
 	if err := s.Signal("BOGUS"); err == nil {
@@ -433,6 +443,9 @@ func TestKillWorkspaceConfirmsAllSessionsStopped(t *testing.T) {
 }
 
 func TestPTYEchoAndResize(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the session PTY backend uses Unix PTYs; ConPTY is not implemented")
+	}
 	m := newMgr(t)
 	s, err := m.Open(Spec{WS: "ws_1", Kind: proto.SessionPTY, Program: []string{"sh", "-c", "stty size; read x; stty size; echo got:$x"}, Rows: 30, Cols: 100})
 	if err != nil {
@@ -551,11 +564,27 @@ func TestIdempotentOpenAndRemove(t *testing.T) {
 func TestExecEnvAndCwd(t *testing.T) {
 	m := newMgr(t)
 	dir := t.TempDir()
-	s, _ := m.Open(Spec{WS: "ws_1", Kind: proto.SessionExec, Program: []string{"sh", "-c", "pwd; echo $FOO"}, Cwd: dir, Env: []string{"PATH=" + os.Getenv("PATH"), "FOO=bar"}})
+	program := []string{"sh", "-c", "pwd; echo $FOO"}
+	if runtime.GOOS == "windows" {
+		program = []string{"cmd.exe", "/d", "/s", "/c", "cd & echo %FOO%"}
+	}
+	s, _ := m.Open(Spec{WS: "ws_1", Kind: proto.SessionExec, Program: program, Cwd: dir, Env: []string{"PATH=" + os.Getenv("PATH"), "FOO=bar"}})
 	out, _, _ := collect(t, s)
 	got := strings.TrimSpace(string(out))
-	if !strings.HasSuffix(strings.Split(got, "\n")[0], dir[strings.LastIndex(dir, "/"):]) || !strings.HasSuffix(got, "bar") {
+	lines := strings.Split(strings.ReplaceAll(got, "\r\n", "\n"), "\n")
+	if len(lines) != 2 || lines[1] != "bar" {
 		t.Fatalf("%q", out)
+	}
+	gotDir, err := filepath.EvalSymlinks(lines[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(filepath.Clean(gotDir), filepath.Clean(wantDir)) {
+		t.Fatalf("cwd = %q, want %q", gotDir, wantDir)
 	}
 }
 
@@ -833,7 +862,11 @@ func TestManagerRetentionFailureKeepsSessionAndReferences(t *testing.T) {
 
 func TestTerminateRecordsReasonInExitChunk(t *testing.T) {
 	m := newMgr(t)
-	s, err := m.Open(Spec{WS: "ws_1", Kind: proto.SessionPTY, Program: []string{"sleep", "30"}, Rows: 10, Cols: 40})
+	spec := Spec{WS: "ws_1", Kind: proto.SessionPTY, Program: []string{"sleep", "30"}, Rows: 10, Cols: 40}
+	if runtime.GOOS == "windows" {
+		spec = Spec{WS: "ws_1", Kind: proto.SessionExec, Program: []string{"ping.exe", "-n", "30", "127.0.0.1"}}
+	}
+	s, err := m.Open(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -841,7 +874,7 @@ func TestTerminateRecordsReasonInExitChunk(t *testing.T) {
 		t.Fatal("terminate should find the session")
 	}
 	_, _, exit := collect(t, s)
-	if exit.Reason != proto.ExitReasonRevoked || exit.Signal == "" {
+	if exit.Reason != proto.ExitReasonRevoked || (runtime.GOOS != "windows" && exit.Signal == "") {
 		t.Fatalf("exit=%+v", exit)
 	}
 	if m.Terminate("s_missing", proto.ExitReasonRevoked) {

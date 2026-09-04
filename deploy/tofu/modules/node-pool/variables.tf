@@ -122,7 +122,7 @@ variable "node_assignments" {
   # that has already changed, and would move a live workspace to satisfy a plan.
   validation {
     condition     = length(var.node_assignments) == 0
-    error_message = "Terraform does not place, move, or pin live workspaces. Placement, claims and moves belong to the Remount control plane; use `remount ws move` or a placement constraint on the workspace itself."
+    error_message = "Terraform does not place, move, or pin live workspaces. Placement, claims and moves belong to the Remount control plane; use the Remount workspace move command or a placement constraint on the workspace itself."
   }
 }
 

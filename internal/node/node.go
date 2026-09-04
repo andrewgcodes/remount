@@ -1176,29 +1176,30 @@ func (n *Node) collectVolumeSourcesLocked() error {
 			return err
 		}
 		for _, entry := range entries {
-			id := entry.Name()
-			if strings.HasPrefix(id, ".staging-") {
-				if err := os.RemoveAll(filepath.Join(tenantPath, id)); err != nil {
+			name := entry.Name()
+			if strings.HasPrefix(name, ".staging-") {
+				if err := os.RemoveAll(filepath.Join(tenantPath, name)); err != nil {
 					return err
 				}
 				continue
 			}
-			if strings.HasPrefix(id, ".complete-") {
-				artifactID := strings.TrimPrefix(id, ".complete-")
+			if strings.HasPrefix(name, ".complete-") {
+				artifactID := artifactIDFromVolumeName(strings.TrimPrefix(name, ".complete-"))
 				if _, err := artifact.Digest(artifactID); err != nil || !n.store.Has(artifactID) {
-					if err := os.Remove(filepath.Join(tenantPath, id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+					if err := os.Remove(filepath.Join(tenantPath, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 						return err
 					}
 				}
 				continue
 			}
-			if _, err := artifact.Digest(id); err != nil || n.store.Has(id) {
+			artifactID := artifactIDFromVolumeName(name)
+			if _, err := artifact.Digest(artifactID); err != nil || n.store.Has(artifactID) {
 				continue
 			}
-			if err := os.RemoveAll(filepath.Join(tenantPath, id)); err != nil {
+			if err := os.RemoveAll(filepath.Join(tenantPath, name)); err != nil {
 				return err
 			}
-			if err := os.Remove(filepath.Join(tenantPath, ".complete-"+id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err := os.Remove(filepath.Join(tenantPath, ".complete-"+name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
 		}
@@ -1251,11 +1252,14 @@ func (n *Node) shutdown() {
 		if w.broker != nil {
 			_ = w.broker.Close()
 		}
-		if err := n.detachWorkspaceVolumes(context.Background(), w, w.Spec.Volumes); err != nil {
-			n.logger.Error("retain workspace tree after shutdown volume detach failure", "ws", w.ID, "err", err)
+		detachErr := n.detachWorkspaceVolumes(context.Background(), w, w.Spec.Volumes)
+		if w.handle != nil {
+			_ = w.handle.FS().Close()
+		}
+		if detachErr != nil {
+			n.logger.Error("retain workspace tree after shutdown volume detach failure", "ws", w.ID, "err", detachErr)
 			continue
 		}
-		_ = w.handle.FS().Close()
 	}
 	if n.volumes != nil {
 		_ = n.volumes.Close()
@@ -1777,11 +1781,9 @@ func (n *Node) fenceWorkspace(ctx context.Context, id, reason string) {
 		// Wait for an operation already inside the tree critical section and
 		// prevent a pre-authorized waiter from racing the close. Such a waiter
 		// revalidates after it acquires treeMu and observes removal above.
-		if detachErr == nil {
-			w.treeMu.Lock()
-			_ = w.handle.FS().Close()
-			w.treeMu.Unlock()
-		}
+		w.treeMu.Lock()
+		_ = w.handle.FS().Close()
+		w.treeMu.Unlock()
 	}
 	n.logger.Warn("workspace execution fenced; local filesystem retained", "ws", id, "reason", reason,
 		"network_revoked", networkErr == nil, "network_error", errorString(networkErr),
@@ -1858,6 +1860,13 @@ func (n *Node) quarantine(ctx context.Context, req *proto.WSQuarantineReq) (*pro
 		return &res, nil
 	}
 	var retainedWorkspace *ws
+	defer func() {
+		if retainedWorkspace != nil && retainedWorkspace.handle != nil {
+			retainedWorkspace.treeMu.Lock()
+			_ = retainedWorkspace.handle.FS().Close()
+			retainedWorkspace.treeMu.Unlock()
+		}
+	}()
 	if record.State == quarantinePreparing {
 		if live != nil && live.Generation != req.Gen {
 			return nil, proto.Err(proto.CodeConflict, "generation mismatch")
@@ -1963,9 +1972,6 @@ func (n *Node) quarantine(ctx context.Context, req *proto.WSQuarantineReq) (*pro
 			retainedWorkspace.Spec.Volumes, req.OperationID+":quarantine"); err != nil {
 			return nil, fmt.Errorf("detach quarantine volumes: %w", err)
 		}
-		retainedWorkspace.treeMu.Lock()
-		_ = retainedWorkspace.handle.FS().Close()
-		retainedWorkspace.treeMu.Unlock()
 		if err := n.advanceQuarantine(req.OperationID, req.WS, quarantineCheckpointed, quarantineDetached, record.Response); err != nil {
 			return nil, err
 		}
@@ -2294,8 +2300,12 @@ func (n *Node) authorizeClaims(client, wsID string, g *proto.Grant) (*ws, proto.
 	if g.Claims.Gen != w.Generation {
 		return nil, proto.GrantClaims{}, proto.Err(proto.CodeConflict, "grant generation %d != workspace generation %d (workspace moved?)", g.Claims.Gen, w.Generation)
 	}
-	if g.Claims.Tenant != w.Tenant || g.Claims.AuthzRevision != w.AuthzRevision {
+	if g.Claims.Tenant != w.Tenant || g.Claims.AuthzRevision < w.AuthzRevision {
 		return nil, proto.GrantClaims{}, proto.Err(proto.CodeUnauthorized, "grant authorization revision or tenant is stale")
+	}
+	if g.Claims.AuthzRevision > w.AuthzRevision {
+		return nil, proto.GrantClaims{}, proto.Err(proto.CodeConflict,
+			"node authorization revision %d is behind grant revision %d", w.AuthzRevision, g.Claims.AuthzRevision)
 	}
 	if proto.HasCapability(n.protocol, proto.CapabilityControllerEpoch) && g.Claims.ControllerEpoch != n.currentControllerEpoch() {
 		return nil, proto.GrantClaims{}, proto.Err(proto.CodeUnauthorized, "grant controller epoch is stale")
@@ -4188,9 +4198,10 @@ func (n *Node) prepareVolumeArtifactForWorkspace(ctx context.Context, w *proto.W
 	if _, err := artifact.Digest(artifactID); err != nil {
 		return err
 	}
-	destination := filepath.Join(n.opts.DataDir, "volumes", "sources", tenant, artifactID)
+	artifactName := volumeArtifactName(artifactID)
+	destination := filepath.Join(n.opts.DataDir, "volumes", "sources", volume.SourceRelativePath(tenant, artifactID))
 	tenantPath := filepath.Dir(destination)
-	completeMarker := filepath.Join(tenantPath, ".complete-"+artifactID)
+	completeMarker := filepath.Join(tenantPath, ".complete-"+artifactName)
 	if err := os.MkdirAll(tenantPath, 0o700); err != nil {
 		return err
 	}
@@ -4239,7 +4250,7 @@ func (n *Node) prepareVolumeArtifactForWorkspace(ctx context.Context, w *proto.W
 	}
 	remaining -= markerBytes
 	remainingEntries -= 2
-	stage, err := os.MkdirTemp(tenantPath, ".staging-"+artifactID+"-")
+	stage, err := os.MkdirTemp(tenantPath, ".staging-"+artifactName+"-")
 	if err != nil {
 		return err
 	}

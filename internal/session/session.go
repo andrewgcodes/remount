@@ -634,6 +634,15 @@ func (m *Manager) Close() {
 	for _, s := range all {
 		m.Remove(s.ID, true)
 	}
+	m.mu.Lock()
+	remaining := make([]*Session, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		remaining = append(remaining, s)
+	}
+	m.mu.Unlock()
+	for _, s := range remaining {
+		_ = s.Log.closeLocal()
+	}
 	// Bounded for the same reason as Shutdown: a producer that will not stop
 	// must not turn Close into a hang.
 	_ = m.joinObservers()
@@ -696,7 +705,11 @@ func (m *Manager) Shutdown() bool {
 		_, _ = s.Wait(ctx)
 		cancel()
 	}
-	return m.joinObservers()
+	clean := m.joinObservers()
+	for _, s := range all {
+		_ = s.Log.closeLocal()
+	}
+	return clean
 }
 
 // Open starts a session. If spec.IdempotencyKey names an existing session it
@@ -1048,6 +1061,11 @@ func (s *Session) startExec(spec Spec) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	if err := registerProcessGroup(cmd); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("contain process tree: %w", err)
+	}
 	s.mu.Lock()
 	s.cmd = cmd
 	s.Info.PID = cmd.Process.Pid
@@ -1067,6 +1085,7 @@ func (s *Session) startExec(spec Spec) error {
 	go func() {
 		wg.Wait()
 		err := cmd.Wait()
+		releaseProcessGroup(cmd)
 		s.finish(exitInfo(err, cmd))
 	}()
 	return nil
@@ -1090,6 +1109,12 @@ func (s *Session) startPTY(spec Spec) error {
 	if err != nil {
 		return err
 	}
+	if err := registerProcessGroup(cmd); err != nil {
+		_ = ptmx.Close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("contain process tree: %w", err)
+	}
 	s.mu.Lock()
 	s.cmd = cmd
 	s.ptmx = ptmx
@@ -1106,6 +1131,7 @@ func (s *Session) startPTY(spec Spec) error {
 		}
 		s.recordLogError(logErr)
 		err := cmd.Wait()
+		releaseProcessGroup(cmd)
 		_ = ptmx.Close()
 		s.finish(exitInfo(err, cmd))
 	}()

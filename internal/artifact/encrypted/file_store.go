@@ -96,7 +96,7 @@ func (s *FileStore) inventory() error {
 		if err != nil {
 			return err
 		}
-		key := filepath.ToSlash(rel)
+		key := logicalObjectKey(filepath.ToSlash(rel))
 		if filepath.Dir(path) == s.dir && strings.HasPrefix(entry.Name(), ".create-") {
 			if entry.Type()&os.ModeSymlink != 0 {
 				return fmt.Errorf("encrypted artifact: file-store staging %q is a symlink", entry.Name())
@@ -290,7 +290,7 @@ func (s *FileStore) List(_ context.Context, prefix string) ([]string, error) {
 		if err != nil {
 			return err
 		}
-		key := filepath.ToSlash(rel)
+		key := logicalObjectKey(filepath.ToSlash(rel))
 		if _, _, _, err := parseObjectKey(key); err != nil {
 			return fmt.Errorf("encrypted artifact: unexpected file-store entry %q", key)
 		}
@@ -320,7 +320,7 @@ func (s *FileStore) Tenants(_ context.Context) ([]string, error) {
 		if err != nil {
 			return err
 		}
-		tenant, _, _, err := parseObjectKey(filepath.ToSlash(rel))
+		tenant, _, _, err := parseObjectKey(logicalObjectKey(filepath.ToSlash(rel)))
 		if err != nil {
 			return fmt.Errorf("encrypted artifact: unexpected file-store entry %q", rel)
 		}
@@ -342,7 +342,7 @@ func (s *FileStore) path(key string) (string, error) {
 	if _, _, _, err := parseObjectKey(key); err != nil {
 		return "", err
 	}
-	return filepath.Join(s.dir, filepath.FromSlash(key)), nil
+	return filepath.Join(s.dir, filepath.FromSlash(physicalObjectKey(key))), nil
 }
 
 func validObjectPrefix(prefix string) bool {

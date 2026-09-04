@@ -117,8 +117,15 @@ func checkBindLeakBlocked(ctx context.Context, s *Session) error {
 		if e.Type != "egress.denied" {
 			continue
 		}
-		if payloadContains(e.Payload, "leak_blocked") {
-			return nil
+		for _, e := range events {
+			if e.Type == "egress.denied" && payloadContains(e.Payload, "leak_blocked") {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 	return failf("the broker refused the request (%d %s) but recorded no egress.denied with decision leak_blocked on %s's stream", status, strings.TrimSpace(string(body)), f.WS.ID)

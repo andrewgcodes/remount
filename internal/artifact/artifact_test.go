@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -391,7 +392,7 @@ func TestSnapshotRestoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, _ := os.Stat(filepath.Join(dst, "src", "pkg", "run.sh"))
-	if st.Mode().Perm() != 0o755 {
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o755 {
 		t.Fatalf("mode %o", st.Mode().Perm())
 	}
 	st, _ = os.Stat(filepath.Join(dst, "src", "main.go"))
@@ -408,7 +409,7 @@ func TestSnapshotRestoreRoundTrip(t *testing.T) {
 		t.Fatal("build/keep.txt missing")
 	}
 	target, err := os.Readlink(filepath.Join(dst, "link"))
-	if err != nil || target != "src/main.go" {
+	if err != nil || filepath.Clean(target) != filepath.Clean("src/main.go") {
 		t.Fatal(err, target)
 	}
 }

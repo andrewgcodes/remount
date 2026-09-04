@@ -166,6 +166,56 @@ The docker backend checks the daemon lazily and reports `unsupported` if it is
 missing. Filesystem operations and snapshots use the host-side mount, so they
 are as fast as `process`.
 
+### Windows hosts
+
+Use the native executable from PowerShell. Keep state on an NTFS volume and
+pass Windows paths directly:
+
+```powershell
+$env:REMOUNT_TOKEN = Read-Host -MaskInput "Remount token"
+.\remount-windows-amd64.exe standalone `
+  --listen 127.0.0.1:7443 `
+  --data C:\remount\data
+```
+
+`REMOUNT_SERVER`, `REMOUNT_TOKEN`, `REMOUNT_DATA`,
+`REMOUNT_NODE_DATA`, and `REMOUNT_CREDENTIAL_FILE` have the same meanings as
+on Unix. User state defaults below the current user's `.remount` directory.
+Do not put a token on the command line: Windows process inspection exposes
+arguments too.
+
+The native `process` backend supports filesystem operations, snapshots,
+explicit command execution, and descendant termination through a Windows Job
+Object. It provides no host isolation: commands run as the node account and
+can reach that account's files and network. Docker workspaces remain Linux
+containers and use their POSIX launchers inside the container. Firecracker and
+gVisor are Linux-kernel mechanisms and are unavailable on Windows hosts.
+
+The following boundaries are explicit rather than emulated:
+
+- Interactive Unix PTYs are unavailable because there is no ConPTY session
+  backend. Use non-interactive execution.
+- Recipe install and ACP launcher scripts require a POSIX shell and are
+  unavailable in Windows `process` workspaces. Explicit ACP commands work;
+  recipe launchers work in Linux Docker workspaces.
+- Go has no portable Windows parent-directory fsync operation. Remount flushes
+  file contents before rename, but cannot claim the same directory-metadata
+  crash-durability guarantee as Unix.
+- Replacing an open or read-only destination may be denied by Windows. The
+  operation fails without exposing a partial new file.
+
+Windows path validation rejects traversal, drive and UNC/device paths,
+alternate data streams, reserved device names, ambiguous trailing dots or
+spaces, and reparse-point escapes. Do not bypass Remount's rooted filesystem
+operations with workspace-side host tools.
+
+POSIX modes such as `0600` do not describe Windows ACL confidentiality. File
+master keys are checked against their Windows DACL and are refused when a
+principal other than the owner, current account, Local System, or local
+Administrators has read access. Apply equivalently restrictive ACLs to other
+sensitive files and audit them with `icacls`; using
+`REMOUNT_MASTER_KEY` avoids a master-key file.
+
 ## Snapshot consistency
 
 `remount ws snapshot WS` is a live capture. It may observe concurrent process
