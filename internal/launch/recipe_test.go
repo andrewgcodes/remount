@@ -167,6 +167,56 @@ func TestOpenCodeKeepsTransientStateOutsideWorkspace(t *testing.T) {
 	}
 }
 
+func TestNPMRecipesInstallIntoWorkspaceLocalPrefix(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("recipes run under POSIX sh on workspace nodes")
+	}
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh")
+	}
+	for _, name := range []string{"codex", "gemini", "opencode"} {
+		t.Run(name, func(t *testing.T) {
+			r, err := Load(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := r.Env["PATH"]; got != "${NPM_CONFIG_PREFIX:-$HOME/.local}/bin:$PATH" {
+				t.Fatalf("PATH = %q", got)
+			}
+			script, err := r.InstallScript(Data{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := t.TempDir()
+			bin := t.TempDir()
+			got := filepath.Join(t.TempDir(), "npm-env")
+			npm := "#!/bin/sh\nprintf '%s\\n%s\\n' \"$NPM_CONFIG_PREFIX\" \"$PATH\" > \"$OUT\"\n"
+			if err := os.WriteFile(filepath.Join(bin, "npm"), []byte(npm), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(sh, "-c", script)
+			cmd.Env = []string{
+				"HOME=" + root,
+				"OUT=" + got,
+				"PATH=" + bin + ":/usr/bin:/bin",
+			}
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("install: %v\n%s\n%s", err, out, script)
+			}
+			b, err := os.ReadFile(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantPrefix := filepath.Join(root, ".local")
+			lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+			if len(lines) != 2 || lines[0] != wantPrefix || !strings.HasPrefix(lines[1], wantPrefix+"/bin:") {
+				t.Fatalf("npm env = %q, want prefix %q first on PATH", string(b), wantPrefix)
+			}
+		})
+	}
+}
+
 func TestParseRejectsBadRecipes(t *testing.T) {
 	cases := map[string]string{
 		"no command":       "name: x\nproviders: [openai]\n",
