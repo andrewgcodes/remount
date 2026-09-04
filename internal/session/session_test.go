@@ -394,8 +394,19 @@ func TestExecEnvAndCwd(t *testing.T) {
 	out, _, _ := collect(t, s)
 	got := strings.TrimSpace(string(out))
 	lines := strings.Split(strings.ReplaceAll(got, "\r\n", "\n"), "\n")
-	if len(lines) != 2 || !strings.EqualFold(filepath.Clean(lines[0]), filepath.Clean(dir)) || lines[1] != "bar" {
+	if len(lines) != 2 || lines[1] != "bar" {
 		t.Fatalf("%q", out)
+	}
+	gotDir, err := filepath.EvalSymlinks(lines[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(filepath.Clean(gotDir), filepath.Clean(wantDir)) {
+		t.Fatalf("cwd = %q, want %q", gotDir, wantDir)
 	}
 }
 

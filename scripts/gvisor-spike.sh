@@ -49,7 +49,6 @@ ip link add "$host_if" type veth peer name "$guest_if"
 ip link set "$guest_if" netns "$namespace"
 ip addr add 169.254.251.1/30 dev "$host_if"
 ip netns exec "$namespace" ip addr add 169.254.251.2/30 dev "$guest_if"
-ip netns exec "$namespace" ip route add default via 169.254.251.1
 ip netns exec "$namespace" sh -c 'echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6'
 ip netns exec "$namespace" nft -f - <<'NFT'
 table inet remount {
@@ -60,11 +59,16 @@ table inet remount {
 }
 NFT
 
+# The guest endpoint must be up before Linux accepts its gateway. The host
+# endpoint stays down until the sandbox is running, so no traffic can cross.
+ip netns exec "$namespace" ip link set "$guest_if" up
+ip netns exec "$namespace" ip route add default via 169.254.251.1
+
 socat TCP4-LISTEN:17443,bind=169.254.251.1,reuseaddr,fork EXEC:/bin/cat &
 broker_pid=$!
 
-# Start runsc while the veth is down and after deny-all is committed. This
-# eliminates an unfiltered startup interval.
+# Start runsc while the host veth endpoint is down and after deny-all is
+# committed. This eliminates an unfiltered startup interval.
 cat >"$bundle/config.json" <<JSON
 {
   "ociVersion": "1.0.2",
@@ -94,7 +98,6 @@ runsc --root="$state" --network=sandbox --net-raw=false --allow-packet-socket-wr
 runsc --root="$state" start "$container"
 ip link set "$host_if" up
 ip netns exec "$namespace" ip link set lo up
-ip netns exec "$namespace" ip link set "$guest_if" up
 
 inside() { runsc --root="$state" exec "$container" /bin/sh -c "$1"; }
 deny() {

@@ -448,10 +448,23 @@ const DefaultImageRepository = "ghcr.io/andrewgcodes/remount-workspace"
 // none. A release binary pins the tag built alongside it; a development build
 // (`dev`, or any version that is not a release tag) tracks `latest`.
 func DefaultImage(version string) string {
-	if strings.HasPrefix(version, "v") && !strings.Contains(version, "-dirty") {
+	if isReleaseVersion(version) {
 		return DefaultImageRepository + ":" + version
 	}
 	return DefaultImageRepository + ":latest"
+}
+
+func isReleaseVersion(version string) bool {
+	parts := strings.Split(strings.TrimPrefix(version, "v"), ".")
+	if !strings.HasPrefix(version, "v") || len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || strings.IndexFunc(part, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // NewDocker creates the backend; the daemon is checked lazily on first use.
@@ -536,8 +549,8 @@ func (d *Docker) probeSharedFilesystem(ctx context.Context) error {
 	out, err := exec.CommandContext(probeCtx, d.Binary, "run", "--rm",
 		"-v", dir+":/probe:ro", d.Image, "cat", "/probe/probe").CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("docker filesystem probe: the daemon could not read this node's data directory %s: %s: %w",
-			d.Dir, strings.TrimSpace(string(out)), err)
+		return fmt.Errorf("docker filesystem probe: image %q could not read this node's data directory %s: %s: %w",
+			d.Image, d.Dir, strings.TrimSpace(string(out)), err)
 	}
 	if strings.TrimSpace(string(out)) != want {
 		return fmt.Errorf("docker filesystem probe: the daemon bind-mounted %s and saw different content, "+
