@@ -4,11 +4,15 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"testing"
 	"time"
 )
 
 func TestExecRuntimeDoesNotWaitForInheritedOutput(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("unavailable: the fake runsc binary is a POSIX shell script")
+	}
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "runsc")
 	if err := os.WriteFile(binary, []byte("#!/bin/sh\nsleep 2 &\nexit 0\n"), 0o755); err != nil {
