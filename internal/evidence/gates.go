@@ -69,7 +69,7 @@ func ProbeBackends(ctx context.Context, root string) []Probe {
 			{Name: "gvisor", Script: backendGatesScript, Reason: "gate script is absent from this checkout"},
 		}
 	}
-	cmd := exec.CommandContext(ctx, "sh", path)
+	cmd := exec.CommandContext(ctx, "sh", path, "--probe")
 	cmd.Dir = root
 	out, err := cmd.CombinedOutput()
 	probes := map[string]Probe{}

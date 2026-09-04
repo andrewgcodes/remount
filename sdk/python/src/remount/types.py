@@ -1756,6 +1756,7 @@ WSQuarantineRes = TypedDict("WSQuarantineRes", {
 WSReadyReq = TypedDict("WSReadyReq", {
     "id": Required[str],
     "gen": Required[int],
+    "restore_processes": NotRequired[str],
 }, total=False)
 
 WSReleaseCommitReq = TypedDict("WSReleaseCommitReq", {

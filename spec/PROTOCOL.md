@@ -490,7 +490,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `events.stop` | C | `EventsStopReq{sub}` → `{}` |
 | `events.post` | C N | `EventPost{events}` → `{}` |
 | `ws.claim` | N | `WSClaimReq{id}` → `WSClaimRes{workspace, lease_sec}` |
-| `ws.ready` | N | `WSReadyReq{id, gen}` → `{}` |
+| `ws.ready` | N | `WSReadyReq{id, gen, restore_processes?}` → `{}` |
 | `ws.renew` | N | `WSRenewReq{ids, gen, authz, controller_epoch}` → `WSRenewRes{results, controller_epoch}`; each result repeats the epoch and explicitly says continue/fence/destroy/reconcile and, for a continued lease, carries `authz_revision`, `revoked`, `authz_reset` (§3.2, §4.1) |
 | `ws.released` | N | `WSReleasedReq{id, gen, snapshot, reason, failed?}` → `{}`; `failed:true` means materialization could not complete and control holds the workspace out of placement with a growing delay (1s doubling to 30s, reset by the next `ws.ready`) instead of re-offering it at once |
 | `ws.snapshot.commit` | N | `WSSnapshotCommitReq{id, gen, snapshot}` → `{}` |
@@ -1131,6 +1131,12 @@ restore itself succeeding. `processes:"preserved"` MUST NOT be asserted from
 the artifact format alone; it is reserved for a checkpoint that demonstrably
 restored on the destination (ADR 0063). A reader that needs process continuity
 must treat `restore_pending` as unknown, never as preserved.
+
+After a destination successfully restores a checkpoint, `ws.ready` carries
+`restore_processes:"preserved"` for an actual full-VM restore or
+`restore_processes:"restarted"` for a filesystem-only restore. Control records
+that settled outcome on `ws.claimed`. An omitted field leaves the earlier
+`restore_pending` claim unsettled and never implies preservation.
 
 `PUT /v1/artifacts/{id}` stores a blob in a private temporary file, enforces the
 configured compressed-size limit, and publishes it only after the digest

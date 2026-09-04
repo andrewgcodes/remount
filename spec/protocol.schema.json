@@ -6135,6 +6135,9 @@
         },
         "id": {
           "type": "string"
+        },
+        "restore_processes": {
+          "type": "string"
         }
       },
       "required": [
