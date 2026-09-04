@@ -341,6 +341,8 @@ type Control struct {
 	fleetLocks            map[string]*keyedMutex
 	bases                 map[string]*proto.Base // baseKey(tenant, name) -> pinned snapshot
 	sessionLogs           map[string]*proto.SessionLogRecord
+	sessionLogAdmissions  map[string]*sessionLogAdmission // new session -> slot reserved until its row commits
+	sessionLogPins        map[string]map[string]int       // tenant -> artifact -> in-flight publications holding it as a GC root
 	volumes               map[string]*proto.Volume
 	pools                 map[string]*proto.Pool // poolKey(tenant, name) -> desired node capacity
 	poolBusy              map[string]bool
@@ -550,6 +552,8 @@ func New(opts Options) (*Control, error) {
 		fleetOps: map[string]*proto.FleetOperation{}, fleetLocks: map[string]*keyedMutex{}, fleetWake: make(chan struct{}, 1),
 		bases:                 map[string]*proto.Base{},
 		sessionLogs:           map[string]*proto.SessionLogRecord{},
+		sessionLogAdmissions:  map[string]*sessionLogAdmission{},
+		sessionLogPins:        map[string]map[string]int{},
 		volumes:               map[string]*proto.Volume{},
 		pools:                 map[string]*proto.Pool{},
 		poolBusy:              map[string]bool{},
