@@ -1315,10 +1315,11 @@ func (c *Control) forkSnapshot(ctx context.Context, subject Subject, ws *proto.W
 //
 // The report is applied to a private copy of the agent and to staged
 // approval copies, committed, and only then published into c.agents, the
-// live approvals, the delivery marks and the retry clock. Seq is the node's
-// deduplication key, so it must advance only with the durable row: a report
-// whose commit fails leaves memory as the database has it and the node's
-// retry of the same seq is applied rather than acknowledged as a duplicate.
+// live approvals, the delivery marks, the retry clock and the lifecycle
+// counters. Seq is the node's deduplication key, so it must advance only
+// with the durable row: a report whose commit fails leaves memory as the
+// database has it and the node's retry of the same seq is applied rather
+// than acknowledged as a duplicate.
 func (c *Control) agentReport(ctx context.Context, node string, rep *proto.AgentReport) error {
 	if rep.Agent == "" || rep.Run == "" {
 		return proto.Err(proto.CodeBadRequest, "agent and run are required")
@@ -1370,7 +1371,6 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 	stopRun := ""
 	var undeliver []string
 	var retryAt time.Time
-	var terminalMetric *metrics.Counter
 	switch rep.Kind {
 	case proto.AgentReportStarted:
 		run.State = proto.AgentRunActive
@@ -1432,7 +1432,7 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 				a.StatusReason = fmt.Sprintf("max_turns %d reached", a.Policy.MaxTurns)
 				undeliver = append(undeliver, dropInbox(a)...)
 				events = append(events, c.agentEvent(proto.EvAgentFinished, a, ws, "", node, map[string]any{"reason": a.StatusReason}))
-				terminalMetric = metrics.AgentsFinished
+				st.count(metrics.AgentsFinished)
 				// The harness would otherwise idle on the node forever; its
 				// finished report closes the run and lands the exit chunk.
 				stopRun = run.ID
@@ -1469,7 +1469,7 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 					a.StatusReason = run.Error
 					undeliver = append(undeliver, dropInbox(a)...)
 					events = append(events, c.agentEvent(proto.EvAgentFailed, a, ws, "", node, map[string]any{"reason": run.Error, "run": run.ID, "attempt": run.Attempt}))
-					terminalMetric = metrics.AgentsFailed
+					st.count(metrics.AgentsFailed)
 				}
 			} else {
 				retryAt = c.now().Add(agentRetryBackoff)
@@ -1505,9 +1505,6 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 	}
 	if !retryAt.IsZero() {
 		c.agentRetry[a.ID] = retryAt
-	}
-	if terminalMetric != nil {
-		terminalMetric.Inc()
 	}
 	needKick := run.State == proto.AgentRunDone && len(a.Inbox) > 0 && !agentTerminal(a.Status)
 	agentID := a.ID
@@ -1558,7 +1555,7 @@ func (c *Control) finishRunLocked(st *approvalStage, a *proto.Agent, run *proto.
 		"run": run.ID, "attempt": run.Attempt, "stop_reason": stopReason, "error": errText, "cancelled": cancelled, "turns": run.Turns,
 	})}
 	events = append(events, st.expire(a, run, principal)...)
-	metrics.AgentRunsFinished.Inc()
+	st.count(metrics.AgentRunsFinished)
 	return events
 }
 
