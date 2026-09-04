@@ -82,14 +82,16 @@ the driver does not infer success or invent an undocumented request.
   to drive natively, the way `fly` is driven, and a native driver is the
   intended end state.
 
-  Remount ships the helper protocol for it today because the shape of `ix ls
-  --output json` has not been observed: the account used for verification had
-  no VMs, so the call returned `[]`, and the create needed to produce one was
-  refused by the server (`unsupported method: vm.build_commit_from_oci`)
-  against a 2026-06-28 CLI. Writing a parser for field names nobody has seen
-  is the guessing this ADR exists to prevent, so the helper keeps that mapping
-  behind a versioned contract until the schema is observed on a supported CLI.
-  The driver pins to a tenant and pool. Region is placement the vendor
+  Remount ships the helper protocol for it today because ix.dev has no tags or
+  labels on a VM, and so nowhere to record the tenant and pool that pool
+  reconciliation filters on. Encoding them into the VM name is the likely
+  answer — the name is the only provider-side string Remount controls — but it
+  needs a delimiter that cannot collide with an operator-chosen node name, and
+  it publishes the tenant to anyone who can list the account. Until that is
+  settled the helper keeps the mapping behind a versioned contract. The
+  response schema itself is known and recorded in
+  `docs/engineering/ix-dev-native-driver-2026-09-04.md`. The driver pins to a
+  tenant and pool. Region is placement the vendor
   supports and is passed through; an unset region leaves the vendor's own
   default in force. Size is not part of that surface and is unavailable.
   Missing helper or API credential is unavailable.
