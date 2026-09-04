@@ -352,8 +352,23 @@ func TestPoolRetirementFenceBlocksClaimsAcrossTheProviderDestroy(t *testing.T) {
 		t.Fatalf("pool current after destroy = %+v, %v", got, err)
 	}
 
+	// The pool counts zero machines, but the node is still connected and its
+	// fence unresolved. Removing the pool now would remove the only
+	// reconciler able to resolve it, so removal is refused and the node stays
+	// unclaimable.
+	removeErr := rf.f.c.poolRemove(context.Background(), localSubject(), &proto.PoolRemoveReq{Name: "audit", IdempotencyKey: "remove-early"})
+	if codeOf(removeErr) != proto.CodeConflict {
+		t.Fatalf("pool remove with a retirement in flight = %v, want %s", removeErr, proto.CodeConflict)
+	}
+	if _, ok := rf.fenced(t); !ok {
+		t.Fatal("refused pool removal lifted the fence")
+	}
+	if err := rf.claimAndReady(t); err == nil || codeOf(err) != proto.CodeDenied {
+		t.Fatalf("claim after refused pool removal = %v, want %s", err, proto.CodeDenied)
+	}
+
 	// The next inventory no longer lists the machine, which releases the
-	// fence durably and in memory.
+	// fence durably and in memory, with one pool.retired event.
 	rf.parked.release = make(chan struct{})
 	rf.f.c.reconcilePoolsAsync()
 	select {
@@ -369,6 +384,15 @@ func TestPoolRetirementFenceBlocksClaimsAcrossTheProviderDestroy(t *testing.T) {
 	}
 	if n := rf.durableFences(t); n != 0 {
 		t.Fatalf("durable fences after prune = %d, want 0", n)
+	}
+	if retired := poolEvents(t, rf.f, proto.EvPoolRetired); len(retired) != 1 {
+		t.Fatalf("pool.retired events = %d, want exactly one", len(retired))
+	}
+	if aborted := poolEvents(t, rf.f, proto.EvPoolRetireAborted); len(aborted) != 0 {
+		t.Fatalf("pool.retire_aborted events = %d after a successful destroy, want none", len(aborted))
+	}
+	if err := rf.f.c.poolRemove(context.Background(), localSubject(), &proto.PoolRemoveReq{Name: "audit", IdempotencyKey: "remove-late"}); err != nil {
+		t.Fatalf("pool remove after the fence resolved = %v", err)
 	}
 }
 
@@ -501,6 +525,9 @@ func TestPoolRetirementFenceSurvivesControllerRestart(t *testing.T) {
 	}
 	if n := restarted.durableFences(t); n != 0 {
 		t.Fatalf("durable fences after restart prune = %d, want 0", n)
+	}
+	if retired := poolEvents(t, restarted.f, proto.EvPoolRetired); len(retired) != 1 {
+		t.Fatalf("pool.retired events after restart = %d, want exactly one", len(retired))
 	}
 	if err := restarted.claimAndReady(t); err != nil {
 		t.Fatalf("claim after fence release = %v", err)

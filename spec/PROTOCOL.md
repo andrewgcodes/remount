@@ -1258,7 +1258,7 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `volume.published`, `volume.attached`, `volume.detached`, `volume.removed`, `run.started`,
 `run.finished`, `auth.workspace_resident`, `queue.created`,
 `queue.advanced`, `pool.created`, `pool.removed`, `pool.scaled`,
-`pool.provision_failed`, `pool.retiring`, `pool.retire_aborted`, `repo.cloned`, `agent.created`, `agent.message`,
+`pool.provision_failed`, `pool.retiring`, `pool.retire_aborted`, `pool.retired`, `repo.cloned`, `agent.created`, `agent.message`,
 `agent.run.started`, `agent.run.finished`, `agent.session`, `agent.turn`,
 `agent.tool_call`, `agent.waiting`, `agent.cancelled`, `agent.slept`,
 `agent.woken`, `agent.forked`, `agent.failed`, `agent.finished`,
@@ -1310,7 +1310,9 @@ environment. `pool.retiring` carries `pool`, `machine` and `node`: the node
 is durably fenced from new claims and the provider destroy follows. A
 `pool.retire_aborted` with the same payload records that a definite provider
 failure lifted the fence; an ambiguous result (timeout, cancellation) keeps
-it until inventory shows whether the machine survived.
+it until inventory shows whether the machine survived. `pool.retired`, same
+payload, records that provider inventory no longer lists the machine and the
+fence was lifted; it is the only way a fence ends after a successful destroy.
 
 `export.cursor.advanced` carries a destination name, previous/next sequence
 and revision. It commits with the tenant-scoped cursor row only after the
