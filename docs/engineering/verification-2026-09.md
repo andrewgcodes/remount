@@ -273,6 +273,11 @@ not enter the workspace while writing its model catalog as the container user.
 Focused policy and S3 package tests passed, and the deterministic OpenCode model
 lane passed in 46.128 seconds.
 
+The first post-merge CI run exposed one integration defect in the composed S3
+test: `staticcheck` reported `U1000` for an unused `bodies` field left on
+`staleOnceTransport`. The field was test scaffolding with no behavior and was
+removed; the focused S3 package and its static analysis were rerun afterward.
+
 On the merged history, native Windows passed build, vet, the complete
 serialized ordinary package lane with the five documented Windows exclusions,
 the nested public-SDK module, and the complete serialized race package lane
