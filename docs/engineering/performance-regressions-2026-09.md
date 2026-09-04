@@ -361,7 +361,7 @@ ratio between two named files is a fact about those two files.
 | 5 | Reattach after control restart | **improved** — 4.90 s → 4.17 s |
 | 6 | Volume fence write per claim/move | **fixed** for volume-incapable nodes |
 | 7 | Whole fleet-scale scenario | **improved** — 35.1 s → 22.4 s |
-| 3 | Exec round trip p50 at 200-way concurrency | **diagnosed and partly reduced** — see "Regression 3, re-diagnosed" below. The first diagnosis in this document was wrong. |
+| 3 | Exec round trip p50 at 200-way concurrency | **fixed to 2.2x of baseline** — 3.125 s at `a3b5235`, 1.41 s now against 0.645 s. See "Regression 3, re-diagnosed" and "Both remedies taken". The first diagnosis in this document was wrong. |
 
 Also fixed separately: the 200 MiB two-node move, 33–76 s → 0.88 s (228 MB/s
 against a 235 MB/s baseline), by bounding chunk-transfer concurrency and
@@ -484,12 +484,19 @@ per *record* in `spillLocked`; this removes an fsync per *seal* in
 
 ### What is still open, and deliberately not changed
 
-**The seal is on the exec's critical path.** Roughly 15 ms of the remaining
-cost is the genuine price of §8.2 durability: two fsyncs in the node's artifact
-store, two in the control plane's, an HTTP upload, and a control commit.
-Removing it from the caller's critical path would change an observable
-guarantee — that an exited session is immediately durably replayable — and so
-is a design decision needing an ADR, not a performance patch.
+**The seal is on the exec's critical path. Decided: it stays there.** This was
+the third open item; it is now settled in
+`docs/adr/0082-the-session-log-seal-stays-on-the-critical-path.md`. Deferring
+the seal would open a window in which a client has been told a session exited
+while its output exists only in tiers §8.2 states do not survive node loss, and
+the failure would be silent in the direction that matters, because the client
+already has the exit status and has no reason to ask again. After the two fixes
+below, the remaining cost is about 8 ms against an 11-12 ms exec, and all of it
+is irreducible without weakening the guarantee: one durable write in the control
+plane's store, the upload that carries the segment there, and one control round
+trip. A node that does not want to pay it can decline to advertise
+`tiered-session-logs` — a deployment choice with a visible capability attached,
+rather than an invisible durability window inside a node that claims it.
 
 A narrower version is available and also unstarted: the node's *local* artifact
 store fsyncs twice (`tmp.Sync`, then `syncDir` after the rename) for a copy
@@ -635,3 +642,70 @@ and a run against more than one S3 implementation, not a 3 a.m. commit. Whoever
 picks it up: the disambiguation for the probe specifically is that its staging
 key is freshly random and private, so a 412 on a retry proves our own earlier
 attempt landed rather than indicating a real conflict.
+
+---
+
+## Both remedies taken, 2026-09-04
+
+The two changes the section above priced and left for a reviewer are now made,
+and they land where the measurement said they would.
+
+### The node's local artifact write is a cache write
+
+`workspaceBlobStore.Put` writes into the node's own store and then immediately
+uploads to the control plane's store, which is durable, and only then is a
+record committed naming the object. An object stranded by a crash between those
+steps is referenced by no record: it is garbage the store's collector removes,
+not data anyone can lose. So the two fsyncs that made the intermediate copy
+survive a crash it has no meaning after were pure cost.
+
+`Store.PutLimitCached` writes and publishes without syncing; `PutLimit` is
+unchanged and remains what every caller for whom this store is the authority
+must use, standalone mode included. `TestACachedPutIsTheSameObjectAsADurableOne`
+pins that the two differ only in durability — same digest, same size, readable
+and self-verifying immediately, which is the property the node depends on since
+it reopens the object to upload it in the next statement.
+
+Predicted 1.48-1.79x, measured **1.69-1.78x**. The estimate held.
+
+### `artifact.publish` no longer holds the store-wide lock across the filesystem
+
+Blobs are content addressed and published mode 0444, so two publishers of
+different digests write different paths and cannot interfere; only same-digest
+publishers need to agree on who created the object. `publish` now takes a
+per-digest shard lock and touches `s.mu` twice, briefly, never across a
+filesystem call. The full-file re-hash in `verifyBlobPath` — the call that would
+make one large artifact's verification block every other upload in the store —
+is now outside every lock, which is safe precisely because a published blob is
+immutable.
+
+**`os.Link` was not used.** The earlier note proposed deriving "did I create
+this?" from an atomic create-if-absent, which is a good design and portable in
+principle, but hardlink behaviour differs on Windows and that is the platform
+`handoff-windows-host-2026-09-03.md` identifies as least verified. A shard lock
+needs no syscall and no platform assumption.
+
+The accounting is the only thing at risk in this restructure, and it is what the
+test asserts: `TestConcurrentPublishersOfOneDigestCreateItExactlyOnce` drives 24
+concurrent uploads of identical content and requires the store to count one
+object, no leaked reservations. Verified to fail with the shard lock removed —
+**20 objects counted instead of 1**, a drift that would eventually make a
+quota-bearing store refuse writes it has room for.
+
+### Effect at fleet scale
+
+Same command, same host, `TestHandoffScaleAndControlFailover`:
+
+| Operation | `21ef995` baseline | `a3b5235` | before these two changes | now |
+|---|---:|---:|---:|---:|
+| exec round trip p50 | 0.645 s | 3.125 s | 2.78 s | **1.41 s** |
+| reattach after control restart p50 | 2.24 s | 4.90 s | 4.74 s | **2.75 s** |
+| claim p99 | 0.793 s | 7.82 s | 0.668 s | 0.750 s |
+| move p50 | 1.88 s | 5.75 s | 4.84 s | 5.13 s |
+| whole scenario | 16.5 s | 35.1 s | 23.7 s | **21.0 s** |
+
+Reattach is within noise of its original baseline. Exec is at 2.2x of baseline,
+down from 4.8x, and what remains is the control plane's own durable write plus
+the HTTP upload — the part that must stay. Move is the one operation these
+changes did not help and it is still 2.7x its baseline; it is the next thing to
+profile, and nothing in this document has yet attributed it.
