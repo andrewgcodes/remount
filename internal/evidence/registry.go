@@ -477,7 +477,7 @@ var scenarios = []Scenario{
 		ID: "B32", Title: "clean installs pass the black-box smoke without source-tree imports",
 		Layer: LayerArtifact, Required: true, Source: sourceLinux,
 		Owner:    "integration/installs.TestB32*",
-		Argv:     []string{"go", "test", "-count=1", "-timeout=20m", "./integration/installs/"},
+		Argv:     []string{"go", "test", "-count=1", "-timeout=20m", "-run", "^TestB32", "./integration/installs/"},
 		Recorded: StatusPassed,
 		Note:     "the dist binary and both release images passed manifest 1.1.0 black-box conformance; the wheel, npm tarball and external Go module drove an installed server without a source-tree dependency, and the checksums, static-link, inventory and SPDX SBOM lanes passed",
 	},

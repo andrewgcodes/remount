@@ -95,6 +95,17 @@ func TestOnlyDeliberatelyWiredScenariosAreWired(t *testing.T) {
 	}
 }
 
+func TestB32RunsOnlyItsOwningProofs(t *testing.T) {
+	s, ok := ScenarioByID("B32")
+	if !ok {
+		t.Fatal("B32 not found")
+	}
+	want := []string{"go", "test", "-count=1", "-timeout=20m", "-run", "^TestB32", "./integration/installs/"}
+	if !slices.Equal(s.Argv, want) {
+		t.Fatalf("B32 command = %q, want %q", s.Argv, want)
+	}
+}
+
 // TestAWiredScenarioIsOwnedAndKeyless pins what wiring is allowed to mean. A
 // wired row runs on every candidate, so it may not depend on a credential.
 // Non-secret host prerequisites are allowed because the runner reports their
