@@ -557,11 +557,63 @@ func (s *Store) doStream(ctx context.Context, method, physical string, query url
 	}
 	s.sign(req, payloadHash, s.now())
 	resp, err := s.httpClient.Do(req)
+	if err != nil && unusedConnection(err) {
+		// The transport handed this request to a pooled connection the server
+		// had already closed, and says so before writing a single byte. Nothing
+		// reached S3, so sending it again cannot repeat an effect or observe a
+		// partial one — this is the one transport error where a retry is
+		// provably safe even for a conditional PUT.
+		//
+		// net/http will not retry it itself: Request.isReplayable replays only
+		// GET, HEAD, OPTIONS and TRACE, so every upload fails outright. It is
+		// not rare either. MinIO closed a twenty-millisecond-old connection in
+		// CI and broke the run on its first conditional write, on every commit
+		// for a day.
+		//
+		// Only a rewindable body qualifies. A stream that has already been
+		// partially read cannot be replayed honestly, and guessing there would
+		// trade a visible failure for a corrupt object.
+		if seeker, ok := body.(io.Seeker); ok || body == nil {
+			replay := true
+			if ok {
+				_, seekErr := seeker.Seek(0, io.SeekStart)
+				replay = seekErr == nil
+			}
+			if replay {
+				retry, buildErr := http.NewRequestWithContext(requestCtx, method, u.String(), body)
+				if buildErr == nil {
+					if headers != nil {
+						retry.Header = headers.Clone()
+					}
+					if body != nil {
+						retry.ContentLength = size
+					}
+					s.sign(retry, payloadHash, s.now())
+					resp, err = s.httpClient.Do(retry)
+				}
+			}
+		}
+	}
 	if err != nil {
 		cancel()
 		return nil, nil, fmt.Errorf("s3: request failed: %w", err)
 	}
 	return resp, cancel, nil
+}
+
+// unusedConnection reports whether err means the request was never written.
+//
+// net/http has no exported sentinel for this, so the check is on the message it
+// produces, which has been stable for many releases. The consequence of the
+// match being wrong is bounded in the safe direction: a false negative is
+// today's behaviour, and a false positive would only replay a request the
+// server has still never seen, because a request that reached the server fails
+// with something else entirely.
+func unusedConnection(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "server closed idle connection")
 }
 
 func (s *Store) requestURL(physical string, query url.Values) *url.URL {
