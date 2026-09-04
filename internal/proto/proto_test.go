@@ -112,6 +112,47 @@ func TestUnknownFieldsIgnored(t *testing.T) {
 	}
 }
 
+func TestSessionSubscriptionFieldIsWireCompatible(t *testing.T) {
+	type legacyAttach struct {
+		S    string `cbor:"s"`
+		From uint64 `cbor:"from"`
+	}
+	type legacyClose struct {
+		S    string `cbor:"s"`
+		Kill bool   `cbor:"kill,omitempty"`
+	}
+
+	var oldAttach legacyAttach
+	if err := Unmarshal(MustMarshal(SAttachReq{S: "s_1", From: 7, Subscription: "sub_1"}), &oldAttach); err != nil {
+		t.Fatal(err)
+	}
+	if oldAttach.S != "s_1" || oldAttach.From != 7 {
+		t.Fatalf("legacy attach = %+v", oldAttach)
+	}
+	var newAttach SAttachReq
+	if err := Unmarshal(MustMarshal(legacyAttach{S: "s_1", From: 7}), &newAttach); err != nil {
+		t.Fatal(err)
+	}
+	if newAttach.Subscription != "" {
+		t.Fatalf("legacy attach subscription = %q", newAttach.Subscription)
+	}
+
+	var oldClose legacyClose
+	if err := Unmarshal(MustMarshal(SCloseReq{S: "s_1", Kill: true, Subscription: "sub_1"}), &oldClose); err != nil {
+		t.Fatal(err)
+	}
+	if oldClose.S != "s_1" || !oldClose.Kill {
+		t.Fatalf("legacy close = %+v", oldClose)
+	}
+	var newClose SCloseReq
+	if err := Unmarshal(MustMarshal(legacyClose{S: "s_1", Kill: true}), &newClose); err != nil {
+		t.Fatal(err)
+	}
+	if newClose.Subscription != "" {
+		t.Fatalf("legacy close subscription = %q", newClose.Subscription)
+	}
+}
+
 func TestDecodeRejectsUnsupportedVersion(t *testing.T) {
 	for _, version := range []uint8{0, Version + 1} {
 		b, err := cbor.Marshal(Frame{V: version, T: KindReq, Op: "test"})

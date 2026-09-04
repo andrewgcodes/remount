@@ -741,11 +741,11 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | op | Body → Response |
 |---|---|
 | `s.open` | `SOpenReq{ws, kind, program, cwd, env, rows, cols, stdin, timeout_sec, idem, run?}` → `SOpenRes{s, next}` |
-| `s.attach` | `SAttachReq{s, from}` → `SOpenRes{s, next}` |
+| `s.attach` | `SAttachReq{s, from, subscription?}` → `SOpenRes{s, next}` |
 | `s.input` | `SInputReq{s, iseq, d, eof}` → `{}` |
 | `s.resize` | `SResizeReq{s, rows, cols}` → `{}` |
 | `s.signal` | `SSignalReq{s, signal}` → `{}` |
-| `s.close` | `SCloseReq{s, kill}` → `{}` |
+| `s.close` | `SCloseReq{s, kill, subscription?}` → `{}` |
 | `s.wait` | `SWaitReq{s, timeout_sec}` → `SWaitRes{exited, exit}` |
 | `s.list` | `SListReq{ws}` → `SListRes{sessions}` |
 | `port.open` | `PortOpenReq{ws, port, host}` → `SOpenRes` |
@@ -899,7 +899,10 @@ Guarantees:
    chunk, so a replay from 0 reconstructs the session header.
 2. The `exit` chunk is the last chunk. After it the log is closed.
 3. `s.attach` with `from: N` replays every chunk from N, then continues live.
-   Replay and live tail are the same code path.
+   Replay and live tail are the same code path. A client MAY include a unique
+   `subscription`; when it does, `s.close` includes the same value and detaches
+   only that cursor. This fences a delayed close from an older cursor after a
+   replacement attach. Omitting the field retains the unconditional v0 detach.
 4. If N is older than what the node retained, the node MUST send a `gap` chunk
    naming the lost range and then continue from the oldest chunk it has. It MUST
    NOT silently skip, and it MUST NOT kill the session. The harness can then tell

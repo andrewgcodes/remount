@@ -1401,6 +1401,7 @@ type Session struct {
 	exited       chan struct{}
 	closed       bool
 	attached     bool
+	subscription string
 	attachMu     sync.Mutex
 	inputMu      sync.Mutex
 	iseq         uint64
@@ -1482,11 +1483,14 @@ func (c *Client) OpenPort(ctx context.Context, wsID string, port int, options ..
 func (c *Client) Attach(ctx context.Context, wsID, sid string, from uint64) (*Session, error) {
 	s := c.newSession(sid, wsID, "")
 	s.next = from
+	s.subscription = ids.New("sub")
 	c.mu.Lock()
 	c.sessions[sid] = s
 	c.mu.Unlock()
 	var res proto.SOpenRes
-	err := c.nodeCall(ctx, wsID, proto.OpSAttach, func(g *proto.Grant) any { return proto.SAttachReq{S: sid, From: from, Grant: g} }, &res)
+	err := c.nodeCall(ctx, wsID, proto.OpSAttach, func(g *proto.Grant) any {
+		return proto.SAttachReq{S: sid, From: from, Subscription: s.subscription, Grant: g}
+	}, &res)
 	if err != nil {
 		c.mu.Lock()
 		delete(c.sessions, sid)
@@ -1757,11 +1761,11 @@ func (s *Session) reattach(ctx context.Context, generation uint64) {
 			s.mu.Unlock()
 			return
 		}
-		from, id, ws := s.next, s.ID, s.WS
+		from, id, ws, subscription := s.next, s.ID, s.WS, s.subscription
 		s.mu.Unlock()
 		var res proto.SOpenRes
 		err := s.c.nodeCall(ctx, ws, proto.OpSAttach, func(g *proto.Grant) any {
-			return proto.SAttachReq{S: id, From: from, Grant: g}
+			return proto.SAttachReq{S: id, From: from, Subscription: subscription, Grant: g}
 		}, &res)
 		if err == nil {
 			s.seedInputSeq(res.LastInputSeq)
@@ -1840,11 +1844,11 @@ func (s *Session) Signal(ctx context.Context, sig string) error {
 // Close detaches; kill also terminates the process.
 func (s *Session) Close(ctx context.Context, kill bool) error {
 	s.mu.Lock()
-	id, ws := s.ID, s.WS
+	id, ws, subscription := s.ID, s.WS, s.subscription
 	s.mu.Unlock()
 	s.fail(proto.Err(proto.CodeClosed, "session detached"))
 	return s.c.nodeCall(ctx, ws, proto.OpSClose, func(g *proto.Grant) any {
-		return proto.SCloseReq{S: id, Kill: kill, Grant: g}
+		return proto.SCloseReq{S: id, Kill: kill, Subscription: subscription, Grant: g}
 	}, nil)
 }
 

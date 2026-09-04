@@ -95,18 +95,43 @@ func TestReplacingSessionCursorDoesNotCancelSharedPeerWrite(t *testing.T) {
 	p := transport.NewPeer(conn, nil)
 	t.Cleanup(func() { _ = p.Close() })
 
-	n.subscribe(p, "c_cursor", s, 0)
+	n.subscribe(p, "c_cursor", s, 0, "")
 	select {
 	case <-conn.sendStarted:
 	case <-time.After(time.Second):
 		t.Fatal("initial cursor did not start its chunk write")
 	}
 
-	n.subscribe(p, "c_cursor", s, 0)
+	n.subscribe(p, "c_cursor", s, 0, "")
 	select {
 	case <-p.Done():
 		t.Fatalf("replacing the cursor closed the shared peer: %v", p.Err())
 	case <-time.After(100 * time.Millisecond):
+	}
+	close(conn.releaseSend)
+}
+
+func TestStaleSessionDetachDoesNotCancelReplacementCursor(t *testing.T) {
+	n := newTestNode(t, nil)
+	s, err := n.sessions.Open(session.Spec{WS: "ws_cursor", Kind: proto.SessionExec, Program: []string{"/bin/cat"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { n.sessions.Remove(s.ID, true) })
+
+	conn := newCancelClosingConn()
+	p := transport.NewPeer(conn, nil)
+	t.Cleanup(func() { _ = p.Close() })
+
+	n.subscribe(p, "c_cursor", s, 0, "sub_old")
+	n.subscribe(p, "c_cursor", s, 0, "sub_new")
+	n.unsubscribe("c_cursor", s.ID, "sub_old")
+
+	n.mu.Lock()
+	current := n.subs["c_cursor|"+s.ID]
+	n.mu.Unlock()
+	if current == nil || current.subscription != "sub_new" {
+		t.Fatal("stale detach removed the replacement cursor")
 	}
 	close(conn.releaseSend)
 }

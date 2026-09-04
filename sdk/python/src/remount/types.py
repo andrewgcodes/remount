@@ -1254,12 +1254,14 @@ SAckReq = TypedDict("SAckReq", {
 SAttachReq = TypedDict("SAttachReq", {
     "s": Required[str],
     "from": Required[int],
+    "subscription": NotRequired[str],
     "grant": NotRequired[Optional["Grant"]],
 }, total=False)
 
 SCloseReq = TypedDict("SCloseReq", {
     "s": Required[str],
     "kill": NotRequired[bool],
+    "subscription": NotRequired[str],
     "grant": NotRequired[Optional["Grant"]],
 }, total=False)
 

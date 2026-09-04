@@ -1276,9 +1276,10 @@ type SOpenRes struct {
 }
 
 type SAttachReq struct {
-	S     string `cbor:"s" json:"s"`
-	From  uint64 `cbor:"from" json:"from"` // replay from this seq
-	Grant *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+	S            string `cbor:"s" json:"s"`
+	From         uint64 `cbor:"from" json:"from"` // replay from this seq
+	Subscription string `cbor:"subscription,omitempty" json:"subscription,omitempty"`
+	Grant        *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type SInputReq struct {
@@ -1309,9 +1310,10 @@ type SAckReq struct {
 }
 
 type SCloseReq struct {
-	S     string `cbor:"s" json:"s"`
-	Kill  bool   `cbor:"kill,omitempty" json:"kill,omitempty"` // also terminate the process
-	Grant *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+	S            string `cbor:"s" json:"s"`
+	Kill         bool   `cbor:"kill,omitempty" json:"kill,omitempty"` // also terminate the process
+	Subscription string `cbor:"subscription,omitempty" json:"subscription,omitempty"`
+	Grant        *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
 }
 
 type SListReq struct {

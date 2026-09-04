@@ -1251,12 +1251,14 @@ export interface SAckReq {
 export interface SAttachReq {
   "s": string;
   "from": number;
+  "subscription"?: string;
   "grant"?: Grant | null;
 }
 
 export interface SCloseReq {
   "s": string;
   "kill"?: boolean;
+  "subscription"?: string;
   "grant"?: Grant | null;
 }
 
