@@ -175,7 +175,7 @@ func TestNPMRecipesInstallIntoWorkspaceLocalPrefix(t *testing.T) {
 	if err != nil {
 		t.Skip("no sh")
 	}
-	for _, name := range []string{"codex", "gemini", "opencode"} {
+	for _, name := range []string{"claude", "cline", "codex", "gemini", "opencode", "pi"} {
 		t.Run(name, func(t *testing.T) {
 			r, err := Load(name)
 			if err != nil {
