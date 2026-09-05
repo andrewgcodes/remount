@@ -490,7 +490,7 @@ For individual files:
 ```
 
 `pull` snapshots the workspace and writes files that differ locally. It does
-not delete local files. It refuses to overwrite conflicting uncommitted local
+not delete local files. It refuses when the destination has uncommitted
 changes; inspect them rather than immediately bypassing that check. If
 overwriting is intentionally safe:
 
