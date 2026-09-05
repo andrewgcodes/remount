@@ -79,6 +79,9 @@ func TestDriverCreateListDestroyContract(t *testing.T) {
 			if len(create.Config.Processes) != 1 || len(create.Config.Processes[0].Secrets) != 1 {
 				t.Errorf("missing process secret ref: %+v", create)
 			}
+			if !create.Config.Processes[0].IgnoreAppSecrets {
+				t.Error("process did not opt into explicit app-secret selection")
+			}
 			if create.MinSecretsVersion != 42 {
 				t.Errorf("min secrets version=%d", create.MinSecretsVersion)
 			}
