@@ -166,6 +166,26 @@ dependencies into it. A snapshot is the whole filesystem, so a 400 MB
 dependency tree is uploaded and downloaded on every move. That turned a one
 second move into 38 seconds. Reinstall on the far side instead.
 
+## Operating browser and desktop workspaces
+
+Remount does not provide a desktop stack. Preinstall Xvfb, a window manager,
+the browser, and any VNC or XTEST tools in the node image. For Chromium, create
+the workspace with `--exclude .chromium-profile`: singleton lock symlinks are
+not portable, and snapshot or `pull` must continue to reject unsafe symlinks.
+
+Bind x11vnc to workspace loopback. Use a no-password listener only for a
+disposable run; `remount port` inherits the server transport, so it is encrypted
+only when `REMOUNT_SERVER` uses HTTPS. Never publish that listener directly.
+Keep the desktop supervisor in the foreground of a Remount exec session so
+another client can attach and replay its output after the initiator disconnects.
+
+Disconnect preserves the remote session and processes. Move, sleep, failover,
+or restore preserves files only: restart X11, the window manager, browser, VNC,
+and application after materialization. A process or Docker backend remains a
+cooperative boundary regardless of the remote desktop stack. The full recipe
+and verification checklist are in
+`docs/harness-integration.md#browser-and-virtual-desktop-workloads`.
+
 ## Moving a workspace
 
 ```sh
