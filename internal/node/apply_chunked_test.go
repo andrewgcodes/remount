@@ -160,11 +160,11 @@ func TestApplyChunkedAndTarProduceIdenticalTrees(t *testing.T) {
 		writeTree(t, root, map[string]string{"README.md": "stale", "local-only.txt": "kept"})
 	}
 
-	tarRaw, err := tarNode.applyTar(ctx, tarWS, storeTar(t, tarNode, source), proto.ArtifactFormatTar, "c1")
+	tarRaw, err := tarNode.applyTar(ctx, tarWS, storeTar(t, tarNode, source), proto.ArtifactFormatTar, "", "c1")
 	if err != nil {
 		t.Fatalf("tar apply: %v", err)
 	}
-	chunkRaw, err := chunkNode.applyTar(ctx, chunkWS, storeChunked(t, chunkNode, source), proto.ArtifactFormatChunkedV1, "c1")
+	chunkRaw, err := chunkNode.applyTar(ctx, chunkWS, storeChunked(t, chunkNode, source), proto.ArtifactFormatChunkedV1, "", "c1")
 	if err != nil {
 		t.Fatalf("chunked apply: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestApplyRefusesUnsupportedFormatWithoutTouchingTree(t *testing.T) {
 	id := storeChunked(t, n, source)
 
 	for _, format := range []string{proto.ArtifactFormatFirecrackerFullV1, "zip-v9", "chunked-v2"} {
-		_, err := n.applyTar(context.Background(), w, id, format, "c1")
+		_, err := n.applyTar(context.Background(), w, id, format, "", "c1")
 		if err == nil {
 			t.Fatalf("format %q was accepted", format)
 		}
@@ -234,7 +234,7 @@ func TestChunkedApplyKeepsOverlaySafetyProperties(t *testing.T) {
 		writeTree(t, source, map[string]string{".remount/env": "REMOUNT_BROKER=attacker"})
 		n, w, root := applyFixture(t, "ws_env")
 		writeTree(t, root, map[string]string{"safe.txt": "safe"})
-		_, err := n.applyTar(ctx, w, storeChunked(t, n, source), proto.ArtifactFormatChunkedV1, "c1")
+		_, err := n.applyTar(ctx, w, storeChunked(t, n, source), proto.ArtifactFormatChunkedV1, "", "c1")
 		if err == nil || !strings.Contains(err.Error(), artifact.OverlayStageDir) {
 			t.Fatalf("chunked overlay into .remount accepted: %v", err)
 		}
@@ -254,7 +254,7 @@ func TestChunkedApplyKeepsOverlaySafetyProperties(t *testing.T) {
 		if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := n.applyTar(ctx, w, storeChunked(t, n, source), proto.ArtifactFormatChunkedV1, "c1"); err == nil {
+		if _, err := n.applyTar(ctx, w, storeChunked(t, n, source), proto.ArtifactFormatChunkedV1, "", "c1"); err == nil {
 			t.Fatal("chunked write through a symlinked directory accepted")
 		}
 		if _, err := os.Stat(filepath.Join(outside, "victim")); !os.IsNotExist(err) {
@@ -269,7 +269,7 @@ func TestChunkedApplyKeepsOverlaySafetyProperties(t *testing.T) {
 		if err := os.MkdirAll(filepath.Join(root, "isdir"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		_, err := n.applyTar(ctx, w, storeChunked(t, n, source), proto.ArtifactFormatChunkedV1, "c1")
+		_, err := n.applyTar(ctx, w, storeChunked(t, n, source), proto.ArtifactFormatChunkedV1, "", "c1")
 		if err == nil || !strings.Contains(err.Error(), "replace a directory") {
 			t.Fatalf("chunked file over directory accepted: %v", err)
 		}
@@ -285,7 +285,7 @@ func TestChunkedApplyKeepsOverlaySafetyProperties(t *testing.T) {
 		writeTree(t, source, map[string]string{"afile/child.txt": "x", "zzz.txt": "y"})
 		n, w, root := applyFixture(t, "ws_dirclash")
 		writeTree(t, root, map[string]string{"afile": "a regular file"})
-		_, err := n.applyTar(ctx, w, storeChunked(t, n, source), proto.ArtifactFormatChunkedV1, "c1")
+		_, err := n.applyTar(ctx, w, storeChunked(t, n, source), proto.ArtifactFormatChunkedV1, "", "c1")
 		if err == nil || !strings.Contains(err.Error(), "replace a file with a directory") {
 			t.Fatalf("chunked directory over file accepted: %v", err)
 		}
@@ -303,7 +303,7 @@ func TestChunkedApplyRejectsAMissingManifest(t *testing.T) {
 	writeTree(t, root, map[string]string{"safe.txt": "safe"})
 	before := treeShape(t, root)
 	absent := artifact.ID(make([]byte, 32))
-	_, err := n.applyTar(context.Background(), w, absent, proto.ArtifactFormatChunkedV1, "c1")
+	_, err := n.applyTar(context.Background(), w, absent, proto.ArtifactFormatChunkedV1, "", "c1")
 	if err == nil || !errors.Is(err, &proto.Error{Code: proto.CodeNotFound}) {
 		t.Fatalf("missing manifest error = %v, want not_found", err)
 	}

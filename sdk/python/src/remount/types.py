@@ -712,6 +712,7 @@ ExitInfo = TypedDict("ExitInfo", {
 FSApplyTarReq = TypedDict("FSApplyTarReq", {
     "ws": Required[str],
     "artifact": Required[str],
+    "path": NotRequired[str],
     "format": NotRequired[str],
     "idem": NotRequired[str],
     "grant": NotRequired[Optional["Grant"]],

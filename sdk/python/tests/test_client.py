@@ -461,7 +461,7 @@ async def test_snapshot_archive_and_apply_tar_helpers_encode_node_operations():
 
     client = Client("https://cp.example", "token", connector=connector)
     entries = await client.list_files("ws_1", "workspace")
-    applied = await client.apply_tar("ws_1", "art_sha256:" + "2" * 64)
+    applied = await client.apply_tar("ws_1", "art_sha256:" + "2" * 64, path="state")
     snapshot = await client.snapshot_workspace("ws_1", authoritative=True)
     archive = await client.archive_path("ws_1", "workspace")
 
@@ -475,6 +475,7 @@ async def test_snapshot_archive_and_apply_tar_helpers_encode_node_operations():
         if frame.get("op") in {"fs.apply_tar", "ws.snapshot", "volume.archive"}
     }
     assert bodies["fs.apply_tar"]["format"] == "tar"
+    assert bodies["fs.apply_tar"]["path"] == "state"
     assert bodies["ws.snapshot"]["upload"] is True
     assert bodies["ws.snapshot"]["authoritative"] is True
     assert bodies["volume.archive"]["path"] == "workspace"

@@ -674,20 +674,24 @@ class Client:
         workspace: str,
         artifact: str,
         *,
+        path: str = "",
         format: str = "tar",
         idempotency_key: str | None = None,
     ) -> FSApplyTarRes:
+        body = {
+            "ws": workspace,
+            "artifact": artifact,
+            "format": format,
+            "idem": idempotency_key or _idempotency_key(),
+        }
+        if path:
+            body["path"] = path
         return cast(
             FSApplyTarRes,
             await self._node_call(
                 workspace,
                 "fs.apply_tar",
-                {
-                    "ws": workspace,
-                    "artifact": artifact,
-                    "format": format,
-                    "idem": idempotency_key or _idempotency_key(),
-                },
+                body,
             ),
         )
 

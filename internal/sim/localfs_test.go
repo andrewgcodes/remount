@@ -208,6 +208,80 @@ func TestLocalDirectoryRoundTrip(t *testing.T) {
 	}
 }
 
+func TestApplyTarAtPath(t *testing.T) {
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("c1")
+	ws := mustWS(t, c, proto.WorkspaceSpec{})
+	ctx := ctxT(t, 60*time.Second)
+
+	var packed bytes.Buffer
+	src := t.TempDir()
+	writeTree(t, src, map[string]string{
+		"resume-proof.txt": "restored\n",
+	})
+	if _, err := localfs.Pack(src, localfs.PackOptions{}, &packed); err != nil {
+		t.Fatal(err)
+	}
+	overlay, _, err := c.UploadArtifact(ctx, bytes.NewReader(packed.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Mkdir(ctx, ws.ID, "workspace"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ApplyTarAt(ctx, ws.ID, overlay, "workspace", client.WithIdempotencyKey("nested-restore")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ReadFile(ctx, ws.ID, "resume-proof.txt"); err == nil {
+		t.Fatal("archive escaped its requested destination")
+	}
+	got, err := c.ReadFile(ctx, ws.ID, "workspace/resume-proof.txt")
+	if err != nil || string(got) != "restored\n" {
+		t.Fatalf("nested overlay: %v %q", err, got)
+	}
+	if err := c.Mkdir(ctx, ws.ID, "other"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ApplyTarAt(ctx, ws.ID, overlay, "other", client.WithIdempotencyKey("nested-restore")); err == nil {
+		t.Fatal("idempotency key reuse with a different destination succeeded")
+	}
+	if _, err := c.ApplyTarAt(ctx, ws.ID, overlay, ".remount"); err == nil {
+		t.Fatal("archive applied into node-owned .remount directory")
+	}
+
+	evs, err := c.ReadEvents(ctx, 1, ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var applyPath string
+	wroteNested := false
+	for _, event := range evs {
+		switch event.Type {
+		case proto.EvFSApplyTar:
+			var payload struct {
+				Artifact string `cbor:"artifact"`
+				Path     string `cbor:"path"`
+			}
+			if err := proto.Unmarshal(event.Payload, &payload); err == nil && payload.Artifact == overlay {
+				applyPath = payload.Path
+			}
+		case proto.EvFSWrite:
+			var payload struct {
+				Artifact string `cbor:"artifact"`
+				Path     string `cbor:"path"`
+			}
+			if err := proto.Unmarshal(event.Payload, &payload); err == nil &&
+				payload.Artifact == overlay && payload.Path == "workspace/resume-proof.txt" {
+				wroteNested = true
+			}
+		}
+	}
+	if applyPath != "workspace" || !wroteNested {
+		t.Fatalf("nested overlay events: apply path %q, write observed %v", applyPath, wroteNested)
+	}
+}
+
 // A corrupted download must surface at EOF rather than silently unpack.
 func TestDownloadArtifactVerifiesDigest(t *testing.T) {
 	w := newWorld(t)

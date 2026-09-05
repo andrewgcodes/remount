@@ -1131,7 +1131,13 @@ func (c *Client) Edit(ctx context.Context, wsID, path string, edits []proto.FSEd
 // ApplyTar overlays an artifact previously stored with UploadArtifact onto the
 // workspace tree. Files land one rename at a time; nothing else is removed.
 func (c *Client) ApplyTar(ctx context.Context, wsID, artifactID string, options ...OperationOption) (*proto.FSApplyTarRes, error) {
-	return c.ApplyArtifact(ctx, wsID, artifactID, proto.ArtifactFormatTar, options...)
+	return c.ApplyTarAt(ctx, wsID, artifactID, "", options...)
+}
+
+// ApplyTarAt overlays an artifact into an existing workspace directory.
+// Files land one rename at a time; nothing else is removed.
+func (c *Client) ApplyTarAt(ctx context.Context, wsID, artifactID, path string, options ...OperationOption) (*proto.FSApplyTarRes, error) {
+	return c.ApplyArtifactAt(ctx, wsID, artifactID, proto.ArtifactFormatTar, path, options...)
 }
 
 // ApplyArtifact is ApplyTar for an artifact in a named representation. The
@@ -1139,6 +1145,11 @@ func (c *Client) ApplyTar(ctx context.Context, wsID, artifactID string, options 
 // guesses one from the id, and refuses a representation it cannot restore
 // without touching the tree.
 func (c *Client) ApplyArtifact(ctx context.Context, wsID, artifactID, format string, options ...OperationOption) (*proto.FSApplyTarRes, error) {
+	return c.ApplyArtifactAt(ctx, wsID, artifactID, format, "", options...)
+}
+
+// ApplyArtifactAt is ApplyArtifact for an existing workspace directory.
+func (c *Client) ApplyArtifactAt(ctx context.Context, wsID, artifactID, format, path string, options ...OperationOption) (*proto.FSApplyTarRes, error) {
 	format, err := proto.NormalizeArtifactFormat(format)
 	if err != nil {
 		return nil, err
@@ -1151,7 +1162,7 @@ func (c *Client) ApplyArtifact(ctx context.Context, wsID, artifactID, format str
 	var res proto.FSApplyTarRes
 	idem, _ := operationKey(options)
 	err = c.nodeCall(ctx, wsID, proto.OpFSApplyTar, func(g *proto.Grant) any {
-		return proto.FSApplyTarReq{WS: wsID, Artifact: artifactID, Format: format, IdempotencyKey: idem, Grant: g}
+		return proto.FSApplyTarReq{WS: wsID, Artifact: artifactID, Path: path, Format: format, IdempotencyKey: idem, Grant: g}
 	}, &res)
 	return &res, err
 }
