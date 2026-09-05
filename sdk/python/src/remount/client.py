@@ -654,6 +654,23 @@ class Client:
         )
         return cast(list[FSEntry], response["entries"])
 
+    async def mkdir(
+        self,
+        workspace: str,
+        path: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> None:
+        await self._node_call(
+            workspace,
+            "fs.mkdir",
+            {
+                "ws": workspace,
+                "path": path,
+                "idem": idempotency_key or _idempotency_key(),
+            },
+        )
+
     async def list_sessions(self, workspace: str) -> list[SessionStatus]:
         response = await self._node_call(
             workspace, "s.list", {"ws": workspace}

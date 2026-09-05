@@ -31,6 +31,7 @@ async with Client("https://remount.example", token="...") as remount:
     workspace_id = workspace["id"]
     await remount.wait_workspace(workspace_id)
     await remount.write_file(workspace_id, "workspace/input.txt", b"hello")
+    await remount.mkdir(workspace_id, "state")
     session = await remount.exec(workspace_id, ["cat", "input.txt"], cwd="workspace")
     async for chunk in session:
         print(chunk.data.decode(), end="")
