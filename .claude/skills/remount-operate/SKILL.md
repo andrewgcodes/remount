@@ -12,7 +12,7 @@ changes, update that guide and the relevant detailed document, run
 `make docs`, and verify `make lint`; never edit generated `llms.txt` or
 `llms-full.txt` by hand.
 
-Every command needs a server URL. Authenticated deployments also require a
+Client operations need a server URL. Authenticated deployments also require a
 token; local standalone commonly does not. Set the applicable values once.
 
 ```sh
