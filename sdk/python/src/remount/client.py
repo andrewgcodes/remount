@@ -6,17 +6,21 @@ import asyncio
 import hashlib
 import json
 import secrets
+import time
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, cast
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import cbor2
 import httpx
 from websockets.asyncio.client import connect as websocket_connect
 
+from .types import FSApplyTarRes, FSEntry, FSReadRes, Timer, Workspace, WSSnapshotRes
+
 PROTOCOL_VERSION = 1
 CONTROL = "control"
 MAX_FRAME_BYTES = 16 << 20
+MAX_FILE_CHUNK_BYTES = 8 << 20
 MAX_PENDING = 4096
 MAX_ORPHAN_SESSIONS = 256
 MAX_ORPHAN_CHUNKS = 16_384
@@ -508,6 +512,188 @@ class Client:
 
     async def destroy_workspace(self, workspace: str, idempotency_key: str | None = None) -> None:
         await self.call("ws.destroy", {"id": workspace, "idem": idempotency_key or _idempotency_key()})
+
+    async def wait_workspace(
+        self,
+        workspace: str,
+        *,
+        states: tuple[str, ...] = ("claimed",),
+        timeout: float = 60,
+        poll_interval: float = 0.1,
+    ) -> Workspace:
+        deadline = time.monotonic() + timeout
+        while True:
+            current = cast(Workspace, await self.get_workspace(workspace))
+            if current["state"] in states:
+                return current
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"workspace {workspace} did not reach {states}")
+            await asyncio.sleep(poll_interval)
+
+    async def sleep_workspace(
+        self,
+        workspace: str,
+        *,
+        after_sec: int = 0,
+        at_millis: int = 0,
+        on_event: str = "",
+        match: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> Timer:
+        body: dict[str, object] = {
+            "id": workspace,
+            "idem": idempotency_key or _idempotency_key(),
+        }
+        if after_sec:
+            body["after_sec"] = after_sec
+        if at_millis:
+            body["at"] = at_millis
+        if on_event:
+            body["on"] = on_event
+        if match:
+            body["match"] = match
+        return cast(Timer, await self.call("ws.sleep", body))
+
+    async def wake_workspace(
+        self, workspace: str, idempotency_key: str | None = None
+    ) -> Workspace:
+        return cast(
+            Workspace,
+            await self.call(
+                "ws.wake",
+                {"id": workspace, "idem": idempotency_key or _idempotency_key()},
+            ),
+        )
+
+    async def read_file(
+        self,
+        workspace: str,
+        path: str,
+        *,
+        max_bytes: int = 512 << 20,
+        chunk_bytes: int = MAX_FILE_CHUNK_BYTES,
+    ) -> bytes:
+        if max_bytes < 0 or chunk_bytes <= 0 or chunk_bytes > MAX_FILE_CHUNK_BYTES:
+            raise ValueError("invalid file read limits")
+        chunks: list[bytes] = []
+        offset = 0
+        while True:
+            response = cast(
+                FSReadRes,
+                await self._node_call(
+                    workspace,
+                    "fs.read",
+                    {"ws": workspace, "path": path, "offset": offset, "limit": chunk_bytes},
+                ),
+            )
+            data = _wire_bytes(response["d"], "file data")
+            if offset + len(data) > max_bytes or response["size"] > max_bytes:
+                raise ProtocolError("resource_exhausted", "file exceeds configured download limit")
+            chunks.append(data)
+            offset += len(data)
+            if response["eof"]:
+                return b"".join(chunks)
+            if not data:
+                raise ProtocolError("internal", "file read made no progress")
+
+    async def write_file(
+        self,
+        workspace: str,
+        path: str,
+        data: bytes,
+        *,
+        mode: int = 0,
+        mkdirp: bool = True,
+        idempotency_key: str | None = None,
+    ) -> None:
+        key = idempotency_key or _idempotency_key()
+        chunks = range(0, max(len(data), 1), MAX_FILE_CHUNK_BYTES)
+        for index, offset in enumerate(chunks):
+            chunk = data[offset : offset + MAX_FILE_CHUNK_BYTES]
+            body: dict[str, object] = {
+                "ws": workspace,
+                "path": path,
+                "d": chunk,
+                "append": index > 0,
+                "mkdirp": mkdirp,
+                "idem": f"{key}:{index}",
+            }
+            if mode:
+                body["mode"] = mode
+            await self._node_call(workspace, "fs.write", body)
+
+    async def list_files(self, workspace: str, path: str) -> list[FSEntry]:
+        response = await self._node_call(
+            workspace, "fs.list", {"ws": workspace, "path": path}
+        )
+        return cast(list[FSEntry], response["entries"])
+
+    async def apply_tar(
+        self,
+        workspace: str,
+        artifact: str,
+        *,
+        format: str = "tar",
+        idempotency_key: str | None = None,
+    ) -> FSApplyTarRes:
+        return cast(
+            FSApplyTarRes,
+            await self._node_call(
+                workspace,
+                "fs.apply_tar",
+                {
+                    "ws": workspace,
+                    "artifact": artifact,
+                    "format": format,
+                    "idem": idempotency_key or _idempotency_key(),
+                },
+            ),
+        )
+
+    async def snapshot_workspace(
+        self,
+        workspace: str,
+        *,
+        upload: bool = True,
+        authoritative: bool = False,
+        idempotency_key: str | None = None,
+    ) -> WSSnapshotRes:
+        if authoritative and not upload:
+            raise ValueError("authoritative snapshots must be uploaded")
+        return cast(
+            WSSnapshotRes,
+            await self._node_call(
+                workspace,
+                "ws.snapshot",
+                {
+                    "ws": workspace,
+                    "upload": upload,
+                    "authoritative": authoritative,
+                    "idem": idempotency_key or _idempotency_key(),
+                },
+            ),
+        )
+
+    async def archive_path(
+        self,
+        workspace: str,
+        path: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> WSSnapshotRes:
+        return cast(
+            WSSnapshotRes,
+            await self._node_call(
+                workspace,
+                "volume.archive",
+                {
+                    "ws": workspace,
+                    "path": path,
+                    "upload": True,
+                    "idem": idempotency_key or _idempotency_key(),
+                },
+            ),
+        )
 
     async def exec(
         self,
