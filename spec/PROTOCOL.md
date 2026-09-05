@@ -143,12 +143,21 @@ in the canonical order of the table below, `v1` first.
 
 A security profile requires the capabilities whose absence would break the
 promise the profile makes. `local` requires none, so an older node keeps
-working there. `isolated` and `multi_tenant` require every named capability
-this release implements; a capability is added to that requirement in the
-same release that implements it on both sides. This release implements
+working there. `isolated` and `multi_tenant` require the implemented
+enforcement capabilities; a capability joins that requirement when its
+semantics land on both sides. This release implements
 `authz-push`, `controller-epoch`, `session-cap`, `chunked-artifacts`,
 `tiered-session-logs`, `release-epoch`, and `identity-admin`. The remaining
 identifiers are reserved and are neither offered nor required yet.
+`identity-admin` is offered but is not a workspace enforcement requirement.
+
+The Go, Python and TypeScript protocol clients offer this release's set.
+Clients stamp the negotiated controller epoch on requests and reject stale
+frames before request correlation or session delivery. Session-capability
+issuance/revocation, release ordering, and tiered-log reconstruction remain
+node/control responsibilities; a client's capability advertisement does not
+turn it into a node or confer those authorities. Artifact helpers verify
+plaintext digests, and replay preserves explicit gaps.
 
 | Deployment security floor | Peer offers `v1` only | Peer offers this release's set |
 |---|---|---|
@@ -938,9 +947,23 @@ Retention is a bounded in-memory ring plus a spill file. The reference node uses
 and a chunk count cap, because a pty emitting one byte at a time will blow a
 chunk-count budget long before a byte budget.
 
+Clients MUST authenticate a chunk's relay-stamped `from` as the node named by
+the control-issued workspace grant, and its `ws` as the session's workspace.
+This applies to stdout, exit, gap and info alike, including chunks buffered
+before an open response. Reattachment binds the producer from the new grant;
+a session ID alone is not output authority. Canonical `log` events are accepted
+only from `control`, never from another client or node.
+
 Input is idempotent. `s.input` carries `iseq`, a client-side counter. A node
 drops any `iseq` at or below the last one it applied. Without this, a keystroke
 retried after a dropped connection is typed twice.
+The sequence advances only after every byte and any requested EOF succeeds.
+A partial write retains its accepted-byte offset and request fingerprint; an
+identical retry resumes at the unwritten suffix. A retry after a failed EOF
+does not write the bytes again. While input is pending, changing its sequence,
+bytes or EOF flag returns `conflict`. Only one fixed-size pending-input record
+is retained per session. This is live-session retry accounting, not a durable
+transaction with the child process, and it does not survive loss of that process.
 
 ### 8.1 Harness runs
 

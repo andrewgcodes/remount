@@ -21,3 +21,14 @@ skipping retained output.
 
 Package publication and live-provider validation remain release gates. The
 repository workflow builds and tests the package without publishing it.
+
+The protocol `Client` negotiates the current capabilities with strict-profile
+servers and fences frames using exact uint64 controller epochs. Session output
+is accepted only from the grant-authorized node, including early buffered
+chunks; replay gaps remain explicit. Revocation, session capabilities and
+release ordering remain server/node responsibilities. Artifact helpers transfer
+digest-verified `art_sha256` byte objects, not reconstructed chunked manifests.
+Downloads verify nonempty response bytes before returning them.
+
+See [the cross-language protocol gate](../../integration/sdks/README.md) for
+local verification. Passing it is not production backend-isolation evidence.

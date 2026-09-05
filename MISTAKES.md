@@ -1504,3 +1504,36 @@ cover the minimal escaping form, and `make fuzz` runs the target.
 **Lesson.** Portability normalization must not make validation and use assign
 different path semantics. Canonicalize once into the wire format or reject the
 ambiguous input.
+
+---
+
+## 58. Session IDs were treated as output authority
+
+An authenticated client in another tenant could address a victim client with
+forged stdout, exit or gap chunks. The relay correctly stamped the attacker's
+identity, but SDKs routed chunks solely by session ID. Early orphan buffering
+preserved the same mistake. The Go event subscriber also accepted `log` events
+from non-control peers.
+
+All three SDKs now check the grant-authorized producer and workspace before
+delivery, including buffered chunks. Reattachment updates that producer from
+the current grant. Go canonical events require the control peer. A real
+cross-tenant simulator attack asserts genuine output and exit, then reconnects
+and replays; focused tests cover wrong nodes, wrong workspaces and early frames.
+
+**Lesson.** An authenticated sender is not necessarily an authorized producer.
+Apply the authority check to every frame kind and every buffering path.
+
+## 59. Retrying a partial stdin write duplicated its prefix
+
+The fix in entry 26 deferred sequence advancement, but an error after writing
+`he` still caused a retry of `hello` to produce `hehello`. Its test replaced
+the failed writer, hiding the already-applied prefix.
+
+The session now retains one fixed-size sequence/fingerprint/offset record and
+continues only the unwritten suffix of an identical retry. A failed EOF is
+retried without repeating the bytes. Changed pending input returns `conflict`.
+Tests preserve the same writer across partial-write and EOF errors. This state
+belongs to the live session; pipe writes are not a durable transaction.
+
+**Lesson.** Retry tests must preserve the side effects of the failed attempt.
