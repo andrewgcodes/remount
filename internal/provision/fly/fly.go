@@ -123,10 +123,10 @@ func New(config Config) (*Driver, error) {
 	}
 	wait := config.WaitTimeout
 	if wait == 0 {
-		wait = 2 * time.Minute
+		wait = time.Minute
 	}
-	if wait < time.Second || wait > 10*time.Minute {
-		return nil, errors.New("fly: wait timeout must be between 1s and 10m")
+	if wait < time.Second || wait > time.Minute {
+		return nil, errors.New("fly: wait timeout must be between 1s and 1m")
 	}
 	headers := make(http.Header)
 	headers.Set("Authorization", "Bearer "+config.Token)

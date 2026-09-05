@@ -152,6 +152,25 @@ func TestFlySizeAndCLISecretInvocation(t *testing.T) {
 	}
 }
 
+func TestFlyWaitTimeoutMatchesProviderLimit(t *testing.T) {
+	driver, err := New(Config{
+		Endpoint: "https://example.invalid", Token: "api-token", App: "app",
+		Image: "image", Secrets: &fakeSecrets{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if driver.wait != time.Minute {
+		t.Fatalf("default wait=%s", driver.wait)
+	}
+	if _, err := New(Config{
+		Endpoint: "https://example.invalid", Token: "api-token", App: "app",
+		Image: "image", Secrets: &fakeSecrets{}, WaitTimeout: time.Minute + time.Second,
+	}); err == nil {
+		t.Fatal("accepted wait timeout above Fly's API limit")
+	}
+}
+
 type leakingSecrets struct{ secret string }
 
 func (s leakingSecrets) Stage(context.Context, string, string) error { return errors.New(s.secret) }
