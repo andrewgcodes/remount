@@ -49,6 +49,10 @@ async with Client("https://remount.example", token="...") as remount:
     await remount.wait_workspace(workspace_id)
 ```
 
+`write_file` splits large values into wire-safe chunks. If a later chunk
+fails, the workspace contains the acknowledged prefix; retry the same bytes
+with the same explicit `idempotency_key` to continue without duplicating it.
+
 Package publication and live-provider validation are release gates; this tree
 only builds and tests the package locally.
 
