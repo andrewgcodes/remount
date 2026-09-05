@@ -276,6 +276,9 @@ func (c *Client) handle(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		s := c.sessions[f.S]
 		overflow := false
 		if s == nil {
+			// The open's grant may outlive the cache across reconnect. Retain
+			// source metadata within the existing bounds and authenticate it
+			// against that open's producer when register resolves the id.
 			_, known := c.orphans[f.S]
 			if (!known && len(c.orphans) >= 256) || len(c.orphans[f.S]) >= 4096 || c.orphanCount >= 16384 {
 				// Force a reconnect and replay rather than silently discarding an
@@ -294,10 +297,10 @@ func (c *Client) handle(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return
 		}
 		if s != nil {
-			s.enqueue(f)
+			s.enqueueFromNode(f)
 		}
 	case proto.KindEvent:
-		if f.Op == "log" {
+		if f.Op == "log" && f.From == proto.PeerControl {
 			var post proto.EventPost
 			if err := f.Decode(&post); err == nil {
 				c.mu.Lock()
@@ -1450,6 +1453,7 @@ type Session struct {
 	attachMu     sync.Mutex
 	inputMu      sync.Mutex
 	iseq         uint64
+	node         string // expected output producer, derived only from a control grant
 }
 
 // Exec starts an exec/pty session. Chunks arrive on Session.Chunks().
@@ -1467,7 +1471,12 @@ func (c *Client) Exec(ctx context.Context, req proto.SOpenReq) (*Session, error)
 	c.mu.Lock()
 	c.sessions["pending:"+req.IdempotencyKey] = s
 	c.mu.Unlock()
-	err := c.nodeCall(ctx, req.WS, proto.OpSOpen, func(g *proto.Grant) any { r := req; r.Grant = g; return r }, &res)
+	err := c.nodeCall(ctx, req.WS, proto.OpSOpen, func(g *proto.Grant) any {
+		s.bindNode(g.Node)
+		r := req
+		r.Grant = g
+		return r
+	}, &res)
 	c.mu.Lock()
 	delete(c.sessions, "pending:"+req.IdempotencyKey)
 	c.mu.Unlock()
@@ -1506,6 +1515,7 @@ func (c *Client) OpenPort(ctx context.Context, wsID string, port int, options ..
 	c.mu.Unlock()
 	idem, _ := operationKey(options)
 	err := c.nodeCall(ctx, wsID, proto.OpPortOpen, func(g *proto.Grant) any {
+		s.bindNode(g.Node)
 		return proto.PortOpenReq{WS: wsID, Port: port, IdempotencyKey: idem, Grant: g}
 	}, &res)
 	c.mu.Lock()
@@ -1534,6 +1544,7 @@ func (c *Client) Attach(ctx context.Context, wsID, sid string, from uint64) (*Se
 	c.mu.Unlock()
 	var res proto.SOpenRes
 	err := c.nodeCall(ctx, wsID, proto.OpSAttach, func(g *proto.Grant) any {
+		s.bindNode(g.Node)
 		return proto.SAttachReq{S: sid, From: from, Subscription: s.subscription, Grant: g}
 	}, &res)
 	if err != nil {
@@ -1570,7 +1581,7 @@ func (c *Client) register(id string, s *Session) *Session {
 		c.mu.Unlock()
 		s.fail(proto.Err(proto.CodeClosed, "session cursor superseded by idempotent open"))
 		for _, f := range early {
-			existing.enqueue(f)
+			existing.enqueueFromNode(f)
 		}
 		return existing
 	}
@@ -1583,7 +1594,7 @@ func (c *Client) register(id string, s *Session) *Session {
 	delete(c.orphans, id)
 	c.mu.Unlock()
 	for _, f := range early {
-		s.enqueue(f)
+		s.enqueueFromNode(f)
 	}
 	return s
 }
@@ -1643,6 +1654,23 @@ func (s *Session) enqueue(f *proto.Frame) {
 	case s.in <- f:
 	default:
 		s.fail(proto.Err(proto.CodeResourceExhausted, "session delivery queue is full"))
+	}
+}
+
+func (s *Session) bindNode(node string) {
+	s.mu.Lock()
+	s.node = node
+	s.mu.Unlock()
+}
+
+// Apply the same authority check to live and orphan-buffered output, before
+// it can occupy the reorder queue or publish an exit/gap to the application.
+func (s *Session) enqueueFromNode(f *proto.Frame) {
+	s.mu.Lock()
+	valid := s.node != "" && f.From == s.node && f.WS == s.WS
+	s.mu.Unlock()
+	if valid {
+		s.enqueue(f)
 	}
 }
 
@@ -1810,6 +1838,7 @@ func (s *Session) reattach(ctx context.Context, generation uint64) {
 		s.mu.Unlock()
 		var res proto.SOpenRes
 		err := s.c.nodeCall(ctx, ws, proto.OpSAttach, func(g *proto.Grant) any {
+			s.bindNode(g.Node)
 			return proto.SAttachReq{S: id, From: from, Subscription: subscription, Grant: g}
 		}, &res)
 		if err == nil {

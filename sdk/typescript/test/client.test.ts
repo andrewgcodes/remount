@@ -1,5 +1,6 @@
 import { Decoder, Encoder } from "cbor-x";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { AgentClient, Client, encodeProtocol, ProtocolError, Session } from "../src/index.js";
 import { OPERATIONS } from "../src/types.js";
@@ -20,6 +21,9 @@ class FakeSocket {
   listeners = new Map<string, Array<(...args: any[]) => void>>();
   sent: any[] = [];
   attached?: () => void;
+  caps = ["v1"];
+  epoch = 0n;
+  earlyFrames: any[] = [];
   addEventListener(name: string, listener: (...args: any[]) => void) {
     const list = this.listeners.get(name) ?? [];
     list.push(listener);
@@ -29,14 +33,15 @@ class FakeSocket {
     const frame: any = decoder.decode(wire);
     this.sent.push(frame);
     let body: any = {};
-    if (frame.t === "hello") body = { peer: "client_1", caps: ["v1"] };
+    if (frame.t === "hello") body = { peer: "client_1", caps: this.caps, controller_epoch: this.epoch };
     else if (frame.op === "grant") body = { node: "node_1", claims: {} };
     else if (frame.op === "s.open") {
-      this.emit("message", { data: encoder.encode({ v: 1, t: "chunk", s: "s_1", seq: 0, body: encoder.encode({ st: 4, d: new Uint8Array([1]) }) }) });
+      for (const frame of this.earlyFrames) this.emit("message", { data: encoder.encode(frame) });
+      this.emit("message", { data: encoder.encode({ v: 1, t: "chunk", controller_epoch: this.epoch, from: "node_1", ws: "ws_1", s: "s_1", seq: 0, body: encoder.encode({ st: 4, d: new Uint8Array([1]) }) }) });
       body = { s: "s_1", next: 1 };
     }
     else if (frame.op === "s.attach") { this.attached?.(); body = { s: "s_1", next: 4 }; }
-    this.emit("message", { data: encoder.encode({ v: 1, t: "res", id: frame.id, op: frame.op ?? "", from: frame.to ?? "", body: encoder.encode(body) }) });
+    this.emit("message", { data: encoder.encode({ v: 1, t: "res", controller_epoch: this.epoch, id: frame.id, op: frame.op ?? "", from: frame.to ?? "", body: encoder.encode(body) }) });
   }
   close() { this.emit("close", {}); }
   emit(name: string, value: any) { queueMicrotask(() => this.listeners.get(name)?.forEach((listener) => listener(value))); }
@@ -63,7 +68,7 @@ describe("session cursor", () => {
     const session = await client.exec("ws_1", ["true"]);
     const first = await session[Symbol.asyncIterator]().next();
     expect(first.value).toEqual({ seq: 0, stream: 4, data: new Uint8Array([1]) });
-    expect(decoder.decode(socket.sent[0].body).caps).toEqual(["v1", "authz-push"]);
+    expect(decoder.decode(socket.sent[0].body).caps).toEqual(["v1", "authz-push", "controller-epoch", "session-cap", "chunked-artifacts", "tiered-session-logs", "release-epoch", "identity-admin"]);
     await client.close();
   });
 
@@ -129,6 +134,113 @@ describe("session cursor", () => {
     const client = new Client("https://cp.example", "token");
     const session = new Session(client, "ws_1", "exec", "s_1");
     await expect(session.accept({ seq: 0, body: encoder.encode({ st: 1, d: Number.MAX_SAFE_INTEGER }) })).rejects.toEqual(expect.objectContaining<Partial<ProtocolError>>({ code: "bad_request" }));
+  });
+});
+
+describe("protocol authority", () => {
+  it("encodes small controller epochs as canonical unsigned integers", async () => {
+    const socket = new FakeSocket(); socket.caps = ["v1", "controller-epoch"]; socket.epoch = 7n;
+    const client = new Client("https://cp.example", "token", { websocketFactory: async () => socket });
+    await client.call("ws.list");
+    expect(socket.sent[1].controller_epoch).toBe(7);
+    await client.close();
+  });
+
+  it("charges orphan routing metadata to the byte limit", async () => {
+    const client = new Client("https://cp.example", "token");
+    const socket = new FakeSocket();
+    (client as any).socket = socket;
+    await (client as any).handleChunk({ s: "s_1", from: "node_1", ws: "x".repeat(9 << 20), body: new Uint8Array() });
+    expect((client as any).orphans.size).toBe(0);
+    expect((client as any).orphanBytes).toBe(0);
+    await client.close();
+  });
+
+  it("keeps early output when an open retry reconnects and clears grants", async () => {
+    const first = new FakeSocket(), second = new FakeSocket();
+    const sockets = [first, second];
+    const original = first.send.bind(first);
+    first.send = (wire) => {
+      if (decoder.decode(wire).op === "s.open") { first.close(); return; }
+      original(wire);
+    };
+    const client = new Client("https://cp.example", "token", { websocketFactory: async () => sockets.shift()! });
+    try {
+      const session = await client.exec("ws_1", ["true"]);
+      expect(client.generation).toBe(2);
+      expect((client as any).grants.size).toBe(0);
+      expect((await session[Symbol.asyncIterator]().next()).value?.stream).toBe(4);
+    } finally { await client.close(); }
+  });
+
+  it("rejects forged early/live chunks and updates the producer on reattach", async () => {
+    const socket = new FakeSocket();
+    const chunk = (from: string, ws = "ws_1", seq = 0) => ({ v: 1, t: "chunk", from, ws, s: "s_1", seq, body: encoder.encode({ st: 3, d: encoder.encode({ code: 99 }) }) });
+    socket.earlyFrames = [chunk(""), chunk("client_evil"), chunk("node_evil"), chunk("node_1", "ws_other")];
+    const client = new Client("https://cp.example", "token", { websocketFactory: async () => socket });
+    const session = await client.exec("ws_1", ["cat"]);
+    expect((await session[Symbol.asyncIterator]().next()).value?.stream).toBe(4);
+    expect(session.exit).toBeUndefined();
+    for (const from of ["", "client_evil", "node_evil"]) await (client as any).handleChunk(chunk(from, "ws_1", 1));
+    session.bindNode("node_new");
+    await (client as any).handleChunk(chunk("node_1", "ws_1", 1));
+    expect(session.exit).toBeUndefined();
+    await (client as any).handleChunk(chunk("node_new", "ws_1", 1));
+    expect(session.exit?.code).toBe(99);
+    await client.close();
+  });
+
+  it("fences stale responses/chunks and stamps exact uint64 epochs", async () => {
+    const socket = new FakeSocket();
+    socket.caps = ["v1", "controller-epoch"];
+    socket.epoch = 9007199254740993n;
+    socket.earlyFrames = [{ v: 1, t: "chunk", controller_epoch: socket.epoch - 1n, from: "node_1", ws: "ws_1", s: "s_1", seq: 0, body: encoder.encode({ st: 3, d: encoder.encode({ code: 99 }) }) }];
+    const original = socket.send.bind(socket);
+    socket.send = (wire) => {
+      const request: any = decoder.decode(wire);
+      if (request.op === "ws.list") {
+        for (const [from, epoch] of [["control", socket.epoch - 1n], ["", socket.epoch], ["client_evil", socket.epoch]]) {
+          socket.emit("message", { data: encoder.encode({ v: 1, t: "res", from, controller_epoch: epoch, op: request.op, id: request.id, body: encoder.encode({ forged: true }) }) });
+        }
+      }
+      original(wire);
+    };
+    const client = new Client("https://cp.example", "token", { websocketFactory: async () => socket });
+    expect(await client.call("ws.list")).toEqual({});
+    const session = await client.exec("ws_1", ["true"]);
+    expect((await session[Symbol.asyncIterator]().next()).value?.stream).toBe(4);
+    for (const request of socket.sent.slice(1)) expect(request.controller_epoch).toBe(socket.epoch);
+    await client.close();
+  });
+
+  it("refuses a negotiated epoch with no nonzero value", async () => {
+    const socket = new FakeSocket(); socket.caps = ["v1", "controller-epoch"];
+    const client = new Client("https://cp.example", "token", { websocketFactory: async () => socket });
+    await expect(client.connect()).rejects.toMatchObject({ code: "conflict" });
+    await client.close();
+  });
+});
+
+describe("artifact transfer", () => {
+  const payload = new TextEncoder().encode("nonempty artifact");
+  const id = `art_sha256:${createHash("sha256").update(payload).digest("hex")}`;
+  it("downloads a successful nonempty upload without cancelling its body", async () => {
+    let uploaded: Uint8Array | undefined;
+    const client = new Client("https://cp.example", "token", { fetch: async (_url, options) => {
+      if (options?.method === "PUT") { uploaded = options.body as Uint8Array; return new Response(null, { status: 201 }); }
+      return new Response(uploaded);
+    } });
+    expect(await client.uploadArtifact(payload)).toEqual({ id, size: payload.length });
+    expect(await client.downloadArtifact(id)).toEqual(payload);
+  });
+  it("still detects corruption and refuses oversized downloads", async () => {
+    const client = new Client("https://cp.example", "token", { fetch: async () => new Response(payload) });
+    await expect(client.downloadArtifact(id, 1)).rejects.toMatchObject({ code: "resource_exhausted" });
+    await expect(client.downloadArtifact(`art_sha256:${"0".repeat(64)}`)).rejects.toMatchObject({ code: "conflict" });
+  });
+  it("preserves HTTP error codes while redacting credentials", async () => {
+    const client = new Client("https://cp.example", "secret-canary", { fetch: async () => new Response(JSON.stringify({ error: { code: "not_found", message: "secret-canary missing" } }), { status: 404 }) });
+    await expect(client.downloadArtifact(id)).rejects.toMatchObject({ code: "not_found", message: "not_found: [redacted] missing" });
   });
 });
 

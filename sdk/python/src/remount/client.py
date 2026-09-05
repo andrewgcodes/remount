@@ -26,6 +26,9 @@ MAX_REORDER_BYTES = 16 << 20
 MAX_DELIVERY_BYTES = 16 << 20
 STREAM_EXIT = 3
 STREAM_GAP = 5
+# Node-owned enforcement stays on the node; clients fence frames, verify
+# artifact bytes and preserve explicit gaps in replayed session output.
+PEER_CAPABILITIES = ["v1", "authz-push", "controller-epoch", "session-cap", "chunked-artifacts", "tiered-session-logs", "release-epoch", "identity-admin"]
 
 
 class ProtocolError(Exception):
@@ -59,6 +62,17 @@ def _wire_bytes(value: Any, field: str) -> bytes:
     return bytes(value)
 
 
+def _wire_epoch(value: Any) -> int:
+    if type(value) is not int or not 0 <= value <= (1 << 64) - 1:
+        raise ProtocolError("bad_request", "invalid controller epoch")
+    return value
+
+
+def _orphan_frame_bytes(session_id: str, frame: dict[str, Any]) -> int:
+    # Charge routing metadata at the worst-case Unicode width, not just body.
+    return len(frame["body"]) + 4 * (len(session_id) + len(frame["from"]) + len(frame["ws"]))
+
+
 def _ws_url(base_url: str) -> str:
     value = urlsplit(base_url)
     scheme = {"http": "ws", "https": "wss", "ws": "ws", "wss": "wss"}.get(value.scheme)
@@ -89,6 +103,14 @@ class Session:
         self._closed = False
         self._attach_lock = asyncio.Lock()
         self._input_lock = asyncio.Lock()
+        self._node = ""
+
+    def _bind_node(self, node: str) -> None:
+        self._node = node
+
+    async def _enqueue_from_node(self, frame: dict[str, Any]) -> None:
+        if self._node and frame.get("from") == self._node and frame.get("ws") == self.workspace:
+            await self._enqueue({"seq": frame.get("seq", 0), "body": frame.get("body", b"")})
 
     def __aiter__(self) -> AsyncIterator[Chunk]:
         return self._iterate()
@@ -191,7 +213,7 @@ class Session:
                     return
                 try:
                     response = await self.client._node_call(
-                        self.workspace, "s.attach", {"s": self.id, "from": self.next_seq}
+                        self.workspace, "s.attach", {"s": self.id, "from": self.next_seq}, self._bind_node
                     )
                     async with self._input_lock:
                         self.last_input_seq = max(self.last_input_seq, int(response.get("last_iseq", 0)))
@@ -251,7 +273,8 @@ class Client:
         self._reader: asyncio.Task[None] | None = None
         self._connect_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
-        self._pending: dict[int, tuple[asyncio.Future[dict[str, Any]], str, str]] = {}
+        self._pending: dict[int, tuple[asyncio.Future[dict[str, Any]], str, str, bool]] = {}
+        self._controller_epoch = 0
         self._request_id = 0
         self._closed = False
         self._sessions: dict[str, Session] = {}
@@ -284,7 +307,7 @@ class Client:
     async def connect(self) -> None:
         if self._closed:
             raise ConnectionClosed("client closed")
-        if self._socket is not None:
+        if self._socket is not None and not self._connect_lock.locked():
             return
         async with self._connect_lock:
             if self._socket is not None:
@@ -299,10 +322,11 @@ class Client:
                 timeout=self.request_timeout,
             )
             self._socket = socket
+            self._controller_epoch = 0
             self._reader = asyncio.create_task(self._read_loop(socket))
             try:
                 hello = await self._round_trip(
-                    {"v": 1, "t": "hello", "body": cbor2.dumps({"peer": self.peer_id, "role": "client", "token": self.token, "principal": self.principal, "caps": ["v1", "authz-push"]})}
+                    {"v": 1, "t": "hello", "body": cbor2.dumps({"peer": self.peer_id, "role": "client", "token": self.token, "principal": self.principal, "caps": PEER_CAPABILITIES})}
                 )
                 body = cbor2.loads(hello.get("body", b""))
                 if "v1" not in body.get("caps", []):
@@ -325,6 +349,8 @@ class Client:
         failure: Exception = ConnectionClosed("connection closed")
         try:
             async for message in socket:
+                if self._socket is not socket:
+                    return
                 if isinstance(message, str):
                     raise ProtocolError("bad_request", "text WebSocket frame")
                 if len(message) > self.max_frame_bytes:
@@ -333,10 +359,20 @@ class Client:
                 kind = frame.get("t")
                 if int(frame.get("v", 0)) != PROTOCOL_VERSION:
                     raise ProtocolError("unsupported", "wire version mismatch")
+                pending = self._pending.get(int(frame.get("id", 0)))
+                if not (pending and pending[3]) and _wire_epoch(frame.get("controller_epoch", 0)) < self._controller_epoch:
+                    continue
                 if kind in ("res", "pong") and int(frame.get("id", 0)) in self._pending:
-                    future, expected_from, expected_op = self._pending[int(frame["id"])]
-                    if ((not expected_from or not frame.get("from") or frame.get("from") == expected_from)
+                    future, expected_from, expected_op, hello = self._pending[int(frame["id"])]
+                    if ((not expected_from or frame.get("from") == expected_from)
                             and (not expected_op or frame.get("op") == expected_op)):
+                        if hello and not frame.get("err"):
+                            body = cbor2.loads(frame.get("body", b""))
+                            if "controller-epoch" in body.get("caps", []):
+                                epoch = _wire_epoch(body.get("controller_epoch", 0))
+                                if not epoch:
+                                    raise ProtocolError("conflict", "server negotiated controller-epoch without an epoch")
+                                self._controller_epoch = epoch
                         self._pending.pop(int(frame["id"]))
                         if not future.done():
                             future.set_result(frame)
@@ -349,14 +385,14 @@ class Client:
         except Exception as error:
             failure = error if isinstance(error, ProtocolError) else ConnectionClosed("connection failed")
         finally:
-            if self._socket is socket:
+            if self._socket is socket or self._socket is None:
                 self._socket = None
-            for future, _, _ in list(self._pending.values()):
-                if not future.done():
-                    future.set_exception(failure)
-            self._pending.clear()
-            if not self._closed and self._sessions:
-                asyncio.create_task(self._supervise())
+                for future, _, _, _ in list(self._pending.values()):
+                    if not future.done():
+                        future.set_exception(failure)
+                self._pending.clear()
+                if not self._closed and self._sessions:
+                    asyncio.create_task(self._supervise())
 
     async def _supervise(self) -> None:
         delay = 0.1
@@ -372,6 +408,8 @@ class Client:
         socket = self._socket
         if socket is None:
             raise ConnectionClosed("not connected")
+        if frame.get("t") != "hello" and self._controller_epoch:
+            frame = {**frame, "controller_epoch": self._controller_epoch}
         encoded = cbor2.dumps(frame, canonical=True)
         if len(encoded) > self.max_frame_bytes:
             raise ProtocolError("resource_exhausted", "wire frame exceeds configured limit")
@@ -391,7 +429,7 @@ class Client:
         request_id = self._request_id
         frame["id"] = request_id
         future = asyncio.get_running_loop().create_future()
-        self._pending[request_id] = (future, str(frame.get("to", "")), str(frame.get("op", "")))
+        self._pending[request_id] = (future, str(frame.get("to", "")), str(frame.get("op", "")), frame.get("t") == "hello")
         try:
             await self._send(frame)
             response = await asyncio.wait_for(asyncio.shield(future), timeout=self.request_timeout)
@@ -416,12 +454,14 @@ class Client:
                     await asyncio.sleep(0.2 * (attempt + 1))
         raise failure
 
-    async def _node_call(self, workspace: str, op: str, body: dict[str, Any]) -> dict[str, Any]:
+    async def _node_call(self, workspace: str, op: str, body: dict[str, Any], bind_node: Callable[[str], None] | None = None) -> dict[str, Any]:
         for attempt in range(2):
             grant = self._grants.get(workspace)
             if grant is None:
                 grant = await self.call("grant", {"ws": workspace})
                 self._grants[workspace] = grant
+            if bind_node:
+                bind_node(str(grant["node"]))
             request = dict(body)
             request["grant"] = grant
             try:
@@ -435,15 +475,20 @@ class Client:
 
     async def _handle_chunk(self, frame: dict[str, Any]) -> None:
         session_id = str(frame.get("s", ""))
-        raw_body = _wire_bytes(frame.get("body", b""), "chunk body")
-        chunk_frame = {"seq": int(frame.get("seq", 0)), "body": raw_body}
         session = self._sessions.get(session_id)
         if session is not None:
-            await session._enqueue(chunk_frame)
+            await session._enqueue_from_node(frame)
             return
+        # Reconnect may clear the cache while an open still holds its grant.
+        # Registration authenticates this bounded orphan against that open.
+        raw_body = _wire_bytes(frame.get("body", b""), "chunk body")
+        orphan = {"seq": int(frame.get("seq", 0)), "body": raw_body,
+                  "from": frame.get("from", "") if isinstance(frame.get("from"), str) else "",
+                  "ws": frame.get("ws", "") if isinstance(frame.get("ws"), str) else ""}
+        size = _orphan_frame_bytes(session_id, orphan)
         bucket = self._orphans.setdefault(session_id, [])
         if (len(self._orphans) > MAX_ORPHAN_SESSIONS or len(bucket) >= MAX_REORDER_CHUNKS
-                or self._orphan_count >= MAX_ORPHAN_CHUNKS or self._orphan_bytes + len(raw_body) > MAX_ORPHAN_BYTES):
+                or self._orphan_count >= MAX_ORPHAN_CHUNKS or self._orphan_bytes + size > MAX_ORPHAN_BYTES):
             self._orphans.clear()
             self._orphan_count = 0
             self._orphan_bytes = 0
@@ -451,9 +496,9 @@ class Client:
             if socket is not None:
                 await socket.close()
             return
-        bucket.append(chunk_frame)
+        bucket.append(orphan)
         self._orphan_count += 1
-        self._orphan_bytes += len(raw_body)
+        self._orphan_bytes += size
 
     async def create_workspace(self, spec: dict[str, Any], idempotency_key: str | None = None) -> dict[str, Any]:
         return await self.call("ws.create", {"spec": spec, "idem": idempotency_key or _idempotency_key()})
@@ -476,19 +521,20 @@ class Client:
         idempotency_key: str | None = None,
     ) -> Session:
         key = idempotency_key or _idempotency_key()
-        response = await self._node_call(workspace, "s.open", {"ws": workspace, "kind": kind, "program": program, "cwd": cwd, "env": env or {}, "stdin": stdin, "idem": key})
+        session = Session(self, workspace, kind)
+        response = await self._node_call(workspace, "s.open", {"ws": workspace, "kind": kind, "program": program, "cwd": cwd, "env": env or {}, "stdin": stdin, "idem": key}, session._bind_node)
         session_id = str(response["s"])
         existing = self._sessions.get(session_id)
         if existing is not None:
             return existing
-        session = Session(self, workspace, kind, session_id)
+        session.id = session_id
         session.last_input_seq = int(response.get("last_iseq", 0))
         self._sessions[session_id] = session
         early = self._orphans.pop(session_id, [])
         self._orphan_count -= len(early)
-        self._orphan_bytes -= sum(len(frame["body"]) for frame in early)
+        self._orphan_bytes -= sum(_orphan_frame_bytes(session_id, frame) for frame in early)
         for frame in early:
-            await session._enqueue(frame)
+            await session._enqueue_from_node(frame)
         return session
 
     async def attach(self, workspace: str, session_id: str, from_seq: int = 0) -> Session:

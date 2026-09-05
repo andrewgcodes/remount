@@ -84,27 +84,35 @@ type Session struct {
 	Principal string
 	Tenant    string
 
-	mu          sync.Mutex
-	inputMu     sync.Mutex     // serializes writes without blocking lifecycle reads
-	stdin       io.WriteCloser // exec: pipe; pty: the pty master; port: the conn
-	ptmx        *os.File
-	cmd         *exec.Cmd
-	conn        net.Conn
-	running     Running
-	lastISeq    uint64
-	exit        *proto.ExitInfo
-	exited      chan struct{}
-	observed    chan struct{} // closed after durable completion callback and OnExit
-	startDone   chan struct{} // closed once process/connection startup has resolved
-	timeout     *time.Timer
-	outputReady chan struct{} // pumps wait until StreamInfo is committed at seq 0
-	logErr      error
-	onComplete  func(proto.ExitInfo, LogRecord) error // commits durability before exited is closed
-	onFinish    func()                                // commits manager accounting before exited is closed
-	closeReason string                                // recorded in the exit chunk when the node ends the session
+	mu           sync.Mutex
+	inputMu      sync.Mutex     // serializes writes without blocking lifecycle reads
+	stdin        io.WriteCloser // exec: pipe; pty: the pty master; port: the conn
+	ptmx         *os.File
+	cmd          *exec.Cmd
+	conn         net.Conn
+	running      Running
+	lastISeq     uint64
+	inputPending *inputProgress // guarded by inputMu; one fixed-size retry record
+	exit         *proto.ExitInfo
+	exited       chan struct{}
+	observed     chan struct{} // closed after durable completion callback and OnExit
+	startDone    chan struct{} // closed once process/connection startup has resolved
+	timeout      *time.Timer
+	outputReady  chan struct{} // pumps wait until StreamInfo is committed at seq 0
+	logErr       error
+	onComplete   func(proto.ExitInfo, LogRecord) error // commits durability before exited is closed
+	onFinish     func()                                // commits manager accounting before exited is closed
+	closeReason  string                                // recorded in the exit chunk when the node ends the session
 	// onSignal is how a record-only session (kind acp) hears a kill: there is
 	// no process, so the owner that appends to it decides what stopping means.
 	onSignal func(name string)
+}
+
+type inputProgress struct {
+	sequence uint64
+	digest   [sha256.Size]byte
+	offset   int
+	eof      bool
 }
 
 // Record appends one chunk to a record-only session. Kinds with a process
@@ -194,8 +202,19 @@ func (s *Session) Input(iseq uint64, data []byte, eof bool) error {
 	if stdin == nil {
 		return proto.Err(proto.CodeUnsupported, "session has no stdin")
 	}
-	if len(data) > 0 {
-		if err := writeFull(stdin, data); err != nil {
+	digest := sha256.Sum256(data)
+	if p := s.inputPending; p != nil {
+		if p.sequence != iseq || p.digest != digest || p.eof != eof {
+			return proto.Err(proto.CodeConflict, "retry pending stdin input with the same sequence, bytes and EOF")
+		}
+	} else {
+		s.inputPending = &inputProgress{sequence: iseq, digest: digest, eof: eof}
+	}
+	p := s.inputPending
+	if p.offset < len(data) {
+		n, err := writeFull(stdin, data[p.offset:])
+		p.offset += n
+		if err != nil {
 			return proto.Err(proto.CodeClosed, "stdin: %v", err)
 		}
 	}
@@ -224,24 +243,31 @@ func (s *Session) Input(iseq uint64, data []byte, eof bool) error {
 		}
 		s.mu.Unlock()
 	}
+	s.inputPending = nil
 	return nil
 }
 
-func writeFull(w io.Writer, data []byte) error {
+func writeFull(w io.Writer, data []byte) (int, error) {
+	written := 0
 	for len(data) > 0 {
 		n, err := w.Write(data)
+		if n < 0 || n > len(data) {
+			return written, io.ErrShortWrite
+		}
+		written += n
 		if err != nil {
-			return err
+			return written, err
 		}
 		if n == 0 {
-			return io.ErrShortWrite
+			return written, io.ErrShortWrite
 		}
 		data = data[n:]
 	}
-	return nil
+	return written, nil
 }
 
-// LastInputSeq is the last input sequence durably handed to the process.
+// LastInputSeq is the last input sequence completely handed to the process.
+// Pipe writes are not a durable transaction; progress belongs to this session.
 func (s *Session) LastInputSeq() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
