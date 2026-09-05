@@ -44,15 +44,16 @@ image = (
 app = modal.App(APP_NAME, image=image)
 control_secret = modal.Secret.from_name(SECRET_NAME, required_keys=["REMOUNT_TOKEN"])
 
-# Optional. With it the deployment can broker a model credential instead of
-# merely allowing egress to the provider: the workspace holds `ref:b_openai`
-# and the node substitutes the real value at the network edge. Without it the
-# demo can reach api.openai.com and has nothing to send, so no harness can
-# actually run there.
+# Optional. With these the deployment can broker model credentials instead of
+# merely allowing egress to the providers: workspaces hold binding references
+# and the node substitutes real values at the network edge.
 MODEL_SECRET_NAME = os.environ.get("REMOUNT_MODAL_MODEL_SECRET", "remount-openai")
+ANTHROPIC_SECRET_NAME = os.environ.get(
+    "REMOUNT_MODAL_ANTHROPIC_SECRET", "remount-anthropic"
+)
 
 
-def _optional_model_secret() -> list[modal.Secret]:
+def _optional_secret(name: str, required_key: str) -> list[modal.Secret]:
     """The model secret is optional, so its absence must not fail a deploy.
 
     from_name is lazy, so a missing secret surfaces at hydration rather than
@@ -61,11 +62,11 @@ def _optional_model_secret() -> list[modal.Secret]:
     to broker, which the control function reports at startup.
     """
     try:
-        secret = modal.Secret.from_name(MODEL_SECRET_NAME, required_keys=["OPENAI_API_KEY"])
+        secret = modal.Secret.from_name(name, required_keys=[required_key])
         secret.hydrate()
         return [secret]
     except Exception as err:  # noqa: BLE001 - any resolution failure means absent
-        print(f"remount: model secret {MODEL_SECRET_NAME!r} unavailable ({err.__class__.__name__}); "
+        print(f"remount: model secret {name!r} unavailable ({err.__class__.__name__}); "
               "the deployment will allow egress to the provider but broker no credential")
         return []
 
@@ -78,7 +79,10 @@ def _optional_model_secret() -> list[modal.Secret]:
 # function it is running ("Function has 3 dependencies but container got 4
 # object ids"). Whatever this expression does, it has to do it identically on
 # both sides.
-model_secrets = _optional_model_secret()
+model_secrets = [
+    *_optional_secret(MODEL_SECRET_NAME, "OPENAI_API_KEY"),
+    *_optional_secret(ANTHROPIC_SECRET_NAME, "ANTHROPIC_API_KEY"),
+]
 
 # The control plane is a single stateful process, so it must be exactly one
 # container with a durable volume. A web endpoint that scales out would give
@@ -159,19 +163,31 @@ def control():
     # The secret's value never enters the bindings file: it names the
     # environment variable the node resolves at lease time, the same contract
     # docs/operations.md documents for a production deployment.
+    bindings = []
     if os.environ.get("OPENAI_API_KEY"):
-        bindings = Path("/data/bindings.json")
-        bindings.write_text(json.dumps([{
+        bindings.append({
             "id": "b_openai",
             "secret": "$OPENAI_API_KEY",
             "destinations": ["api.openai.com"],
             "placeholder": "sk-proj-REMOUNT-PLACEHOLDER-NOT-A-REAL-KEY",
             "ttl_sec": 900,
-        }]))
-        argv += ["--bindings", str(bindings)]
+        })
         print("remount: brokering b_openai for api.openai.com", flush=True)
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        bindings.append({
+            "id": "b_anthropic",
+            "secret": "$ANTHROPIC_API_KEY",
+            "destinations": ["api.anthropic.com"],
+            "placeholder": "sk-ant-api03-REMOUNT-PLACEHOLDER-NOT-A-REAL-KEY",
+            "ttl_sec": 900,
+        })
+        print("remount: brokering b_anthropic for api.anthropic.com", flush=True)
+    if bindings:
+        bindings_path = Path("/data/bindings.json")
+        bindings_path.write_text(json.dumps(bindings))
+        argv += ["--bindings", str(bindings_path)]
     else:
-        print("remount: no OPENAI_API_KEY; no binding configured", flush=True)
+        print("remount: no model API key; no binding configured", flush=True)
     server = _spawn(argv, "/data/server.log")
     # Wait for the control plane to answer before enrolling the local node.
     for _ in range(60):
@@ -191,7 +207,10 @@ def control():
          "--label", "vendor=modal",
          "--label", "zone=cloud",
          "--allow", "api.openai.com",
-         "--allow", "registry.npmjs.org"],
+         "--allow", "api.anthropic.com",
+         "--allow", "platform.claude.com",
+         "--allow", "registry.npmjs.org",
+         "--allow", "statsig.anthropic.com"],
         "/data/node.log",
     )
     # Do not claim the deployment is ready merely because the HTTP listener is

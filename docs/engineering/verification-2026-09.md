@@ -1983,3 +1983,82 @@ race repetitions and the complete serialized race rerun passed without changing
 that test or its implementation. The serialized simulation package completed in
 401.060 seconds. This failure is retained as timing-sensitive evidence, not
 silently omitted from the record.
+
+## 2026-09-05 — Claude Code local and Modal ACP permission validation
+
+**Verified on an uncommitted candidate based on `68df7f1`.** A disposable local
+repository was exercised through both Claude Code transports. PTY mode created
+`CLAUDE_LOCAL.txt`; ACP initially reached Anthropic through `b_anthropic` but
+could not write because the adapter remained in its default permission mode.
+After the recipe and node applied `acceptEdits` through ACP
+`session/set_mode`, the same workspace-write launch created
+`CLAUDE_ACP_LOCAL.txt`. Both files were read through `remount fs read`, not
+inferred from model output. Local events recorded successful credential
+substitution and allowed egress to `api.anthropic.com`.
+
+The exact Linux candidate was then deployed as the uniquely named Modal app
+`remount-claude-0c59ef2b` in the `dev` environment with a unique volume,
+control secret, and Anthropic secret. Authenticated `nodes --json` showed one
+online Modal process node running `68df7f1-dirty`. Claude ACP created
+`CLAUDE_ACP_MODAL.txt` containing `claude-acp-modal-ok`; `remount fs read`
+confirmed the bytes. The Agent reported a structured ACP session and one
+completed turn. Durable events recorded four successful `cred.used` decisions
+for `b_anthropic` to `api.anthropic.com:443/v1/messages` with HTTP 200, plus
+the accompanying `egress.allowed` events.
+
+This run also verified the deployment change that accepts an optional,
+separately named Anthropic Modal secret and constructs `b_anthropic`; the
+previous reference deployment could broker only OpenAI. The disposable Agent
+and owned workspace reached `destroyed`. The Modal app was stopped and its
+volume and test-only secrets were deleted; provider inventory verified that
+all uniquely named resources were absent.
+
+No credential value was placed in a command argument, workspace, repository,
+or this ledger. The Modal reference still uses Remount's process backend and
+cooperative proxy egress; this point-in-time test is not production
+multi-tenant isolation evidence.
+
+The first full local verification run also exposed a test-isolation defect:
+`TestRunValidatesBeforeDialing` discovered the active local `b_anthropic`
+binding, selected API-key authentication for its Claude case, launched a real
+Agent, and reached the package timeout instead of exercising the expected
+pre-dial error. The test now uses an empty temporary `REMOUNT_DATA` directory.
+The formerly hanging case then passed in 0.008 seconds while the live local
+binding still existed. With an empty verification data directory, all 17
+portable `make verify` gates then passed, including the full suite, race,
+conformance, bounded fuzzing, static analysis, vulnerability scan, generated
+documentation check, and cross-platform vetting. Four pending Agents created by
+the diagnostic reruns were explicitly destroyed, their owned workspaces were
+absent from the active workspace list, and the disposable standalone process
+was stopped.
+
+### Follow-up: omitted Agent sandbox normalization
+
+Automated review found that the CLI's `workspace-write` default did not cover
+direct `AgentCreateReq` clients, because `AgentSpec.Sandbox` is optional on the
+wire. The control plane now rejects unknown sandbox values and normalizes an
+omitted value to `workspace-write` after parent inheritance and before the
+Agent is persisted or dispatched.
+
+The regression was first observed against the unfixed code: the focused
+control test returned an empty persisted sandbox and the end-to-end simulation
+returned the same empty value before the harness turn. The fixed simulation
+uses the public Go client to omit `sandbox`, crosses the control plane and node,
+and observes `acceptEdits` in the fake ACP session before the first prompt.
+Existing child-Agent coverage confirms an omitted child sandbox still inherits
+the parent's explicit `read-only` value.
+
+The review verification also exposed a second source of nondeterminism in
+`TestRunValidatesBeforeDialing`: an intentionally provisioned provider key lets
+the CLI synthesize a default binding even when `REMOUNT_DATA` points at an
+empty directory. The test now clears every preset provider-key environment
+variable as well as isolating local data, so its pre-dial validation cases do
+not depend on the developer's credentials. Ten focused ordinary repetitions
+and five race-detector repetitions passed with the Anthropic key still
+provisioned outside the test.
+
+After that correction, an isolated full `make verify` run passed all 17
+portable local gates. The ordinary suite completed in 423 seconds, the race
+lane in 679 seconds, serialized conformance in 352 seconds, and bounded
+fuzzing in 87 seconds. Native macOS and Windows runtime lanes remain CI-only;
+their cross-platform vet gates passed locally.

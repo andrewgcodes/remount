@@ -586,11 +586,14 @@ whose `acp_session_id` is the parent's. A child's policy may only be narrower
 than its parent's: `approve` may not widen and a bounded `max_turns` may not
 grow or become unbounded.
 
-`agent.create` with `parent` makes a child of a live agent the caller may
+`agent.create` accepts `sandbox` values `read-only`, `workspace-write`, and
+`full`. An omitted value becomes `workspace-write` before persistence or
+dispatch. With `parent`, it makes a child of a live agent the caller may
 execute (a fork is a child too). A child inherits what it does not name —
 `providers`, `primary`, `sandbox`, the workspace `bindings`, the security
-profile — and may never hold more than the parent: a provider or binding the
-parent lacks is `denied`, as is a wider policy. Trees are at most three deep.
+profile — before the sandbox default is applied, and may never hold more than
+the parent: a provider or binding the parent lacks is `denied`, as is a wider
+policy. Trees are at most three deep.
 When a child reaches `failed`, `finished` or `destroyed`, the control plane
 appends one `kind: child` message to the parent's inbox whose text is a
 `ChildSummary{child, name, status, reason, turns, ws, url}` JSON document,

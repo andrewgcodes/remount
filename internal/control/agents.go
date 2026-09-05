@@ -424,7 +424,19 @@ func validateAgentSpec(spec *proto.AgentSpec) error {
 	default:
 		return proto.Err(proto.CodeBadRequest, "spec.auth %q is not api-key or workspace-resident", spec.Auth)
 	}
+	switch spec.Sandbox {
+	case "", proto.AgentSandboxReadOnly, proto.AgentSandboxWorkspaceWrite, proto.AgentSandboxFull:
+	default:
+		return proto.Err(proto.CodeBadRequest, "spec.sandbox %q is not read-only, workspace-write or full", spec.Sandbox)
+	}
 	return nil
+}
+
+func normalizeAgentSpec(spec *proto.AgentSpec) error {
+	if spec.Sandbox == "" {
+		spec.Sandbox = proto.AgentSandboxWorkspaceWrite
+	}
+	return validateAgentSpec(spec)
 }
 
 // agentMode is ACP unless the recipe has no ACP server, which the node
@@ -484,10 +496,10 @@ func (c *Control) agentCreate(ctx context.Context, subject Subject, req *proto.A
 		if err := inheritFromParent(req, p, pws); err != nil {
 			return nil, err
 		}
-		if err := validateAgentSpec(&req.Spec); err != nil {
-			return nil, err
-		}
 		parent = p
+	}
+	if err := normalizeAgentSpec(&req.Spec); err != nil {
+		return nil, err
 	}
 	scope := subject.Tenant + "|" + subject.ID + "|agent.create"
 	unlockMutation := c.lockMutation(scope, req.IdempotencyKey)
