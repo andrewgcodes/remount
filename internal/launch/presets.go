@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -228,16 +229,59 @@ func BindingsFromLabels(labels map[string]string) ([]Binding, error) {
 	if raw == "" {
 		return nil, nil
 	}
+	out, err := BindingsFromSpecs(strings.Split(raw, ","))
+	if err != nil {
+		return nil, fmt.Errorf("workspace binding label: %w", err)
+	}
+	return out, nil
+}
+
+// BindingsFromSpecs parses the non-secret ID:preset declarations persisted
+// with a launch or durable Agent.
+func BindingsFromSpecs(specs []string) ([]Binding, error) {
 	var out []Binding
-	for _, spec := range strings.Split(raw, ",") {
+	ids := map[string]bool{}
+	presets := map[string]bool{}
+	for _, spec := range specs {
 		if spec == "" {
 			continue
 		}
 		b, err := ParseBinding(spec)
 		if err != nil {
-			return nil, fmt.Errorf("workspace binding label: %w", err)
+			return nil, err
 		}
+		if ids[b.ID] {
+			return nil, fmt.Errorf("binding %s given twice", b.ID)
+		}
+		if presets[b.Preset.Name] {
+			return nil, fmt.Errorf("two bindings use the %s preset", b.Preset.Name)
+		}
+		ids[b.ID] = true
+		presets[b.Preset.Name] = true
 		out = append(out, b)
+	}
+	return out, nil
+}
+
+// BindingsForWorkspace resolves Agent declarations first and legacy launch
+// labels second, then proves every declared binding is attached to the target.
+func BindingsForWorkspace(specs []string, labels map[string]string, attached []string) ([]Binding, error) {
+	var (
+		out []Binding
+		err error
+	)
+	if len(specs) > 0 {
+		out, err = BindingsFromSpecs(specs)
+	} else {
+		out, err = BindingsFromLabels(labels)
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, binding := range out {
+		if !slices.Contains(attached, binding.ID) {
+			return nil, fmt.Errorf("binding %s is not attached to workspace", binding.ID)
+		}
 	}
 	return out, nil
 }

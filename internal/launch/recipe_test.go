@@ -154,6 +154,16 @@ func TestLauncherWritesConfigWithRuntimeBrokerAndQuotesTask(t *testing.T) {
 	}
 }
 
+func TestOpenCodeRecipeAllowsDefaultServiceHost(t *testing.T) {
+	r, err := Load("opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(r.Hosts, "opencode.ai") {
+		t.Fatalf("OpenCode hosts = %v; default model cannot reach opencode.ai", r.Hosts)
+	}
+}
+
 func TestOpenCodeKeepsTransientStateOutsideWorkspace(t *testing.T) {
 	r, err := Load("opencode")
 	if err != nil {
@@ -674,6 +684,32 @@ func TestParseBinding(t *testing.T) {
 	}
 	if len(PresetNames()) != 13 {
 		t.Fatalf("presets: %v", PresetNames())
+	}
+}
+
+func TestBindingsForWorkspaceUsesAgentSpecsAndLegacyLabels(t *testing.T) {
+	specs := []string{"b_team:openai", "b_az:azure-openai?host=myres"}
+	got, err := BindingsForWorkspace(specs, map[string]string{LabelBindings: "b_wrong:anthropic"}, []string{"b_team", "b_az"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].ID != "b_team" || got[0].Preset.Name != "openai" || got[1].Host != "myres" {
+		t.Fatalf("agent bindings = %+v", got)
+	}
+	legacy, err := BindingsForWorkspace(nil, map[string]string{LabelBindings: "b_team:openai"}, []string{"b_team"})
+	if err != nil || len(legacy) != 1 || legacy[0].ID != "b_team" {
+		t.Fatalf("legacy bindings = %+v, %v", legacy, err)
+	}
+	if _, err := BindingsForWorkspace([]string{"b_other:openai"}, nil, []string{"b_team"}); err == nil {
+		t.Fatal("an unattached agent binding must be refused")
+	}
+	for _, specs := range [][]string{
+		{"b_team:openai", "b_team:openai"},
+		{"b_team:openai", "b_other:openai"},
+	} {
+		if _, err := BindingsForWorkspace(specs, nil, []string{"b_team", "b_other"}); err == nil {
+			t.Fatalf("ambiguous agent bindings %v were accepted", specs)
+		}
 	}
 }
 

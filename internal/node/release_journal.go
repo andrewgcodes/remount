@@ -127,13 +127,17 @@ func sameReleaseRequest(a, b proto.WSReleaseReq) bool {
 		string(proto.MustMarshal(a.Spec)) == string(proto.MustMarshal(b.Spec))
 }
 
+func startsNewReleaseCycle(existing durableRelease, req proto.WSReleaseReq) bool {
+	return (existing.State == releaseCommitted && req.Gen > existing.Request.Gen) ||
+		(existing.State == releasePublished && req.OperationID != "" && req.OperationID != existing.Request.OperationID)
+}
+
 func (n *Node) beginRelease(req proto.WSReleaseReq) (durableRelease, bool, error) {
 	n.releaseMu.Lock()
 	defer n.releaseMu.Unlock()
 	var replaced *durableRelease
 	if existing, ok := n.releases[req.WS]; ok {
-		if (existing.State == releaseCommitted && req.Gen > existing.Request.Gen) ||
-			(existing.State == releasePublished && req.OperationID != "" && req.OperationID != existing.Request.OperationID) {
+		if startsNewReleaseCycle(existing, req) {
 			replaced = &existing
 			delete(n.releases, req.WS)
 		} else if !sameReleaseRequest(existing.Request, req) {

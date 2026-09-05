@@ -147,10 +147,12 @@ func Snapshot(ctx context.Context, store artifact.BlobStore, root string, opts S
 		case info.Mode()&os.ModeSymlink != 0:
 			entry.Type = "symlink"
 			entry.Link, err = rr.Readlink(name)
-			if err != nil || !safeLink(rel, filepath.ToSlash(entry.Link)) {
+			if err == nil {
+				entry.Link, err = artifact.PortableSymlinkTarget(rel, entry.Link, root, "")
+			}
+			if err != nil || !safeLink(rel, entry.Link) {
 				return result, errors.New("chunked artifact: unsafe symlink")
 			}
-			entry.Link = filepath.ToSlash(entry.Link)
 		case info.IsDir():
 			entry.Type = "dir"
 			file, openErr := rr.Open(name)

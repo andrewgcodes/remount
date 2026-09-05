@@ -206,6 +206,7 @@ AgentSpec = TypedDict("AgentSpec", {
     "task": Required[str],
     "providers": NotRequired[list[str]],
     "primary": NotRequired[str],
+    "binding_specs": NotRequired[list[str]],
     "model": NotRequired[str],
     "sandbox": NotRequired[str],
     "acp_command": NotRequired[list[str]],

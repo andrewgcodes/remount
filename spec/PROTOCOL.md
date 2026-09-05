@@ -590,10 +590,14 @@ grow or become unbounded.
 `full`. An omitted value becomes `workspace-write` before persistence or
 dispatch. With `parent`, it makes a child of a live agent the caller may
 execute (a fork is a child too). A child inherits what it does not name —
-`providers`, `primary`, `sandbox`, the workspace `bindings`, the security
-profile — before the sandbox default is applied, and may never hold more than
-the parent: a provider or binding the parent lacks is `denied`, as is a wider
-policy. Trees are at most three deep.
+`providers`, `primary`, `binding_specs`, `sandbox`, the workspace `bindings`,
+the security profile — before the sandbox default is applied, and may never
+hold more than the parent: a provider, binding declaration or workspace
+binding the parent lacks is `denied`, as is a wider policy. Trees are at most
+three deep. `binding_specs` is a non-secret list of `ID:PRESET` declarations
+used to construct the recipe environment. Every ID MUST be present in the
+target workspace's `bindings`. When omitted, nodes resolve the legacy
+`remount.bindings` workspace label.
 When a child reaches `failed`, `finished` or `destroyed`, the control plane
 appends one `kind: child` message to the parent's inbox whose text is a
 `ChildSummary{child, name, status, reason, turns, ws, url}` JSON document,

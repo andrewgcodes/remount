@@ -1416,3 +1416,35 @@ and the child-Agent simulation still inherits `read-only` from its parent.
 **Lesson.** A CLI default is not a protocol invariant. Normalize optional wire
 fields at the authoritative boundary before persisting or dispatching them,
 after applying any inheritance that should outrank the default.
+
+---
+
+## 55. An existing bound workspace lost the Agent's provider environment
+
+A real Codex ACP Agent on an ix.dev node failed before `initialize` because its
+launcher ran under `set -u` without `OPENAI_API_KEY`. The workspace correctly
+had binding `b_openai`, but it had been created directly with `ws create
+--binding`; unlike `remount run`, that path did not add the launch-only
+`remount.bindings` label. The node reconstructed provider environment names
+from that label alone, so attachment authority existed without the recipe
+metadata needed to name its placeholder.
+
+Agents now persist non-secret `ID:PRESET` binding declarations in
+`AgentSpec.binding_specs`. The control plane parses them, refuses IDs not
+already attached to the target workspace, preserves them through copies and
+forks, and allows children to inherit but not expand them. Nodes prefer those
+declarations and retain the workspace-label path for older Agents. Duplicate
+binding IDs or provider presets are refused rather than producing an
+order-dependent environment.
+
+**Proof.** A focused standalone regression creates a workspace with an attached
+binding and no launch label, then observes a fake ACP harness finish with its
+provider placeholder environment. Compatibility tests cover old and new wire
+shapes. The rebuilt candidate ran a real Codex ACP Agent on ix.dev; the Agent
+wrote and read a two-line file, an independent Remount read matched it, OpenAI
+egress was durably recorded, and Agent destruction left no adapter process.
+
+**Lesson.** Binding attachment and recipe interpretation are separate facts.
+Persist both at the durable Agent boundary, validate interpretation against
+attachment authority, and do not try to recover launch intent from optional
+workspace labels.

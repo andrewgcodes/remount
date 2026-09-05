@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"remount.dev/remount/internal/acp"
 	"remount.dev/remount/internal/acp/acptest"
 	"remount.dev/remount/internal/client"
+	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/launch"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/server"
@@ -44,11 +46,14 @@ func TestMain(m *testing.M) {
 
 // standaloneForTest runs a control plane and a process-backend node in this
 // process, the way `remount standalone` does, and returns the server URL.
-func standaloneForTest(t *testing.T) string {
+func standaloneForTest(t *testing.T, bindings ...control.Binding) string {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	data := t.TempDir()
-	srv, err := server.New(server.Options{DataDir: filepath.Join(data, "server"), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Mode: server.ModeStandalone})
+	srv, err := server.New(server.Options{
+		DataDir: filepath.Join(data, "server"), Bindings: bindings,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Mode: server.ModeStandalone,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,6 +223,74 @@ func TestAgentCreateWatchConversation(t *testing.T) {
 	// surfaced with a stable code, never a crash.
 	if _, err := cl.Diff(ctx, a.ID, false); !errors.Is(err, &proto.Error{Code: proto.CodeUnreachable}) {
 		t.Fatalf("diff without a repository: %v", err)
+	}
+}
+
+func TestAgentCreateOnExistingBoundWorkspaceCarriesBindingEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: recipe ACP launcher scripts require a POSIX shell")
+	}
+	t.Setenv("REMOUNT_AUTOSTART", "off")
+	serverURL := standaloneForTest(t, control.Binding{
+		ID: "b_openai", Secret: "test-only-secret", Destinations: []string{"api.openai.com"},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	cl := (&common{server: serverURL}).client()
+	defer cl.Close()
+	ws, err := cl.CreateWorkspace(ctx, proto.WorkspaceSpec{
+		Bindings: []string{"b_openai"},
+		Security: proto.SecuritySpec{Profile: proto.SecurityLocal},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, ctx, func() bool {
+		got, err := cl.GetWorkspace(ctx, ws.ID)
+		return err == nil && got.State == proto.WSClaimed
+	})
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	yaml := fmt.Sprintf(`name: boundacp
+auth: api_key
+providers: [openai]
+command: ["true"]
+env:
+  PROBE_KEY: "{{key .Primary}}"
+acp:
+  command: [%q, %q]
+`, filepath.ToSlash(exe), cliFakeACPArg)
+	recipe, err := launch.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := common{server: serverURL}
+	f := agentSeedFlags{
+		ws: ws.ID, bindings: listFlag{"b_openai"}, sandbox: launch.SandboxWorkspaceWrite,
+		approve: launch.ApproveNever, maxTurns: 1,
+	}
+	p, err := planAgent(ctx, &c, &f, recipe, yaml, "prove the binding environment")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := p.create(ctx, cl, nil, "existing-bound-workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, ctx, func() bool {
+		got, err := cl.GetAgent(ctx, a.ID)
+		if err != nil {
+			return false
+		}
+		a = got
+		return got.Status == proto.AgentFinished || got.Status == proto.AgentFailed
+	})
+	if a.Status != proto.AgentFinished {
+		t.Fatalf("agent status = %s: %s", a.Status, a.StatusReason)
 	}
 }
 
