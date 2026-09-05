@@ -1,10 +1,10 @@
 // Package verifylocal proves scripts/verify-local.sh reports what it ran.
 //
-// The script is the substitute for a metered CI, so its verdict is the only
-// thing between a developer and a push. The claim that matters is not "the
-// script exited zero": it is that zero means every gate it names actually ran
-// and passed. An analyzer that is not installed did not pass, a subset of the
-// gates is not "all gates", and a suite that skips the external
+// The script is a portable local precursor to CI. The claim that matters is
+// not "the script exited zero": it is that zero means every gate it names
+// actually ran and passed, without claiming native macOS or Windows evidence.
+// An analyzer that is not installed did not pass, a selected subset is not the
+// complete local set, and a suite that skips the external
 // integration/publicsdk module is not the `make test` gate CI runs
 // (docs/engineering/review-handoff-2026-09-04.md, RMR-012).
 //
@@ -179,8 +179,13 @@ func TestVerdictNamesTheGateSet(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("full run exited %d\n%s", code, out)
 	}
-	if !claimsFullPass(out) {
-		t.Errorf("a complete passing run was not reported as the full gate set\n%s", out)
+	if claimsFullPass(out) {
+		t.Errorf("portable host checks were reported as complete CI verification\n%s", out)
+	}
+	if !strings.Contains(out, "portable local") ||
+		!strings.Contains(out, "native macOS and Windows") ||
+		!strings.Contains(out, "incomplete") {
+		t.Errorf("broad local verdict does not name unavailable native CI lanes\n%s", out)
 	}
 	for _, want := range []string{"go|" + root + "|test -race", "make|" + root + "|conformance", "make|" + root + "|dist", "staticcheck|", "govulncheck|"} {
 		if !containsCall(calls, want) {
