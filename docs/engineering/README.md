@@ -1,10 +1,18 @@
 # Engineering reviews and requests
 
 This directory contains point-in-time engineering assessments and
-implementation requests. These documents are internal planning inputs, not
+implementation requests, alongside a maintained status index, verification
+ledger and review playbook. Historical requests are planning inputs, not
 statements that the described controls already exist.
 
 ## Documents
+
+### [Current implementation status](./current-status.md) — start here
+
+The maintained index separates implemented features, stock integration gaps,
+host/provider prerequisites and dated verification. Use it with current code
+and the verification ledger; the historical closure below is not a release-wide
+feature inventory.
 
 ### [Codebase review and remediation handoff — 2026-09-04](./review-handoff-2026-09-04.md)
 
@@ -14,10 +22,10 @@ and remediation requirements. It distinguishes current findings from inherited
 PR #7 issues and historical evidence. No bugs are fixed by this document; read
 its finding register alongside the earlier implementation closure.
 
-### [Hardening implementation closure — 2026-09-03](./implementation-closure-2026-09-03.md) — current status
+### [Hardening implementation closure — 2026-09-03](./implementation-closure-2026-09-03.md) — historical closure
 
-**Start here.** Its `2026-09 build plan disposition` section is the current
-status entry for the Phase 2–6 build plan: every numbered item, every
+Its `2026-09 build plan disposition` section records the Phase 2–6 build plan
+at that implementation pass: every numbered item, every
 acceptance scenario, the gates that were run, the defects found and fixed, and
 the residual gaps with a named owner and exact next proof for each. Read the
 two handoffs below for the requirements it dispositions.
@@ -40,7 +48,7 @@ secret-blind broker is the preferred harness lane.
 
 ### [Codex continuation handoff — 2026-09-03](./handoff-2026-09-03-codex-wrap.md)
 
-The current continuation ledger for the Phase 2–6 implementation pass. It
+The continuation ledger for the Phase 2–6 implementation pass. It
 records completed code and tests, integration/CI incidents, the exact remaining
 local and external gates, and a safe ownership/verification order. Read it for
 the requirements of the pass that followed the quota-bounded Codex session; its
@@ -69,9 +77,11 @@ prove it. Each item names the exact missing prerequisite and the exact command,
 so neither document needs re-derivation.
 
 Linux carries gVisor, Firecracker KVM, the live E2B pool lanes, the
-docker/gVisor scale matrix, and Terraform/Helm validation. Windows carries the
-least-verified surface in the repository: seven Windows-specific source files
-ship in every release and no test has ever run on that platform.
+docker/gVisor scale matrix, and Terraform/Helm validation. Windows records the
+prerequisites that were missing on that macOS host. Native Windows verification
+and later Linux/KVM/gVisor work are now recorded in the monthly verification
+ledger; those original unavailable results are historical, not claims that
+the lanes have never run.
 
 ### [External and live verification ledger — 2026-09](./verification-2026-09.md)
 
@@ -99,7 +109,7 @@ lessons into an executable agent workflow.
 
 ### [Hardening implementation closure — 2026-09-03](./implementation-closure-2026-09-03.md)
 
-The current disposition and verification ledger for the two reviews and two
+The dated disposition and verification ledger for the two reviews and two
 implementation requests below. It maps every numbered audit finding, every
 surviving adversarial finding, the incident-hardening requirements and the
 production-readiness gates to implementation evidence or an explicit residual
@@ -177,7 +187,9 @@ User-facing behavior belongs in the README, tutorial, protocol specification or
 operations guide. Keep this directory focused on assessments, requirements and
 verification evidence.
 
-The hardening playbook is the one intentional living exception: update it when
+The current-status index, verification ledger and hardening playbook are
+maintained documents: update the index when implementation boundaries change,
+append new proof to the ledger, and update the playbook when
 a completed investigation reveals a reusable engineering method. Keep
 point-in-time findings and their original severity unchanged, and record newly
 accepted architecture in a new ADR.

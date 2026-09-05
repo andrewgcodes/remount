@@ -11,7 +11,8 @@ default matters it is stated with the flag that changes it.
 process on one port.
 
 ```sh
-remount server --listen 0.0.0.0:7443 --data /var/lib/remount --token "$REMOUNT_TOKEN" \
+# Export REMOUNT_TOKEN separately; the server reads it from the environment.
+remount server --listen 0.0.0.0:7443 --data /var/lib/remount \
   --bindings /etc/remount/bindings.json --lease 30
 ```
 
@@ -30,6 +31,11 @@ environment variable, and `remount up`, `remount server` and the client all
 accept `REMOUNT_TOKEN`. Production mode avoids the question entirely: it issues
 per-principal tokens through `--bootstrap-token-file`, an exclusive mode-0600
 path, and `remount token issue`, rather than a shared secret anyone can reuse.
+
+Additional server flags:
+
+| Flag | Default | Meaning |
+|---|---|---|
 | `--bindings` | none | JSON file of secrets the nodes may lease |
 | `--provisioners` | none | provider registry JSON; credentials are named environment references |
 | `--notifications` | none | provider-webhook and outbound-notification JSON; credentials are named environment references |
@@ -110,7 +116,7 @@ Enroll a machine with `remount up`. It dials the server, presents its identity
 key and capabilities, and waits for work.
 
 ```sh
-remount up --server https://remount.example --token "$REMOUNT_TOKEN" \
+remount up --server https://remount.example \
   --label zone=eu-west --label gpu=a100 --backend process,docker \
   --allow registry.npmjs.org --allow pypi.org --allow files.pythonhosted.org
 ```
@@ -119,7 +125,7 @@ remount up --server https://remount.example --token "$REMOUNT_TOKEN" \
 |---|---|---|
 | `--data` | `~/.remount/node` | identity, workspaces, spill, artifact cache; also `REMOUNT_NODE_DATA` |
 | `--label k=v` | none | placement labels, repeatable |
-| `--backend` | `process` | comma-separated: `process`, `docker` |
+| `--backend` | `process` | comma-separated: `process`, `docker`, `gvisor`, `firecracker`; hardened backends require host prerequisites |
 | `--image` | `ghcr.io/andrewgcodes/remount-workspace:<version>` | default image for docker workspaces; see `docs/images.md`; `ubuntu:24.04` still works |
 | `--allow` | none | hosts reachable without a credential, repeatable |
 | `--allow-private` | none | hosts allowed to resolve to private addresses, repeatable |
@@ -154,13 +160,26 @@ requirement and every `--label` in the placement matches.
 |---|---|---|---|
 | `process` | none | a directory on the host, processes as the node's user | the machine is yours and you already trust the agent with it |
 | `docker` | container, cooperative egress | a long-lived container with the workspace mounted at `/work` | local/single-owner containment where Docker's default boundary is sufficient |
+| `gvisor` | Linux `runsc`, node-owned enforced gateway | container filesystem and sessions with deny-first network setup | an `isolated` profile on a host whose runtime probes and E4 denial checks pass |
+| `firecracker` | Linux KVM microVM, jailer and enforced gateway | a guest filesystem and sessions; compatible full disk/state/memory checkpoints | an explicitly prepared KVM host with passing construction probes and exact-host conformance |
 
 Be honest with yourself about `process`. The agent runs as the same user as the
 node with the host's full network and filesystem. The workspace root is only a
 convention. That is fine for a laptop you are watching and a fleet box that
 exists to run agents, and wrong for a shared machine or a multi-tenant host.
-Neither backend enforces egress at the network layer; the broker is the
-credential boundary, not a firewall. MicroVM backends are not built yet.
+Neither process nor Docker enforces egress at the network layer; the broker
+alone is not a firewall. The gVisor and Firecracker implementations add
+node-owned enforcement and fail closed when prerequisites are unavailable.
+gVisor does not satisfy the microVM requirement of `multi_tenant`.
+A constructed, verified Firecracker backend can advertise that profile's
+capabilities; its zero-value descriptor deliberately does not.
+
+See [the generated capability matrix](security-profiles.md),
+[`scripts/gvisor-conformance.sh`](../scripts/gvisor-conformance.sh), and
+[the Firecracker host guide](../integration/firecracker/README.md). A backend's
+existence or a historical cloud run is not certification of your host. Run
+the relevant denial, lifecycle and cleanup checks against the exact candidate.
+Vendor sandbox isolation does not upgrade a Remount process backend's caps.
 
 The docker backend checks the daemon lazily and reports `unsupported` if it is
 missing. Filesystem operations and snapshots use the host-side mount, so they
@@ -320,8 +339,9 @@ The broker capability authenticates one workspace and generation, but proxy
 environment variables alone cannot stop a hostile process from opening a
 direct socket. The built-in `process` and `docker` backends advertise
 `cooperative_proxy`, so `isolated` and `multi_tenant` workspaces reject them.
-There is currently no built-in production backend. An external backend may
-advertise `enforced_gateway` only when its handle implements the network
+The Linux gVisor and Firecracker implementations can advertise
+`enforced_gateway` only after validating their host/runtime prerequisites.
+Any backend making that claim must implement the network
 controller that installs the generation-specific policy before readiness and
 revokes it synchronously during fencing, quarantine, and node shutdown.
 
@@ -770,10 +790,12 @@ but the single-writer and backup rules above still apply.
 
 ### What this deployment proved
 
-A workspace was created on a Modal node running Debian on linux/amd64 under
-gVisor, written to, then moved to an Apple Silicon Mac enrolled over the public
+A workspace was created on a Modal node running Debian on linux/amd64 with
+Remount's **process backend**, written to, then moved to an Apple Silicon Mac enrolled over the public
 internet. A 300 KB random file hashed identically on both sides. Both machines
 dialed out only; neither opened an inbound port.
+Modal's underlying isolation is not Remount's `gvisor` backend and does not
+make this an enforced-egress or multi-tenant conformance result.
 
 ```
 $ remount nodes

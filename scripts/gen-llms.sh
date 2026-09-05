@@ -12,7 +12,7 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-BASE=${LLMS_BASE_URL:-https://github.com/remount-dev/remount/blob/main}
+BASE=${LLMS_BASE_URL:-https://github.com/andrewgcodes/remount/blob/main}
 
 first_para() {
 	# first_para FILE HEADING: the first sentence of the first prose paragraph
@@ -59,8 +59,9 @@ section() {
 	echo
 	echo "Remount is an open protocol and a single static Go binary that gives an AI"
 	echo "agent a workspace it can run on from anywhere: snapshotted, moved between"
-	echo "machines, put to sleep, reattached mid-command, and never holding a"
-	echo "credential. \`remount run RECIPE -- TASK\` launches a coding harness in one"
+	echo "machines, put to sleep, and reattached within session retention limits."
+	echo "Broker-managed provider keys stay outside it; explicit workspace login is"
+	echo "a separate trust choice. \`remount run RECIPE -- TASK\` launches a coding harness in one"
 	echo "command. The normative wire protocol is [spec/PROTOCOL.md]($BASE/spec/PROTOCOL.md)."
 	section README.md "README"
 	section docs/using-remount.md "Using Remount"
@@ -72,6 +73,8 @@ section() {
 	echo
 	echo "- [design.md]($BASE/docs/design.md): why each piece is shaped the way it is, and the failure model."
 	echo "- [operations.md]($BASE/docs/operations.md): tokens, TLS, backends, leases, backups."
+	echo "- [current-status.md]($BASE/docs/engineering/current-status.md): implementation boundaries and dated verification evidence."
+	echo "- [console.md]($BASE/docs/console.md): the embedded operator console and its real-server tests."
 	echo "- [ADRs]($BASE/docs/adr): one decision per file, never edited after the fact."
 } > llms.txt
 

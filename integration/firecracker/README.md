@@ -1,6 +1,6 @@
 # Firecracker host integration
 
-This lane is intentionally unavailable on ordinary GitHub-hosted and macOS
+This lane is unavailable on ordinary GitHub-hosted and macOS
 runners. It needs a dedicated Linux host with KVM, a trusted Firecracker and
 jailer installation, an explicit cgroup, and the Remount guest kernel/rootfs.
 
@@ -17,7 +17,8 @@ Exit 77 means unavailable, never pass. A release claim additionally requires
 the host-gated end-to-end test below; this prerequisite script alone is not a
 Firecracker conformance result.
 
-The node now composes the jailed Firecracker API, reflink-backed root disk,
+Run the remaining commands on the prepared Linux host, not on macOS after
+cross-compiling a Linux executable. The node composes the jailed Firecracker API, reflink-backed root disk,
 node-owned network namespace/TAP, full disk+state+memory bundle, and versioned
 vsock guest filesystem/session bridge. Build the guest binary and its immutable
 manifest before constructing the root image:
@@ -39,13 +40,23 @@ firecracker` and the `--firecracker-*` flags (or matching
 microVM capabilities when KVM, trusted binaries/images, cgroups, reflink,
 network namespace recovery, or guest manifest validation is unavailable.
 
-The full self-hosted KVM scenario remains a release gate: fresh boot, a guest
+The full self-hosted KVM scenario is implemented and remains a release gate: fresh boot, a guest
 filesystem RPC hitting the block disk, exec and PTY, denied direct egress,
 successful broker egress, synchronous revoke of an in-flight connection, full
 checkpoint, retained-source fence, fresh pre-boot VMM restore, process marker
-continuity, output reattachment, and cleanup. The current workflow deliberately
-fails its final step until that host scenario is checked in; do not interpret
-the unit/race suite as that proof.
+continuity, output reattachment, and cleanup. The workflow runs
+`scripts/firecracker-conformance.sh`, which selects
+`TestB29FirecrackerHostSmoke`, `TestB29FirecrackerCheckpointMoveRestore`, and
+`TestDiskFullRestoreStagingFailsClosedAndCleansUp`, then checks process,
+network, cgroup and staging cleanup. It no longer contains a placeholder
+failure step. Do not interpret the unit/race suite as exact-host proof.
+
+Set every `REMOUNT_FIRECRACKER_*` input required by that script, including the
+trusted binary/jailer, data root, cgroup parent, kernel, rootfs and guest
+manifest. Missing prerequisites return 77 (unavailable). Run only on a
+dedicated test host: the final inventory checks require no leftover Remount
+Firecracker resources. Dated Linux/KVM evidence is in
+[the verification ledger](../../docs/engineering/verification-2026-09.md#2026-09-04--firecracker-23-and-b29-on-linuxkvm).
 
 Implementation constraints follow Firecracker's official
 [snapshot support](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md),

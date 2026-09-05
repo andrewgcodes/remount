@@ -2062,3 +2062,156 @@ portable local gates. The ordinary suite completed in 423 seconds, the race
 lane in 679 seconds, serialized conformance in 352 seconds, and bounded
 fuzzing in 87 seconds. Native macOS and Windows runtime lanes remain CI-only;
 their cross-platform vet gates passed locally.
+
+## 2026-09-05 — PR #30 live functional regression verification
+
+**Verified within the boundaries below.** The candidate is PR #30 commit
+`47b379fb36e9d1dac6ece6e0d9a4121cd1328f8f`; merge commit `0cab8a1` has the
+same tree. Tests used the repository `.env` through allowlisted parsing,
+without sourcing shell commands, displaying credential values, or copying the
+repository or personal conversations into a workspace.
+
+| Frozen binary | SHA-256 |
+|---|---|
+| macOS arm64 | `4b44780f7d2d166ef6cf8c8ab21353a0b123fa37b7a2e812162536eedbaf892f` |
+| Linux amd64 | `8d52a88667fdd406d76b3ad914e4495e4afcc48c942523cd3f645531678aa16e` |
+
+### Real Claude conversation and tools on Modal
+
+The checked-in `scripts/live-handoff.py` driver ran `seed`, `prepare`, and
+`test --recipes claude`, with `--execute`, explicit frozen binary paths, and
+`--candidate 47b379f`. Run directory:
+`remount-data/pr30-live-20260905-claude/`. This was a new ephemeral Modal VM,
+not a redeployment or test of the named reference service. It used stock Docker
+security options; the nested-sandbox test relaxation was not enabled.
+
+Claude Code `2.1.260`, using `claude-haiku-4-5-20251001`, remembered a nonce
+from a synthetic local conversation and wrote it into `RESULT.txt` remotely.
+The selected conversation UUID survived, its transcript grew, execution was
+Linux at the canonical checkout path, and `pull` recovered the exact result.
+A live attachment was interrupted and a fresh attachment replayed identical
+output. Audit evidence contained two `cred.used`, two `egress.allowed`, and
+one each of `run.started` and `run.finished`.
+
+The remote workspace scan examined 26 files (52,326 bytes) and found zero real
+credential matches; the workspace environment and retrieved tree were also
+clean. A synthetic canary verified the scanner. Deep artifact checks found
+zero damaged objects in both server and node stores. **Tenant residency was
+explicitly unavailable:** this standalone test had no tenant-policy authority.
+The doctor's zero exit and top-level `ok` do not turn that finding into a
+verified residency check.
+
+Workspace `ws_06g77apen1k6zb71qfagrzd5q0` was destroyed and authenticated
+workspace inventory was verified empty. Sandbox `sb-ndsPMU6o727ItQN0maPknS`
+was terminated, absent from inventory, and its tunnel stopped serving. App
+`ap-6j5RlgZwxhKVzVUM7x5kyE` was stopped; the generated local control token was
+removed. No persistent provider volume or named secret was created.
+
+### Real OpenCode workflows on local Docker
+
+The real-provider Go lanes used `OPENAI_API_KEY` from `.env` only as the
+subprocess environment variable `REMOUNT_INTEGRATION_OPENAI_KEY`, with
+`go test -race -count=1 -v -timeout=25m ./internal/sim -run
+'^TestRunOpenCode(DockerIntegration|HandoffAcrossNodesDockerIntegration|QueueDockerIntegration)$'`.
+The host daemon was Docker `29.4.1`. The `node:22-bookworm-slim` image resolved
+to digest `sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5`;
+the stock recipe installed OpenCode `1.18.29` and used `openai/gpt-4o-mini`.
+The recipe's npm install is not version-pinned, so this is point-in-time
+harness evidence rather than a reproducible dependency-resolution guarantee.
+
+The two-node conversation-continuity lane passed in 127.10 seconds: two
+model turns preceded the move, and a third turn on generation 2 recalled
+both facts. Three run-start/run-finish pairs and at least three credential-use
+events were verified. The two-task queue lane passed in 99.49 seconds,
+checking both file contents, cursor completion, and checkpoint/queue events.
+That live lane checkpoints without sleeping; the separate repeated simulator
+test covers the queue's sleep-and-move path.
+
+The file-writing/broker lane passed in 316.50 seconds, including real
+`GREETING.txt` creation, placeholder configuration, workspace/snapshot/event/
+diagnostic secret scans, and planted synthetic-canary positive controls. All
+three live lanes passed under the race detector in 544.695 seconds. The
+redacting wrapper detected no credential in command output. Final Docker
+inventory contained no Remount workspace containers, matching the empty
+pre-run inventory; the test process exited. The extensive snapshot scans are
+not a benchmark of workspace movement latency.
+
+### SDK and lifecycle regression checks
+
+An isolated authenticated local server and process node, both running the
+frozen binary, exercised the actual Python and built TypeScript SDKs:
+
+- nonempty digest-verified artifact roundtrips (1,054,200 bytes in Python;
+  1,048,613 bytes in TypeScript), plus over-limit download rejection;
+- stdin plus EOF, fresh-client replay, and ten fast-output execs per SDK;
+- Python nonzero exit propagation, authoritative snapshot, sleep/wake, and
+  file persistence;
+- a control-plane process restart during Python session output, with exact
+  `beforeafter` output, preserved files, and same-generation node re-adoption;
+- a real TypeScript WebSocket cut during output, with exact `beforeafter`
+  output and a successful terminal exit.
+
+Both workspaces were destroyed, inventory was empty, and the owned server/node
+processes exited. Local deep doctor found no damaged artifacts. Private
+reproduction scripts and diagnostics are under
+`/private/tmp/remount-live-pr30.3ERIxs/`; they are evidence, not new public API.
+
+Python's 28 tests, TypeScript's 31 tests, and the strict-profile cross-language
+protocol gate all passed. Three race-detector repetitions passed the focused
+session-authority, reused-workspace security, partial-input, lossless reconnect,
+sleep/wake, and queue-across-sleep/move regressions. The handoff driver's twelve
+offline safety tests also passed.
+The complete client, session, and launch packages passed one further race
+run. `make docs`, `make lint`, and `git diff --check` passed for this ledger
+update; generated user-documentation bundles did not change.
+
+These are functional checks, not throughput benchmarks or a production
+isolation certification. Process has no host isolation and Docker egress is
+cooperative. No E2B, ix.dev, native Windows, KVM, or gVisor live lane was run
+in this pass. The full portable verification matrix was exercised during PR
+preparation; this follow-up adds targeted race and real-provider evidence,
+not another full-matrix run. GitHub-hosted checks remained externally blocked
+by the account billing/spending-limit condition reported on PR #30.
+
+## 2026-09-05 — Current-documentation freshness pass
+
+Reviewed current user guides, examples, architecture/status claims, build and
+release guidance, repository skills and generated documentation against source.
+The checkout began at `47b379f`; a final fetch found documentation-only PR #31,
+and the checkout was fast-forwarded to `4e3066b` before reapplying the audit
+changes. The new desktop/VNC guidance was retained. There is no Go runtime or
+dependency change: the only Go edit is the ix.dev constructor's explanatory
+comment. The documentation generator now uses the actual repository URL and
+has offline regression tests.
+
+The new `current-status.md` distinguishes implemented features, incomplete
+stock integrations and exact-host verification requirements. Old ADRs and
+dated findings were preserved; the engineering index and living review
+playbook now point to current source/evidence instead of treating a historical
+closure as the current feature inventory.
+
+Verification on macOS arm64 with Go 1.27.1:
+
+- `make test` passed all ordinary packages and the separate public-SDK module;
+  `internal/sim` completed in 325.053 seconds. The suite began before the
+  documentation-only fast-forward; `git diff 47b379f origin/main -- '*.go'
+  go.mod go.sum` confirmed no Go or module changes in that update.
+- `make docs` regenerated both bundles. Four
+  `python3 scripts/test_gen_llms.py` tests passed: default repository/section
+  targets, base-URL override and determinism, empty override fallback, and
+  checked-in output freshness.
+- `make lint` passed after integration. A temporary Git index held the expected
+  generated outputs for its `git diff --quiet` gate; the real staging index
+  was left unchanged. This checks regenerated content without committing it.
+- The relative-link scan checked 147 file links across 137 Markdown inputs,
+  including linked heading fragments, with no missing targets.
+- Both edited Claude skills passed the skill-creator frontmatter validator.
+  Its PyYAML dependency was installed only in a temporary validation environment.
+- Focused `go test ./scripts/security-profiles ./internal/provision/ix` and
+  `git diff --check` passed. Authenticated GitHub inspection still reported a
+  private repository and an empty release inventory.
+
+This was not a new comprehensive security audit, a dependency upgrade, or a
+production qualification. No `.env` credentials were loaded, cloud resources
+deployed, browser/host-isolation lanes rerun, or new race/full-verify result
+claimed. Prior live and race evidence remains dated in its original entries.

@@ -12,8 +12,9 @@ deliberately different from the other documents in this directory:
   and reviewing Remount safely.
 
 This guide is not itself proof that a release is production-ready. Re-run the
-appropriate checks against the exact candidate and target backend. The closure
-document's residual-risk register remains the current limit on product claims.
+appropriate checks against the exact candidate and target backend. The
+[current-status index](current-status.md) distinguishes current implementation
+boundaries from the closure document's historical residual-risk register.
 
 ## The shortest useful mental model
 
@@ -404,16 +405,21 @@ The self-review also caught less dramatic issues worth preserving:
 
 Do not turn an honest boundary into a bug-fix claim:
 
-- the controller is a single SQLite writer with no automatic fenced failover;
-- no built-in backend supplies production-qualified isolation plus
-  non-bypassable egress;
-- checkpoints move files, not RAM, process state, or live TCP connections;
-- the relay sees frame-envelope routing metadata;
+- the controller has one active SQLite writer; optional fenced warm-standby
+  replication is not consensus and has a nonzero recovery-point window;
+- process and Docker backends remain cooperative; Linux gVisor and Firecracker
+  isolation and enforced egress require exact-host qualification;
+- ordinary filesystem checkpoints do not transfer running processes or TCP
+  connections; Firecracker full checkpoints have compatibility constraints;
+- stock CLI/SDK connections expose payloads to the relay; the internal E2EE
+  component is not wired into those connections, and routing metadata remains
+  visible even with encryption;
 - connector retention is capacity-bounded but has no independent age policy;
-- resource commits and events are not universally one transactional outbox;
+- control-plane rows and events commit atomically through the transactional
+  outbox; node event acknowledgement and external delivery are separate boundaries;
 - event-tail consumers own cancellation and cursor persistence;
-- there is no OpenTelemetry span export or production-scale load/chaos result;
-  and
+- there is no OpenTelemetry span export; recorded scale and chaos exercises
+  are point-in-time evidence, not production service guarantees; and
 - point-in-time E2B/Modal evidence does not guarantee future provider behavior.
 
 The right response is to state these constraints, test the selected production
