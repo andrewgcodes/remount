@@ -339,6 +339,7 @@ async def test_workspace_lifecycle_helpers_encode_control_operations():
         {
             "ws.get": {"id": "ws_1", "state": "claimed"},
             "ws.sleep": {"id": "timer_1"},
+            "events.post": {},
             "ws.wake": {"id": "ws_1", "state": "claiming"},
         }
     )
@@ -348,7 +349,10 @@ async def test_workspace_lifecycle_helpers_encode_control_operations():
 
     client = Client("https://cp.example", "token", connector=connector)
     workspace = await client.wait_workspace("ws_1", timeout=0)
-    timer = await client.sleep_workspace("ws_1", after_sec=30, on_event="job.done", match={"id": "job_1"})
+    timer = await client.sleep_workspace(
+        "ws_1", after_sec=30, on_event="job.done", match={"id": "job_1"}
+    )
+    await client.post_event("job.done", stream="ws_1", payload={"id": "job_1"})
     waking = await client.wake_workspace("ws_1")
 
     assert workspace["state"] == "claimed"
@@ -357,12 +361,23 @@ async def test_workspace_lifecycle_helpers_encode_control_operations():
     bodies = {
         frame["op"]: cbor2.loads(frame["body"])
         for frame in socket.sent
-        if frame.get("op") in {"ws.sleep", "ws.wake"}
+        if frame.get("op") in {"ws.sleep", "events.post", "ws.wake"}
     }
     assert bodies["ws.sleep"]["after_sec"] == 30
     assert bodies["ws.sleep"]["match"] == {"id": "job_1"}
+    posted = bodies["events.post"]["events"][0]
+    assert posted["type"] == "job.done"
+    assert posted["stream"] == "ws_1"
+    assert cbor2.loads(posted["payload"]) == {"id": "job_1"}
     assert bodies["ws.wake"]["id"] == "ws_1"
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_sleep_workspace_requires_wake_trigger():
+    client = Client("https://cp.example", "token", connector=FakeSocket)
+    with pytest.raises(ValueError, match="requires"):
+        await client.sleep_workspace("ws_1")
 
 
 @pytest.mark.asyncio

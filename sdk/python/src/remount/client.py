@@ -540,6 +540,10 @@ class Client:
         match: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> Timer:
+        if after_sec == 0 and at_millis == 0 and not on_event:
+            raise ValueError(
+                "workspace sleep requires after_sec, at_millis, or on_event"
+            )
         body: dict[str, object] = {
             "id": workspace,
             "idem": idempotency_key or _idempotency_key(),
@@ -553,6 +557,20 @@ class Client:
         if match:
             body["match"] = match
         return cast(Timer, await self.call("ws.sleep", body))
+
+    async def post_event(
+        self,
+        event_type: str,
+        *,
+        stream: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        event: dict[str, object] = {"seq": 0, "at": 0, "type": event_type}
+        if stream:
+            event["stream"] = stream
+        if payload is not None:
+            event["payload"] = cbor2.dumps(payload, canonical=True)
+        await self.call("events.post", {"events": [event]})
 
     async def wake_workspace(
         self, workspace: str, idempotency_key: str | None = None
