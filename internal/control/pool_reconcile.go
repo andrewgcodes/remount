@@ -158,8 +158,7 @@ func (c *Control) enrichPoolInventory(work poolWork, machines []provision.Machin
 		visible[machine.ID] = struct{}{}
 		node := nodepool.Node{Machine: provision.CloneMachine(machine), Workspaces: -1}
 		nodeID := machine.Labels[provision.NodeLabel]
-		state := c.nodes[nodeID]
-		if nodeID != "" && state != nil && state.Status.Online && state.Status.Labels[provision.PoolLabel] == work.pool.Spec.Name && state.Status.Labels["tenant"] == work.pool.Tenant {
+		if c.poolNodeIdentityLocked(work, nodeID) {
 			node.Workspaces = 0
 			for _, ws := range c.workspaces {
 				if ws.Node == nodeID && held(ws.State) {
@@ -172,12 +171,14 @@ func (c *Control) enrichPoolInventory(work poolWork, machines []provision.Machin
 					c.poolIdle[key] = now
 				}
 				node.IdleSince = c.poolIdle[key]
+				node.Retirement = &poolRetireFence{c: c, work: work, node: nodeID, machine: machine.ID}
 			} else {
 				delete(c.poolIdle, key)
 			}
 		}
 		out = append(out, node)
 	}
+	c.prunePoolRetirementsLocked(work, visible)
 	// Prune only this pool's own entries. The map is control-wide, and
 	// reconcilePoolsAsync starts every pool on the same tick, so a prune keyed
 	// on machine id alone made pool A erase pool B's idle clocks: no machine in
@@ -201,6 +202,120 @@ func (c *Control) enrichPoolInventory(work poolWork, machines []provision.Machin
 type poolMachine struct {
 	pool    string
 	machine string
+}
+
+// poolRetirement is one durable scale-down fence: the pool that selected the
+// node, the exact provider machine it intends to destroy, and the node id
+// whose claims are refused meanwhile. It is keyed by node in c.poolRetiring
+// and in the pool_retirements table.
+type poolRetirement struct {
+	Pool    string
+	Machine string
+	Node    string
+}
+
+// poolRetireFence is the nodepool.Retirement control hands out with every
+// idle node in an inventory snapshot. Retire and Release take c.mu and touch
+// only control state; the provider is never called under that lock.
+type poolRetireFence struct {
+	c       *Control
+	work    poolWork
+	node    string
+	machine string
+}
+
+func (f *poolRetireFence) payload() map[string]any {
+	return map[string]any{"pool": f.work.pool.Spec.Name, "machine": f.machine, "node": f.node}
+}
+
+// Retire re-checks the node against current assignment state and, only if it
+// is still this pool's online, assignment-free node, durably fences it from
+// new claims. False means the snapshot went stale: a claim landed, the node
+// changed identity, or the pool moved on. Re-fencing a node this pool already
+// fenced for the same machine is a no-op that returns true.
+func (f *poolRetireFence) Retire(context.Context) (bool, error) {
+	c := f.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pools[f.work.key] != f.work.source {
+		return false, nil
+	}
+	if existing, ok := c.poolRetiring[f.node]; ok {
+		return existing.Pool == f.work.key && existing.Machine == f.machine, nil
+	}
+	if !c.poolNodeIdentityLocked(f.work, f.node) {
+		return false, nil
+	}
+	for _, ws := range c.workspaces {
+		if ws.Node == f.node && held(ws.State) {
+			return false, nil
+		}
+	}
+	fence := poolRetirement{Pool: f.work.key, Machine: f.machine, Node: f.node}
+	if err := c.transact(func(tx *eventlog.Tx) error {
+		_, err := tx.Exec(`INSERT INTO pool_retirements(node, tenant, pool, machine, created_at) VALUES(?,?,?,?,?)`,
+			f.node, f.work.pool.Tenant, f.work.pool.Spec.Name, f.machine, c.now().UnixMilli())
+		return err
+	}, []*proto.Event{c.poolEvent(proto.EvPoolRetiring, f.work.pool, "", f.payload())}); err != nil {
+		return false, err
+	}
+	c.poolRetiring[f.node] = fence
+	return true, nil
+}
+
+// Release lifts the fence after a definite provider failure, so the node
+// returns to service. A fence held by another pool or for another machine is
+// not this caller's to lift.
+func (f *poolRetireFence) Release(context.Context) error {
+	c := f.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	existing, ok := c.poolRetiring[f.node]
+	if !ok || existing.Pool != f.work.key || existing.Machine != f.machine {
+		return nil
+	}
+	if err := c.transact(func(tx *eventlog.Tx) error {
+		_, err := tx.Exec(`DELETE FROM pool_retirements WHERE node=?`, f.node)
+		return err
+	}, []*proto.Event{c.poolEvent(proto.EvPoolRetireAborted, f.work.pool, "", f.payload())}); err != nil {
+		return err
+	}
+	delete(c.poolRetiring, f.node)
+	return nil
+}
+
+// poolNodeIdentityLocked reports whether node is an online control node whose
+// enrollment labels place it in exactly this pool and tenant.
+func (c *Control) poolNodeIdentityLocked(work poolWork, node string) bool {
+	state := c.nodes[node]
+	return node != "" && state != nil && state.Status.Online &&
+		state.Status.Labels[provision.PoolLabel] == work.pool.Spec.Name &&
+		state.Status.Labels["tenant"] == work.pool.Tenant
+}
+
+// prunePoolRetirementsLocked releases this pool's fences whose machine the
+// provider no longer lists: the destroy took effect, or the machine vanished
+// on its own. Until inventory says so, a fence outlives even a successful
+// destroy, because the node may still be connected. A fence whose row cannot
+// be deleted stays in force; refusing claims is the safe failure.
+func (c *Control) prunePoolRetirementsLocked(work poolWork, visible map[string]struct{}) {
+	for node, fence := range c.poolRetiring {
+		if fence.Pool != work.key {
+			continue
+		}
+		if _, ok := visible[fence.Machine]; ok {
+			continue
+		}
+		payload := map[string]any{"pool": work.pool.Spec.Name, "machine": fence.Machine, "node": node}
+		if err := c.transact(func(tx *eventlog.Tx) error {
+			_, err := tx.Exec(`DELETE FROM pool_retirements WHERE node=?`, node)
+			return err
+		}, []*proto.Event{c.poolEvent(proto.EvPoolRetired, work.pool, "", payload)}); err != nil {
+			c.logger.Error("release pool retirement", "pool", work.pool.Spec.Name, "node", node, "err", err)
+			continue
+		}
+		delete(c.poolRetiring, node)
+	}
 }
 
 func (c *Control) commitPoolFailure(work poolWork, reason string, cause error) {

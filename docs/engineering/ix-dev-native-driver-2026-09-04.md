@@ -34,8 +34,9 @@ that satisfies Remount's secret rule without any wrapper:
 | enrollment token off argv | `ix secret set <name>` (value from **stdin**) then `ix new --secret-env` |
 
 `ix secret set` documents that the value "is read from a hidden prompt, stdin,
-or `--value-file`; it is never taken on the command line" — the same property
-`fly secrets import --stage` provides, which `fly.CLISecrets` already relies on.
+or `--value-file`; it is never taken on the command line" — the same
+secret-blind provider handoff that the Fly driver implements through Fly's
+encrypted app-secrets API.
 
 So a native driver is both possible and preferable: it removes a
 `remount-ix-helper` binary that is not shipped anywhere in this repo, which

@@ -1036,24 +1036,28 @@ func (c *Control) sleepAgent(ctx context.Context, principal, id, by, idem string
 		c.mu.Unlock()
 		return nil, proto.Err(proto.CodeNotFound, "agent %s", a.ID)
 	}
-	ws := c.workspaces[live.WS]
-	live.WakeTimer = timer.ID
-	live.IdleSince = 0
-	events := []*proto.Event{c.agentEvent(proto.EvAgentSlept, live, ws, principal, "", map[string]any{"ws": live.WS, "timer": timer.ID, "by": by})}
-	if run := liveRun(live); run != nil {
-		events = append(events, c.finishRunLocked(live, run, ws, principal, "sleep", "", true)...)
+	candidate := copyAgent(live)
+	ws := c.workspaces[candidate.WS]
+	candidate.WakeTimer = timer.ID
+	candidate.IdleSince = 0
+	events := []*proto.Event{c.agentEvent(proto.EvAgentSlept, candidate, ws, principal, "", map[string]any{"ws": candidate.WS, "timer": timer.ID, "by": by})}
+	st := c.stageApprovals()
+	if run := liveRun(candidate); run != nil {
+		events = append(events, c.finishRunLocked(st, candidate, run, ws, principal, "sleep", "", true)...)
 	}
-	more, err := c.refreshAgentStatusLocked(live, principal)
+	more, err := c.refreshAgentStatusLocked(candidate, principal)
 	if err != nil {
 		c.mu.Unlock()
 		return nil, err
 	}
 	events = append(events, more...)
-	if err := c.persistAgentAndMutation(live, scope, idem, proto.OpAgentSleep, request, mutationAgentResult{ID: live.ID}, events...); err != nil {
+	if err := c.commitAgentRows(candidate, st.rows(), scope, idem, proto.OpAgentSleep, request, mutationAgentResult{ID: candidate.ID}, events); err != nil {
 		c.mu.Unlock()
 		return nil, err
 	}
-	cp := copyAgent(live)
+	*live = *candidate
+	st.publishLocked()
+	cp := copyAgent(candidate)
 	c.mu.Unlock()
 	metrics.AgentsSlept.Inc()
 	return cp, nil
@@ -1112,25 +1116,32 @@ func (c *Control) agentDestroy(ctx context.Context, subject Subject, req *proto.
 		c.mu.Unlock()
 		return nil
 	}
-	ws := c.workspaces[live.WS]
+	candidate := copyAgent(live)
+	ws := c.workspaces[candidate.WS]
 	var events []*proto.Event
-	if run := liveRun(live); run != nil {
-		events = append(events, c.finishRunLocked(live, run, ws, subject.ID, "destroy", "", true)...)
+	st := c.stageApprovals()
+	if run := liveRun(candidate); run != nil {
+		events = append(events, c.finishRunLocked(st, candidate, run, ws, subject.ID, "destroy", "", true)...)
 	}
-	events = append(events, c.expireApprovalsLocked(live, nil, subject.ID)...)
-	if err := transitionAgent(live.Status, proto.AgentDestroyed); err != nil {
+	events = append(events, st.expire(candidate, nil, subject.ID)...)
+	if err := transitionAgent(candidate.Status, proto.AgentDestroyed); err != nil {
 		c.mu.Unlock()
 		return err
 	}
-	live.Status = proto.AgentDestroyed
-	live.StatusReason = "destroyed by " + subject.ID
-	c.dropInboxLocked(live)
-	live.IdleSince = 0
-	live.WakeTimer = ""
-	events = append(events, c.agentEvent(proto.EvAgentDestroyed, live, ws, subject.ID, "", map[string]any{"ws": live.WS, "owns_ws": live.OwnsWS}))
-	if err := c.persistAgentAndMutation(live, scope, req.IdempotencyKey, proto.OpAgentDestroy, req, struct{}{}, events...); err != nil {
+	candidate.Status = proto.AgentDestroyed
+	candidate.StatusReason = "destroyed by " + subject.ID
+	undeliver := dropInbox(candidate)
+	candidate.IdleSince = 0
+	candidate.WakeTimer = ""
+	events = append(events, c.agentEvent(proto.EvAgentDestroyed, candidate, ws, subject.ID, "", map[string]any{"ws": candidate.WS, "owns_ws": candidate.OwnsWS}))
+	if err := c.commitAgentRows(candidate, st.rows(), scope, req.IdempotencyKey, proto.OpAgentDestroy, req, struct{}{}, events); err != nil {
 		c.mu.Unlock()
 		return err
+	}
+	*live = *candidate
+	st.publishLocked()
+	for _, id := range undeliver {
+		delete(c.agentDelivered, id)
 	}
 	delete(c.agentRetry, live.ID)
 	c.mu.Unlock()
@@ -1308,17 +1319,25 @@ func (c *Control) forkSnapshot(ctx context.Context, subject Subject, ws *proto.W
 // agentReport applies one observation from the node running the harness.
 // Reports are ordered per run by Seq and applied at most once; a report
 // from a node that does not hold the run's workspace generation is refused.
+//
+// The report is applied to a private copy of the agent and to staged
+// approval copies, committed, and only then published into c.agents, the
+// live approvals, the delivery marks, the retry clock and the lifecycle
+// counters. Seq is the node's deduplication key, so it must advance only
+// with the durable row: a report whose commit fails leaves memory as the
+// database has it and the node's retry of the same seq is applied rather
+// than acknowledged as a duplicate.
 func (c *Control) agentReport(ctx context.Context, node string, rep *proto.AgentReport) error {
 	if rep.Agent == "" || rep.Run == "" {
 		return proto.Err(proto.CodeBadRequest, "agent and run are required")
 	}
 	c.mu.Lock()
-	a := c.agents[rep.Agent]
-	if a == nil {
+	live := c.agents[rep.Agent]
+	if live == nil {
 		c.mu.Unlock()
 		return proto.Err(proto.CodeNotFound, "agent %s", rep.Agent)
 	}
-	run := findRun(a, rep.Run)
+	run := findRun(live, rep.Run)
 	if run == nil {
 		c.mu.Unlock()
 		return proto.Err(proto.CodeNotFound, "agent %s run %s", rep.Agent, rep.Run)
@@ -1328,7 +1347,7 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 		c.mu.Unlock()
 		return proto.Err(proto.CodeUnauthorized, "run %s belongs to node %s, not %s", rep.Run, runNode, node)
 	}
-	if rep.WS != a.WS || rep.Gen != run.Generation {
+	if rep.WS != live.WS || rep.Gen != run.Generation {
 		gen := run.Generation
 		c.mu.Unlock()
 		return proto.Err(proto.CodeConflict, "report for workspace %s generation %d does not match run generation %d", rep.WS, rep.Gen, gen)
@@ -1348,12 +1367,17 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 		}
 		return proto.Err(proto.CodeConflict, "run %s is finished; %s report seq %d is not authoritative", rep.Run, rep.Kind, rep.Seq)
 	}
+	a := copyAgent(live)
+	run = findRun(a, rep.Run)
+	st := c.stageApprovals()
 	ws := c.workspaces[a.WS]
 	run.LastReport = rep.Seq
 	now := c.now().UnixMilli()
 	var events []*proto.Event
 	payload := map[string]any{"run": run.ID, "node": node}
 	stopRun := ""
+	var undeliver []string
+	var retryAt time.Time
 	switch rep.Kind {
 	case proto.AgentReportStarted:
 		run.State = proto.AgentRunActive
@@ -1400,7 +1424,7 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 				break
 			}
 		}
-		delete(c.agentDelivered, done)
+		undeliver = append(undeliver, done)
 		payload["message"] = done
 		payload["stop_reason"] = rep.StopReason
 		payload["turn"] = a.Turns
@@ -1413,9 +1437,9 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 			if err := transitionAgent(a.Status, proto.AgentFinished); err == nil {
 				a.Status = proto.AgentFinished
 				a.StatusReason = fmt.Sprintf("max_turns %d reached", a.Policy.MaxTurns)
-				c.dropInboxLocked(a)
+				undeliver = append(undeliver, dropInbox(a)...)
 				events = append(events, c.agentEvent(proto.EvAgentFinished, a, ws, "", node, map[string]any{"reason": a.StatusReason}))
-				metrics.AgentsFinished.Inc()
+				st.count(metrics.AgentsFinished)
 				// The harness would otherwise idle on the node forever; its
 				// finished report closes the run and lands the exit chunk.
 				stopRun = run.ID
@@ -1433,14 +1457,14 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 			c.mu.Unlock()
 			return proto.Err(proto.CodeBadRequest, "%s report needs an approval", rep.Kind)
 		}
-		more, err := c.parkApprovalLocked(a, run, ws, node, rep.Approval)
+		more, err := st.park(a, run, ws, node, rep.Approval)
 		if err != nil {
 			c.mu.Unlock()
 			return err
 		}
 		events = append(events, more...)
 	case proto.AgentReportFinished:
-		events = append(events, c.finishRunLocked(a, run, ws, "", rep.StopReason, rep.Error, rep.Cancelled)...)
+		events = append(events, c.finishRunLocked(st, a, run, ws, "", rep.StopReason, rep.Error, rep.Cancelled)...)
 		if rep.ExitCode != 0 && rep.Error == "" && !rep.Cancelled {
 			run.Error = fmt.Sprintf("harness exited %d", rep.ExitCode)
 		}
@@ -1450,12 +1474,12 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 				if err := transitionAgent(a.Status, proto.AgentFailed); err == nil {
 					a.Status = proto.AgentFailed
 					a.StatusReason = run.Error
-					c.dropInboxLocked(a)
+					undeliver = append(undeliver, dropInbox(a)...)
 					events = append(events, c.agentEvent(proto.EvAgentFailed, a, ws, "", node, map[string]any{"reason": run.Error, "run": run.ID, "attempt": run.Attempt}))
-					metrics.AgentsFailed.Inc()
+					st.count(metrics.AgentsFailed)
 				}
 			} else {
-				c.agentRetry[a.ID] = c.now().Add(agentRetryBackoff)
+				retryAt = c.now().Add(agentRetryBackoff)
 			}
 		}
 	case proto.AgentReportTranscript:
@@ -1473,11 +1497,21 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 	if rep.Kind == proto.AgentReportTranscript {
 		err = c.mirrorTranscriptLocked(a, run, rep.Chunks, events)
 	} else {
-		err = c.persistAgent(a, events...)
+		err = c.commitAgentRows(a, st.rows(), "", "", "", nil, nil, events)
 	}
 	if err != nil {
 		c.mu.Unlock()
 		return err
+	}
+	// Committed: publish the copy as the live row and apply the volatile
+	// side effects that describe it.
+	*live = *a
+	st.publishLocked()
+	for _, id := range undeliver {
+		delete(c.agentDelivered, id)
+	}
+	if !retryAt.IsZero() {
+		c.agentRetry[a.ID] = retryAt
 	}
 	needKick := run.State == proto.AgentRunDone && len(a.Inbox) > 0 && !agentTerminal(a.Status)
 	agentID := a.ID
@@ -1491,20 +1525,31 @@ func (c *Control) agentReport(ctx context.Context, node string, rep *proto.Agent
 	return nil
 }
 
+// dropInbox empties an agent's inbox and returns the ids it held so the
+// caller can forget their delivery marks once the change is committed.
+func dropInbox(a *proto.Agent) []string {
+	ids := make([]string, 0, len(a.Inbox))
+	for _, m := range a.Inbox {
+		ids = append(ids, m.ID)
+	}
+	a.Inbox = a.Inbox[:0]
+	return ids
+}
+
 // dropInboxLocked empties an agent's inbox and forgets the delivery marks of
 // what it held, so the marks map only ever holds messages that still exist.
 // Caller holds c.mu.
 func (c *Control) dropInboxLocked(a *proto.Agent) {
-	for _, m := range a.Inbox {
-		delete(c.agentDelivered, m.ID)
+	for _, id := range dropInbox(a) {
+		delete(c.agentDelivered, id)
 	}
-	a.Inbox = a.Inbox[:0]
 }
 
 // finishRunLocked closes a run and returns its events. It is the one place
 // a run becomes done, whether the node said so, the control plane gave up
-// on it, or a lifecycle operation killed it. Caller holds c.mu.
-func (c *Control) finishRunLocked(a *proto.Agent, run *proto.AgentRun, ws *proto.Workspace, principal, stopReason, errText string, cancelled bool) []*proto.Event {
+// on it, or a lifecycle operation killed it. The approvals the run parked
+// expire into st. Caller holds c.mu.
+func (c *Control) finishRunLocked(st *approvalStage, a *proto.Agent, run *proto.AgentRun, ws *proto.Workspace, principal, stopReason, errText string, cancelled bool) []*proto.Event {
 	if run.State == proto.AgentRunDone {
 		return nil
 	}
@@ -1516,8 +1561,8 @@ func (c *Control) finishRunLocked(a *proto.Agent, run *proto.AgentRun, ws *proto
 	events := []*proto.Event{c.agentEvent(proto.EvAgentRunFinished, a, ws, principal, run.Node, map[string]any{
 		"run": run.ID, "attempt": run.Attempt, "stop_reason": stopReason, "error": errText, "cancelled": cancelled, "turns": run.Turns,
 	})}
-	events = append(events, c.expireApprovalsLocked(a, run, principal)...)
-	metrics.AgentRunsFinished.Inc()
+	events = append(events, st.expire(a, run, principal)...)
+	st.count(metrics.AgentRunsFinished)
 	return events
 }
 
@@ -1609,28 +1654,29 @@ func (c *Control) agentDecide() []agentWork {
 	}
 	sort.Strings(keys)
 	for _, id := range keys {
-		a := c.agents[id]
-		if agentTerminal(a.Status) {
-			if a.Parent != "" && !a.ParentNotified {
-				c.notifyParentLocked(a, now)
+		live := c.agents[id]
+		if agentTerminal(live.Status) {
+			if live.Parent != "" && !live.ParentNotified {
+				c.notifyParentLocked(live, now)
 			}
 			continue
 		}
 		if _, busy := c.agentBusy[id]; busy {
 			continue
 		}
+		a := copyAgent(live)
 		ws := c.workspaces[a.WS]
 		var (
 			events  []*proto.Event
 			pending []func(context.Context)
 			marked  []string
-			saved   *proto.Agent
+			changed bool
+			retryAt time.Time
 		)
 		mutate := func() {
-			if saved == nil {
-				saved = copyAgent(a)
-			}
+			changed = true
 		}
+		st := c.stageApprovals()
 		run := liveRun(a)
 		if run != nil {
 			lost := ""
@@ -1649,10 +1695,10 @@ func (c *Control) agentDecide() []agentWork {
 			if lost != "" {
 				mutate()
 				cancelled := lost == "workspace released"
-				events = append(events, c.finishRunLocked(a, run, ws, "", lost, "", cancelled)...)
+				events = append(events, c.finishRunLocked(st, a, run, ws, "", lost, "", cancelled)...)
 				if !cancelled {
 					run.Error = lost
-					c.agentRetry[a.ID] = now.Add(agentRetryBackoff)
+					retryAt = now.Add(agentRetryBackoff)
 				}
 				// The durable run is over; a harness still executing it on a
 				// reachable node must stop, or it keeps working with brokered
@@ -1669,7 +1715,7 @@ func (c *Control) agentDecide() []agentWork {
 			switch {
 			case a.Policy.StartAt > now.UnixMilli() && run == nil:
 				// Scheduled: hold the inbox, do not launch, do not wake.
-			case run == nil && len(a.Inbox) > 0 && ws.State == proto.WSClaimed && c.send.Online(ws.Node) && !c.agentRetry[a.ID].After(now):
+			case run == nil && len(a.Inbox) > 0 && ws.State == proto.WSClaimed && c.send.Online(ws.Node) && retryAt.IsZero() && !c.agentRetry[a.ID].After(now):
 				mutate()
 				attempt := 1
 				if n := len(a.Runs); n > 0 {
@@ -1728,18 +1774,22 @@ func (c *Control) agentDecide() []agentWork {
 		if err == nil {
 			events = append(events, more...)
 			if len(events) > 0 {
-				err = c.persistAgent(a, events...)
+				err = c.commitAgentRows(a, st.rows(), "", "", "", nil, nil, events)
 			}
 		}
 		if err != nil {
 			c.logger.Error("reconcile agent", "agent", a.ID, "err", err)
-			if saved != nil {
-				*a = *saved
-			}
 			for _, id := range marked {
 				delete(c.agentDelivered, id)
 			}
 			continue
+		}
+		if changed {
+			*live = *a
+			st.publishLocked()
+			if !retryAt.IsZero() {
+				c.agentRetry[a.ID] = retryAt
+			}
 		}
 		if len(pending) > 0 {
 			c.agentBusy[a.ID] = struct{}{}
@@ -1845,6 +1895,8 @@ func (c *Control) launchRun(ctx context.Context, d agentDispatch) {
 	if a == nil {
 		return
 	}
+	live := a
+	a = copyAgent(live)
 	run := findRun(a, d.req.Run)
 	if run == nil || run.State == proto.AgentRunDone {
 		return
@@ -1855,9 +1907,12 @@ func (c *Control) launchRun(ctx context.Context, d agentDispatch) {
 	}
 	ws := c.workspaces[a.WS]
 	var events []*proto.Event
+	st := c.stageApprovals()
+	var undeliver []string
+	var retryAt time.Time
 	if err != nil {
 		text := "launch: " + err.Error()
-		events = append(events, c.finishRunLocked(a, run, ws, "", "launch_failed", text, false)...)
+		events = append(events, c.finishRunLocked(st, a, run, ws, "", "launch_failed", text, false)...)
 		var pe *proto.Error
 		conflict := errors.As(err, &pe) && pe.Code == proto.CodeConflict
 		if !conflict {
@@ -1867,12 +1922,12 @@ func (c *Control) launchRun(ctx context.Context, d agentDispatch) {
 			if terr := transitionAgent(a.Status, proto.AgentFailed); terr == nil {
 				a.Status = proto.AgentFailed
 				a.StatusReason = text
-				c.dropInboxLocked(a)
+				undeliver = append(undeliver, dropInbox(a)...)
 				events = append(events, c.agentEvent(proto.EvAgentFailed, a, ws, "", d.node, map[string]any{"reason": text, "run": run.ID, "attempt": run.Attempt}))
-				metrics.AgentsFailed.Inc()
+				st.count(metrics.AgentsFailed)
 			}
 		} else {
-			c.agentRetry[a.ID] = c.now().Add(agentRetryBackoff)
+			retryAt = c.now().Add(agentRetryBackoff)
 		}
 	} else {
 		if res.Transcript != "" {
@@ -1880,7 +1935,7 @@ func (c *Control) launchRun(ctx context.Context, d agentDispatch) {
 			a.TranscriptSession = res.Transcript
 			a.TranscriptNode = d.node
 		}
-		metrics.AgentRunsStarted.Inc()
+		st.count(metrics.AgentRunsStarted)
 	}
 	more, terr := c.refreshAgentStatusLocked(a, "")
 	if terr != nil {
@@ -1888,8 +1943,17 @@ func (c *Control) launchRun(ctx context.Context, d agentDispatch) {
 	}
 	events = append(events, more...)
 	if len(events) > 0 || err == nil {
-		if perr := c.persistAgent(a, events...); perr != nil {
+		if perr := c.commitAgentRows(a, st.rows(), "", "", "", nil, nil, events); perr != nil {
 			c.logger.Error("persist agent", "agent", a.ID, "err", perr)
+			return
+		}
+		*live = *a
+		st.publishLocked()
+		for _, id := range undeliver {
+			delete(c.agentDelivered, id)
+		}
+		if !retryAt.IsZero() {
+			c.agentRetry[a.ID] = retryAt
 		}
 	}
 }

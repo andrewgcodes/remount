@@ -34,10 +34,28 @@ type Spec struct {
 
 // Node is provider inventory enriched with the control plane's current
 // assignment count. IdleSince is meaningful only when Workspaces is zero.
+// Workspaces and IdleSince are an observation taken before Reconcile runs;
+// Retirement is the authority that makes the observation safe to act on.
 type Node struct {
 	Machine    provision.Machine
 	Workspaces int
 	IdleSince  time.Time
+	Retirement Retirement
+}
+
+// Retirement is the control plane's claim fence for one node. Retire is
+// called immediately before the provider destroy: it re-checks the node
+// against current assignment state and, only if it is still idle, durably
+// blocks new claims and returns true. False means a claim won the race and
+// the node is no longer a victim. Release lifts the fence after a definite
+// provider failure; an ambiguous result keeps it, because the machine may be
+// gone. Retire must be idempotent for a node this pool already fenced.
+//
+// Implementations run under the control plane's own locks and must not call
+// the provider. A Node without a Retirement is never destroyed.
+type Retirement interface {
+	Retire(context.Context) (bool, error)
+	Release(context.Context) error
 }
 
 // EnrollmentSource mints one short-lived, single-use node token immediately
@@ -285,12 +303,34 @@ func (r *Reconciler) scaleDown(ctx context.Context, driver provision.Driver, spe
 		}
 		return strings.Compare(a.Machine.ID, b.Machine.ID)
 	})
-	victim := candidates[0]
-	if err := driver.Destroy(ctx, victim.Machine.ID); err != nil && !errors.Is(err, provision.ErrNotFound) {
-		return r.failed(st, ActionDestroyFailed, len(nodes), "idle", err)
+	for _, victim := range candidates {
+		if victim.Retirement == nil {
+			continue
+		}
+		fenced, err := victim.Retirement.Retire(ctx)
+		if err != nil {
+			return r.failed(st, ActionDestroyFailed, len(nodes), "retire", err)
+		}
+		if !fenced {
+			// The snapshot said idle; the control plane says a claim landed
+			// since. The node is not a victim any more. Try the next one.
+			continue
+		}
+		err = driver.Destroy(ctx, victim.Machine.ID)
+		if err != nil && !errors.Is(err, provision.ErrNotFound) {
+			if !provision.IsDestroyNotApplied(err) {
+				return r.failed(st, ActionDestroyFailed, len(nodes), "idle", err)
+			}
+			if releaseErr := victim.Retirement.Release(ctx); releaseErr != nil {
+				err = errors.Join(err, releaseErr)
+			}
+			return r.failed(st, ActionDestroyFailed, len(nodes), "idle", err)
+		}
+		st.failures, st.retryAt = 0, time.Time{}
+		return []Action{{Kind: ActionDestroyed, Machine: provision.CloneMachine(victim.Machine), From: len(nodes), To: len(nodes) - 1, Reason: "idle"}}, nil
 	}
 	st.failures, st.retryAt = 0, time.Time{}
-	return []Action{{Kind: ActionDestroyed, Machine: provision.CloneMachine(victim.Machine), From: len(nodes), To: len(nodes) - 1, Reason: "idle"}}, nil
+	return nil, nil
 }
 
 func (r *Reconciler) failed(st *state, kind string, count int, reason string, err error) ([]Action, error) {

@@ -17,6 +17,29 @@ import (
 // ErrNotFound means the provider no longer has the requested machine.
 var ErrNotFound = errors.New("provision: machine not found")
 
+// DestroyNotApplied marks a destroy failure that authoritatively proves the
+// provider did not delete or begin deleting the machine.
+type DestroyNotApplied struct {
+	Err error
+}
+
+func (e *DestroyNotApplied) Error() string { return e.Err.Error() }
+func (e *DestroyNotApplied) Unwrap() error { return e.Err }
+
+// MarkDestroyNotApplied records that err proves a destroy had no effect.
+func MarkDestroyNotApplied(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &DestroyNotApplied{Err: err}
+}
+
+// IsDestroyNotApplied reports whether the machine is known to have survived.
+func IsDestroyNotApplied(err error) bool {
+	var notApplied *DestroyNotApplied
+	return errors.As(err, &notApplied)
+}
+
 // Driver creates and destroys whole machines that run one Remount node.
 // Implementations must not retain or log Bootstrap.EnrollmentToken after
 // Create returns.
