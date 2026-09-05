@@ -5,6 +5,13 @@ description: Use when reviewing, hardening, diagnosing, or implementing Remount 
 
 # Remount hardening review
 
+`docs/using-remount.md` is the canonical user and coding-agent entry point.
+When a hardening change alters a command, recipe, provider, deployment,
+security behavior, file-transfer rule, diagnostic, or lifecycle outcome,
+update that guide and its linked detailed document in the same change. Run
+`make docs` and verify `make lint`; never edit generated `llms.txt` or
+`llms-full.txt` by hand.
+
 Treat Remount as an authority-transfer system, not merely a remote shell. A
 correct change must preserve the resource, its authoritative generation, its
 durable record, and the evidence an operator uses to distinguish success from

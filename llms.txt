@@ -22,6 +22,20 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/re
 - [Status](https://github.com/remount-dev/remount/blob/main/README.md#status): Working and tested: exec and pty sessions with replayable reconnect, workspace filesystem with server-side search and atomic edits, snapshots and cross-node moves, sleep and wake with durable timers, the credential broker, the claim queue with leases, the event log, port forwarding, and both `process` and `docker` backends.
 - [License](https://github.com/remount-dev/remount/blob/main/README.md#license): Apache-2.0.
 
+## Using Remount
+
+- [Choose the workflow](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#choose-the-workflow)
+- [Build and select a server](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#build-and-select-a-server): From a repository checkout:
+- [Run a coding agent on a checkout](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#run-a-coding-agent-on-a-checkout): The shortest local path is:
+- [Operate a durable Agent](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#operate-a-durable-agent): An Agent owns a workspace and a durable transcript.
+- [Retrieve modified files](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#retrieve-modified-files): Agent changes live in the workspace, not automatically in the original host checkout.
+- [Use workspace primitives directly](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#use-workspace-primitives-directly): Start a manual local deployment:
+- [Broker provider credentials](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#broker-provider-credentials): Provider keys belong in the server or node environment, never in a workspace or committed bindings file.
+- [Deploy the Modal reference](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#deploy-the-modal-reference): `deploy/modal_app.py` is a reference deployment of one control plane and one process-backend node in one Modal container.
+- [Provider-backed nodes are not credential checks](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#provider-backed-nodes-are-not-credential-checks): Fly, E2B, Modal, ix.dev, and SSH pool drivers create whole Remount nodes.
+- [Verify outcomes and clean up](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#verify-outcomes-and-clean-up): Use the resource state and durable evidence, not a successful client call alone:
+- [Documentation map and maintenance](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#documentation-map-and-maintenance): This guide owns the supported **user journeys** and links to their detailed contracts:
+
 ## Tutorial
 
 - [1. Build](https://github.com/remount-dev/remount/blob/main/docs/tutorial.md#1-build): Remount is one Go binary with no runtime dependencies.
