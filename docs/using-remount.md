@@ -88,7 +88,9 @@ Important behavior:
 - `--dir` uploads a Git-ignore-aware copy of the checkout. `.git` is included
   by default; use `--include-git=false` to omit it.
 - ACP-capable recipes run as durable Agents unless `--pty` is supplied.
-- `--sandbox` is `read-only`, `workspace-write` (default), or `full`.
+- `--sandbox` is `read-only`, `workspace-write` (default), or `full`. The
+  control plane applies the same default to API requests that omit `sandbox`;
+  child Agents inherit their parent's sandbox before that default is applied.
   Recipes apply their corresponding harness-native PTY flags and, when
   configured, ACP session mode before the first prompt.
 - `--approve` is `never` (default) or `on-request`.

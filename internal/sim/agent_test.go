@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -68,6 +69,17 @@ func simACPConfig(mode string) acptest.Config {
 		cfg.Turn = func(ctx context.Context, s *acptest.Session, req acp.PromptRequest) (acp.StopReason, error) {
 			env, _ := os.ReadFile(".remount/env")
 			return acp.StopReasonEndTurn, s.Text("env:" + strings.Join(os.Environ(), " ") + " file:" + string(env))
+		}
+	case "mode":
+		cfg.Modes = &acp.SessionModeState{
+			CurrentModeID: "default",
+			AvailableModes: []acp.SessionMode{
+				{ID: "default", Name: "Manual"},
+				{ID: "acceptEdits", Name: "Accept edits"},
+			},
+		}
+		cfg.Turn = func(ctx context.Context, s *acptest.Session, req acp.PromptRequest) (acp.StopReason, error) {
+			return acp.StopReasonEndTurn, s.Text("mode:" + string(s.Mode()))
 		}
 	}
 	return cfg
@@ -260,6 +272,44 @@ func TestAgentEndToEndTurnsAndTranscript(t *testing.T) {
 	got := waitAgent(t, ctx, c, a.ID, "destroyed", func(a *proto.Agent) bool { return a.Status == proto.AgentDestroyed })
 	if got.Status != proto.AgentDestroyed {
 		t.Fatalf("status = %s", got.Status)
+	}
+}
+
+func TestAgentOmittedSandboxAppliesWorkspaceWriteACPMode(t *testing.T) {
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("c1")
+	ctx := ctxT(t, 90*time.Second)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := c.CreateAgent(ctx, proto.AgentCreateReq{
+		Workspace: &proto.WorkspaceSpec{Name: "default-sandbox-ws"},
+		Spec: proto.AgentSpec{
+			Recipe: "claude",
+			Task:   "check mode",
+			RecipeYAML: fmt.Sprintf(`name: claude
+auth: workspace_resident
+command: ["unused"]
+acp:
+  command: [%q, %q, "mode"]
+  sandbox_modes:
+    workspace-write: acceptEdits
+`, exe, fakeACPArg),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Spec.Sandbox != proto.AgentSandboxWorkspaceWrite {
+		t.Fatalf("sandbox = %q, want workspace-write", a.Spec.Sandbox)
+	}
+	idle := waitAgent(t, ctx, c, a.ID, "workspace-write turn", func(a *proto.Agent) bool {
+		return len(a.Inbox) == 0 && (a.Status == proto.AgentIdle || a.Status == proto.AgentWaitingInput)
+	})
+	if tr := transcriptBytes(t, ctx, c, idle); !bytes.Contains(tr, []byte(`"text":"mode:acceptEdits"`)) {
+		t.Fatalf("transcript does not show workspace-write ACP mode: %s", tr)
 	}
 }
 
@@ -668,7 +718,7 @@ func TestAgentChildReportsToParent(t *testing.T) {
 		Workspace: &proto.WorkspaceSpec{Name: "parent-ws", Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Rules: []proto.EgressRule{{
 			ID: "docs", Protocol: proto.EgressProtocolHTTPS, Hosts: []string{"docs.example.com"}, Methods: []string{"GET"},
 		}}}}},
-		Spec:   proto.AgentSpec{Recipe: "custom", Task: "coordinate", ACPCommand: fakeACPCommand(t, "echo"), Sandbox: "read-only"},
+		Spec:   proto.AgentSpec{Recipe: "custom", Task: "coordinate", ACPCommand: fakeACPCommand(t, "echo"), Sandbox: proto.AgentSandboxReadOnly},
 		Policy: proto.AgentPolicy{Approve: proto.ApproveNever, MaxTurns: 4},
 	})
 	if err != nil {
@@ -701,7 +751,7 @@ func TestAgentChildReportsToParent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if child.Parent != parent.ID || child.Spec.Sandbox != "read-only" || child.WS == parent.WS {
+	if child.Parent != parent.ID || child.Spec.Sandbox != proto.AgentSandboxReadOnly || child.WS == parent.WS {
 		t.Fatalf("child = %+v", child)
 	}
 	if cws, err := c.GetWorkspace(ctx, child.WS); err != nil {

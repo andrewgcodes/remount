@@ -77,6 +77,13 @@ const (
 	AgentModePTY = "pty"
 )
 
+// AgentSpec.Sandbox values.
+const (
+	AgentSandboxReadOnly       = "read-only"
+	AgentSandboxWorkspaceWrite = "workspace-write"
+	AgentSandboxFull           = "full"
+)
+
 // Agent.Status values. The order here is the order a healthy agent moves
 // through them; sleeping, failed, finished and destroyed are the exits.
 const (

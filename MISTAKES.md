@@ -1382,10 +1382,37 @@ because Claude would otherwise rely on workspace-resident login. Instead, the
 CLI found the live `b_anthropic` binding, correctly selected key auth, created a
 real Agent, and waited until the package timeout.
 
-The test now gives `REMOUNT_DATA` an empty temporary directory, so its
-validation cases cannot inherit a developer's active standalone process or
-bindings.
+The first correction gave `REMOUNT_DATA` an empty temporary directory. A later
+verification run with an Anthropic key intentionally present exposed the other
+discovery path: the CLI synthesized `b_anthropic` directly from the provider
+environment. The test now also clears every preset provider-key variable, so
+its validation cases cannot inherit either persistent bindings or ambient
+credentials.
 
-**Lesson.** A validation test must isolate every local discovery input, not
-only environment variables. Persistent development state can turn a presumed
+**Lesson.** A validation test must isolate every local discovery input.
+Persistent development state and ambient credentials can each turn a presumed
 pre-dial error path into a real operation.
+
+---
+
+## 54. The CLI default did not protect direct Agent API requests
+
+The CLI initialized `--sandbox` to `workspace-write`, but `AgentSpec.Sandbox`
+is optional on the wire. A direct API client could omit it, leaving the
+persisted Agent with an empty sandbox. Recipe ACP mode lookup then found no
+mapping, so Claude retained the adapter's default mode instead of selecting
+`acceptEdits`.
+
+The control plane now validates sandbox values and normalizes an omitted value
+to `workspace-write` after parent inheritance and before idempotency,
+persistence, or dispatch. Sandbox constants live with the protocol Agent type
+and the launch package aliases them.
+
+**Proof.** A client-to-control-to-node simulation omits `sandbox`, observes the
+persisted `workspace-write` value, and sees the fake ACP harness receive
+`acceptEdits` before its first prompt. Control tests reject an unknown value,
+and the child-Agent simulation still inherits `read-only` from its parent.
+
+**Lesson.** A CLI default is not a protocol invariant. Normalize optional wire
+fields at the authoritative boundary before persisting or dispatching them,
+after applying any inheritance that should outrank the default.

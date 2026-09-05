@@ -406,7 +406,9 @@ Important behavior:
 - `--dir` uploads a Git-ignore-aware copy of the checkout. `.git` is included
   by default; use `--include-git=false` to omit it.
 - ACP-capable recipes run as durable Agents unless `--pty` is supplied.
-- `--sandbox` is `read-only`, `workspace-write` (default), or `full`.
+- `--sandbox` is `read-only`, `workspace-write` (default), or `full`. The
+  control plane applies the same default to API requests that omit `sandbox`;
+  child Agents inherit their parent's sandbox before that default is applied.
   Recipes apply their corresponding harness-native PTY flags and, when
   configured, ACP session mode before the first prompt.
 - `--approve` is `never` (default) or `on-request`.
@@ -2036,6 +2038,10 @@ agent from a recipe is:
   "policy": {"approve": "on-request", "max_turns": 50, "sleep_after_sec": 900}
 }
 ```
+
+`spec.sandbox` accepts `read-only`, `workspace-write`, or `full`. An omitted
+value is normalized to `workspace-write` before the Agent is persisted or
+dispatched. A child Agent first inherits an omitted sandbox from its parent.
 
 `ws` adopts an existing workspace instead of `workspace`. The task text goes
 into the inbox as the first message; events carry its hash, never the text.

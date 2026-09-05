@@ -2031,3 +2031,34 @@ documentation check, and cross-platform vetting. Four pending Agents created by
 the diagnostic reruns were explicitly destroyed, their owned workspaces were
 absent from the active workspace list, and the disposable standalone process
 was stopped.
+
+### Follow-up: omitted Agent sandbox normalization
+
+Automated review found that the CLI's `workspace-write` default did not cover
+direct `AgentCreateReq` clients, because `AgentSpec.Sandbox` is optional on the
+wire. The control plane now rejects unknown sandbox values and normalizes an
+omitted value to `workspace-write` after parent inheritance and before the
+Agent is persisted or dispatched.
+
+The regression was first observed against the unfixed code: the focused
+control test returned an empty persisted sandbox and the end-to-end simulation
+returned the same empty value before the harness turn. The fixed simulation
+uses the public Go client to omit `sandbox`, crosses the control plane and node,
+and observes `acceptEdits` in the fake ACP session before the first prompt.
+Existing child-Agent coverage confirms an omitted child sandbox still inherits
+the parent's explicit `read-only` value.
+
+The review verification also exposed a second source of nondeterminism in
+`TestRunValidatesBeforeDialing`: an intentionally provisioned provider key lets
+the CLI synthesize a default binding even when `REMOUNT_DATA` points at an
+empty directory. The test now clears every preset provider-key environment
+variable as well as isolating local data, so its pre-dial validation cases do
+not depend on the developer's credentials. Ten focused ordinary repetitions
+and five race-detector repetitions passed with the Anthropic key still
+provisioned outside the test.
+
+After that correction, an isolated full `make verify` run passed all 17
+portable local gates. The ordinary suite completed in 423 seconds, the race
+lane in 679 seconds, serialized conformance in 352 seconds, and bounded
+fuzzing in 87 seconds. Native macOS and Windows runtime lanes remain CI-only;
+their cross-platform vet gates passed locally.
