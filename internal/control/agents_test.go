@@ -1175,8 +1175,10 @@ func (af *agentFixture) parkRaw(t *testing.T, a *proto.Agent, run proto.AgentRun
 	ws := af.c.workspaces[live.WS]
 	kind := ap.Kind
 	ap.Kind = proto.ApprovalToolCall
-	events, err := af.c.parkApprovalLocked(live, r, ws, "n_one", &ap)
+	st := af.c.stageApprovals()
+	events, err := st.park(live, r, ws, "n_one", &ap)
 	if err == nil {
+		st.publishDirtyLocked()
 		af.c.approvals[ap.ID].Kind = kind
 		af.c.markApprovalDirty(af.c.approvals[ap.ID])
 		var more []*proto.Event

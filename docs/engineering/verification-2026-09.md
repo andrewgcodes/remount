@@ -1812,3 +1812,88 @@ No public output was published. **Status: implementation and post-upstream
 race/conformance compatibility verification complete; committed-candidate
 aggregate and built-binary conformance remain to be rerun after the final
 commit.**
+
+### Consolidated September 4 remediation candidate, 2026-09-05
+
+PR #24 combined the independently reproduced RMR-001 through RMR-012
+remediations on `origin/main` `7542a236e9cefef180237efd0df58381f104fdfd`.
+The first exact provider candidate was
+`5ac47ed07a70be53c1222f50c55477bf1af1c232`; a Fly API compatibility fix
+produced `b092578`, secret-version and lifecycle fixes produced `10c6198`, and
+explicit Fly process-secret selection produced final candidate `b30699a`.
+
+**Modal — verified but bounded on `5ac47ed`.** The named deployment
+`remount-pr24-5ac47ed` reported an online node running `5ac47ed`. A disposable
+Git repository was uploaded to a workspace, OpenCode used brokered OpenAI
+access, and a relative-path retry created `RESULT.txt` with the expected
+content. Pulling the workspace recovered the file locally. The event stream
+contained `cred.used` and `egress.allowed`; `doctor --deep --json` reported
+`ok: true` with tenant-residency explicitly unavailable because that reference
+deployment has no tenant authority. The agent was destroyed.
+
+**E2B — verified but bounded on `5ac47ed`.** A custom 2 GiB sandbox ran the
+exact binary, accepted a process-backed workspace, executed a command, and
+returned inspect and deep-diagnostic output. Workspace and sandbox destruction
+completed; the provider sandbox was no longer connectable and the node became
+offline after lease expiry. The default 512 MiB E2B sandbox remains
+insufficient for installing and running OpenCode.
+
+**ix.dev — unavailable before Remount readiness on `5ac47ed`.** Two VM boots
+failed in provider infrastructure before a usable VM existed. The observed
+errors included VMM worker startup, virtio-blk root-device, CAS-fold, and page
+writeback failures. Cleanup verification showed zero remaining ix VMs. This is
+not a Remount pass.
+
+**Fly — authenticated exact-candidate readiness verified on `b30699a`.**
+The first live run exposed that the driver sent `timeout=120` to Fly's Machine
+wait endpoint, whose documented and observed maximum is 60 seconds; Fly
+returned HTTP 400. `b092578` sets and enforces a one-minute maximum, and the
+exact integration lifecycle then created, listed, destroyed, and verified
+absence of a Machine in 17 seconds.
+
+The first authenticated-readiness runs then exposed three distinct boundaries:
+launch was not fenced to the version returned by Fly's app-secrets API; the
+driver removed the enrollment secret after provider `started`, before the
+guest process consumed it; and a unique process-secret reference was accepted
+but not injected without explicit app-secret selection. `723b4e1` added
+`min_secrets_version`, `10c6198` retained the unique secret until Machine
+destruction, and `b30699a` set `ignore_app_secrets: true` while mapping only
+that unique secret to `REMOUNT_ENROLL_TOKEN`.
+
+The repository integration test ran the exact `b30699a` binary from the named
+Modal binary endpoint against Fly app `remount-pr24-9f4daf1`:
+
+```sh
+go test -tags integration -count=1 -v \
+  -run '^TestLiveProvisionerEnrollmentReadiness$' \
+  -timeout 240s ./internal/provision/fly
+```
+
+It passed in 26.24 seconds after observing a new authenticated, online Fly node
+with version `b30699a` and a successful node diagnostic. The control-plane
+event stream recorded `node.enrolled`, `node.online`, then `node.offline`;
+provider logs recorded the node starting and establishing its uplink.
+`doctor --deep --json` reported `ok: true`. Deferred teardown removed the
+Machine and its unique app secret; subsequent provider inventory contained
+zero Machines and the app-secret list was empty.
+
+The generic provider `started` result still is not the readiness authority:
+the pool/controller layer must continue to require authenticated Remount
+enrollment before treating a provisioned node as usable.
+
+**Final local candidate gates — verified on `b30699a`.** `make lint`,
+`make test`, `make race`, `make conformance`, `make public-api`,
+`make fuzz FUZZTIME=5s`, `go mod verify`, `go mod tidy -diff`, `make dist`,
+and `git diff --check` passed. The ordinary simulation package completed in
+290.272 seconds, the full race simulation package in 394.367 seconds, and the
+serialized conformance simulation package in 244.382 seconds. Distribution
+produced Linux, macOS, and Windows binaries for amd64 and arm64.
+
+PR checks reported seventeen failures, but attempts to fetch representative
+job logs returned Azure `BlobNotFound`; the repository owner reported that the
+organization had exhausted its GitHub Actions minutes. Those CI results remain
+unavailable evidence rather than local or live-test failures, and they are not
+reported as passing.
+
+No credential values were written to this ledger, repositories, workspaces, or
+provider logs by the test harnesses.

@@ -22,6 +22,14 @@ const (
 	maxSessionLogChunkBytes        = 1 << 20
 )
 
+// sessionLogAdmission is one reserved tenant slot for a new session whose
+// first commit is in flight. refs counts concurrent commits for the same
+// session sharing the slot; the slot is released when the last one ends.
+type sessionLogAdmission struct {
+	tenant string
+	refs   int
+}
+
 func cloneSessionLogRecord(record *proto.SessionLogRecord) *proto.SessionLogRecord {
 	if record == nil {
 		return nil
@@ -99,42 +107,183 @@ func sameSessionLogRecord(existing, replacement *proto.SessionLogRecord) bool {
 	return bytes.Equal(proto.MustMarshal(a), proto.MustMarshal(b))
 }
 
+// sessionLogPublication is the in-flight state one sessionLogCommit holds
+// between admission and its durable commit: the tenant slot it reserved for a
+// new session, and the segment artifacts it pinned as GC roots while they are
+// verified outside c.mu. Both are process-local; a restart has no in-flight
+// commits, and committed rows are reconstructed by loadSessionLogs.
+type sessionLogPublication struct {
+	tenant    string
+	session   string
+	admitted  bool
+	artifacts []string
+}
+
+// sessionLogAdmitLocked reserves what a commit needs before verification runs
+// outside the lock. For a new session it takes one tenant slot, counting both
+// committed rows and other reserved slots, so two concurrent new sessions can
+// never both pass the check. It pins every not-yet-referenced segment so a
+// GC pass between verification and commit sees the artifact as a root. It
+// returns used and false when the tenant limit is reached, and an error when
+// another tenant is already publishing the same session id, since a session
+// belongs to exactly one tenant and must never share its slot across tenants.
+func (c *Control) sessionLogAdmitLocked(tenant, session string, isNew bool, artifacts []string) (*sessionLogPublication, int, bool, error) {
+	publication := &sessionLogPublication{tenant: tenant, session: session}
+	if isNew {
+		admission := c.sessionLogAdmissions[session]
+		if admission != nil && admission.tenant != tenant {
+			return nil, 0, false, proto.Err(proto.CodeConflict, "session log %s is being published by another tenant", session)
+		}
+		if admission == nil {
+			used := 0
+			for _, record := range c.sessionLogs {
+				if record.Tenant == tenant {
+					used++
+				}
+			}
+			for otherSession, other := range c.sessionLogAdmissions {
+				if other.tenant == tenant && c.sessionLogs[otherSession] == nil {
+					used++
+				}
+			}
+			if used >= c.opts.MaxSessionLogsPerTenant {
+				return nil, used, false, nil
+			}
+			admission = &sessionLogAdmission{tenant: tenant}
+			c.sessionLogAdmissions[session] = admission
+		}
+		admission.refs++
+		publication.admitted = true
+	}
+	pins := c.sessionLogPins[tenant]
+	if pins == nil && len(artifacts) > 0 {
+		pins = map[string]int{}
+		c.sessionLogPins[tenant] = pins
+	}
+	for _, id := range artifacts {
+		pins[id]++
+	}
+	publication.artifacts = append([]string(nil), artifacts...)
+	return publication, 0, true, nil
+}
+
+// sessionLogReleaseLocked ends a publication on every terminal path. On
+// success the caller has already installed the record, so its segments stay
+// roots through c.sessionLogs and its slot is now a committed row; on failure
+// the slot and pins simply return. Both happen in the same critical section
+// as the outcome, so there is no interval where a segment is unrooted or a
+// slot is double-counted.
+func (c *Control) sessionLogReleaseLocked(publication *sessionLogPublication) {
+	if publication == nil {
+		return
+	}
+	if publication.admitted {
+		if admission := c.sessionLogAdmissions[publication.session]; admission != nil {
+			admission.refs--
+			if admission.refs <= 0 {
+				delete(c.sessionLogAdmissions, publication.session)
+			}
+		}
+	}
+	pins := c.sessionLogPins[publication.tenant]
+	for _, id := range publication.artifacts {
+		if pins[id] <= 1 {
+			delete(pins, id)
+		} else {
+			pins[id]--
+		}
+	}
+	if len(pins) == 0 {
+		delete(c.sessionLogPins, publication.tenant)
+	}
+	publication.admitted, publication.artifacts = false, nil
+}
+
+func (c *Control) sessionLogRelease(publication *sessionLogPublication) {
+	c.mu.Lock()
+	c.sessionLogReleaseLocked(publication)
+	c.mu.Unlock()
+}
+
+// sessionLogCommit publishes a session's segment references on behalf of the
+// workspace's current holder.
+//
+// Authority: the control plane, acting for the node that holds req.Workspace
+// at req.Generation. Resource: the verified segment blobs and one tenant
+// retained-record slot. Irreversible action: GC unlinking a blob the record
+// will name, or accepting a row past MaxSessionLogsPerTenant. Fence: the
+// slot is reserved and the new segments pinned as GC roots under c.mu before
+// verification leaves the lock; the session_logs row and its event commit in
+// one transaction while the reservation is still held, and the reservation
+// is released in that same critical section. Postcondition: a committed
+// record's bytes are present, the tenant never holds more than its limit,
+// and any failure leaves no row, no event, no pin and no reserved slot.
 func (c *Control) sessionLogCommit(ctx context.Context, node string, req *proto.SessionLogCommitReq) (*proto.SessionLogRecord, error) {
 	if req.Session == "" || req.Workspace == "" || req.Generation == 0 || req.Principal == "" || req.Kind == "" {
 		return nil, proto.Err(proto.CodeBadRequest, "session log commit omits identity metadata")
 	}
 	c.mu.Lock()
 	workspace := c.workspaces[req.Workspace]
-	var authority proto.Workspace
-	if workspace != nil {
-		authority = *workspace
-	}
-	existing := cloneSessionLogRecord(c.sessionLogs[req.Session])
-	used := 0
-	if existing == nil {
-		for _, candidate := range c.sessionLogs {
-			if candidate.Tenant == authority.Tenant {
-				used++
-			}
-		}
-	}
-	c.mu.Unlock()
 	if workspace == nil {
+		c.mu.Unlock()
 		return nil, proto.Err(proto.CodeNotFound, "workspace %s", req.Workspace)
 	}
+	authority := *workspace
 	if authority.Node != node || authority.Generation != req.Generation || !held(authority.State) {
+		c.mu.Unlock()
 		return nil, proto.Err(proto.CodeConflict, "stale session log producer for %s", req.Workspace)
 	}
+	existing := cloneSessionLogRecord(c.sessionLogs[req.Session])
 	record := &proto.SessionLogRecord{
 		Session: req.Session, Workspace: req.Workspace, Tenant: authority.Tenant,
 		Principal: req.Principal, Kind: req.Kind, Info: req.Info, Exit: req.Exit, MaxChunk: req.MaxChunk,
 		Segments: append([]proto.SessionLogSegment(nil), req.Segments...), Complete: req.Complete,
 		UpdatedAt: c.now().UnixMilli(),
 	}
+	if record.Complete && (record.Info.ID != record.Session || record.Info.WS != record.Workspace) {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeBadRequest, "complete session log omits matching session info")
+	}
+	if err := validateSessionLogRecord(record); err != nil {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeBadRequest, "invalid session log record: %v", err)
+	}
+	if existing != nil && existing.Complete && sameSessionLogRecord(existing, record) {
+		c.mu.Unlock()
+		return cloneSessionLogRecord(existing), nil
+	}
+	if existing != nil && (existing.Workspace != record.Workspace || existing.Tenant != record.Tenant || existing.Principal != record.Principal || existing.Kind != record.Kind || existing.MaxChunk != record.MaxChunk || existing.Complete || !sessionLogPrefix(existing.Segments, record.Segments)) {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "session log replacement is not a monotonic continuation")
+	}
+	verifiedFrom := 0
+	if existing != nil {
+		verifiedFrom = len(existing.Segments)
+	}
+	pending := record.Segments[verifiedFrom:]
+	artifacts := make([]string, 0, len(pending))
+	for _, segment := range pending {
+		artifacts = append(artifacts, segment.Artifact)
+	}
+	publication, used, admitted, err := c.sessionLogAdmitLocked(authority.Tenant, req.Session, existing == nil, artifacts)
+	if err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	if !admitted {
+		limit := c.opts.MaxSessionLogsPerTenant
+		event := c.newEvent(proto.EvQuotaExceeded, req.Session, req.Principal, node, map[string]any{
+			"resource": "session_logs", "scope": "tenant", "workspace": req.Workspace, "used": used, "limit": limit,
+		})
+		event.Tenant = authority.Tenant
+		c.mu.Unlock()
+		metrics.SessionLogQuotaRejected.Inc()
+		c.appendAudit(ctx, event)
+		return nil, proto.Err(proto.CodeResourceExhausted, "tenant session log record limit %d reached", limit)
+	}
+	c.mu.Unlock()
+
 	if record.Complete {
-		if record.Info.ID != record.Session || record.Info.WS != record.Workspace {
-			return nil, proto.Err(proto.CodeBadRequest, "complete session log omits matching session info")
-		}
 		retention := c.opts.SessionLogRetention
 		if c.opts.Tenants != nil {
 			if tenantValue, err := c.opts.Tenants.Get(ctx, authority.Tenant); err == nil && tenantValue.Policy.Retention.SessionLogs > 0 {
@@ -143,46 +292,36 @@ func (c *Control) sessionLogCommit(ctx context.Context, node string, req *proto.
 		}
 		record.ExpiresAt = c.now().Add(retention).UnixMilli()
 	}
-	if err := validateSessionLogRecord(record); err != nil {
-		return nil, proto.Err(proto.CodeBadRequest, "invalid session log record: %v", err)
-	}
-	if existing != nil && existing.Complete && sameSessionLogRecord(existing, record) {
-		return cloneSessionLogRecord(existing), nil
-	}
-	if existing == nil {
-		if used >= c.opts.MaxSessionLogsPerTenant {
-			return nil, proto.Err(proto.CodeResourceExhausted, "tenant session log record limit %d reached", c.opts.MaxSessionLogsPerTenant)
-		}
-	} else if existing.Workspace != record.Workspace || existing.Tenant != record.Tenant || existing.Principal != record.Principal || existing.Kind != record.Kind || existing.MaxChunk != record.MaxChunk || existing.Complete || !sessionLogPrefix(existing.Segments, record.Segments) {
-		return nil, proto.Err(proto.CodeConflict, "session log replacement is not a monotonic continuation")
-	}
 	store, err := c.artifactStoreForTenant(authority.Tenant)
 	if err != nil {
+		c.sessionLogRelease(publication)
 		return nil, proto.Err(proto.CodeUnsupported, "session log storage is unavailable")
 	}
-	// Verify outside c.mu; the generation is revalidated below before commit.
-	verifiedFrom := 0
-	if existing != nil {
-		verifiedFrom = len(existing.Segments)
-	}
-	for _, segment := range record.Segments[verifiedFrom:] {
+	// Verify outside c.mu; the pins taken above keep these segments as GC
+	// roots meanwhile, and the generation is revalidated below before commit.
+	for _, segment := range pending {
 		if err := ctx.Err(); err != nil {
+			c.sessionLogRelease(publication)
 			return nil, err
 		}
 		if err := store.Verify(segment.Artifact); err != nil {
+			c.sessionLogRelease(publication)
 			return nil, proto.Err(proto.CodeConflict, "session log segment is unavailable: %v", err)
 		}
 		r, size, err := store.Open(segment.Artifact)
 		if err != nil {
+			c.sessionLogRelease(publication)
 			return nil, proto.Err(proto.CodeConflict, "session log segment is unavailable: %v", err)
 		}
 		closeErr := r.Close()
 		if closeErr != nil || size != segment.Bytes {
+			c.sessionLogRelease(publication)
 			return nil, proto.Err(proto.CodeConflict, "session log segment size mismatch")
 		}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	defer c.sessionLogReleaseLocked(publication)
 	workspace = c.workspaces[req.Workspace]
 	if workspace == nil || workspace.Node != node || workspace.Generation != req.Generation || !held(workspace.State) || workspace.Tenant != authority.Tenant {
 		return nil, proto.Err(proto.CodeConflict, "session log authority changed during verification")
@@ -297,6 +436,9 @@ func (c *Control) pruneSessionLogsLocked(ids []string) int {
 	return len(records)
 }
 
+// sessionLogReferencesLocked reports every segment a committed record names
+// plus every segment an in-flight publication has verified or is verifying,
+// so reference-aware GC never unlinks bytes a commit is about to reference.
 func (c *Control) sessionLogReferencesLocked(add func(string, string)) {
 	ids := make([]string, 0, len(c.sessionLogs))
 	for id := range c.sessionLogs {
@@ -307,6 +449,21 @@ func (c *Control) sessionLogReferencesLocked(add func(string, string)) {
 		record := c.sessionLogs[id]
 		for _, segment := range record.Segments {
 			add(record.Tenant, segment.Artifact)
+		}
+	}
+	tenants := make([]string, 0, len(c.sessionLogPins))
+	for tenant := range c.sessionLogPins {
+		tenants = append(tenants, tenant)
+	}
+	sort.Strings(tenants)
+	for _, tenant := range tenants {
+		pinned := make([]string, 0, len(c.sessionLogPins[tenant]))
+		for id := range c.sessionLogPins[tenant] {
+			pinned = append(pinned, id)
+		}
+		sort.Strings(pinned)
+		for _, id := range pinned {
+			add(tenant, id)
 		}
 	}
 }

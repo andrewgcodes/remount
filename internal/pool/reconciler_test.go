@@ -28,6 +28,7 @@ type fakeDriver struct {
 	destroys    []string
 	createErr   error
 	destroyErr  error
+	destroyHook func(string) error
 	createBlock chan struct{}
 	inventory   []provision.Machine
 }
@@ -49,6 +50,9 @@ func (f *fakeDriver) Destroy(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.destroys = append(f.destroys, id)
+	if f.destroyHook != nil {
+		return f.destroyHook(id)
+	}
 	return f.destroyErr
 }
 func (f *fakeDriver) List(context.Context, provision.ListOptions) ([]provision.Machine, error) {
@@ -149,14 +153,46 @@ func TestVisibleBootingMachineSatisfiesRepeatedDemand(t *testing.T) {
 	}
 }
 
+// fakeFence is a Retirement whose answer the test scripts. It records the
+// order of Retire and Release calls relative to the provider destroy.
+type fakeFence struct {
+	mu       sync.Mutex
+	fenced   bool
+	retireOK bool
+	calls    []string
+}
+
+func (f *fakeFence) Retire(context.Context) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "retire")
+	f.fenced = f.retireOK
+	return f.retireOK, nil
+}
+
+func (f *fakeFence) Release(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "release")
+	f.fenced = false
+	return nil
+}
+
+func (f *fakeFence) snapshot() (bool, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fenced, append([]string(nil), f.calls...)
+}
+
 func TestIdleScaleDownNeverDestroysActiveNode(t *testing.T) {
 	now := time.Unix(1000, 0)
 	driver, tokens := &fakeDriver{}, &fakeTokens{}
 	r, _ := New([]provision.Driver{driver}, tokens, Options{Now: func() time.Time { return now }})
 	spec := testSpec()
+	fence := &fakeFence{retireOK: true}
 	nodes := []Node{
-		{Machine: ownedMachine("active"), Workspaces: 1, IdleSince: now.Add(-time.Hour)},
-		{Machine: ownedMachine("idle"), IdleSince: now.Add(-time.Hour)},
+		{Machine: ownedMachine("active"), Workspaces: 1, IdleSince: now.Add(-time.Hour), Retirement: &fakeFence{retireOK: true}},
+		{Machine: ownedMachine("idle"), IdleSince: now.Add(-time.Hour), Retirement: fence},
 	}
 	actions, err := r.Reconcile(context.Background(), spec, nodes, 0)
 	if err != nil {
@@ -164,6 +200,87 @@ func TestIdleScaleDownNeverDestroysActiveNode(t *testing.T) {
 	}
 	if len(actions) != 1 || actions[0].Kind != ActionDestroyed || actions[0].Machine.ID != "idle" {
 		t.Fatalf("actions = %#v", actions)
+	}
+	if fenced, calls := fence.snapshot(); !fenced || len(calls) != 1 || calls[0] != "retire" {
+		t.Fatalf("fence after a successful destroy: fenced=%v calls=%v; the fence must outlive the destroy until inventory confirms it", fenced, calls)
+	}
+}
+
+func TestIdleScaleDownSkipsANodeTheFenceRefuses(t *testing.T) {
+	now := time.Unix(1000, 0)
+	driver, tokens := &fakeDriver{}, &fakeTokens{}
+	r, _ := New([]provision.Driver{driver}, tokens, Options{Now: func() time.Time { return now }})
+	claimed := &fakeFence{retireOK: false}
+	nodes := []Node{
+		{Machine: ownedMachine("claimed"), IdleSince: now.Add(-2 * time.Hour), Retirement: claimed},
+		{Machine: ownedMachine("unfenced"), IdleSince: now.Add(-time.Hour)},
+	}
+	actions, err := r.Reconcile(context.Background(), testSpec(), nodes, 0)
+	if err != nil || len(actions) != 0 {
+		t.Fatalf("actions=%#v err=%v", actions, err)
+	}
+	driver.mu.Lock()
+	destroys := append([]string(nil), driver.destroys...)
+	driver.mu.Unlock()
+	if len(destroys) != 0 {
+		t.Fatalf("destroys = %v: a node the control plane would not fence, or one without a fence, was destroyed", destroys)
+	}
+}
+
+func TestOnlyAuthoritativeDestroyRejectionReleasesTheFence(t *testing.T) {
+	now := time.Unix(1000, 0)
+	for _, tc := range []struct {
+		name   string
+		err    error
+		fenced bool
+		calls  []string
+	}{
+		{"authoritative rejection", provision.MarkDestroyNotApplied(errors.New("quota exceeded")), false, []string{"retire", "release"}},
+		{"unclassified failure", errors.New("provider failed"), true, []string{"retire"}},
+		{"timeout", errors.Join(errors.New("gateway timeout"), context.DeadlineExceeded), true, []string{"retire"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			driver, tokens := &fakeDriver{destroyErr: tc.err}, &fakeTokens{}
+			r, _ := New([]provision.Driver{driver}, tokens, Options{Now: func() time.Time { return now }})
+			fence := &fakeFence{retireOK: true}
+			nodes := []Node{{Machine: ownedMachine("idle"), IdleSince: now.Add(-time.Hour), Retirement: fence}}
+			actions, err := r.Reconcile(context.Background(), testSpec(), nodes, 0)
+			if err == nil || len(actions) != 1 || actions[0].Kind != ActionDestroyFailed {
+				t.Fatalf("actions=%#v err=%v", actions, err)
+			}
+			fenced, calls := fence.snapshot()
+			if fenced != tc.fenced || len(calls) != len(tc.calls) {
+				t.Fatalf("fenced=%v calls=%v, want fenced=%v calls=%v", fenced, calls, tc.fenced, tc.calls)
+			}
+			for i := range calls {
+				if calls[i] != tc.calls[i] {
+					t.Fatalf("calls=%v, want %v", calls, tc.calls)
+				}
+			}
+		})
+	}
+}
+
+func TestLostDestroyResponseKeepsTheRetirementFence(t *testing.T) {
+	now := time.Unix(1000, 0)
+	deleted := false
+	driver := &fakeDriver{destroyHook: func(string) error {
+		deleted = true
+		return errors.New("provider transport failed")
+	}}
+	r, _ := New([]provision.Driver{driver}, &fakeTokens{}, Options{Now: func() time.Time { return now }})
+	fence := &fakeFence{retireOK: true}
+	nodes := []Node{{Machine: ownedMachine("idle"), IdleSince: now.Add(-time.Hour), Retirement: fence}}
+
+	actions, err := r.Reconcile(context.Background(), testSpec(), nodes, 0)
+	if err == nil || len(actions) != 1 || actions[0].Kind != ActionDestroyFailed {
+		t.Fatalf("actions=%#v err=%v", actions, err)
+	}
+	if !deleted {
+		t.Fatal("destroy did not take effect before its response was lost")
+	}
+	if fenced, calls := fence.snapshot(); !fenced || len(calls) != 1 || calls[0] != "retire" {
+		t.Fatalf("fenced=%v calls=%v, want the retirement fence retained", fenced, calls)
 	}
 }
 

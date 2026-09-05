@@ -17,8 +17,9 @@ type blockingPoolController struct {
 	entered chan string
 	release chan struct{}
 
-	mu    sync.Mutex
-	calls []string
+	mu     sync.Mutex
+	calls  []string
+	forgot int
 }
 
 func (b *blockingPoolController) block(call string) {
@@ -42,7 +43,11 @@ func (b *blockingPoolController) Reconcile(context.Context, nodepool.Spec, []nod
 	return nil, nil
 }
 
-func (*blockingPoolController) Forget(nodepool.Spec) {}
+func (b *blockingPoolController) Forget(nodepool.Spec) {
+	b.mu.Lock()
+	b.forgot++
+	b.mu.Unlock()
+}
 
 // TestPoolReconcileNeverHoldsControlAuthorityAcrossAProviderCall is Plan B's
 // B10. A provider call is a network call to somebody else's service: it can be
@@ -116,5 +121,56 @@ func TestPoolReconcileNeverHoldsControlAuthorityAcrossAProviderCall(t *testing.T
 	provider.mu.Unlock()
 	if len(calls) == 0 {
 		t.Fatal("the provider was never called")
+	}
+}
+
+func TestPoolRemoveRejectsAnInFlightReconciliation(t *testing.T) {
+	provider := &blockingPoolController{entered: make(chan string, 4), release: make(chan struct{})}
+	f := newControlFixture(t, "", func(opts *Options) {
+		opts.PoolReconciler = provider
+		opts.PoolBootstrap = PoolBootstrap{ServerURL: "https://control.example", BinaryURL: "https://control.example/remount", DataDir: "/var/lib/remount"}
+	})
+	subject := Subject{ID: "owner", Tenant: "tenant-a", Roles: []string{"tenant_admin"}}
+	if _, err := f.c.poolCreate(context.Background(), subject, &proto.PoolCreateReq{Spec: proto.PoolSpec{
+		Name: "iad", Vendor: "fake", Max: 1, Backend: "process",
+	}, IdempotencyKey: "pool-create"}); err != nil {
+		t.Fatal(err)
+	}
+
+	f.c.reconcilePoolsAsync()
+	select {
+	case <-provider.entered:
+	case <-time.After(10 * time.Second):
+		close(provider.release)
+		t.Fatal("pool reconciliation never reached the provider")
+	}
+
+	err := f.c.poolRemove(context.Background(), subject, &proto.PoolRemoveReq{
+		Name: "iad", IdempotencyKey: "remove-in-flight",
+	})
+	if !isCode(err, proto.CodeConflict) {
+		close(provider.release)
+		t.Fatalf("remove during reconciliation = %v, want conflict", err)
+	}
+	provider.mu.Lock()
+	forgot := provider.forgot
+	provider.mu.Unlock()
+	if forgot != 0 {
+		close(provider.release)
+		t.Fatalf("reconciler forgotten during in-flight provider work: %d", forgot)
+	}
+
+	close(provider.release)
+	f.c.poolWG.Wait()
+	if err := f.c.poolRemove(context.Background(), subject, &proto.PoolRemoveReq{
+		Name: "iad", IdempotencyKey: "remove-after-reconcile",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	provider.mu.Lock()
+	forgot = provider.forgot
+	provider.mu.Unlock()
+	if forgot != 1 {
+		t.Fatalf("reconciler forget calls=%d, want 1", forgot)
 	}
 }

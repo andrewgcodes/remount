@@ -22,8 +22,8 @@ make cover    # coverage summary
 make dist     # linux/darwin × amd64/arm64 static binaries in dist/
 make demo     # remount standalone on 127.0.0.1:7443
 
-make verify       # every gate CI runs, locally — run this before pushing
-make verify-fast  # the same without the race lane and conformance
+make verify       # every ci.yml gate, locally — run this before pushing
+make verify-fast  # the same without the race lane and conformance; reported as a subset
 ```
 
 **Verify locally before you push.** This repository is private, so Actions
@@ -34,7 +34,12 @@ job at 2x. A push that fails CI costs minutes and teaches nothing that
 darwin, linux and windows, the lock-discipline lint, the suite, `make dist`,
 `go mod verify`/`tidy -diff`, staticcheck, govulncheck, the seeded fuzz corpus,
 the race lane and conformance — reporting every gate rather than stopping at
-the first, so one run replaces a bisect through six pushes.
+the first, so one run replaces a bisect through six pushes. The suite gate
+runs both Go modules, as `make test` does. An analyzer that is not installed
+is reported unavailable and the run exits 2 as incomplete rather than passing,
+and only the full set may say "safe to push"; `verify-fast` and named gates
+report which subset they covered. The other workflows (SDKs, web, isolation,
+KVM, vendors, MinIO, MCP, release) are not mirrored.
 
 Cross-vetting all three `GOOS` values matters more than it looks: the Windows
 lane has caught defects a darwin-only vet cannot see, including tests that

@@ -54,6 +54,26 @@ func (c *Control) loadPools() error {
 	return rows.Err()
 }
 
+// loadPoolRetirements restores scale-down fences committed before a restart.
+// A fenced node stays unclaimable until provider inventory shows whether its
+// destroy took effect; the in-flight goroutine that held it died with the
+// process, but the provider call it made may not have.
+func (c *Control) loadPoolRetirements() error {
+	rows, err := c.db.Query(`SELECT node, tenant, pool, machine FROM pool_retirements`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var node, tenant, pool, machine string
+		if err := rows.Scan(&node, &tenant, &pool, &machine); err != nil {
+			return err
+		}
+		c.poolRetiring[node] = poolRetirement{Pool: poolKey(tenant, pool), Machine: machine, Node: node}
+	}
+	return rows.Err()
+}
+
 func (c *Control) poolCreate(ctx context.Context, subject Subject, req *proto.PoolCreateReq) (*proto.Pool, error) {
 	if err := proto.ValidatePoolSpec(req.Spec); err != nil {
 		return nil, err
@@ -160,9 +180,23 @@ func (c *Control) poolRemove(ctx context.Context, subject Subject, req *proto.Po
 		c.mu.Unlock()
 		return proto.Err(proto.CodeConflict, "pool %q changed during removal", req.Name)
 	}
+	if c.poolBusy[key] {
+		c.mu.Unlock()
+		return proto.Err(proto.CodeConflict, "pool %q is reconciling; retry removal", req.Name)
+	}
 	if current.Current != 0 {
 		c.mu.Unlock()
 		return proto.Err(proto.CodeConflict, "pool %q still owns %d machines", req.Name, current.Current)
+	}
+	// A retirement fence outlives its destroy until inventory no longer lists
+	// the machine. Removing the pool would remove the only reconciler that can
+	// confirm that, so the fence must resolve first; the node stays unclaimable
+	// meanwhile and the removal is retryable.
+	for node, fence := range c.poolRetiring {
+		if fence.Pool == key {
+			c.mu.Unlock()
+			return proto.Err(proto.CodeConflict, "pool %q is still retiring node %s; retry after its machine leaves provider inventory", req.Name, node)
+		}
 	}
 	if err := c.transact(func(tx *eventlog.Tx) error {
 		if _, err := tx.Exec(`DELETE FROM pools WHERE tenant=? AND name=?`, pool.Tenant, pool.Spec.Name); err != nil {

@@ -115,6 +115,16 @@ func (c *Control) loadAgents() error {
 // approvals the same change touched (c.dirtyApprovals), with the events and
 // optional mutation record, in one SQLite transaction. Caller holds c.mu.
 func (c *Control) persistAgentRows(a *proto.Agent, scope, key, op string, request, result any, events ...*proto.Event) error {
+	return c.commitAgentRows(a, nil, scope, key, op, request, result, events)
+}
+
+// commitAgentRows writes the agent row, the approvals the change touched and
+// its events in one transaction. Approvals arrive two ways: rows a caller
+// already applied to the live map and left in c.dirtyApprovals, and staged
+// private copies (approvalStage) the caller publishes only if this commit
+// succeeds. Staged rows are written last so they win over a stale dirty row
+// for the same id. Caller holds c.mu.
+func (c *Control) commitAgentRows(a *proto.Agent, staged []*proto.Approval, scope, key, op string, request, result any, events []*proto.Event) error {
 	a.UpdatedAt = c.now().UnixMilli()
 	trimAgentRuns(a)
 	dirty := make([]*proto.Approval, 0, len(c.dirtyApprovals))
@@ -127,6 +137,11 @@ func (c *Control) persistAgentRows(a *proto.Agent, scope, key, op string, reques
 			return err
 		}
 		for _, ap := range dirty {
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO approvals(id, data) VALUES(?,?)`, ap.ID, proto.MustMarshal(ap)); err != nil {
+				return err
+			}
+		}
+		for _, ap := range staged {
 			if _, err := tx.Exec(`INSERT OR REPLACE INTO approvals(id, data) VALUES(?,?)`, ap.ID, proto.MustMarshal(ap)); err != nil {
 				return err
 			}
@@ -152,9 +167,141 @@ func (c *Control) markApprovalDirty(ap *proto.Approval) {
 	c.dirtyApprovals[ap.ID] = ap
 }
 
-// parkApprovalLocked records a permission or elicitation request the node
-// parked for a run. Caller holds c.mu.
-func (c *Control) parkApprovalLocked(a *proto.Agent, run *proto.AgentRun, ws *proto.Workspace, node string, in *proto.Approval) ([]*proto.Event, error) {
+// approvalStage holds the approvals one agent change creates or edits as
+// private copies, so c.approvals is untouched until the caller publishes.
+// Reads see the copies over the live map. A change that commits the agent
+// row first and publishes second (agentReport) passes rows() to the commit
+// and calls publishLocked on success, or drops the stage on failure and
+// leaves the live approvals exactly as the database has them. A change that
+// still applies itself to the live row before committing calls
+// publishDirtyLocked, which is the pre-existing mutate-then-flush path.
+// Caller holds c.mu throughout.
+type approvalStage struct {
+	c       *Control
+	touched map[string]*proto.Approval
+	// counters are the metric increments the change earns; they land with
+	// the publish so a failed commit counts nothing.
+	counters []*metrics.Counter
+}
+
+func (c *Control) stageApprovals() *approvalStage {
+	return &approvalStage{c: c, touched: map[string]*proto.Approval{}}
+}
+
+// count defers one increment of ctr to the publish.
+func (s *approvalStage) count(ctr *metrics.Counter) {
+	s.counters = append(s.counters, ctr)
+}
+
+func (s *approvalStage) flushCounters() {
+	for _, ctr := range s.counters {
+		ctr.Inc()
+	}
+	s.counters = nil
+}
+
+// lookup is the staged copy when there is one, else the live approval.
+func (s *approvalStage) lookup(id string) *proto.Approval {
+	if ap := s.touched[id]; ap != nil {
+		return ap
+	}
+	return s.c.approvals[id]
+}
+
+// edit returns the private copy of a live approval to change, making it on
+// first use. It is nil when no such approval exists.
+func (s *approvalStage) edit(id string) *proto.Approval {
+	if ap := s.touched[id]; ap != nil {
+		return ap
+	}
+	live := s.c.approvals[id]
+	if live == nil {
+		return nil
+	}
+	cp := copyApproval(live)
+	s.touched[id] = cp
+	return cp
+}
+
+func (s *approvalStage) add(ap *proto.Approval) {
+	s.touched[ap.ID] = ap
+}
+
+// pendingIDs are the agent's pending approvals (of one run when run is not
+// ""), staged copies taking precedence over the live map, in id order.
+func (s *approvalStage) pendingIDs(agent, run string) []string {
+	ids := make([]string, 0)
+	seen := map[string]bool{}
+	consider := func(ap *proto.Approval) {
+		if seen[ap.ID] {
+			return
+		}
+		seen[ap.ID] = true
+		if ap.Agent == agent && ap.Status == proto.ApprovalPending && (run == "" || ap.Run == run) {
+			ids = append(ids, ap.ID)
+		}
+	}
+	for _, ap := range s.touched {
+		consider(ap)
+	}
+	for _, ap := range s.c.approvals {
+		consider(ap)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func (s *approvalStage) pending(agent string) int {
+	return len(s.pendingIDs(agent, ""))
+}
+
+// rows are the staged copies in id order, for the commit transaction.
+func (s *approvalStage) rows() []*proto.Approval {
+	out := make([]*proto.Approval, 0, len(s.touched))
+	for _, ap := range s.touched {
+		out = append(out, ap)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// publishLocked makes the committed copies the live approvals. A live row
+// keeps its identity and takes the copy's state; a new row is inserted. Any
+// dirty mark for the id is cleared because the commit just wrote it.
+func (s *approvalStage) publishLocked() {
+	for id, ap := range s.touched {
+		if live := s.c.approvals[id]; live != nil {
+			*live = *ap
+		} else {
+			s.c.approvals[id] = ap
+		}
+		delete(s.c.dirtyApprovals, id)
+	}
+	s.touched = map[string]*proto.Approval{}
+	s.flushCounters()
+}
+
+// publishDirtyLocked applies the copies to the live map now and leaves them
+// dirty for the caller's coming agent commit to flush.
+func (s *approvalStage) publishDirtyLocked() {
+	for id, ap := range s.touched {
+		live := s.c.approvals[id]
+		if live != nil {
+			*live = *ap
+		} else {
+			live = ap
+			s.c.approvals[id] = ap
+		}
+		s.c.dirtyApprovals[id] = live
+	}
+	s.touched = map[string]*proto.Approval{}
+	s.flushCounters()
+}
+
+// park records a permission or elicitation request the node parked for a
+// run, as a staged copy. Caller holds c.mu.
+func (s *approvalStage) park(a *proto.Agent, run *proto.AgentRun, ws *proto.Workspace, node string, in *proto.Approval) ([]*proto.Event, error) {
+	c := s.c
 	if in.ID == "" || !strings.HasPrefix(in.ID, "ap_") || len(in.ID) > 64 {
 		return nil, proto.Err(proto.CodeBadRequest, "approval id %q is not an ap_ id", in.ID)
 	}
@@ -169,18 +316,13 @@ func (c *Control) parkApprovalLocked(a *proto.Agent, run *proto.AgentRun, ws *pr
 	if len(in.Options) > 32 {
 		return nil, proto.Err(proto.CodeBadRequest, "approval offers more than 32 options")
 	}
-	if existing := c.approvals[in.ID]; existing != nil {
+	if existing := s.lookup(in.ID); existing != nil {
 		if existing.Agent != a.ID || existing.Run != run.ID {
 			return nil, proto.Err(proto.CodeConflict, "approval %s belongs to another run", in.ID)
 		}
 		return nil, nil
 	}
-	pending := 0
-	for _, other := range c.approvals {
-		if other.Agent == a.ID && other.Status == proto.ApprovalPending {
-			pending++
-		}
-	}
+	pending := s.pending(a.ID)
 	if pending >= c.opts.MaxApprovalsPerAgent {
 		metrics.ApprovalQuotaRejected.Inc()
 		return nil, proto.Err(proto.CodeResourceExhausted, "agent %s has %d pending approvals", a.ID, pending)
@@ -192,10 +334,9 @@ func (c *Control) parkApprovalLocked(a *proto.Agent, run *proto.AgentRun, ws *pr
 		Locations: append([]string(nil), in.Locations...), Options: append([]proto.ApprovalOption(nil), in.Options...),
 		Detail: append(json.RawMessage(nil), in.Detail...), Status: proto.ApprovalPending, CreatedAt: now, UpdatedAt: now,
 	}
-	c.approvals[ap.ID] = ap
-	c.markApprovalDirty(ap)
+	s.add(ap)
 	a.PendingApprovals = pending + 1
-	metrics.ApprovalsPending.Inc()
+	s.count(metrics.ApprovalsPending)
 	return []*proto.Event{c.approvalEvent(proto.EvApprovalPending, ap, ws, "", node, map[string]any{
 		"run": run.ID, "title": ap.Title, "tool_call": ap.ToolCall, "tool_kind": ap.ToolKind, "options": len(ap.Options),
 	})}, nil
@@ -208,26 +349,33 @@ func truncate(s string, n int) string {
 	return s[:n]
 }
 
-// expireApprovalsLocked ends every pending approval of the agent (or of one
-// run) because the run that asked is over. Caller holds c.mu.
-func (c *Control) expireApprovalsLocked(a *proto.Agent, run *proto.AgentRun, principal string) []*proto.Event {
+// expire ends every pending approval of the agent (or of one run) because
+// the run that asked is over, as staged copies. Caller holds c.mu.
+func (s *approvalStage) expire(a *proto.Agent, run *proto.AgentRun, principal string) []*proto.Event {
+	c := s.c
 	var events []*proto.Event
 	ws := c.workspaces[a.WS]
-	ids := make([]string, 0)
-	for id, ap := range c.approvals {
-		if ap.Agent == a.ID && ap.Status == proto.ApprovalPending && (run == nil || ap.Run == run.ID) {
-			ids = append(ids, id)
-		}
+	runID := ""
+	if run != nil {
+		runID = run.ID
 	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		ap := c.approvals[id]
+	for _, id := range s.pendingIDs(a.ID, runID) {
+		ap := s.edit(id)
 		ap.Status = proto.ApprovalExpired
-		c.markApprovalDirty(ap)
-		metrics.ApprovalsExpired.Inc()
+		ap.UpdatedAt = c.now().UnixMilli()
+		s.count(metrics.ApprovalsExpired)
 		events = append(events, c.approvalEvent(proto.EvApprovalExpired, ap, ws, principal, "", map[string]any{"run": ap.Run}))
 	}
-	a.PendingApprovals = c.pendingApprovalsLocked(a.ID)
+	a.PendingApprovals = s.pending(a.ID)
+	return events
+}
+
+// expireApprovalsLocked is expire for a caller that applies its change to
+// the live row before committing it. Caller holds c.mu.
+func (c *Control) expireApprovalsLocked(a *proto.Agent, run *proto.AgentRun, principal string) []*proto.Event {
+	st := c.stageApprovals()
+	events := st.expire(a, run, principal)
+	st.publishDirtyLocked()
 	return events
 }
 
@@ -669,65 +817,86 @@ func (c *Control) approvalDecide(ctx context.Context, subject Subject, req *prot
 		c.mu.Unlock()
 		return nil, proto.Err(proto.CodeInternal, "approval %s has unknown kind %q", ap.ID, kind)
 	}
-	live.Status = proto.ApprovalDecided
-	live.Decision = &decision
-	if live.Kind == proto.ApprovalEgress {
-		live.ExpiresAt = decision.At + c.opts.ApprovalDecisionTTL.Milliseconds()
+	// The decision is a candidate installed under c.mu so the transaction and
+	// the agent's derived status see it; every failure below restores the
+	// pending row and its dirty marker before the lock is released.
+	decided := copyApproval(live)
+	decided.Status = proto.ApprovalDecided
+	decided.Decision = &decision
+	if decided.Kind == proto.ApprovalEgress {
+		decided.ExpiresAt = decision.At + c.opts.ApprovalDecisionTTL.Milliseconds()
 	}
-	c.markApprovalDirty(live)
-	a := c.agents[live.Agent]
-	ws := c.workspaces[live.WS]
+	priorDirty, wasDirty := c.dirtyApprovals[live.ID]
+	c.approvals[live.ID] = decided
+	c.markApprovalDirty(decided)
+	restore := func() {
+		c.approvals[live.ID] = live
+		if wasDirty {
+			c.dirtyApprovals[live.ID] = priorDirty
+		} else {
+			delete(c.dirtyApprovals, live.ID)
+		}
+	}
+	a := c.agents[decided.Agent]
+	ws := c.workspaces[decided.WS]
 	eventType := proto.EvApprovalDecided
-	if live.Kind == proto.ApprovalEgress {
+	if decided.Kind == proto.ApprovalEgress {
 		if decision.Denied {
 			eventType = proto.EvEgressDenied
 		} else {
 			eventType = proto.EvEgressAllowed
 		}
 	}
-	events := []*proto.Event{c.approvalEvent(eventType, live, ws, subject.ID, "", map[string]any{
-		"option": decision.Option, "denied": decision.Denied, "by": subject.ID, "run": live.Run,
-		"approved_by": subject.ID, "decision_id": live.ID, "remember": decision.Remember, "reason": "approval_decision",
+	events := []*proto.Event{c.approvalEvent(eventType, decided, ws, subject.ID, "", map[string]any{
+		"option": decision.Option, "denied": decision.Denied, "by": subject.ID, "run": decided.Run,
+		"approved_by": subject.ID, "decision_id": decided.ID, "remember": decision.Remember, "reason": "approval_decision",
 	})}
 	var send *proto.AgentApprovalDecidedReq
 	node := ""
 	if a != nil {
+		agentBefore := copyAgent(a)
 		a.PendingApprovals = c.pendingApprovalsLocked(a.ID)
 		more, err := c.refreshAgentStatusLocked(a, subject.ID)
 		if err != nil {
+			*a = *agentBefore
+			restore()
 			c.mu.Unlock()
 			return nil, err
 		}
 		events = append(events, more...)
-		if run := findRun(a, live.Run); run != nil && run.State == proto.AgentRunActive && run.Node != "" {
-			send = &proto.AgentApprovalDecidedReq{Agent: a.ID, Run: run.ID, Approval: live.ID, Decision: decision}
+		if run := findRun(a, decided.Run); run != nil && run.State == proto.AgentRunActive && run.Node != "" {
+			send = &proto.AgentApprovalDecidedReq{Agent: a.ID, Run: run.ID, Approval: decided.ID, Decision: decision}
 			node = run.Node
 		}
 		if err := c.persistAgentRows(a, scope, req.IdempotencyKey, proto.OpApprovalDecide, req, struct{}{}, events...); err != nil {
+			*a = *agentBefore
+			restore()
 			c.mu.Unlock()
 			return nil, err
 		}
 	} else {
 		var nextWS *proto.Workspace
-		if live.Kind == proto.ApprovalEgress && !decision.Denied && decision.Remember == proto.ApprovalRememberHost && ws != nil {
+		if decided.Kind == proto.ApprovalEgress && !decision.Denied && decision.Remember == proto.ApprovalRememberHost && ws != nil {
 			next := *ws
 			security, normalizeErr := proto.NormalizeSecurity(ws.Spec.Security)
 			if normalizeErr != nil {
+				restore()
 				c.mu.Unlock()
 				return nil, normalizeErr
 			}
 			next.Spec = ws.Spec
 			next.Spec.Security = security
 			remembered := proto.EgressRule{
-				ID: "approved-" + live.ID, Mode: proto.EgressModeAllow, Protocol: ruleProtocol(next.Spec.Security.Network.Rules, live.Rule), Hosts: []string{live.Host},
+				ID: "approved-" + decided.ID, Mode: proto.EgressModeAllow, Protocol: ruleProtocol(next.Spec.Security.Network.Rules, decided.Rule), Hosts: []string{decided.Host},
 			}
 			next.Spec.Security.Network.Rules = append([]proto.EgressRule{remembered}, next.Spec.Security.Network.Rules...)
 			nextWS = &next
-			events = append(events, c.approvalEvent(proto.EvPolicyUpdated, live, &next, subject.ID, "", map[string]any{
-				"rule": live.Rule, "host": live.Host, "decision_id": live.ID,
+			events = append(events, c.approvalEvent(proto.EvPolicyUpdated, decided, &next, subject.ID, "", map[string]any{
+				"rule": decided.Rule, "host": decided.Host, "decision_id": decided.ID,
 			}))
 		}
 		if err := c.persistEgressDecision(nextWS, scope, req, events); err != nil {
+			restore()
 			c.mu.Unlock()
 			return nil, err
 		}
@@ -735,7 +904,7 @@ func (c *Control) approvalDecide(ctx context.Context, subject Subject, req *prot
 			c.workspaces[nextWS.ID] = nextWS
 		}
 	}
-	cp := copyApproval(live)
+	cp := copyApproval(decided)
 	c.mu.Unlock()
 	metrics.ApprovalsDecided.Inc()
 	if send != nil && c.send != nil {

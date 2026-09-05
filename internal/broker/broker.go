@@ -976,26 +976,18 @@ func sortedBindings(used map[string]bool) []string {
 	return bindings
 }
 
-func (b *Broker) reserveBudget(ctx context.Context, policy policyAuthorization, host, method, requestTarget, idempotencyKey string, body []byte, used map[string]bool) (*budgetAdmission, error) {
-	return b.reserveBudgetForProvider(ctx, meter.ProviderForHost(host), policy, host, method, requestTarget, idempotencyKey, body, used)
-}
-
-func (b *Broker) reserveBudgetForProvider(ctx context.Context, provider meter.Provider, policy policyAuthorization, host, method, requestTarget, idempotencyKey string, body []byte, used map[string]bool) (*budgetAdmission, error) {
+// reserveBudget admits one outbound attempt against the central ledger. The
+// reservation key is fresh per attempt: a workspace-supplied Idempotency-Key
+// is forwarded to the upstream but never collapses two admitted attempts into
+// one charge, because the broker cannot verify that the upstream deduplicates
+// the effect (ADR 0083). The authority's exact-replay rule remains available
+// to a retry of this single RPC, which reuses the same key.
+func (b *Broker) reserveBudget(ctx context.Context, provider meter.Provider, body []byte, used map[string]bool) (*budgetAdmission, error) {
 	if b.opts.BudgetReserve == nil {
 		return nil, nil
 	}
 	model, inputTokens, maxOutputTokens := requestBudgetBound(provider, body)
 	key := ids.New("breq")
-	if idempotencyKey != "" {
-		// An explicit upstream idempotency key identifies one logical provider
-		// mutation. Body-derived accounting remains part of the authority's
-		// replay comparison, so changed usage bounds at the same endpoint fail
-		// with a conflict rather than reserving a second allowance.
-		key = "breq_" + digestString(strings.Join([]string{
-			b.opts.WS, strconv.FormatUint(b.opts.Generation, 10), b.opts.Principal,
-			policy.rule.ID, host, strings.ToUpper(method), digestString(requestTarget), idempotencyKey,
-		}, "\x00"))
-	}
 	result, err := b.opts.BudgetReserve(ctx, proto.BudgetReserveReq{
 		Key: key, WS: b.opts.WS, Gen: b.opts.Generation, Principal: b.opts.Principal,
 		Bindings: sortedBindings(used), Provider: string(provider), Model: model,
@@ -1063,6 +1055,95 @@ func (b *settlingBody) Close() error {
 }
 
 var errRequestLimit = errors.New("request body exceeds rule limit")
+
+// bufferRequest replaces r.Body with an in-memory copy bounded by limit so
+// governance can fingerprint and bound the request before release. A refusal
+// has been written and audited when ok is false.
+func (b *Broker) bufferRequest(w http.ResponseWriter, r *http.Request, audit *Audit, limit int64) (body []byte, ok bool) {
+	if r.ContentLength > limit {
+		audit.RequestBytes = r.ContentLength
+		audit.Decision, audit.Reason = DecisionLimitExceeded, "request body exceeds governance limit"
+		b.emit(*audit)
+		http.Error(w, "remount broker: request body exceeds governance limit", http.StatusRequestEntityTooLarge)
+		return nil, false
+	}
+	buffered, bodyBytes, bodyErr := bufferRequestBody(r.Body, limit)
+	audit.RequestBytes = bodyBytes
+	if bodyErr != nil {
+		status := http.StatusBadRequest
+		audit.Decision, audit.Reason = DecisionDenied, "cannot inspect request body"
+		if errors.Is(bodyErr, errRequestLimit) {
+			status = http.StatusRequestEntityTooLarge
+			audit.Decision, audit.Reason = DecisionLimitExceeded, errRequestLimit.Error()
+		}
+		b.emit(*audit)
+		http.Error(w, "remount broker: "+audit.Reason, status)
+		return nil, false
+	}
+	body, bodyErr = io.ReadAll(buffered)
+	if bodyErr != nil {
+		http.Error(w, "remount broker: cannot inspect request body", http.StatusBadRequest)
+		return nil, false
+	}
+	r.Body, r.ContentLength, r.GetBody = io.NopCloser(bytes.NewReader(body)), bodyBytes, nil
+	return body, true
+}
+
+// govern is the pre-execution stage every egress surface passes after policy
+// selection and before credential substitution or upstream I/O: approve-mode
+// authority, the approved rule's request count, and central hard-budget
+// admission. used names the bindings the request will substitute once
+// admitted; body is the buffered request body when the surface has one. When
+// ok is false the refusal has been written to w and audited.
+func (b *Broker) govern(w http.ResponseWriter, r *http.Request, audit *Audit, policy policyAuthorization, provider meter.Provider, host, requestTarget string, body []byte, used map[string]bool) (admission *budgetAdmission, ok bool) {
+	if policy.approval {
+		approval, approvalErr := b.awaitApproval(r.Context(), policy, host, r.Method, requestTarget, digestString(string(body)))
+		if approvalErr != nil {
+			audit.Decision, audit.Reason = DecisionDenied, "approval unavailable"
+			b.emit(*audit)
+			status := http.StatusServiceUnavailable
+			var pe *proto.Error
+			if errors.As(approvalErr, &pe) && pe.Code == proto.CodeResourceExhausted {
+				status = http.StatusTooManyRequests
+			}
+			http.Error(w, "remount broker: approval unavailable", status)
+			return nil, false
+		}
+		if !approval.Allowed {
+			w.Header().Set("X-Remount-Approval", approval.ID)
+			if approval.Status == proto.ApprovalPending {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "remount broker: approval pending", http.StatusForbidden)
+				return nil, false
+			}
+			audit.Decision, audit.Reason = DecisionDenied, "approval denied"
+			b.emit(*audit)
+			http.Error(w, "remount broker: approval denied", http.StatusForbidden)
+			return nil, false
+		}
+		if !b.consumeApprovedRule(policy.rule) {
+			audit.Decision, audit.Reason = DecisionLimitExceeded, "request limit exhausted"
+			b.emit(*audit)
+			http.Error(w, "remount broker: request limit exhausted", http.StatusTooManyRequests)
+			return nil, false
+		}
+	}
+	admission, budgetErr := b.reserveBudget(r.Context(), provider, body, used)
+	if budgetErr != nil {
+		if errors.Is(budgetErr, budget.ErrBudgetExceeded) {
+			// The authority committed the canonical egress.denied event before
+			// returning this result. A second node audit would duplicate one
+			// decision in the system of record.
+			http.Error(w, "remount broker: budget authority denied request", http.StatusTooManyRequests)
+			return nil, false
+		}
+		audit.Decision, audit.Reason = DecisionDenied, "budget authority unavailable"
+		b.emit(*audit)
+		http.Error(w, "remount broker: budget authority unavailable", http.StatusServiceUnavailable)
+		return nil, false
+	}
+	return admission, true
+}
 
 // authorizePolicy evaluates rules in declaration order and consumes a rule's
 // request budget atomically. An explicit typed policy replaces the legacy
@@ -1380,20 +1461,58 @@ func (b *Broker) packageProxy(w http.ResponseWriter, r *http.Request, host, requ
 		http.Error(w, "remount broker: "+audit.Reason, http.StatusServiceUnavailable)
 		return
 	}
-	used, rejected := b.rewriteCredentials(r.Header, proto.EgressProtocolHTTPS, authority)
+	used, rejected := b.inspectCredentials(r.Header, proto.EgressProtocolHTTPS, authority)
 	if rejected != nil {
 		audit.Decision, audit.Binding, audit.Reason = rejected.decision, rejected.binding, rejected.reason
 		b.emit(audit)
 		http.Error(w, "remount broker: "+rejected.public, rejected.status)
 		return
 	}
-	credUse := b.credentialUse(audit, used, "credential released to managed package connector")
 	target := &url.URL{Scheme: proto.EgressProtocolHTTPS, Host: authority, Path: requestPath, RawQuery: query}
-	response, err := managed.Execute(r.Context(), connector.ConnectorRequest{
+	request := connector.ConnectorRequest{
 		Workspace: b.opts.WS, Tenant: b.opts.Tenant, Principal: b.opts.Principal,
 		Generation: b.opts.Generation, Rule: policy.rule, Method: strings.ToUpper(r.Method),
 		URL: target, Header: r.Header, ExpectedDigest: r.Header.Get(connector.ExpectedDigestHeader),
-	})
+	}
+	// The connector's side-effect-free authorization runs first so a request
+	// it can never execute consumes neither an approval nor a budget unit.
+	decision, err := managed.Authorize(r.Context(), request)
+	if err != nil {
+		audit.Decision, audit.Reason = DecisionDenied, "package connector authorization failed"
+		b.emit(audit)
+		http.Error(w, "remount broker: "+audit.Reason, http.StatusBadGateway)
+		return
+	}
+	if !decision.Allowed {
+		status := http.StatusForbidden
+		if decision.Code == "invalid_digest" {
+			status = http.StatusBadRequest
+		}
+		audit.Decision, audit.Reason = DecisionDenied, decision.Reason
+		b.emit(audit)
+		http.Error(w, "remount broker: "+audit.Reason, status)
+		return
+	}
+	requestTarget := requestPath
+	if query != "" {
+		requestTarget += "?" + query
+	}
+	// Approval and budget admission precede the connector: a digest cache
+	// hit saves registry bytes, not a request unit.
+	admission, ok := b.govern(w, r, &audit, policy, meter.ProviderUnknown, authority, requestTarget, nil, used)
+	if !ok {
+		return
+	}
+	used, rejected = b.rewriteCredentials(r.Header, proto.EgressProtocolHTTPS, authority)
+	if rejected != nil {
+		_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
+		audit.Decision, audit.Binding, audit.Reason = rejected.decision, rejected.binding, rejected.reason
+		b.emit(audit)
+		http.Error(w, "remount broker: "+rejected.public, rejected.status)
+		return
+	}
+	credUse := b.credentialUse(audit, used, "credential released to managed package connector")
+	response, err := managed.Execute(r.Context(), request)
 	if err != nil {
 		status := http.StatusBadGateway
 		audit.Decision, audit.Reason = DecisionDenied, "package connector request failed"
@@ -1407,12 +1526,14 @@ func (b *Broker) packageProxy(w http.ResponseWriter, r *http.Request, host, requ
 				audit.Decision = DecisionLimitExceeded
 			}
 		}
+		_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
 		credUse(0, ErrorClassConnector)
 		b.emit(audit)
 		http.Error(w, "remount broker: "+audit.Reason, status)
 		return
 	}
 	defer response.Body.Close()
+	defer func() { _ = b.settleBudget(r.Context(), admission, budget.SettlementRequestOnly, 0, 0) }()
 	audit.Status = response.StatusCode
 	credUse(response.StatusCode, "")
 	audit.ResponseBytes = response.ContentLength
@@ -1490,9 +1611,9 @@ func (b *Broker) gitProxy(w http.ResponseWriter, r *http.Request, host, requestP
 		return
 	}
 	audit.Host = authority
-	var rule proto.EgressRule
+	var policy policyAuthorization
 	if b.hasTypedGitRule() {
-		policy := b.authorizePolicy(proto.EgressConnectorGit, proto.EgressProtocolHTTPS, authority, r.Method, requestPath)
+		policy = b.authorizePolicy(proto.EgressConnectorGit, proto.EgressProtocolHTTPS, authority, r.Method, requestPath)
 		if policy.rule.ID != "" {
 			audit.Rule, audit.SharedState = policy.rule.ID, policy.rule.SharedState
 		}
@@ -1505,16 +1626,16 @@ func (b *Broker) gitProxy(w http.ResponseWriter, r *http.Request, host, requestP
 			fail(decision, policy.reason, status)
 			return
 		}
-		rule = policy.rule
 	} else {
 		implicit, ok := b.implicitGitRule(authority)
 		if !ok {
 			fail(DecisionDenied, "no repository is declared for this host; create the workspace with --repo or add a git connector rule", http.StatusForbidden)
 			return
 		}
-		rule = implicit
-		audit.Rule, audit.SharedState = rule.ID, rule.SharedState
+		policy = policyAuthorization{enabled: true, allowed: true, rule: implicit}
+		audit.Rule, audit.SharedState = implicit.ID, implicit.SharedState
 	}
+	rule := policy.rule
 	managed := b.connectors[proto.EgressConnectorGit]
 	if managed == nil {
 		fail(DecisionDenied, "git connector is unavailable", http.StatusServiceUnavailable)
@@ -1538,8 +1659,38 @@ func (b *Broker) gitProxy(w http.ResponseWriter, r *http.Request, host, requestP
 		fail(DecisionDenied, decision.Reason, http.StatusForbidden)
 		return
 	}
-	used, rejected := b.rewriteCredentials(r.Header, proto.EgressProtocolHTTPS, authority)
+	used, rejected := b.inspectCredentials(r.Header, proto.EgressProtocolHTTPS, authority)
 	if rejected != nil {
+		audit.Binding = rejected.binding
+		fail(rejected.decision, rejected.reason, rejected.status)
+		return
+	}
+	requestTarget := requestPath
+	if query != "" {
+		requestTarget += "?" + query
+	}
+	// An approve-mode fingerprint covers the pack body, so the body is
+	// buffered only then; otherwise the connector streams it under the
+	// rule's own request-size limit.
+	var requestBody []byte
+	if policy.approval {
+		limit := maxApprovalRequestBytes
+		if rule.MaxRequestBytes > 0 && rule.MaxRequestBytes < limit {
+			limit = rule.MaxRequestBytes
+		}
+		var ok bool
+		if requestBody, ok = b.bufferRequest(w, r, &audit, limit); !ok {
+			return
+		}
+		request.Body, request.ContentLength = r.Body, r.ContentLength
+	}
+	admission, ok := b.govern(w, r, &audit, policy, meter.ProviderUnknown, authority, requestTarget, requestBody, used)
+	if !ok {
+		return
+	}
+	used, rejected = b.rewriteCredentials(r.Header, proto.EgressProtocolHTTPS, authority)
+	if rejected != nil {
+		_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
 		audit.Binding = rejected.binding
 		fail(rejected.decision, rejected.reason, rejected.status)
 		return
@@ -1559,12 +1710,14 @@ func (b *Broker) gitProxy(w http.ResponseWriter, r *http.Request, host, requestP
 				audit.Decision = DecisionLimitExceeded
 			}
 		}
+		_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
 		credUse(0, ErrorClassConnector)
 		b.emit(audit)
 		http.Error(w, "remount broker: "+audit.Reason, status)
 		return
 	}
 	defer response.Body.Close()
+	defer func() { _ = b.settleBudget(r.Context(), admission, budget.SettlementRequestOnly, 0, 0) }()
 	audit.Status = response.StatusCode
 	audit.RequestBytes = r.ContentLength
 	credUse(response.StatusCode, "")
@@ -1695,77 +1848,13 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 		if policy.rule.MaxRequestBytes > 0 && policy.rule.MaxRequestBytes < limit {
 			limit = policy.rule.MaxRequestBytes
 		}
-		if r.ContentLength > limit {
-			audit.RequestBytes = r.ContentLength
-			audit.Decision, audit.Reason = DecisionLimitExceeded, "request body exceeds governance limit"
-			b.emit(audit)
-			http.Error(w, "remount broker: request body exceeds governance limit", http.StatusRequestEntityTooLarge)
-			return
-		}
-		body, bodyBytes, bodyErr := bufferRequestBody(r.Body, limit)
-		audit.RequestBytes = bodyBytes
-		if bodyErr != nil {
-			status := http.StatusBadRequest
-			audit.Decision, audit.Reason = DecisionDenied, "cannot inspect request body"
-			if errors.Is(bodyErr, errRequestLimit) {
-				status = http.StatusRequestEntityTooLarge
-				audit.Decision, audit.Reason = DecisionLimitExceeded, errRequestLimit.Error()
-			}
-			b.emit(audit)
-			http.Error(w, "remount broker: "+audit.Reason, status)
-			return
-		}
-		requestBody, bodyErr = io.ReadAll(body)
-		if bodyErr != nil {
-			http.Error(w, "remount broker: cannot inspect request body", http.StatusBadRequest)
-			return
-		}
-		r.Body, r.ContentLength, r.GetBody = io.NopCloser(bytes.NewReader(requestBody)), bodyBytes, nil
-	}
-	if policy.approval {
-		approval, approvalErr := b.awaitApproval(r.Context(), policy, matchHost, r.Method, requestTarget, digestString(string(requestBody)))
-		if approvalErr != nil {
-			audit.Decision, audit.Reason = DecisionDenied, "approval unavailable"
-			b.emit(audit)
-			status := http.StatusServiceUnavailable
-			var pe *proto.Error
-			if errors.As(approvalErr, &pe) && pe.Code == proto.CodeResourceExhausted {
-				status = http.StatusTooManyRequests
-			}
-			http.Error(w, "remount broker: approval unavailable", status)
-			return
-		}
-		if !approval.Allowed {
-			w.Header().Set("X-Remount-Approval", approval.ID)
-			if approval.Status == proto.ApprovalPending {
-				w.Header().Set("Retry-After", "1")
-				http.Error(w, "remount broker: approval pending", http.StatusForbidden)
-				return
-			}
-			audit.Decision, audit.Reason = DecisionDenied, "approval denied"
-			b.emit(audit)
-			http.Error(w, "remount broker: approval denied", http.StatusForbidden)
-			return
-		}
-		if !b.consumeApprovedRule(policy.rule) {
-			audit.Decision, audit.Reason = DecisionLimitExceeded, "request limit exhausted"
-			b.emit(audit)
-			http.Error(w, "remount broker: request limit exhausted", http.StatusTooManyRequests)
+		var ok bool
+		if requestBody, ok = b.bufferRequest(w, r, &audit, limit); !ok {
 			return
 		}
 	}
-	admission, budgetErr := b.reserveBudget(r.Context(), policy, matchHost, r.Method, requestTarget, r.Header.Get("Idempotency-Key"), requestBody, used)
-	if budgetErr != nil {
-		if errors.Is(budgetErr, budget.ErrBudgetExceeded) {
-			// The authority committed the canonical egress.denied event before
-			// returning this result. A second node audit would duplicate one
-			// decision in the system of record.
-			http.Error(w, "remount broker: budget authority denied request", http.StatusTooManyRequests)
-			return
-		}
-		audit.Decision, audit.Reason = DecisionDenied, "budget authority unavailable"
-		b.emit(audit)
-		http.Error(w, "remount broker: budget authority unavailable", http.StatusServiceUnavailable)
+	admission, ok := b.govern(w, r, &audit, policy, meter.ProviderForHost(matchHost), matchHost, requestTarget, requestBody, used)
+	if !ok {
 		return
 	}
 	used, rejected = b.rewriteCredentials(r.Header, scheme, matchHost)
@@ -2026,41 +2115,11 @@ func (b *Broker) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "remount broker: CONNECT to "+host+" is not permitted", http.StatusForbidden)
 		return
 	}
-	if policy.approval {
-		approval, approvalErr := b.awaitApproval(r.Context(), policy, host, r.Method, "", digestString(""))
-		if approvalErr != nil {
-			audit.Decision, audit.Reason = DecisionDenied, "approval unavailable"
-			b.emit(audit)
-			http.Error(w, "remount broker: approval unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		if !approval.Allowed {
-			w.Header().Set("X-Remount-Approval", approval.ID)
-			if approval.Status == proto.ApprovalPending {
-				w.Header().Set("Retry-After", "1")
-			}
-			http.Error(w, "remount broker: approval required", http.StatusForbidden)
-			return
-		}
-		if !b.consumeApprovedRule(policy.rule) {
-			audit.Decision, audit.Reason = DecisionLimitExceeded, "request limit exhausted"
-			b.emit(audit)
-			http.Error(w, "remount broker: request limit exhausted", http.StatusTooManyRequests)
-			return
-		}
-	}
 	// CONNECT is opaque by design: reserve request-count budgets, but mark the
 	// provider unknown so token/cost policy cannot mistake an encrypted tunnel
 	// for a metered model response.
-	admission, budgetErr := b.reserveBudgetForProvider(r.Context(), meter.ProviderUnknown, policy, host, r.Method, "", r.Header.Get("Idempotency-Key"), nil, nil)
-	if budgetErr != nil {
-		if errors.Is(budgetErr, budget.ErrBudgetExceeded) {
-			http.Error(w, "remount broker: budget authority denied request", http.StatusTooManyRequests)
-			return
-		}
-		audit.Decision, audit.Reason = DecisionDenied, "budget authority unavailable"
-		b.emit(audit)
-		http.Error(w, "remount broker: budget authority unavailable", http.StatusServiceUnavailable)
+	admission, ok := b.govern(w, r, &audit, policy, meter.ProviderUnknown, host, "", nil, nil)
+	if !ok {
 		return
 	}
 	dialer := &net.Dialer{Timeout: 15 * time.Second}
@@ -2072,8 +2131,8 @@ func (b *Broker) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "remount broker: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	hj, ok := w.(http.Hijacker)
-	if !ok {
+	hj, hijackable := w.(http.Hijacker)
+	if !hijackable {
 		_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
 		up.Close()
 		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
