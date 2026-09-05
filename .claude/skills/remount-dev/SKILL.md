@@ -5,6 +5,13 @@ description: Use when working on the Remount codebase itself. Building, running 
 
 # Developing Remount
 
+`docs/using-remount.md` is the canonical user and coding-agent entry point.
+Any user-visible command, recipe, provider, deployment, security,
+file-transfer, or lifecycle change must update that guide and its linked
+detailed document in the same change. Run `make docs`; `make lint` verifies
+the generated `llms.txt` and `llms-full.txt`. Never edit those generated files
+by hand.
+
 Remount is a Go monorepo with one binary and one protocol. Read `AGENTS.md`
 first for layout and invariants. This skill is the working loop. For lifecycle,
 concurrency, durability, security, capacity, public-API or deployment work,

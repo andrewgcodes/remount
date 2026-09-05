@@ -354,6 +354,61 @@ func TestCodexBoundAPIKey(t *testing.T) {
 	}
 }
 
+func TestCodexACPBoundAPIKey(t *testing.T) {
+	r, err := Load("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, primary := range []string{"", "openai"} {
+		t.Run("primary="+primary, func(t *testing.T) {
+			d := Data{Recipe: r.Name, Primary: primary}
+			if primary != "" {
+				d.Providers = []string{primary}
+			}
+			script, err := r.ACPLauncher(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{
+				`export CODEX_API_KEY="$OPENAI_API_KEY"`,
+				`export CODEX_CONFIG="{\"openai_base_url\":\"$OPENAI_BASE_URL\"}"`,
+				`export DEFAULT_AUTH_REQUEST="{\"methodId\":\"api-key\"}"`,
+			} {
+				if primary == "" {
+					if strings.Contains(script, want) {
+						t.Fatalf("unbound ACP launcher contains %q:\n%s", want, script)
+					}
+				} else if !strings.Contains(script, want) {
+					t.Fatalf("bound ACP launcher lacks %q:\n%s", want, script)
+				}
+			}
+		})
+	}
+}
+
+func TestCodexACPSandboxMode(t *testing.T) {
+	r, err := Load("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for sandbox, mode := range map[string]string{
+		SandboxReadOnly:       "read-only",
+		SandboxWorkspaceWrite: "agent",
+		SandboxFull:           "agent-full-access",
+	} {
+		t.Run(sandbox, func(t *testing.T) {
+			script, err := r.ACPLauncher(Data{Recipe: r.Name, Sandbox: sandbox})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := `export INITIAL_AGENT_MODE="` + mode + `"`
+			if !strings.Contains(script, want) {
+				t.Fatalf("ACP launcher lacks %q:\n%s", want, script)
+			}
+		})
+	}
+}
+
 func TestCodexModelFlags(t *testing.T) {
 	r, err := Load("codex")
 	if err != nil {
