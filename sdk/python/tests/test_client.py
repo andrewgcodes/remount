@@ -159,6 +159,25 @@ async def test_artifact_download_verifies_digest():
 
 
 @pytest.mark.asyncio
+async def test_artifact_http_omits_empty_bearer_token():
+    payload = b"artifact"
+    artifact_id = "art_sha256:" + hashlib.sha256(payload).hexdigest()
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = Client("https://cp.example", "", http_client=http)
+        assert await client.download_artifact(artifact_id) == payload
+        assert await client.upload_artifact(payload) == (artifact_id, len(payload))
+
+    assert [request.method for request in requests] == ["GET", "PUT"]
+    assert all("authorization" not in request.headers for request in requests)
+
+
+@pytest.mark.asyncio
 async def test_artifact_error_preserves_code_and_redacts_token():
     canary = "artifact-secret-canary"
     artifact_id = "art_sha256:" + "0" * 64
