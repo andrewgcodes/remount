@@ -1,9 +1,11 @@
 package launch
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -240,6 +242,324 @@ func TestParseRejectsBadRecipes(t *testing.T) {
 	}
 	if _, err := Parse([]byte("name: x\ncommand: [a]\nproviders: [openai]\nconfigure:\n  - path: .remount/launch/x.json\n    content: x\n")); err != nil {
 		t.Errorf("launcher-dir config must be allowed: %v", err)
+	}
+}
+
+func TestBuiltinResumePolicyFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		sandbox string
+		flags   []string
+	}{
+		{"claude", SandboxReadOnly, []string{"--permission-mode", "plan"}},
+		{"claude", SandboxWorkspaceWrite, []string{"--permission-mode", "acceptEdits"}},
+		{"claude", SandboxFull, []string{"--dangerously-skip-permissions"}},
+		{"codex", SandboxReadOnly, []string{"--sandbox", "read-only"}},
+		{"codex", SandboxWorkspaceWrite, []string{"--sandbox", "workspace-write"}},
+		{"codex", SandboxFull, []string{"--sandbox", "danger-full-access"}},
+	} {
+		t.Run(tc.name+"/"+tc.sandbox, func(t *testing.T) {
+			r, err := Load(tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := Data{Recipe: tc.name, Task: "continue 'quoted' $(printf unsafe)\non another line", Sandbox: tc.sandbox, Approve: ApproveNever}
+			var command, resume []string
+			switch tc.name {
+			case "claude":
+				command = append([]string{"claude", "-p", d.Task, "--output-format", "text"}, tc.flags...)
+				resume = append([]string{"claude", "--continue", "-p", d.Task, "--output-format", "text"}, tc.flags...)
+			case "codex":
+				command = append([]string{"sh", ".remount/launch/codex-driver", "exec", "--skip-git-repo-check", d.Task}, tc.flags...)
+				resume = append([]string{"sh", ".remount/launch/codex-driver", "exec"}, tc.flags...)
+				resume = append(resume, "resume", "--last", "--skip-git-repo-check", d.Task)
+			}
+			assertRecipeLaunchCommands(t, r, d, command, resume)
+		})
+	}
+}
+
+func TestRecipeResumePolicyFlags(t *testing.T) {
+	r, err := Parse([]byte(`
+name: policy-test
+auth: workspace_resident
+command: ["harness", "run", "{{.Task}}"]
+resume_command: ["harness", "resume", "{{.Task}}"]
+sandbox_flags:
+  workspace-write: ["--sandbox", "{{.Sandbox}}"]
+approve_flags:
+  never: ["--approve", "{{.Approve}}"]
+  on-request: ["--approve", "{{.Approve}}"]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, approve := range []string{ApproveNever, ApproveOnRequest} {
+		t.Run(approve, func(t *testing.T) {
+			d := Data{Recipe: r.Name, Task: "keep going", Sandbox: SandboxWorkspaceWrite, Approve: approve}
+			flags := []string{"--sandbox", d.Sandbox, "--approve", d.Approve}
+			command := append([]string{"harness", "run", d.Task}, flags...)
+			resume := append([]string{"harness", "resume", d.Task}, flags...)
+			assertRecipeLaunchCommands(t, r, d, command, resume)
+		})
+	}
+	r.ResumeCommand = nil
+	if _, err := r.Launcher(Data{Sandbox: SandboxWorkspaceWrite, Approve: ApproveNever}, true); err == nil {
+		t.Fatal("policy flags must not create a resume command")
+	}
+}
+
+func TestCodexResumeApprovalFlags(t *testing.T) {
+	r, err := Load("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.ApproveFlags = map[string][]string{ApproveNever: {"-c", "approval_policy=\"{{.Approve}}\""}}
+	d := Data{Recipe: r.Name, Task: "continue", Sandbox: SandboxReadOnly, Approve: ApproveNever}
+	flags := []string{"--sandbox", "read-only", "-c", "approval_policy=\"never\""}
+	command := append([]string{"sh", ".remount/launch/codex-driver", "exec", "--skip-git-repo-check", d.Task}, flags...)
+	resume := append([]string{"sh", ".remount/launch/codex-driver", "exec"}, flags...)
+	resume = append(resume, "resume", "--last", "--skip-git-repo-check", d.Task)
+	assertRecipeLaunchCommands(t, r, d, command, resume)
+}
+
+func TestCodexBoundAPIKey(t *testing.T) {
+	r, err := Load("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, provider := range append([]string{""}, r.Providers...) {
+		t.Run("provider="+provider, func(t *testing.T) {
+			d := Data{Recipe: r.Name, Task: "continue", Primary: provider}
+			want := ""
+			if provider != "" {
+				d.Providers = []string{provider}
+				preset, _ := LookupPreset(provider)
+				want = "export CODEX_API_KEY=\"$" + preset.KeyEnv + "\"\n"
+			}
+			for _, resume := range []bool{false, true} {
+				script, err := r.Launcher(d, resume)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if want == "" {
+					if strings.Contains(script, "export CODEX_API_KEY=") {
+						t.Fatal("unbound launch must not override Codex auth")
+					}
+				} else if !strings.Contains(script, want) {
+					t.Errorf("launcher lacks %q:\n%s", want, script)
+				}
+			}
+		})
+	}
+}
+
+func TestCodexModelFlags(t *testing.T) {
+	r, err := Load("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range []string{"", "gpt-4.1-mini"} {
+		t.Run("model="+model, func(t *testing.T) {
+			d := Data{Recipe: r.Name, Task: "continue", Model: model, Sandbox: SandboxWorkspaceWrite, Approve: ApproveNever}
+			flags := []string{"--sandbox", "workspace-write"}
+			if model != "" {
+				flags = append(flags, "--model", model)
+			}
+			command := append([]string{"sh", ".remount/launch/codex-driver", "exec", "--skip-git-repo-check", d.Task}, flags...)
+			resume := append([]string{"sh", ".remount/launch/codex-driver", "exec"}, flags...)
+			resume = append(resume, "resume", "--last", "--skip-git-repo-check", d.Task)
+			assertRecipeLaunchCommands(t, r, d, command, resume)
+		})
+	}
+}
+
+func TestCodexRuntimeBrokerRouting(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("recipes run under POSIX sh on workspace nodes")
+	}
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh")
+	}
+	r, err := Load("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bound := range []bool{false, true} {
+		for _, resume := range []bool{false, true} {
+			t.Run(fmt.Sprintf("bound=%t/resume=%t", bound, resume), func(t *testing.T) {
+				root := t.TempDir()
+				bin := t.TempDir()
+				for _, dir := range []string{".remount/launch", ".codex"} {
+					if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+						t.Fatal(err)
+					}
+				}
+				config := "model_provider = \"user-owned\"\n"
+				configPath := filepath.Join(root, ".codex", "config.toml")
+				if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				fake := "#!/bin/sh\nprintf '%s\\000' \"$CODEX_API_KEY\" \"$@\"\n"
+				if err := os.WriteFile(filepath.Join(bin, "codex"), []byte(fake), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				d := Data{Recipe: r.Name, Task: "continue 'quoted' $(printf unsafe)\non another line", Sandbox: SandboxWorkspaceWrite, Approve: ApproveNever, Model: "gpt-4.1-mini"}
+				if resume {
+					d.Conversation = "11111111-1111-4111-8111-111111111111"
+				}
+				if bound {
+					d.Primary = "openai"
+					d.Providers = []string{"openai"}
+				}
+				script, err := r.Launcher(d, resume)
+				if err != nil {
+					t.Fatal(err)
+				}
+				launcher := filepath.Join(root, r.LauncherPath())
+				if err := os.WriteFile(launcher, []byte(script), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				for _, broker := range []string{"http://broker-one.test:123/c/first", "http://broker-two.test:456/c/second"} {
+					env := "export OPENAI_BASE_URL=" + broker + "/d/api.openai.com/v1\n"
+					if err := os.WriteFile(filepath.Join(root, ".remount", "env"), []byte(env), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					cmd := exec.Command(sh, launcher)
+					cmd.Env = []string{"HOME=" + root, "PATH=" + bin + ":/usr/bin:/bin", "OPENAI_API_KEY=ref:test-binding", "CODEX_API_KEY=existing-auth"}
+					out, err := cmd.CombinedOutput()
+					if err != nil {
+						t.Fatalf("launcher: %v\n%s\n%s", err, out, script)
+					}
+					want := []string{"existing-auth"}
+					if bound {
+						want = []string{"ref:test-binding", "-c", "openai_base_url=\"" + broker + "/d/api.openai.com/v1\""}
+					}
+					want = append(want, "exec")
+					flags := []string{"--sandbox", "workspace-write", "--model", d.Model}
+					if resume {
+						want = append(want, flags...)
+						want = append(want, "resume", d.Conversation, "--skip-git-repo-check", d.Task)
+					} else {
+						want = append(want, "--skip-git-repo-check", d.Task)
+						want = append(want, flags...)
+					}
+					got := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+					if !slices.Equal(got, want) {
+						t.Errorf("codex received %q, want %q", got, want)
+					}
+					driver, err := os.ReadFile(filepath.Join(root, ".remount", "launch", "codex-driver"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, contents := range []string{script, string(driver)} {
+						if strings.Contains(contents, broker) {
+							t.Fatal("launcher and wrapper must discover the broker at runtime")
+						}
+						if strings.Contains(contents, "ref:test-binding") || strings.Contains(contents, "existing-auth") {
+							t.Fatal("launcher and wrapper must not contain credential literals")
+						}
+					}
+				}
+				gotConfig, err := os.ReadFile(configPath)
+				if err != nil || string(gotConfig) != config {
+					t.Fatalf("user config changed: %q, %v", gotConfig, err)
+				}
+			})
+		}
+	}
+}
+
+func TestBuiltinExplicitConversationArgv(t *testing.T) {
+	const id = "11111111-1111-4111-8111-111111111111"
+	for _, name := range []string{"claude", "codex"} {
+		t.Run(name, func(t *testing.T) {
+			r, err := Load(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := Data{Recipe: name, Task: "continue", Sandbox: SandboxWorkspaceWrite, Model: "test-model", Conversation: id}
+			out, err := r.render(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if slices.Contains(out.Resume, "--last") || slices.Contains(out.Resume, "--continue") {
+				t.Errorf("explicit conversation fell back to latest: %q", out.Resume)
+			}
+			if !slices.Contains(out.Resume, id) && !slices.Contains(out.Resume, "--resume="+id) {
+				t.Errorf("selected conversation absent from argv: %q", out.Resume)
+			}
+		})
+	}
+}
+
+func TestRecipeModelFlags(t *testing.T) {
+	src := `
+name: model-test
+auth: workspace_resident
+command: ["harness", "run", "{{.Task}}"]
+resume_command: ["harness", "resume", "{{.Task}}"]
+sandbox_flags:
+  read-only: ["--sandbox", "{{.Sandbox}}"]
+approve_flags:
+  never: ["--approve", "{{.Approve}}"]
+model_flags: ["--model", "{{.Model}}"]
+`
+	r, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range []string{"", "a model 'with quotes'"} {
+		d := Data{Recipe: r.Name, Task: "continue", Sandbox: SandboxReadOnly, Approve: ApproveNever, Model: model}
+		flags := []string{"--sandbox", d.Sandbox, "--approve", d.Approve}
+		if model != "" {
+			flags = append(flags, "--model", model)
+		}
+		command := append([]string{"harness", "run", d.Task}, flags...)
+		resume := append([]string{"harness", "resume", d.Task}, flags...)
+		assertRecipeLaunchCommands(t, r, d, command, resume)
+	}
+	if _, err := Parse([]byte(strings.ReplaceAll(src, "{{.Model}}", "{{.NoSuchField}}"))); err == nil {
+		t.Fatal("model_flags template error must fail at load time")
+	}
+}
+
+func assertRecipeLaunchCommands(t *testing.T, r *Recipe, d Data, command, resume []string) {
+	t.Helper()
+	originalCommand := slices.Clone(r.Command)
+	originalResume := slices.Clone(r.ResumeCommand)
+	for i := 0; i < 2; i++ {
+		out, err := r.render(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(out.Command, command) {
+			t.Errorf("command = %q, want %q", out.Command, command)
+		}
+		if !slices.Equal(out.Resume, resume) {
+			t.Errorf("resume = %q, want %q", out.Resume, resume)
+		}
+		for _, isResume := range []bool{false, true} {
+			script, err := r.Launcher(d, isResume)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := command
+			if isResume {
+				want = resume
+			}
+			quoted := make([]string, len(want))
+			for j, arg := range want {
+				quoted[j] = ShellQuote(arg)
+			}
+			if tail := "exec " + strings.Join(quoted, " ") + "\n"; !strings.HasSuffix(script, tail) {
+				t.Errorf("resume=%t: launcher does not end with %q:\n%s", isResume, tail, script)
+			}
+		}
+	}
+	if !slices.Equal(r.Command, originalCommand) || !slices.Equal(r.ResumeCommand, originalResume) {
+		t.Fatal("rendering must not mutate recipe commands")
 	}
 }
 

@@ -104,27 +104,68 @@ cooperate through `HTTPS_PROXY`, so they serve `local`.
 The recipe's `resume_command`, `state_dirs` and `path_keyed` fields drive the
 unattended workflow (ADR 0041).
 
+Configure `REMOUNT_SERVER` and `REMOUNT_TOKEN` for your remote deployment first,
+and create the matching provider binding there. Without a remote server,
+autostart may create a local standalone instead; `handoff` does not provision a
+cloud machine. Save the conversation and stop local work before copying it.
+
 ```sh
 cd ~/proj                       # a checkout with a Claude Code conversation open
-remount handoff --task "finish the refactor and open a PR"
+remount handoff --recipe claude --binding b_anthropic \
+  --task "finish the refactor and open a PR"
+remount handoff --recipe codex --binding b_openai --task "continue the refactor"
 ```
 
-`handoff` finds the harness whose state directory exists under your home
-(`--recipe` when several do), packs the checkout and that state into one
-artifact, and starts the `resume_command` in a new workspace. For a
-`path_keyed` recipe — Claude Code, Codex, OpenCode, Gemini and Cline key their
-per-project state on the absolute path of the working tree — the tree is
-mounted at the same absolute path inside the workspace, which needs a node
-with a mount namespace (`docker`). A `process`-only deployment leaves the
-workspace `pending` and `handoff` says so; it never creates a symlink on the
-node to fake the path. Goose, OpenHands and aider keep path-independent state
-and run on either backend at `/work`.
+These are alternative examples for the harness you used locally, not two steps
+of one transfer. GitHub tools, authorization and network access must be
+configured separately if the task needs to push or open a PR.
 
-`remount resume WS` picks the conversation back up: it attaches if a harness
-session is still running, otherwise wakes the workspace if it sleeps and runs
-the `resume_command` with `--task` (default "Continue where you left off.").
-The recipe, bindings and model come from the workspace's labels, so the
-command needs nothing but the id.
+`handoff` detects a recipe from state under your home (`--recipe` when several
+match, `--home` for an isolated state directory). Claude Code and Codex handoffs
+require a brokered provider binding: they do not transfer Keychain credentials,
+subscription logins, provider configuration or unrelated conversations. A local
+autostarted server can select a matching binding from exported provider keys;
+remote bindings must be named explicitly. The CLI does not automatically read
+`.env` files.
+
+For Claude/Codex, the newest valid saved transcript whose metadata matches the
+canonical checkout is selected. Its UUID and transcript path are recorded in
+workspace labels, and the harness resumes that exact UUID rather than using a
+provider-dependent “last conversation” lookup. If no valid matching transcript
+exists, handoff fails rather than silently starting a fresh conversation. Claude's
+selected-session subagent transcripts and tool-result text files travel too.
+State collection is bounded to 64 MiB per file, 256 MiB and 4096 files per
+conversation, and 100,000 discovery entries.
+
+Checkout copies of `.claude`, `.claude.json`, `.codex`, `.env` and `.env.*` are
+excluded; only selected conversation files are added back. This is not a content
+secret scanner: secrets previously pasted into conversation text, ordinary
+source files or Git objects can still travel. Review what the agent has seen
+before handing it to another machine. Other recipes retain their declared
+`state_dirs` transfer behavior; the scoped Claude/Codex guarantees do not apply
+to them.
+
+The checkout is copied, not moved, and the local agent is not stopped by this
+command. There is no live process-memory migration or continuous file sync.
+Once the remote session is running, it no longer depends on the local client.
+By default the CLI detaches and prints IDs; use `--attach` to follow output.
+Opening a session is not proof that the harness finished the requested task.
+
+For a `path_keyed` recipe, the tree appears at the same absolute path inside the
+remote workspace. That needs a namespaced backend such as Docker. Claude/Codex
+handoff checks for an online compatible backend before uploading; a process-only
+deployment is rejected without creating a workspace. No host symlink is created.
+The remote runtime must also support the harness's own sandbox: an ordinary
+Docker profile can block Codex's nested namespace creation. Do not mistake a
+successful API call for working file/command tools or disable the harness sandbox
+to hide that incompatibility.
+
+`remount resume WS` attaches to a live harness session; otherwise it wakes the
+workspace and invokes the resume command with `--task` (default "Continue where
+you left off."). The recipe, bindings, model and selected conversation come from
+the workspace labels. For a scoped handoff, the recorded transcript is checked
+before opening a new session. Legacy workspaces without a selected UUID keep
+their recipe's latest-conversation behavior.
 
 `remount run RECIPE --queue tasks.txt` runs one task per line in one
 workspace, in order, and records progress as a control-plane `Queue`

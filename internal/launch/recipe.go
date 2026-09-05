@@ -17,6 +17,7 @@ import (
 	"io/fs"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"text/template"
@@ -106,6 +107,7 @@ type Recipe struct {
 	SandboxFlags map[string][]string `json:"sandbox_flags,omitempty"`
 	// ApproveFlags maps an --approve policy to harness-native arguments.
 	ApproveFlags map[string][]string `json:"approve_flags,omitempty"`
+	ModelFlags   []string            `json:"model_flags,omitempty"`
 	// ACP runs the harness as an Agent Client Protocol server over stdio
 	// (ADR 0042). Recipes with it have a structured transcript; recipes
 	// without run in PTY mode and prompts are typed via PromptTemplate.
@@ -186,13 +188,14 @@ type ConfigFile struct {
 
 // Data is the template context for a single launch.
 type Data struct {
-	Task      string
-	Args      []string
-	Recipe    string
-	Workspace string
-	Sandbox   string
-	Approve   string
-	Model     string
+	Task         string
+	Args         []string
+	Recipe       string
+	Workspace    string
+	Sandbox      string
+	Approve      string
+	Model        string
+	Conversation string
 	// Providers are the presets bound for this run, in --binding order.
 	Providers []string
 	// Primary is Providers[0] or "".
@@ -342,7 +345,7 @@ func (r *Recipe) Validate() error {
 	}
 	// Compile every template once with a representative Data so a syntax
 	// error or unknown field is a load-time error.
-	probe := Data{Task: "t", Recipe: r.Name, Workspace: "ws_probe", Sandbox: SandboxWorkspaceWrite, Approve: ApproveNever, Broker: "$REMOUNT_BROKER", Message: "m", Port: 1}
+	probe := Data{Task: "t", Recipe: r.Name, Workspace: "ws_probe", Sandbox: SandboxWorkspaceWrite, Approve: ApproveNever, Model: "m", Broker: "$REMOUNT_BROKER", Message: "m", Port: 1}
 	if len(r.Providers) > 0 {
 		probe.Providers = []string{r.Providers[0]}
 		probe.Primary = r.Providers[0]
@@ -426,6 +429,9 @@ func funcs(d Data) template.FuncMap {
 }
 
 func (r *Recipe) render(d Data) (*rendered, error) {
+	if d.Conversation != "" && !conversationIDPattern.MatchString(d.Conversation) {
+		return nil, errors.New("conversation must be a UUID")
+	}
 	if d.Broker == "" {
 		d.Broker = "$REMOUNT_BROKER"
 	}
@@ -488,22 +494,40 @@ func (r *Recipe) render(d Data) (*rendered, error) {
 	} else if out.Command, err = list("command", r.Command); err != nil {
 		return nil, err
 	}
+	var launchFlags []string
 	if flags, ok := r.SandboxFlags[d.Sandbox]; ok {
 		extra, err := list("sandbox_flags."+d.Sandbox, flags)
 		if err != nil {
 			return nil, err
 		}
-		out.Command = append(out.Command, extra...)
+		launchFlags = append(launchFlags, extra...)
 	}
 	if flags, ok := r.ApproveFlags[d.Approve]; ok {
 		extra, err := list("approve_flags."+d.Approve, flags)
 		if err != nil {
 			return nil, err
 		}
-		out.Command = append(out.Command, extra...)
+		launchFlags = append(launchFlags, extra...)
 	}
+	if d.Model != "" {
+		extra, err := list("model_flags", r.ModelFlags)
+		if err != nil {
+			return nil, err
+		}
+		launchFlags = append(launchFlags, extra...)
+	}
+	out.Command = append(out.Command, launchFlags...)
 	if out.Resume, err = list("resume_command", r.ResumeCommand); err != nil {
 		return nil, err
+	}
+	if len(out.Resume) > 0 {
+		flagIndex := len(out.Resume)
+		if len(out.Resume) >= 3 && path.Base(out.Resume[0]) == "codex" && out.Resume[1] == "exec" && out.Resume[2] == "resume" {
+			flagIndex = 2
+		} else if r.Name == "codex" && len(out.Resume) >= 4 && slices.Equal(out.Resume[:4], []string{"sh", LauncherDir + "/codex-driver", "exec", "resume"}) {
+			flagIndex = 3
+		}
+		out.Resume = slices.Insert(out.Resume, flagIndex, launchFlags...)
 	}
 	if r.ACP != nil {
 		if out.ACP, err = list("acp.command", r.ACP.Command); err != nil {

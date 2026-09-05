@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"path"
 	"strings"
 	"time"
 
@@ -26,16 +28,18 @@ type Options struct {
 	Base        string
 	Repo        proto.RepoSpec // cloned by the node before the workspace is ready (ADR 0054)
 
-	Name     string
-	Image    string
-	Backend  string
-	Bindings []Binding
-	Security string
-	Sandbox  string
-	Approve  string
-	Model    string
-	Exclude  []string
-	Resume   bool
+	Name             string
+	Image            string
+	Backend          string
+	Bindings         []Binding
+	Security         string
+	Sandbox          string
+	Approve          string
+	Model            string
+	Exclude          []string
+	Resume           bool
+	Conversation     string
+	ConversationPath string
 	// MountPath pins where the tree appears inside the workspace (ADR 0041).
 	// A handoff sets it to the local checkout's path so path-keyed harness
 	// state stays valid; only namespaced backends can claim such a workspace.
@@ -138,6 +142,18 @@ func (o *Options) Validate() (*Plan, error) {
 	if o.Resume && len(r.ResumeCommand) == 0 {
 		return nil, fmt.Errorf("recipe %s has no resume mode", r.Name)
 	}
+	if o.Conversation != "" {
+		if !o.Resume || !conversationIDPattern.MatchString(o.Conversation) {
+			return nil, errors.New("conversation must be a UUID for a resume launch")
+		}
+		if scopedHandoff(r) {
+			if err := validateConversationPath(r.Name, o.Conversation, o.ConversationPath); err != nil {
+				return nil, err
+			}
+		}
+	} else if o.ConversationPath != "" {
+		return nil, errors.New("conversation transcript requires a conversation UUID")
+	}
 
 	providers := make([]string, 0, len(o.Bindings))
 	sessionEnv := map[string]string{}
@@ -170,7 +186,7 @@ func (o *Options) Validate() (*Plan, error) {
 
 	d := Data{
 		Task: o.Task, Args: o.Args, Recipe: r.Name, Workspace: o.WS,
-		Sandbox: o.Sandbox, Approve: o.Approve, Model: o.Model,
+		Sandbox: o.Sandbox, Approve: o.Approve, Model: o.Model, Conversation: o.Conversation,
 		Providers: providers, Broker: "${REMOUNT_BROKER}",
 	}
 	if len(providers) > 0 {
@@ -224,6 +240,12 @@ func (o *Options) Validate() (*Plan, error) {
 	}
 	if o.Model != "" {
 		spec.Labels[LabelModel] = o.Model
+	}
+	delete(spec.Labels, LabelConversation)
+	delete(spec.Labels, LabelConversationPath)
+	if o.Conversation != "" {
+		spec.Labels[LabelConversation] = o.Conversation
+		spec.Labels[LabelConversationPath] = o.ConversationPath
 	}
 	for k, v := range sessionEnv {
 		spec.Env[k] = v
@@ -291,9 +313,11 @@ func egressPolicy(r *Recipe, bindings []Binding, security, sandbox string) proto
 
 // Workspace labels written by Start and read back by Resume.
 const (
-	LabelRecipe   = "remount.recipe"
-	LabelBindings = "remount.bindings"
-	LabelModel    = "remount.model"
+	LabelRecipe           = "remount.recipe"
+	LabelBindings         = "remount.bindings"
+	LabelModel            = "remount.model"
+	LabelConversation     = "remount.conversation"
+	LabelConversationPath = "remount.conversation.path"
 	// LabelOrigin is the local directory a handoff came from.
 	LabelOrigin = "remount.origin"
 )
@@ -363,6 +387,22 @@ func Start(ctx context.Context, cl *client.Client, o Options) (*Result, error) {
 	if o.BeforeOpen != nil {
 		if err := o.BeforeOpen(ctx, res.Workspace); err != nil {
 			return res, err
+		}
+	}
+	if o.Conversation != "" && scopedHandoff(o.Recipe) {
+		entry, err := cl.Stat(ctx, wsID, o.ConversationPath)
+		if err != nil {
+			return res, fmt.Errorf("selected conversation transcript unavailable: %w", err)
+		}
+		if entry.IsDir || entry.IsLink || !fs.FileMode(entry.Mode).IsRegular() || entry.Size <= 0 || entry.Size > handoffMaxFileBytes {
+			return res, errors.New("selected conversation transcript is not a bounded regular file")
+		}
+		data, err := cl.ReadFile(ctx, wsID, o.ConversationPath)
+		if err != nil {
+			return res, fmt.Errorf("read selected conversation transcript: %w", err)
+		}
+		if _, ok := conversationMetadata(data, o.Recipe.Name, o.Conversation, path.IsAbs); !ok {
+			return res, errors.New("selected conversation transcript is invalid or does not match its UUID")
 		}
 	}
 	script, err := o.Recipe.Launcher(plan.Data, o.Resume)

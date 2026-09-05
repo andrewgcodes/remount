@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"remount.dev/remount/internal/artifact"
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/localfs"
 	"remount.dev/remount/internal/proto"
@@ -105,8 +107,8 @@ func DetectRecipe(home string, candidates []*Recipe) (*Recipe, error) {
 // to the checkout's absolute path so the harness finds its state where it
 // left it; that needs a node with a namespaced backend.
 func Handoff(ctx context.Context, cl *client.Client, o HandoffOptions) (*HandoffResult, error) {
-	if o.Run.WS != "" || o.Run.Dir != "" || o.Run.RestoreFrom != "" || o.Run.Base != "" || o.Run.Recipe != nil {
-		return nil, errors.New("handoff derives the workspace from the checkout; --ws, --dir, --base and the recipe are set by Handoff")
+	if o.Run.WS != "" || o.Run.Dir != "" || o.Run.RestoreFrom != "" || o.Run.Base != "" || o.Run.Repo.URL != "" || o.Run.Recipe != nil {
+		return nil, errors.New("handoff derives the workspace from the checkout; --ws, --dir, --base, --repo and the recipe are set by Handoff")
 	}
 	dir := o.Dir
 	if dir == "" {
@@ -150,9 +152,65 @@ func Handoff(ctx context.Context, cl *client.Client, o HandoffOptions) (*Handoff
 		stderr = io.Discard
 	}
 	res := &HandoffResult{Recipe: r}
-
+	run := o.Run
+	run.Recipe = r
+	run.Resume = true
+	if run.Task == "" {
+		run.Task = DefaultResumeTask
+	}
+	if r.PathKeyed {
+		if run.MountPath != "" && run.MountPath != dir {
+			return nil, fmt.Errorf("recipe %s keys its state on the working directory; the tree must stay at %s, not --mount-path %s", r.Name, dir, run.MountPath)
+		}
+		run.MountPath = dir
+	}
+	if scopedHandoff(r) && len(run.Bindings) == 0 {
+		return nil, fmt.Errorf("%s handoff requires an explicit provider --binding; local login is not portable and authentication files are never imported", r.Name)
+	}
+	if scopedHandoff(r) {
+		for _, binding := range run.Bindings {
+			if _, err := ParseBinding(binding.String()); err != nil {
+				return nil, err
+			}
+		}
+	}
+	plan, err := run.Validate()
+	if err != nil {
+		return nil, err
+	}
+	if scopedHandoff(r) && plan.Auth != AuthAPIKey {
+		return nil, fmt.Errorf("%s handoff requires brokered provider binding authentication; local login is not portable", r.Name)
+	}
+	res.MountPath = run.MountPath
 	var extra []localfs.ExtraTree
-	for _, state := range r.StateDirs {
+	excludes := append([]string(nil), run.Exclude...)
+	states := r.StateDirs
+	if scopedHandoff(r) {
+		selected, cleanup, err := handoffState(home, dir, r)
+		if err != nil {
+			return nil, err
+		}
+		defer cleanup()
+		extra = selected.extra
+		run.Conversation, run.ConversationPath = selected.conversation, selected.transcript
+		for _, file := range extra {
+			for rel := file.Archive; rel != "."; rel = path.Dir(rel) {
+				if artifact.Excluded(rel, run.Exclude) {
+					return nil, fmt.Errorf("--exclude would discard selected conversation state %s from snapshots", file.Archive)
+				}
+			}
+		}
+		nodes, err := cl.ListNodes(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("handoff backend preflight: %w", err)
+		}
+		if err := handoffBackend(plan.Spec, nodes); err != nil {
+			return nil, err
+		}
+		excludes = append(excludes, handoffPrivatePaths...)
+		states = nil
+	}
+	for _, state := range states {
 		local := filepath.Join(home, filepath.FromSlash(state))
 		if st, err := os.Lstat(filepath.Join(dir, filepath.FromSlash(state))); err == nil && !st.IsDir() {
 			// The checkout already carries this file (HOME is the workspace
@@ -163,7 +221,11 @@ func Handoff(ctx context.Context, cl *client.Client, o HandoffOptions) (*Handoff
 		extra = append(extra, localfs.ExtraTree{Local: local, Archive: state})
 	}
 	var buf bytes.Buffer
-	m, err := localfs.Pack(dir, localfs.PackOptions{ExcludeGit: o.ExcludeGit, Excludes: o.Run.Exclude, Extra: extra}, &buf)
+	pack := localfs.Pack
+	if scopedHandoff(r) {
+		pack = packHandoff
+	}
+	m, err := pack(dir, localfs.PackOptions{ExcludeGit: o.ExcludeGit, Excludes: excludes, Extra: extra}, &buf)
 	if err != nil {
 		return nil, fmt.Errorf("pack %s: %w", dir, err)
 	}
@@ -192,24 +254,12 @@ func Handoff(ctx context.Context, cl *client.Client, o HandoffOptions) (*Handoff
 	res.Artifact = artifactID
 	fmt.Fprintf(stderr, "uploaded %d files (%d bytes) as %s\n", m.Files, size, artifactID)
 
-	run := o.Run
-	run.Recipe = r
 	run.RestoreFrom = artifactID
-	run.Resume = true
-	if run.Task == "" {
-		run.Task = DefaultResumeTask
-	}
-	if run.Labels == nil {
-		run.Labels = map[string]string{}
+	run.Labels = make(map[string]string, len(o.Run.Labels)+1)
+	for key, value := range o.Run.Labels {
+		run.Labels[key] = value
 	}
 	run.Labels[LabelOrigin] = dir
-	if r.PathKeyed {
-		if run.MountPath != "" && run.MountPath != dir {
-			return nil, fmt.Errorf("recipe %s keys its state on the working directory; the tree must stay at %s, not --mount-path %s", r.Name, dir, run.MountPath)
-		}
-		run.MountPath = dir
-	}
-	res.MountPath = run.MountPath
 	if run.WaitClaimed <= 0 {
 		run.WaitClaimed = 60 * time.Second
 	}
@@ -355,6 +405,7 @@ func Resume(ctx context.Context, cl *client.Client, o ResumeOptions) (*ResumeRes
 	}
 	run, err := Start(ctx, cl, Options{
 		Recipe: r, Task: task, WS: ws.ID, Bindings: bindings, Model: ws.Spec.Labels[LabelModel],
+		Conversation: ws.Spec.Labels[LabelConversation], ConversationPath: ws.Spec.Labels[LabelConversationPath],
 		Security: security, Sandbox: o.Sandbox, Approve: o.Approve, Resume: true,
 		PTY: o.PTY, Rows: o.Rows, Cols: o.Cols, Stdin: o.Stdin, Timeout: o.Timeout, Stderr: stderr,
 	})
