@@ -180,6 +180,10 @@ func (c *Control) poolRemove(ctx context.Context, subject Subject, req *proto.Po
 		c.mu.Unlock()
 		return proto.Err(proto.CodeConflict, "pool %q changed during removal", req.Name)
 	}
+	if c.poolBusy[key] {
+		c.mu.Unlock()
+		return proto.Err(proto.CodeConflict, "pool %q is reconciling; retry removal", req.Name)
+	}
 	if current.Current != 0 {
 		c.mu.Unlock()
 		return proto.Err(proto.CodeConflict, "pool %q still owns %d machines", req.Name, current.Current)

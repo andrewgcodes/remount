@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Run every gate .github/workflows/ci.yml runs, locally, before pushing.
+# Run the portable local analogues of .github/workflows/ci.yml gates.
 #
 # This exists because CI cannot always answer. The repository is private, so
 # Actions minutes are metered, and a push that fails CI costs minutes and
 # teaches nothing when the budget is spent. Finding the failure here is free.
 #
-# Mirrors the ci.yml jobs, in the order they are cheapest to fail:
+# Mirrors the host-portable parts of the ci.yml jobs, in the order they are
+# cheapest to fail:
 #
 #   test            gofmt, vet, lint-locks, the suite (both Go modules), the
 #                   race lane
@@ -17,9 +18,9 @@
 # through the windows-test job. That job has caught real defects a
 # darwin-only vet does not see.
 #
-# Only ci.yml is mirrored. The SDK, web, isolation, KVM, vendor, MinIO, MCP
-# and release workflows have their own triggers and prerequisites and are not
-# part of this verdict.
+# Native macOS and Windows test/race lanes, and Windows native conformance,
+# cannot be reproduced by cross-compilation. They remain unavailable from one
+# local host and are never included in this script's verdict.
 #
 # Usage:
 #   scripts/verify-local.sh              everything
@@ -37,7 +38,8 @@
 # so `if scripts/verify-local.sh` is a usable precondition. Every gate runs
 # even when an earlier one fails: one full report beats a bisect through six
 # pushes. Only the complete gate set, with every gate executed, is reported
-# as safe to push; `fast` and named gates say which subset they covered.
+# as complete CI verification; `fast` and named gates say which subset they
+# covered.
 set -uo pipefail
 
 cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -159,8 +161,8 @@ run_fast() {
   gate_suite; gate_build; gate_static
 }
 
-# Which set ran decides what the verdict may claim. Only `all` is the full
-# ci.yml gate set; the others are named as the subset they are.
+# Which set ran decides what the verdict may claim. `all` is the complete
+# portable local set; native CI operating-system lanes remain separate.
 gate_set="${1:-all}"
 case "$gate_set" in
   all|fast)
@@ -195,7 +197,7 @@ for line in "${results[@]}"; do
 done
 
 case "$gate_set" in
-  all)      set_desc="the full ci.yml gate set" ;;
+  all)      set_desc="the portable local gate set" ;;
   fast)     set_desc="the fast gate set (race lane and conformance did not run)" ;;
   selected) set_desc="selected gates: $*" ;;
 esac
@@ -211,8 +213,9 @@ if [ "$unavailable" -gt 0 ]; then
   exit 2
 fi
 case "$gate_set" in
-  all) printf '\n%sall %d ci.yml gates passed — safe to push%s\n' "$green" "$ran" "$reset" ;;
-  *)   printf '\n%s%d gate(s) passed in %s — not the full ci.yml gate set; run without arguments before pushing%s\n' \
+  all) printf '\n%sall %d portable local gates passed; native macOS and Windows CI lanes did not run — CI verification remains incomplete%s\n' \
+         "$green" "$ran" "$reset" ;;
+  *)   printf '\n%s%d gate(s) passed in %s — not the complete portable local set; run without arguments for the broadest local verification%s\n' \
          "$green" "$ran" "$set_desc" "$reset" ;;
 esac
 exit 0
