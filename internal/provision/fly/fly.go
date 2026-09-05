@@ -20,62 +20,49 @@ import (
 
 const defaultEndpoint = "https://api.machines.dev"
 
-// SecretStore stages per-machine secrets in Fly's encrypted app vault. A
-// Machine references the secret by name; the plaintext never enters its config.
+// SecretStore stages per-machine secrets in Fly's encrypted app vault. Stage
+// returns the minimum secret version that the Machine must observe.
 type SecretStore interface {
-	Stage(context.Context, string, string) error
+	Stage(context.Context, string, string) (uint64, error)
 	Remove(context.Context, string) error
 }
 
-// CLISecrets uses `fly secrets import` stdin and a staged unset. The secret
-// value is never an argument or part of an error.
-type CLISecrets struct {
-	Runner providerutil.Runner
-	Fly    string
-	App    string
-	Token  string
+type apiSecrets struct {
+	api *providerutil.HTTP
+	app string
 }
 
-// Stage implements SecretStore.
-func (s CLISecrets) Stage(ctx context.Context, name, value string) error {
+type secretUpdate struct {
+	Values map[string]*string `json:"values"`
+}
+
+type secretUpdateResponse struct {
+	Version       uint64 `json:"version"`
+	LegacyVersion uint64 `json:"Version"`
+}
+
+func (s apiSecrets) Stage(ctx context.Context, name, value string) (uint64, error) {
 	if strings.ContainsAny(value, "\x00\r\n") {
-		return errors.New("fly: enrollment token cannot be represented by secrets import")
+		return 0, errors.New("fly: enrollment token cannot be represented by app secrets")
 	}
-	return s.runner().RunDiscard(ctx, providerutil.Command{
-		Executable: s.executable(), Args: []string{"secrets", "import", "--stage", "--app", s.App},
-		Stdin: []byte(name + "=" + value + "\n"), Env: map[string]string{"FLY_API_TOKEN": s.Token},
-	})
-}
-
-// Remove implements SecretStore.
-func (s CLISecrets) Remove(ctx context.Context, name string) error {
-	return s.runner().RunDiscard(ctx, providerutil.Command{
-		Executable: s.executable(), Args: []string{"secrets", "unset", "--stage", "--app", s.App, name},
-		Env: map[string]string{"FLY_API_TOKEN": s.Token},
-	})
-}
-
-func (s CLISecrets) runner() discardRunner {
-	runner := s.Runner
-	if runner == nil {
-		runner = providerutil.OSRunner{}
+	var response secretUpdateResponse
+	body := secretUpdate{Values: map[string]*string{name: &value}}
+	if err := s.api.JSON(ctx, http.MethodPost, s.path(), nil, body, &response, http.StatusOK); err != nil {
+		return 0, err
 	}
-	return discardRunner{Runner: runner}
-}
-
-func (s CLISecrets) executable() string {
-	if s.Fly != "" {
-		return s.Fly
+	version := max(response.Version, response.LegacyVersion)
+	if version == 0 {
+		return 0, errors.New("fly: stage enrollment secret returned no version")
 	}
-	return "fly"
+	return version, nil
 }
 
-type discardRunner struct{ providerutil.Runner }
-
-func (r discardRunner) RunDiscard(ctx context.Context, command providerutil.Command) error {
-	_, err := r.Run(ctx, command)
-	return err
+func (s apiSecrets) Remove(ctx context.Context, name string) error {
+	body := secretUpdate{Values: map[string]*string{name: nil}}
+	return s.api.JSON(ctx, http.MethodPost, s.path(), nil, body, nil, http.StatusOK)
 }
+
+func (s apiSecrets) path() string { return "/v1/apps/" + url.PathEscape(s.app) + "/secrets" }
 
 // Config configures one Fly app as a tenant-pool machine namespace.
 type Config struct {
@@ -93,26 +80,24 @@ type Config struct {
 // Driver provisions Fly Machines. Secret staging is serialized because Fly
 // app secret releases are app-wide state even though names are per machine.
 type Driver struct {
-	api       *providerutil.HTTP
-	app       string
-	image     string
-	bootstrap string
-	secrets   SecretStore
-	wait      time.Duration
-	mu        sync.Mutex
+	api         *providerutil.HTTP
+	app         string
+	image       string
+	bootstrap   string
+	secrets     SecretStore
+	wait        time.Duration
+	httpTimeout time.Duration
+	mu          sync.Mutex
 }
 
-// New validates config. A SecretStore is mandatory: plain Machine env is
-// provider-readable configuration and is not accepted for enrollment tokens.
+// New validates config. The default SecretStore uses Fly's encrypted app-secret
+// API; plain Machine env is never accepted for enrollment tokens.
 func New(config Config) (*Driver, error) {
 	if config.Endpoint == "" {
 		config.Endpoint = defaultEndpoint
 	}
 	if config.Token == "" || config.App == "" || config.Image == "" {
 		return nil, fmt.Errorf("%w: Fly token, app, and image are required", provision.ErrUnavailable)
-	}
-	if config.Secrets == nil {
-		return nil, fmt.Errorf("%w: Fly encrypted secret staging is required", provision.ErrUnavailable)
 	}
 	bootstrap := config.BootstrapPath
 	if bootstrap == "" {
@@ -128,16 +113,33 @@ func New(config Config) (*Driver, error) {
 	if wait < time.Second || wait > time.Minute {
 		return nil, errors.New("fly: wait timeout must be between 1s and 1m")
 	}
+	httpClient := config.HTTPClient
+	httpTimeout := wait + 5*time.Second
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: httpTimeout}
+	} else {
+		copy := *httpClient
+		if copy.Timeout == 0 {
+			copy.Timeout = httpTimeout
+		} else if copy.Timeout <= wait {
+			return nil, errors.New("fly: HTTP timeout must exceed wait timeout")
+		}
+		httpTimeout = copy.Timeout
+		httpClient = &copy
+	}
 	headers := make(http.Header)
 	headers.Set("Authorization", "Bearer "+config.Token)
 	api, err := providerutil.NewHTTP(providerutil.HTTPOptions{
 		Provider: "fly", Endpoint: config.Endpoint, Headers: headers,
-		Client: config.HTTPClient, Retries: config.ProviderRetries,
+		Client: httpClient, Retries: config.ProviderRetries,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &Driver{api: api, app: config.App, image: config.Image, bootstrap: bootstrap, secrets: config.Secrets, wait: wait}, nil
+	if config.Secrets == nil {
+		config.Secrets = apiSecrets{api: api, app: config.App}
+	}
+	return &Driver{api: api, app: config.App, image: config.Image, bootstrap: bootstrap, secrets: config.Secrets, wait: wait, httpTimeout: httpTimeout}, nil
 }
 
 // Name implements provision.Driver.
@@ -168,7 +170,8 @@ func (d *Driver) Create(ctx context.Context, request provision.Request) (provisi
 		return existing.Machine, nil
 	}
 	secretName := enrollmentSecretName(request.Name, request.Bootstrap.EnrollmentToken)
-	if err := d.secrets.Stage(ctx, secretName, request.Bootstrap.EnrollmentToken); err != nil {
+	secretVersion, err := d.secrets.Stage(ctx, secretName, request.Bootstrap.EnrollmentToken)
+	if err != nil {
 		return provision.Machine{}, errors.New("fly: stage enrollment secret failed")
 	}
 	secretRemoved := false
@@ -177,7 +180,7 @@ func (d *Driver) Create(ctx context.Context, request provision.Request) (provisi
 			_ = d.secrets.Remove(context.WithoutCancel(ctx), secretName)
 		}
 	}()
-	body, err := d.createBody(request, secretName)
+	body, err := d.createBody(request, secretName, secretVersion)
 	if err != nil {
 		return provision.Machine{}, err
 	}
@@ -269,9 +272,10 @@ func (d *Driver) waitStarted(ctx context.Context, id string) error {
 func (d *Driver) machinePath() string { return "/v1/apps/" + url.PathEscape(d.app) + "/machines" }
 
 type flyCreate struct {
-	Name   string    `json:"name"`
-	Region string    `json:"region,omitempty"`
-	Config flyConfig `json:"config"`
+	Name              string    `json:"name"`
+	Region            string    `json:"region,omitempty"`
+	Config            flyConfig `json:"config"`
+	MinSecretsVersion uint64    `json:"min_secrets_version"`
 }
 
 type flyConfig struct {
@@ -303,7 +307,7 @@ type flyRestart struct {
 	Policy string `json:"policy"`
 }
 
-func (d *Driver) createBody(request provision.Request, secretName string) (flyCreate, error) {
+func (d *Driver) createBody(request provision.Request, secretName string, secretVersion uint64) (flyCreate, error) {
 	guest, err := parseSize(request.Size)
 	if err != nil {
 		return flyCreate{}, err
@@ -323,7 +327,7 @@ func (d *Driver) createBody(request provision.Request, secretName string) (flyCr
 		"REMOUNT_BACKEND": request.Bootstrap.Backend, "REMOUNT_DATA_DIR": request.Bootstrap.DataDir,
 		"REMOUNT_NODE_ID": request.Bootstrap.NodeID,
 	}
-	return flyCreate{Name: request.Name, Region: request.Region, Config: flyConfig{
+	return flyCreate{Name: request.Name, Region: request.Region, MinSecretsVersion: secretVersion, Config: flyConfig{
 		Image: d.image, Env: env, Metadata: metadata, Guest: guest, Restart: flyRestart{Policy: "always"},
 		Processes: []flyProcess{{Entrypoint: []string{d.bootstrap}, Secrets: []flySecret{{EnvVar: "REMOUNT_ENROLL_TOKEN", Name: secretName}}}},
 	}}, nil

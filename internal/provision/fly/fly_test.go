@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"remount.dev/remount/internal/provision"
-	"remount.dev/remount/internal/provision/internal/providerutil"
 )
 
 type fakeSecrets struct {
@@ -21,14 +20,14 @@ type fakeSecrets struct {
 	removed []string
 }
 
-func (s *fakeSecrets) Stage(_ context.Context, name, value string) error {
+func (s *fakeSecrets) Stage(_ context.Context, name, value string) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.staged == nil {
 		s.staged = make(map[string]string)
 	}
 	s.staged[name] = value
-	return nil
+	return 42, nil
 }
 
 func (s *fakeSecrets) Remove(_ context.Context, name string) error {
@@ -76,6 +75,9 @@ func TestDriverCreateListDestroyContract(t *testing.T) {
 			}
 			if len(create.Config.Processes) != 1 || len(create.Config.Processes[0].Secrets) != 1 {
 				t.Errorf("missing process secret ref: %+v", create)
+			}
+			if create.MinSecretsVersion != 42 {
+				t.Errorf("min secrets version=%d", create.MinSecretsVersion)
 			}
 			machine = &flyMachine{ID: "fly-id", Name: create.Name, State: "created", Region: create.Region, CreatedAt: time.Now()}
 			machine.Config.Metadata = create.Config.Metadata
@@ -128,7 +130,7 @@ func TestDriverCreateListDestroyContract(t *testing.T) {
 	}
 }
 
-func TestFlySizeAndCLISecretInvocation(t *testing.T) {
+func TestFlySizeAndAppSecretVersion(t *testing.T) {
 	guest, err := parseSize("performance-2x")
 	if err != nil || guest.CPUKind != "performance" || guest.CPUs != 2 || guest.MemoryMB != 4096 {
 		t.Fatalf("guest=%+v err=%v", guest, err)
@@ -136,19 +138,36 @@ func TestFlySizeAndCLISecretInvocation(t *testing.T) {
 	if _, err := parseSize("performance-cpu-2x"); err == nil {
 		t.Fatal("accepted nonexistent preset spelling")
 	}
-	runner := &recordRunner{}
-	store := CLISecrets{Runner: runner, Fly: "flyctl", App: "app", Token: "api-token"}
-	if err := store.Stage(context.Background(), "NAME", "secret"); err != nil {
+	var updates []secretUpdate
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer api-token" || r.URL.Path != "/v1/apps/app/secrets" {
+			t.Errorf("secret request path=%s auth=%q", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		var update secretUpdate
+		if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+			t.Fatal(err)
+		}
+		updates = append(updates, update)
+		_, _ = w.Write([]byte(`{"Version":42}`))
+	}))
+	defer server.Close()
+	driver, err := New(Config{Endpoint: server.URL, Token: "api-token", App: "app", Image: "image", WaitTimeout: time.Second})
+	if err != nil {
 		t.Fatal(err)
+	}
+	store := driver.secrets
+	version, err := store.Stage(context.Background(), "NAME", "secret")
+	if err != nil || version != 42 {
+		t.Fatalf("stage version=%d err=%v", version, err)
 	}
 	if err := store.Remove(context.Background(), "NAME"); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(strings.Join(runner.commands[0].Args, " "), "NAME=secret") || string(runner.commands[0].Stdin) != "NAME=secret\n" {
-		t.Fatalf("stage=%+v", runner.commands[0])
+	if len(updates) != 2 || updates[0].Values["NAME"] == nil || *updates[0].Values["NAME"] != "secret" {
+		t.Fatalf("stage updates=%+v", updates)
 	}
-	if strings.Contains(strings.Join(runner.commands[1].Args, " "), "--yes") {
-		t.Fatalf("unsupported unset args=%v", runner.commands[1].Args)
+	if value, ok := updates[1].Values["NAME"]; !ok || value != nil {
+		t.Fatalf("remove updates=%+v", updates)
 	}
 }
 
@@ -163,18 +182,30 @@ func TestFlyWaitTimeoutMatchesProviderLimit(t *testing.T) {
 	if driver.wait != time.Minute {
 		t.Fatalf("default wait=%s", driver.wait)
 	}
+	if driver.httpTimeout <= driver.wait {
+		t.Fatalf("HTTP timeout=%s does not cover provider wait=%s", driver.httpTimeout, driver.wait)
+	}
 	if _, err := New(Config{
 		Endpoint: "https://example.invalid", Token: "api-token", App: "app",
 		Image: "image", Secrets: &fakeSecrets{}, WaitTimeout: time.Minute + time.Second,
 	}); err == nil {
 		t.Fatal("accepted wait timeout above Fly's API limit")
 	}
+	if _, err := New(Config{
+		Endpoint: "https://example.invalid", Token: "api-token", App: "app",
+		Image: "image", Secrets: &fakeSecrets{}, WaitTimeout: time.Second,
+		HTTPClient: &http.Client{Timeout: 500 * time.Millisecond},
+	}); err == nil {
+		t.Fatal("accepted HTTP timeout shorter than the provider wait")
+	}
 }
 
 type leakingSecrets struct{ secret string }
 
-func (s leakingSecrets) Stage(context.Context, string, string) error { return errors.New(s.secret) }
-func (s leakingSecrets) Remove(context.Context, string) error        { return nil }
+func (s leakingSecrets) Stage(context.Context, string, string) (uint64, error) {
+	return 0, errors.New(s.secret)
+}
+func (s leakingSecrets) Remove(context.Context, string) error { return nil }
 
 func TestSecretStoreErrorCannotLeakEnrollment(t *testing.T) {
 	const token = "secret-canary"
@@ -186,13 +217,6 @@ func TestSecretStoreErrorCannotLeakEnrollment(t *testing.T) {
 	if err == nil || strings.Contains(err.Error(), token) {
 		t.Fatalf("secret store error leaked: %v", err)
 	}
-}
-
-type recordRunner struct{ commands []providerutil.Command }
-
-func (r *recordRunner) Run(_ context.Context, command providerutil.Command) ([]byte, error) {
-	r.commands = append(r.commands, command)
-	return nil, nil
 }
 
 func testRequest(token string) provision.Request {
