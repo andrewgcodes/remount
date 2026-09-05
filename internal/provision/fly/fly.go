@@ -145,8 +145,9 @@ func New(config Config) (*Driver, error) {
 // Name implements provision.Driver.
 func (*Driver) Name() string { return "fly" }
 
-// Create stages the one-time token, starts one Machine, waits for Fly's
-// started state, and stages removal of the vault entry before returning.
+// Create stages the one-time token, starts one Machine, and waits for Fly's
+// started state. The token remains in Fly's vault until Destroy because
+// provider started precedes guest process startup.
 func (d *Driver) Create(ctx context.Context, request provision.Request) (provision.Machine, error) {
 	request = provision.CloneRequest(request)
 	if err := provision.ValidateSecretBoundary(request); err != nil {
@@ -174,9 +175,9 @@ func (d *Driver) Create(ctx context.Context, request provision.Request) (provisi
 	if err != nil {
 		return provision.Machine{}, errors.New("fly: stage enrollment secret failed")
 	}
-	secretRemoved := false
+	machineCreated := false
 	defer func() {
-		if !secretRemoved {
+		if !machineCreated {
 			_ = d.secrets.Remove(context.WithoutCancel(ctx), secretName)
 		}
 	}()
@@ -197,13 +198,10 @@ func (d *Driver) Create(ctx context.Context, request provision.Request) (provisi
 	if machine.ID == "" {
 		return provision.Machine{}, errors.New("fly: create response has no machine id")
 	}
+	machineCreated = true
 	if err := d.waitStarted(ctx, machine.ID); err != nil {
 		return provision.Machine{}, err
 	}
-	if err := d.secrets.Remove(context.WithoutCancel(ctx), secretName); err != nil {
-		return provision.Machine{}, errors.New("fly: remove staged enrollment secret failed")
-	}
-	secretRemoved = true
 	machine.State = "started"
 	return machine, nil
 }
@@ -215,8 +213,19 @@ func (d *Driver) Destroy(ctx context.Context, id string) error {
 	if !safeID(id) {
 		return errors.New("fly: machine id is invalid")
 	}
-	err := d.api.JSON(ctx, http.MethodDelete, d.machinePath()+"/"+url.PathEscape(id), url.Values{"force": {"true"}}, nil, nil, http.StatusOK, http.StatusNoContent, http.StatusNotFound)
-	return err
+	var machine flyMachine
+	if err := d.api.JSON(ctx, http.MethodGet, d.machinePath()+"/"+url.PathEscape(id), nil, nil, &machine, http.StatusOK, http.StatusNotFound); err != nil {
+		return err
+	}
+	if machine.ID == "" {
+		return nil
+	}
+	if secretName := machine.Config.Metadata["remount_enroll_secret"]; secretName != "" {
+		if err := d.secrets.Remove(ctx, secretName); err != nil {
+			return errors.New("fly: remove enrollment secret failed")
+		}
+	}
+	return d.api.JSON(ctx, http.MethodDelete, d.machinePath()+"/"+url.PathEscape(id), url.Values{"force": {"true"}}, nil, nil, http.StatusOK, http.StatusNoContent, http.StatusNotFound)
 }
 
 // List returns only machines within the requested tenant and pool.
@@ -315,6 +324,7 @@ func (d *Driver) createBody(request provision.Request, secretName string, secret
 	metadata := map[string]string{
 		"remount_managed": "true", "remount_name": request.Name,
 		"remount_tenant": request.Tenant, "remount_pool": request.Labels[provision.PoolLabel],
+		"remount_enroll_secret": secretName,
 	}
 	for key, value := range request.Labels {
 		if key == provision.PoolLabel {

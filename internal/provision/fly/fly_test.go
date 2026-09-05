@@ -42,6 +42,7 @@ func TestDriverCreateListDestroyContract(t *testing.T) {
 	var mu sync.Mutex
 	var machine *flyMachine
 	posts := 0
+	secrets := &fakeSecrets{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer api-token" {
 			t.Errorf("missing bearer auth")
@@ -54,6 +55,8 @@ func TestDriverCreateListDestroyContract(t *testing.T) {
 				t.Errorf("wait query=%s", r.URL.RawQuery)
 			}
 			_, _ = w.Write([]byte(`{"ok":true}`))
+		case r.Method == http.MethodGet && machine != nil && strings.HasSuffix(r.URL.Path, "/"+machine.ID):
+			_ = json.NewEncoder(w).Encode(machine)
 		case r.Method == http.MethodGet:
 			if machine == nil {
 				_, _ = w.Write([]byte("[]"))
@@ -79,11 +82,17 @@ func TestDriverCreateListDestroyContract(t *testing.T) {
 			if create.MinSecretsVersion != 42 {
 				t.Errorf("min secrets version=%d", create.MinSecretsVersion)
 			}
+			if create.Config.Metadata["remount_enroll_secret"] == "" {
+				t.Error("missing enrollment secret cleanup metadata")
+			}
 			machine = &flyMachine{ID: "fly-id", Name: create.Name, State: "created", Region: create.Region, CreatedAt: time.Now()}
 			machine.Config.Metadata = create.Config.Metadata
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(machine)
 		case r.Method == http.MethodDelete:
+			if len(secrets.removed) != 1 {
+				t.Errorf("Machine deleted before enrollment secret removal")
+			}
 			if r.URL.Query().Get("force") != "true" {
 				t.Errorf("destroy not forced")
 			}
@@ -94,7 +103,6 @@ func TestDriverCreateListDestroyContract(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	secrets := &fakeSecrets{}
 	driver, err := New(Config{Endpoint: server.URL, Token: "api-token", App: "app", Image: "image", Secrets: secrets, WaitTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -113,7 +121,7 @@ func TestDriverCreateListDestroyContract(t *testing.T) {
 	if posts != 1 {
 		t.Fatalf("idempotent create posted %d times", posts)
 	}
-	if len(secrets.staged) != 1 || len(secrets.removed) != 1 {
+	if len(secrets.staged) != 1 || len(secrets.removed) != 0 {
 		t.Fatalf("secret lifecycle staged=%v removed=%v", secrets.staged, secrets.removed)
 	}
 	for _, value := range secrets.staged {
@@ -127,6 +135,9 @@ func TestDriverCreateListDestroyContract(t *testing.T) {
 	}
 	if err := driver.Destroy(context.Background(), got.ID); err != nil {
 		t.Fatal(err)
+	}
+	if len(secrets.removed) != 1 {
+		t.Fatalf("secret lifecycle staged=%v removed=%v", secrets.staged, secrets.removed)
 	}
 }
 
