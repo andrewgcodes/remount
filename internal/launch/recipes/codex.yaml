@@ -30,3 +30,7 @@ path_keyed: true
 acp:
   command: ["npx", "-y", "@agentclientprotocol/codex-acp"]
   adapter: "@agentclientprotocol/codex-acp"
+  env:
+    CODEX_CONFIG: '{{if .Primary}}{"openai_base_url":"{{baseURL .Primary}}"}{{end}}'
+    DEFAULT_AUTH_REQUEST: '{{if .Primary}}{"methodId":"api-key"}{{end}}'
+    INITIAL_AGENT_MODE: '{{if eq .Sandbox "read-only"}}read-only{{else if eq .Sandbox "full"}}agent-full-access{{else}}agent{{end}}'
