@@ -94,8 +94,7 @@ func buildProvisioner(vendor string, entry provisionerEntry) (provision.Driver, 
 		if err != nil {
 			return nil, err
 		}
-		return fly.New(fly.Config{Endpoint: entry.Endpoint, Token: token, App: entry.App, Image: entry.Image,
-			Secrets: fly.CLISecrets{App: entry.App, Token: token}})
+		return fly.New(fly.Config{Endpoint: entry.Endpoint, Token: token, App: entry.App, Image: entry.Image})
 	case "e2b":
 		key, err := requiredProvisionEnv(entry.TokenEnv)
 		if err != nil {

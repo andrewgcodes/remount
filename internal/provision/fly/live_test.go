@@ -14,8 +14,7 @@ import (
 
 func TestLiveProvisionerLifecycle(t *testing.T) {
 	values := requireLiveEnv(t, "FLY_IO_2026_CORRECT_KEY", "REMOUNT_FLY_APP", "REMOUNT_FLY_IMAGE", "REMOUNT_VENDOR_SERVER_URL", "REMOUNT_VENDOR_ENROLL_TOKEN", "REMOUNT_VENDOR_BINARY_URL", "REMOUNT_VENDOR_TENANT", "REMOUNT_VENDOR_POOL")
-	secretStore := CLISecrets{Fly: os.Getenv("REMOUNT_FLYCTL"), App: values["REMOUNT_FLY_APP"], Token: values["FLY_IO_2026_CORRECT_KEY"]}
-	driver, err := New(Config{Token: values["FLY_IO_2026_CORRECT_KEY"], App: values["REMOUNT_FLY_APP"], Image: values["REMOUNT_FLY_IMAGE"], Secrets: secretStore})
+	driver, err := New(Config{Token: values["FLY_IO_2026_CORRECT_KEY"], App: values["REMOUNT_FLY_APP"], Image: values["REMOUNT_FLY_IMAGE"]})
 	if err != nil {
 		t.Fatal(err)
 	}
