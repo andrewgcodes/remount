@@ -1504,10 +1504,10 @@ func validateArchiveName(name string, limits RestoreLimits) (string, error) {
 }
 
 func validateSymlinkTarget(name, target string) error {
-	if target == "" || strings.IndexByte(target, 0) >= 0 || path.IsAbs(target) || filepath.IsAbs(target) || filepath.VolumeName(target) != "" {
+	if target == "" || strings.IndexByte(target, 0) >= 0 || strings.Contains(target, "\\") ||
+		path.IsAbs(target) || filepath.IsAbs(target) || filepath.VolumeName(target) != "" {
 		return fmt.Errorf("artifact: symlink %q has invalid target %q", name, target)
 	}
-	target = strings.ReplaceAll(target, "\\", "/")
 	resolved := path.Clean(path.Join(path.Dir(name), target))
 	if resolved == ".." || strings.HasPrefix(resolved, "../") {
 		return fmt.Errorf("artifact: symlink %q escapes root", name)

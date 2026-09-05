@@ -1475,3 +1475,25 @@ tests cover old records that decode with epoch zero.
 **Lesson.** Uniqueness is not recency. When delayed destructive requests are
 possible, successor authority must be durably ordered or explicitly linked;
 opaque idempotency identifiers cannot supply that relationship.
+
+---
+
+## 57. Symlink validation interpreted backslashes differently from restore
+
+Archive validation replaced backslashes with slashes before checking whether a
+relative symlink escaped the root, but Linux restore preserved those
+backslashes as literal filename bytes. A mixed-separator target could therefore
+validate as contained and resolve outside the archive tree when restored.
+
+Archive symlink targets are now slash-only. Producers normalize native Windows
+separators before validation, Unix links containing literal backslashes fail
+closed, and restore rejects non-portable backslash targets.
+
+**Proof.** A producer-side fuzz target found the mixed-separator discrepancy
+and now checks every accepted rewrite for relative, archive-contained,
+destination-preserving output. A fixed fuzz seed and restore unit test
+cover the minimal escaping form, and `make fuzz` runs the target.
+
+**Lesson.** Portability normalization must not make validation and use assign
+different path semantics. Canonicalize once into the wire format or reject the
+ambiguous input.
