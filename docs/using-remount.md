@@ -219,6 +219,19 @@ The reverse direction overlays a local tree onto the workspace:
 ignore and conflict behavior is documented in
 [`tutorial.md`](tutorial.md#working-from-a-local-checkout).
 
+Public SDKs can apply an uploaded archive below the workspace root when a
+component owns a dedicated subtree. The destination must already exist and is
+resolved through the workspace jail:
+
+```python
+await client.mkdir(workspace_id, "state")
+await client.apply_tar(workspace_id, artifact_id, path="state")
+```
+
+The Go equivalent is `Client.ApplyTarAt`. An empty destination preserves the
+root-overlay behavior used by `remount push`; neither form deletes paths the
+archive does not name.
+
 ### Preserve or move the whole filesystem
 
 ```sh
@@ -262,6 +275,11 @@ Filesystem mutations are jailed to the workspace root:
 ./remount fs mv "$WS" notes.md archive/notes.md
 ./remount fs rm "$WS" archive/notes.md
 ```
+
+The Python SDK's `write_file` helper splits large values into wire-safe
+chunks. If a later chunk fails, the destination contains the acknowledged
+prefix; retry the same bytes with the same explicit `idempotency_key` to
+continue without duplicating that prefix.
 
 Long-running session output is a sequenced log. Ctrl-C detaches unless the
 caller explicitly requests termination:

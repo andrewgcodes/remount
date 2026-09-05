@@ -1478,6 +1478,9 @@ type FSEditRes struct {
 type FSApplyTarReq struct {
 	WS       string `cbor:"ws" json:"ws"`
 	Artifact string `cbor:"artifact" json:"artifact"`
+	// Path is the existing workspace directory that receives the overlay.
+	// Empty means the workspace root.
+	Path string `cbor:"path,omitempty" json:"path,omitempty"`
 	// Format names the representation Artifact is stored in. Empty means the
 	// legacy deterministic tar.gz, so a client built before chunked pushes
 	// existed keeps working unchanged; a node that cannot restore the named
