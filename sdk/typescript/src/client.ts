@@ -14,8 +14,25 @@ const MAX_DELIVERY_BYTES = 16 << 20;
 const MAX_DELIVERY_WAITERS = 1024;
 const STREAM_EXIT = 3;
 const STREAM_GAP = 5;
+// Node-owned enforcement (revocation, session capabilities and release epochs)
+// stays on the node. Clients fence frames, verify artifact bytes and preserve gaps.
+const PEER_CAPABILITIES = ["v1", "authz-push", "controller-epoch", "session-cap", "chunked-artifacts", "tiered-session-logs", "release-epoch", "identity-admin"];
 
 type Frame = Record<string, any>;
+
+function orphanFrameBytes(sessionID: string, frame: Frame): number {
+  // Routing metadata must not bypass the byte bound with an empty body.
+  return bytes(frame.body).byteLength + 2 * (sessionID.length + frame.from.length + frame.ws.length);
+}
+
+function wireEpoch(value: unknown): bigint {
+  if (value === undefined) return 0n;
+  if ((typeof value !== "bigint" && (typeof value !== "number" || !Number.isSafeInteger(value))) ||
+      BigInt(value) < 0n || BigInt(value) > 0xffffffffffffffffn) {
+    throw new ProtocolError("bad_request", "invalid controller epoch");
+  }
+  return BigInt(value);
+}
 
 function compareBytes(left: Uint8Array, right: Uint8Array): number {
   const length = Math.min(left.byteLength, right.byteLength);
@@ -117,6 +134,17 @@ function bytes(message: any): Uint8Array {
 }
 
 export class Session implements AsyncIterable<Chunk> {
+  private node = "";
+
+  /** Bind output to the producer authorized by the control-issued grant. */
+  bindNode(node: string): void { this.node = node; }
+
+  /** Authenticate both live and buffered frames before interpreting their body. */
+  async acceptFromNode(frame: Frame): Promise<void> {
+    if (this.node && frame.from === this.node && frame.ws === this.workspace) {
+      await this.accept({ seq: frame.seq, body: frame.body });
+    }
+  }
   readonly chunks: Chunk[] = [];
   nextSeq = 0;
   lastInputSeq = 0;
@@ -249,7 +277,7 @@ export class Session implements AsyncIterable<Chunk> {
     let delay = 100;
     for (let attempt = 0; attempt < 8 && !this.closed && this.client.generation === generation; attempt++) {
       try {
-        const response = await this.client.nodeCall(this.workspace, "s.attach", { s: this.id, from: this.nextSeq });
+        const response = await this.client.nodeCall(this.workspace, "s.attach", { s: this.id, from: this.nextSeq }, (node) => this.bindNode(node));
         const serverSequence = Number(response.last_iseq ?? 0);
         const seed = this.inputTail.then(() => { this.lastInputSeq = Math.max(this.lastInputSeq, serverSequence); });
         this.inputTail = seed.catch(() => undefined);
@@ -298,7 +326,8 @@ export class Client {
   private socket?: WebSocketLike;
   private connecting?: Promise<void>;
   private requestID = 0;
-  private pending = new Map<number, { resolve: (frame: Frame) => void; reject: (error: Error) => void; from: string; op: string }>();
+  private controllerEpoch = 0n;
+  private pending = new Map<number, { resolve: (frame: Frame) => void; reject: (error: Error) => void; from: string; op: string; hello: boolean }>();
   private sessions = new Map<string, Session>();
   private orphans = new Map<string, Frame[]>();
   private orphanCount = 0;
@@ -322,8 +351,8 @@ export class Client {
 
   async connect(): Promise<void> {
     if (this.closed) throw new ConnectionClosed("client closed");
-    if (this.socket) return;
     if (this.connecting) return this.connecting;
+    if (this.socket) return;
     this.connecting = this.doConnect().finally(() => { this.connecting = undefined; });
     return this.connecting;
   }
@@ -343,7 +372,9 @@ export class Client {
     try { socket = await Promise.race([pendingSocket, timer]); }
     finally { clearTimeout(timerHandle!); }
     this.socket = socket;
+    this.controllerEpoch = 0n;
     listen(socket, "message", (message) => {
+      if (this.socket !== socket) return;
       void this.receive(message).catch((error) => {
         socket.close();
         this.disconnected(socket, error instanceof Error ? error : new ProtocolError("bad_request", "invalid wire frame"));
@@ -352,7 +383,7 @@ export class Client {
     listen(socket, "close", () => this.disconnected(socket, new ConnectionClosed("connection closed")));
     listen(socket, "error", (event) => this.disconnected(socket, event?.error ?? new ConnectionClosed("connection failed")));
     try {
-      const response = await this.roundTrip({ v: 1, t: "hello", body: encodeProtocol({ peer: this.peerID, role: "client", token: this.token, principal: this.principal, caps: ["v1", "authz-push"] }) });
+      const response = await this.roundTrip({ v: 1, t: "hello", body: encodeProtocol({ peer: this.peerID, role: "client", token: this.token, principal: this.principal, caps: PEER_CAPABILITIES }) });
       const hello: any = response.body ? decoder.decode(bytes(response.body)) : {};
       if (!hello.caps?.includes("v1")) throw new ProtocolError("unsupported", "server did not negotiate v1");
       this.peerID = hello.peer ?? "";
@@ -400,9 +431,18 @@ export class Client {
     const frame: Frame = decoder.decode(data) as Frame;
     if (Number(frame.v) !== 1) { this.socket?.close(); return; }
     const pending = this.pending.get(Number(frame.id ?? 0));
+    if (!pending?.hello && this.controllerEpoch && wireEpoch(frame.controller_epoch) < this.controllerEpoch) return;
     if ((frame.t === "res" || frame.t === "pong") && pending &&
-        (!pending.from || !frame.from || frame.from === pending.from) &&
+        (!pending.from || frame.from === pending.from) &&
         (!pending.op || frame.op === pending.op)) {
+      if (pending.hello && !frame.err) {
+        const hello: any = frame.body ? decoder.decode(bytes(frame.body)) : {};
+        if (hello.caps?.includes("controller-epoch")) {
+          const epoch = wireEpoch(hello.controller_epoch);
+          if (!epoch) throw new ProtocolError("conflict", "server negotiated controller-epoch without an epoch");
+          this.controllerEpoch = epoch;
+        }
+      }
       this.pending.delete(Number(frame.id));
       pending.resolve(frame);
       return;
@@ -414,6 +454,11 @@ export class Client {
   private send(frame: Frame): void {
     if (!this.socket) throw new ConnectionClosed("not connected");
     const socket = this.socket;
+    if (frame.t !== "hello" && this.controllerEpoch) {
+      // cbor-x encodes bigint as uint64, but larger JS numbers as floats.
+      // Select the shortest unsigned-integer encoding without losing bits.
+      frame = { ...frame, controller_epoch: this.controllerEpoch <= 0xffffffffn ? Number(this.controllerEpoch) : this.controllerEpoch };
+    }
     const encoded = encodeProtocol(frame);
     if (encoded.byteLength > this.maxFrameBytes) throw new ProtocolError("resource_exhausted", "wire frame exceeds configured limit");
     try { socket.send(encoded); } catch {
@@ -435,7 +480,7 @@ export class Client {
       }, this.requestTimeoutMilliseconds) : undefined;
       const finish = (response: Frame) => { if (timer) clearTimeout(timer); resolve(response); };
       const fail = (error: Error) => { if (timer) clearTimeout(timer); reject(error); };
-      this.pending.set(id, { resolve: finish, reject: fail, from: String(frame.to ?? ""), op: String(frame.op ?? "") });
+      this.pending.set(id, { resolve: finish, reject: fail, from: String(frame.to ?? ""), op: String(frame.op ?? ""), hello: frame.t === "hello" });
       try { this.send(frame); } catch (error) { this.pending.delete(id); reject(error); }
     }).then((response: Frame) => {
       if (response.err) {
@@ -462,10 +507,11 @@ export class Client {
     throw failure;
   }
 
-  async nodeCall(workspace: string, op: string, body: Record<string, any>): Promise<Record<string, any>> {
+  async nodeCall(workspace: string, op: string, body: Record<string, any>, bindNode?: (node: string) => void): Promise<Record<string, any>> {
     for (let attempt = 0; attempt < 2; attempt++) {
       let grant = this.grants.get(workspace);
       if (!grant) { grant = await this.call("grant", { ws: workspace }); this.grants.set(workspace, grant); }
+      bindNode?.(String(grant.node));
       try { return await this.call(op, { ...body, grant }, String(grant.node)); }
       catch (error) {
         if (attempt === 0 && error instanceof ProtocolError && ["conflict", "unreachable", "unauthorized"].includes(error.code)) { this.grants.delete(workspace); continue; }
@@ -477,16 +523,20 @@ export class Client {
 
   private async handleChunk(frame: Frame): Promise<void> {
     const sessionID = String(frame.s ?? "");
-    const body = frame.body ? bytes(frame.body) : new Uint8Array();
-    const chunk = { seq: Number(frame.seq ?? 0), body };
     const session = this.sessions.get(sessionID);
-    if (session) { await session.accept(chunk); return; }
+    if (session) { await session.acceptFromNode(frame); return; }
+    // A reconnect can clear grants while an open still holds its grant.
+    // Authenticate this bounded orphan against that open during registration.
+    const body = frame.body ? bytes(frame.body) : new Uint8Array();
+    const orphan = { seq: Number(frame.seq ?? 0), body, from: typeof frame.from === "string" ? frame.from : "", ws: typeof frame.ws === "string" ? frame.ws : "" };
+    const size = orphanFrameBytes(sessionID, orphan);
     let bucket = this.orphans.get(sessionID);
     if (!bucket) { bucket = []; this.orphans.set(sessionID, bucket); }
-    if (this.orphans.size > MAX_ORPHAN_SESSIONS || bucket.length >= MAX_REORDER_CHUNKS || this.orphanCount >= MAX_ORPHAN_CHUNKS || this.orphanBytes + body.byteLength > MAX_ORPHAN_BYTES) {
+    if (this.orphans.size > MAX_ORPHAN_SESSIONS || bucket.length >= MAX_REORDER_CHUNKS || this.orphanCount >= MAX_ORPHAN_CHUNKS || this.orphanBytes + size > MAX_ORPHAN_BYTES) {
       this.orphans.clear(); this.orphanCount = 0; this.orphanBytes = 0; this.socket?.close(); return;
     }
-    bucket.push(chunk); this.orphanCount++; this.orphanBytes += body.byteLength;
+    bucket.push(orphan);
+    this.orphanCount++; this.orphanBytes += size;
   }
 
   removeSession(id: string): void { this.sessions.delete(id); }
@@ -502,17 +552,18 @@ export class Client {
   }
 
   async exec(workspace: string, program: string[], options: { kind?: string; cwd?: string; env?: Record<string, string>; stdin?: boolean; idempotencyKey?: string } = {}): Promise<Session> {
-    const response = await this.nodeCall(workspace, "s.open", { ws: workspace, kind: options.kind ?? "exec", program, cwd: options.cwd ?? "", env: options.env ?? {}, stdin: options.stdin ?? false, idem: options.idempotencyKey ?? idem() });
+    const session = new Session(this, workspace, options.kind ?? "exec", "");
+    const response = await this.nodeCall(workspace, "s.open", { ws: workspace, kind: options.kind ?? "exec", program, cwd: options.cwd ?? "", env: options.env ?? {}, stdin: options.stdin ?? false, idem: options.idempotencyKey ?? idem() }, (node) => session.bindNode(node));
     const id = String(response.s);
     const existing = this.sessions.get(id);
     if (existing) return existing;
-    const session = new Session(this, workspace, options.kind ?? "exec", id);
+    session.id = id;
     session.lastInputSeq = Number(response.last_iseq ?? 0);
     this.sessions.set(id, session);
     const early = this.orphans.get(id) ?? [];
     this.orphans.delete(id); this.orphanCount -= early.length;
-    this.orphanBytes -= early.reduce((total, frame) => total + bytes(frame.body).byteLength, 0);
-    for (const frame of early) await session.accept(frame);
+    this.orphanBytes -= early.reduce((total, frame) => total + orphanFrameBytes(id, frame), 0);
+    for (const frame of early) await session.acceptFromNode(frame);
     return session;
   }
 
@@ -528,6 +579,7 @@ export class Client {
     const signal = this.requestTimeoutMilliseconds > 0 ? AbortSignal.timeout(this.requestTimeoutMilliseconds) : undefined;
     const response = await this.fetcher(`${this.baseURL}/v1/artifacts/${encodeURIComponent(id)}`, { method: "PUT", headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/gzip" }, body: data as BodyInit, redirect: "error", signal });
     await raiseHTTP(response, this.token);
+    await response.body?.cancel();
     return { id, size: data.byteLength };
   }
 
@@ -551,11 +603,7 @@ export class Client {
 }
 
 export async function raiseHTTP(response: Response, secret = ""): Promise<void> {
-  if (response.ok) {
-    // Upload responses have no useful body; release any unexpected stream.
-    await response.body?.cancel();
-    return;
-  }
+  if (response.ok) return;
   let body: any = {};
   try {
     const reader = response.body?.getReader(); const chunks: Uint8Array[] = []; let size = 0;

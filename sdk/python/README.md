@@ -22,3 +22,14 @@ terminal WebSocket. A terminal exposes `session` and `next_seq`; pass both to
 
 Package publication and live-provider validation are release gates; this tree
 only builds and tests the package locally.
+
+The protocol `Client` negotiates the current capabilities, including controller
+epochs, with strict-profile servers. It accepts session output only from the
+grant-authorized node and retains explicit replay gaps. Node-owned revocation,
+session capabilities and release ordering stay enforced by the server/node.
+Artifact helpers transfer digest-verified `art_sha256` byte objects; they do
+not reconstruct chunked snapshot manifests. These checks do not certify an
+execution backend for production isolation.
+
+See [the cross-language protocol gate](../../integration/sdks/README.md) for
+local interoperability verification without cloud or model credentials.

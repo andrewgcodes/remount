@@ -18,23 +18,6 @@ import (
 	"remount.dev/remount/internal/proto"
 )
 
-type failAfterWriter struct {
-	n int
-}
-
-func (w *failAfterWriter) Write(p []byte) (int, error) {
-	if w.n <= 0 {
-		return 0, io.ErrClosedPipe
-	}
-	if len(p) > w.n {
-		p = p[:w.n]
-	}
-	w.n -= len(p)
-	return len(p), nil
-}
-
-func (w *failAfterWriter) Close() error { return nil }
-
 func newMgr(t *testing.T) *Manager {
 	t.Helper()
 	// Most tests exercise session semantics rather than admission. Keep their
@@ -359,28 +342,77 @@ func TestImmediateOutputStillFollowsInfo(t *testing.T) {
 }
 
 func TestInputSequenceAdvancesOnlyAfterCompleteWrite(t *testing.T) {
-	s := &Session{Kind: proto.SessionExec, stdin: &failAfterWriter{n: 2}}
+	dst := &retryInputWriter{failWrite: true}
+	s := &Session{Kind: proto.SessionExec, stdin: dst}
 	if err := s.Input(7, []byte("hello"), false); err == nil {
 		t.Fatal("expected the partial write to fail")
 	}
 	if got := s.LastInputSeq(); got != 0 {
 		t.Fatalf("failed input advanced sequence to %d", got)
 	}
-	var dst bytes.Buffer
-	s.mu.Lock()
-	s.stdin = nopWriteCloser{Writer: &dst}
-	s.mu.Unlock()
+	for _, retry := range []struct {
+		seq  uint64
+		data string
+		eof  bool
+	}{
+		{8, "hello", false}, {7, "other", false}, {7, "hello", true}, {0, "hello", false},
+	} {
+		if err := s.Input(retry.seq, []byte(retry.data), retry.eof); !errors.Is(err, &proto.Error{Code: proto.CodeConflict}) {
+			t.Fatalf("changed retry was not refused: %v", err)
+		}
+	}
 	if err := s.Input(7, []byte("hello"), false); err != nil {
 		t.Fatal(err)
 	}
 	if dst.String() != "hello" || s.LastInputSeq() != 7 {
 		t.Fatalf("retry wrote %q at sequence %d", dst.String(), s.LastInputSeq())
 	}
+	if err := s.Input(7, []byte("hello"), false); err != nil || dst.String() != "hello" {
+		t.Fatalf("completed retry duplicated input: %q, %v", dst.String(), err)
+	}
 }
 
-type nopWriteCloser struct{ io.Writer }
+type retryInputWriter struct {
+	bytes.Buffer
+	failWrite bool
+	failClose bool
+	closes    int
+}
 
-func (nopWriteCloser) Close() error { return nil }
+func (w *retryInputWriter) Write(data []byte) (int, error) {
+	if w.failWrite {
+		w.failWrite = false
+		n, _ := w.Buffer.Write(data[:2])
+		return n, io.ErrUnexpectedEOF
+	}
+	return w.Buffer.Write(data)
+}
+
+func (w *retryInputWriter) Close() error {
+	w.closes++
+	if w.failClose {
+		w.failClose = false
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+
+func TestInputEOFRetryDoesNotRewriteData(t *testing.T) {
+	dst := &retryInputWriter{failClose: true}
+	s := &Session{Kind: proto.SessionExec, stdin: dst}
+	if err := s.Input(1, []byte("hello"), true); err == nil || s.LastInputSeq() != 0 {
+		t.Fatalf("failed EOF committed: %v", err)
+	}
+	if err := s.Input(1, []byte("hello"), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Input(1, []byte("hello"), true); err != nil {
+		t.Fatal(err)
+	}
+	if dst.String() != "hello" || dst.closes != 2 || s.LastInputSeq() != 1 {
+		t.Fatalf("retry result: data=%q closes=%d seq=%d", dst.String(), dst.closes, s.LastInputSeq())
+	}
+}
 
 func TestExecTimeoutKillsProcessGroup(t *testing.T) {
 	m := newMgr(t)

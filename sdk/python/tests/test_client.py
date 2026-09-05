@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from remount import Client, ProtocolError
-from remount.client import Session
+from remount.client import PEER_CAPABILITIES, Session
 
 
 def test_decodes_go_protocol_golden_fixture():
@@ -24,23 +24,28 @@ class FakeSocket:
         self.closed = False
         self.sent = []
         self.attached = __import__("asyncio").Event()
+        self.caps = ["v1"]
+        self.epoch = 0
+        self.early_frames = []
 
     async def send(self, wire):
         frame = cbor2.loads(wire)
         self.sent.append(frame)
         if frame["t"] == "hello":
-            body = {"peer": "client_1", "caps": ["v1"]}
+            body = {"peer": "client_1", "caps": self.caps, "controller_epoch": self.epoch}
         elif frame["op"] == "grant":
             body = {"node": "node_1", "claims": {}}
         elif frame["op"] == "s.open":
-            await self.incoming.put(cbor2.dumps({"v": 1, "t": "chunk", "s": "s_1", "seq": 0, "body": cbor2.dumps({"st": 4, "d": b"info"})}))
+            for early in self.early_frames:
+                await self.incoming.put(cbor2.dumps(early))
+            await self.incoming.put(cbor2.dumps({"v": 1, "t": "chunk", "controller_epoch": self.epoch, "from": "node_1", "ws": "ws_1", "s": "s_1", "seq": 0, "body": cbor2.dumps({"st": 4, "d": b"info"})}))
             body = {"s": "s_1", "next": 1}
         elif frame["op"] == "s.attach":
             self.attached.set()
             body = {"s": "s_1", "next": 4}
         else:
             body = {}
-        await self.incoming.put(cbor2.dumps({"v": 1, "t": "res", "id": frame["id"], "op": frame.get("op", ""), "from": frame.get("to", ""), "body": cbor2.dumps(body)}))
+        await self.incoming.put(cbor2.dumps({"v": 1, "t": "res", "controller_epoch": self.epoch, "id": frame["id"], "op": frame.get("op", ""), "from": frame.get("to", ""), "body": cbor2.dumps(body)}))
 
     async def close(self):
         if not self.closed:
@@ -68,7 +73,7 @@ async def test_chunk_that_precedes_open_response_is_replayed():
     session = await client.exec("ws_1", ["true"])
     chunk = await anext(session.__aiter__())
     assert (chunk.seq, chunk.stream, chunk.data) == (0, 4, b"info")
-    assert cbor2.loads(socket.sent[0]["body"])["caps"] == ["v1", "authz-push"]
+    assert cbor2.loads(socket.sent[0]["body"])["caps"] == PEER_CAPABILITIES
     await client.close()
 
 
@@ -210,3 +215,117 @@ async def test_non_byte_chunk_data_is_rejected_without_allocating_from_its_value
     session = Session(client, "ws_1", "exec", "s_1")
     with pytest.raises(ProtocolError, match="chunk data must be bytes"):
         await session._enqueue({"seq": 0, "body": cbor2.dumps({"st": 1, "d": 1 << 62})})
+
+
+@pytest.mark.asyncio
+async def test_output_authority_covers_early_live_and_rebound_producers():
+    socket = FakeSocket()
+
+    def chunk(source, workspace="ws_1", seq=0):
+        return {"v": 1, "t": "chunk", "from": source, "ws": workspace, "s": "s_1", "seq": seq,
+                "body": cbor2.dumps({"st": 3, "d": cbor2.dumps({"code": 99})})}
+
+    socket.early_frames = [chunk(""), chunk("client_evil"), chunk("node_evil"), chunk("node_1", "ws_other")]
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client("https://cp.example", "token", connector=connector)
+    session = await client.exec("ws_1", ["cat"])
+    assert (await anext(session.__aiter__())).stream == 4
+    assert session.exit is None
+    for source in ("", "client_evil", "node_evil"):
+        await client._handle_chunk(chunk(source, seq=1))
+    session._bind_node("node_new")
+    await client._handle_chunk(chunk("node_1", seq=1))
+    assert session.exit is None
+    await client._handle_chunk(chunk("node_new", seq=1))
+    assert session.exit == {"code": 99}
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_controller_epoch_fences_frames_and_preserves_uint64():
+    socket = FakeSocket()
+    socket.caps = ["v1", "controller-epoch"]
+    socket.epoch = (1 << 53) + 1
+    socket.early_frames = [{"v": 1, "t": "chunk", "controller_epoch": socket.epoch - 1,
+                            "from": "node_1", "ws": "ws_1", "s": "s_1", "seq": 0,
+                            "body": cbor2.dumps({"st": 3, "d": cbor2.dumps({"code": 99})})}]
+    original_send = socket.send
+
+    async def send(wire):
+        request = cbor2.loads(wire)
+        if request.get("op") == "ws.list":
+            for source, epoch in (("control", socket.epoch - 1), ("", socket.epoch), ("client_evil", socket.epoch)):
+                await socket.incoming.put(cbor2.dumps({"v": 1, "t": "res", "from": source,
+                    "controller_epoch": epoch, "id": request["id"], "op": request["op"],
+                    "body": cbor2.dumps({"forged": True})}))
+        await original_send(wire)
+
+    socket.send = send
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client("https://cp.example", "token", connector=connector)
+    assert await client.call("ws.list") == {}
+    session = await client.exec("ws_1", ["true"])
+    assert (await anext(session.__aiter__())).stream == 4
+    assert all(frame["controller_epoch"] == socket.epoch for frame in socket.sent[1:])
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_negotiated_epoch_is_refused():
+    socket = FakeSocket()
+    socket.caps = ["v1", "controller-epoch"]
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client("https://cp.example", "token", connector=connector)
+    with pytest.raises(ProtocolError) as caught:
+        await client.connect()
+    assert caught.value.code == "conflict"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_open_retry_keeps_early_output_after_grant_cache_is_cleared():
+    first, second = FakeSocket(), FakeSocket()
+    sockets = iter([first, second])
+    original_send = first.send
+
+    async def send(wire):
+        if cbor2.loads(wire).get("op") == "s.open":
+            await first.close()
+            return
+        await original_send(wire)
+
+    first.send = send
+
+    async def connector(*_args, **_kwargs):
+        return next(sockets)
+
+    client = Client("https://cp.example", "token", connector=connector)
+    try:
+        session = await client.exec("ws_1", ["true"])
+        assert client.generation == 2
+        assert not client._grants
+        chunk = await __import__("asyncio").wait_for(anext(session.__aiter__()), timeout=5)
+        assert (chunk.seq, chunk.stream, chunk.data) == (0, 4, b"info")
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_orphan_routing_metadata_is_charged_to_the_byte_limit(monkeypatch):
+    monkeypatch.setattr("remount.client.MAX_ORPHAN_BYTES", 128)
+    client = Client("https://cp.example", "token")
+    socket = FakeSocket()
+    client._socket = socket
+    await client._handle_chunk({"s": "s_1", "from": "node_1", "ws": "x" * 128, "body": b""})
+    assert socket.closed
+    assert not client._orphans and client._orphan_bytes == 0
+    await client.close()
