@@ -476,6 +476,7 @@ func TestBudgetCommandsValidateBeforeDialing(t *testing.T) {
 }
 
 func TestRunValidatesBeforeDialing(t *testing.T) {
+	t.Setenv("REMOUNT_DATA", t.TempDir())
 	ctx := context.Background()
 	cases := []struct {
 		name string

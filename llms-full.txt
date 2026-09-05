@@ -407,6 +407,8 @@ Important behavior:
   by default; use `--include-git=false` to omit it.
 - ACP-capable recipes run as durable Agents unless `--pty` is supplied.
 - `--sandbox` is `read-only`, `workspace-write` (default), or `full`.
+  Recipes apply their corresponding harness-native PTY flags and, when
+  configured, ACP session mode before the first prompt.
 - `--approve` is `never` (default) or `on-request`.
 - Ctrl-C detaches by default; it does not kill the agent. Use
   `--kill-on-interrupt` only when termination is intended.
@@ -622,10 +624,12 @@ resource or secret names.
 Prerequisites:
 
 - Modal CLI authenticated to the intended workspace.
+- The Modal CLI environment includes `python-dotenv`, which
+  `modal secret create --from-dotenv` requires.
 - `MODAL_ENVIRONMENT` set explicitly.
 - A named Modal secret containing `REMOUNT_TOKEN`.
-- Optionally, a second named secret containing `OPENAI_API_KEY` for model
-  calls through `b_openai`.
+- Optionally, named secrets containing `OPENAI_API_KEY` or
+  `ANTHROPIC_API_KEY` for model calls through `b_openai` or `b_anthropic`.
 
 Use unique names for disposable validation:
 
@@ -635,10 +639,12 @@ export REMOUNT_MODAL_APP=remount-example
 export REMOUNT_MODAL_VOLUME=remount-example-data
 export REMOUNT_MODAL_SECRET=remount-example-control
 export REMOUNT_MODAL_MODEL_SECRET=remount-example-openai
+export REMOUNT_MODAL_ANTHROPIC_SECRET=remount-example-anthropic
 ```
 
-Create secrets without placing values in process arguments. The files below
-must be mode 0600 and deleted immediately after import:
+Create only the provider secrets the deployment needs, without placing values
+in process arguments. The files below must be mode 0600 and deleted
+immediately after import:
 
 ```sh
 umask 077
@@ -651,6 +657,11 @@ MODEL_ENV=$(mktemp)
 printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" > "$MODEL_ENV"
 modal secret create "$REMOUNT_MODAL_MODEL_SECRET" --from-dotenv "$MODEL_ENV"
 rm -f "$MODEL_ENV"
+
+ANTHROPIC_ENV=$(mktemp)
+printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_API_KEY" > "$ANTHROPIC_ENV"
+modal secret create "$REMOUNT_MODAL_ANTHROPIC_SECRET" --from-dotenv "$ANTHROPIC_ENV"
+rm -f "$ANTHROPIC_ENV"
 ```
 
 Deploy and run the smoke test:
@@ -688,6 +699,7 @@ modal app stop "$REMOUNT_MODAL_APP" -y
 modal volume delete "$REMOUNT_MODAL_VOLUME" -y --allow-missing
 modal secret delete "$REMOUNT_MODAL_SECRET" -y --allow-missing
 modal secret delete "$REMOUNT_MODAL_MODEL_SECRET" -y --allow-missing
+modal secret delete "$REMOUNT_MODAL_ANTHROPIC_SECRET" -y --allow-missing
 ```
 
 Do not delete a shared model secret. Modal singleton, persistence, readiness,
@@ -1379,7 +1391,7 @@ a YAML pull request, not Go.
 
 | Recipe | Harness | Auth | Providers | `--sandbox` mapping | State that travels |
 |---|---|---|---|---|---|
-| `claude` | Claude Code | key or login | anthropic | `--permission-mode plan` / `acceptEdits` / `--dangerously-skip-permissions` | `.claude/`, `.claude.json` |
+| `claude` | Claude Code | key or login | anthropic | PTY: `--permission-mode plan` / `acceptEdits` / `--dangerously-skip-permissions`; ACP: `plan` / `acceptEdits` / `bypassPermissions` session mode | `.claude/`, `.claude.json` |
 | `codex` | Codex CLI | key or login | openai, azure-openai, openrouter | `--sandbox read-only` / `workspace-write` / `danger-full-access` | `.codex/` |
 | `opencode` | OpenCode | key or login | anthropic, openai, google, openrouter, groq, deepseek, xai, mistral | `permission.edit/bash/webfetch` in a generated config | `.local/share/opencode/` |
 | `openhands` | OpenHands CLI | key | anthropic, openai, google, openrouter, groq, together, fireworks, deepseek, xai, mistral | harness default | `.openhands/` |
@@ -1421,6 +1433,12 @@ when an agent cannot reopen a session, a woken Agent starts a fresh one and the
 event says so. `session_id_from` (opencode: newest
 `.local/share/opencode/storage/session/*/ses_*.json`, key `id`) lets a handoff
 continue the laptop conversation on the node with `session/load`.
+
+An ACP recipe may map each Remount sandbox level through
+`acp.sandbox_modes`. The node applies that mode with `session/set_mode` after
+new, load, or resume and before the first prompt. A configured mode that the
+adapter rejects fails the run rather than silently weakening the requested
+sandbox behavior.
 
 Every backend sets `HOME` to the workspace root, so the state column is where
 the harness's `~/.something` actually lands: inside the workspace, in every

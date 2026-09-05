@@ -1316,3 +1316,76 @@ The corollary, which is the part I should have known from #49: a loop that
 exits on an unexamined error exits silently. `if err != nil { return }` inside
 a background goroutine is a way to lose a subsystem with no evidence. Log the
 error, classify the ones that are recoverable, and only then give up.
+
+---
+
+## 51. Claude's PTY permission flags did not configure its ACP session
+
+Claude Code worked through the PTY recipe but its ACP adapter asked for write
+permission and the default `approve=never` policy denied the request. The same
+`workspace-write` launch therefore had different effective permissions
+depending on whether the recipe selected PTY or ACP.
+
+The recipe mapped Remount sandbox levels only to Claude's command-line
+`--permission-mode` flags. ACP is a separate interface: the adapter creates a
+session with its own mode and changes it through `session/set_mode`. No PTY
+argument can configure that session.
+
+The recipe format now has `acp.sandbox_modes`. The node selects the mapped mode
+after `session/new`, `session/load`, or `session/resume` and before the first
+prompt; a rejected configured mode fails the run rather than weakening the
+requested sandbox. Claude maps `read-only`, `workspace-write`, and `full` to
+`plan`, `acceptEdits`, and `bypassPermissions`. Explicit custom ACP commands do
+not inherit a built-in recipe's mapping.
+
+**Proof.** A focused fake-ACP test observes `acceptEdits` before the first
+prompt. Real local and Modal ACP launches both created files that were read
+back through Remount, and their event streams recorded successful brokered
+Anthropic requests.
+
+**Lesson.** A recipe with two harness transports has two policy surfaces.
+Test each transport's effective behavior; matching user-facing flags do not
+prove matching permissions.
+
+---
+
+## 52. The Modal reference deployment could broker OpenAI but not Anthropic
+
+The reference deployment allowed Anthropic hosts but could create only
+`b_openai`, so a remote Claude launch had no `b_anthropic` credential to use.
+Network reachability without a binding was not a working provider path.
+
+The deployment now accepts an independently named optional Anthropic Modal
+secret, builds `b_anthropic` alongside any OpenAI binding, and allows the
+Claude adapter's required hosts. The OpenAI secret name remains backward
+compatible.
+
+**Proof.** The exact dirty candidate on base `68df7f1` was deployed under a
+unique Modal development app. Its authenticated node ran Claude ACP against a
+real workspace, created the expected file, and emitted `cred.used` with
+`binding=b_anthropic`, `host=api.anthropic.com:443`, `path=/v1/messages`, and
+HTTP 200. The Agent, workspace, app, volume, and test-only secrets were
+destroyed and their absence verified.
+
+**Lesson.** An allowed destination is not an integration. A live provider lane
+must prove runtime, binding construction, credential substitution, filesystem
+postcondition, durable evidence, and cleanup.
+
+---
+
+## 53. A live local binding made a validation test launch a real Agent
+
+The Claude validation left an intentionally reusable local standalone process
+and its binding metadata active while the required suite ran. A CLI test named
+`TestRunValidatesBeforeDialing` expected `claude --security isolated` to fail
+because Claude would otherwise rely on workspace-resident login. Instead, the
+CLI found the live `b_anthropic` binding, correctly selected key auth, created a
+real Agent, and waited until the package timeout.
+
+The test now gives `REMOUNT_DATA` an empty temporary directory, so its
+validation cases cannot inherit a developer's active standalone process or
+bindings.
+
+**Lesson.** A validation test must isolate every local discovery input, not
+only environment variables. Persistent development state can turn a presumed
+pre-dial error path into a real operation.
