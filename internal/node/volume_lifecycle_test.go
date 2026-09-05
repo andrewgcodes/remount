@@ -210,7 +210,7 @@ func TestReleasePreparedProofAndCommitTombstoneSurviveRestart(t *testing.T) {
 	}
 	t.Cleanup(func() { closeNodeRuntimeForTest(n) })
 	w, root := releaseTestWorkspace(t, n, "ws_release_restart", nil)
-	req := &proto.WSReleaseReq{WS: w.ID, Gen: w.Generation}
+	req := &proto.WSReleaseReq{WS: w.ID, Gen: w.Generation, ReleaseEpoch: 7, OperationID: "rel_restart"}
 	prepared, err := n.release(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
@@ -224,16 +224,18 @@ func TestReleasePreparedProofAndCommitTombstoneSurviveRestart(t *testing.T) {
 	}
 	t.Cleanup(func() { closeNodeRuntimeForTest(restarted) })
 	if _, err := restarted.release(context.Background(), &proto.WSReleaseReq{
-		WS: w.ID, Gen: w.Generation, Tenant: "other-tenant",
+		WS: w.ID, Gen: w.Generation, ReleaseEpoch: req.ReleaseEpoch, OperationID: req.OperationID, Tenant: "other-tenant",
 	}); err == nil {
 		t.Fatal("restart retry accepted changed control-derived tenant")
 	}
-	freshRetry := &proto.WSReleaseReq{WS: w.ID, Gen: w.Generation}
+	freshRetry := &proto.WSReleaseReq{
+		WS: w.ID, Gen: w.Generation, ReleaseEpoch: req.ReleaseEpoch, OperationID: req.OperationID,
+	}
 	replayed, err := restarted.release(context.Background(), freshRetry)
 	if err != nil || replayed.(proto.WSReleasedReq) != result {
 		t.Fatalf("replayed prepare=%#v err=%v", replayed, err)
 	}
-	commit := &proto.WSReleaseCommitReq{ID: w.ID, Gen: w.Generation}
+	commit := &proto.WSReleaseCommitReq{ID: w.ID, Gen: w.Generation, OperationID: req.OperationID}
 	if err := restarted.releaseCommit(context.Background(), commit); err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +246,7 @@ func TestReleasePreparedProofAndCommitTombstoneSurviveRestart(t *testing.T) {
 		t.Fatalf("lost commit acknowledgement replay: %v", err)
 	}
 	record, ok := restarted.releaseRecord(w.ID)
-	if !ok || record.State != releaseCommitted {
+	if !ok || record.State != releaseCommitted || record.Request.ReleaseEpoch != req.ReleaseEpoch {
 		t.Fatalf("durable release tombstone=%+v present=%v", record, ok)
 	}
 	newGeneration, _ := releaseTestWorkspace(t, restarted, w.ID, nil)

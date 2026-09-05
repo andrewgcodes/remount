@@ -370,8 +370,11 @@ type Workspace struct {
 	// pruned; a node behind the floor must fail closed for the whole workspace.
 	Revocations     []AuthzRevocation `cbor:"revocations,omitempty" json:"revocations,omitempty"`
 	RevocationFloor uint64            `cbor:"revocation_floor,omitempty" json:"revocation_floor,omitempty"`
-	// ReleaseOperation is the durable epoch for the release or release-abort
-	// handshake currently controlling this workspace generation.
+	// ReleaseEpoch orders control-authorized release cycles for one workspace.
+	// It survives abort publication so a node can reject delayed older cycles.
+	ReleaseEpoch uint64 `cbor:"release_epoch,omitempty" json:"release_epoch,omitempty"`
+	// ReleaseOperation identifies the release or release-abort handshake
+	// currently controlling this workspace generation.
 	ReleaseOperation string `cbor:"release_operation,omitempty" json:"release_operation,omitempty"`
 	// QuarantineOperation identifies the durable fleet operation that fenced
 	// this workspace. It prevents restart reconciliation from treating an
@@ -1529,11 +1532,12 @@ const (
 )
 
 type WSReleaseReq struct {
-	WS          string `cbor:"ws" json:"ws"`
-	Gen         uint64 `cbor:"gen" json:"gen"`
-	OperationID string `cbor:"operation,omitempty" json:"operation,omitempty"`
-	Snapshot    bool   `cbor:"snapshot" json:"snapshot"` // take + upload a snapshot before releasing
-	Reason      string `cbor:"reason,omitempty" json:"reason,omitempty"`
+	WS           string `cbor:"ws" json:"ws"`
+	Gen          uint64 `cbor:"gen" json:"gen"`
+	ReleaseEpoch uint64 `cbor:"release_epoch,omitempty" json:"release_epoch,omitempty"`
+	OperationID  string `cbor:"operation,omitempty" json:"operation,omitempty"`
+	Snapshot     bool   `cbor:"snapshot" json:"snapshot"` // take + upload a snapshot before releasing
+	Reason       string `cbor:"reason,omitempty" json:"reason,omitempty"`
 	// Tenant, Backend and Spec are control-derived recovery declarations. They
 	// let a restarted node reconcile the exact retained tree and volume pins;
 	// they never grant authority to release a different generation.

@@ -194,7 +194,8 @@ func TestWarmStandbyFailoverE10(t *testing.T) {
 	}
 	defer promoted.Stop()
 	defer promotedLog.Close()
-	node := &recoveryNode{report: proto.ControllerNodeState{Node: workspace.Node, Epoch: recovery.Epoch, Releases: []proto.ControllerReleaseState{{Request: proto.WSReleaseReq{WS: workspace.ID, Gen: workspace.Generation, OperationID: operationID, Tenant: workspace.Tenant, Spec: workspace.Spec}, OperationID: operationID, State: "prepared"}}}}
+	const releaseEpoch = 7
+	node := &recoveryNode{report: proto.ControllerNodeState{Node: workspace.Node, Epoch: recovery.Epoch, Releases: []proto.ControllerReleaseState{{Request: proto.WSReleaseReq{WS: workspace.ID, Gen: workspace.Generation, ReleaseEpoch: releaseEpoch, OperationID: operationID, Tenant: workspace.Tenant, Spec: workspace.Spec}, OperationID: operationID, State: "prepared"}}}}
 	promoted.Attach(node)
 	if err := promoted.ReconcileRecovery(ctx); err != nil {
 		t.Fatal(err)
@@ -210,7 +211,8 @@ func TestWarmStandbyFailoverE10(t *testing.T) {
 	if err := proto.Unmarshal(encoded, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.State != proto.WSClaimed || got.Generation != workspace.Generation || got.Node != workspace.Node || got.ReleaseOperation != "" {
+	if got.State != proto.WSClaimed || got.Generation != workspace.Generation || got.Node != workspace.Node ||
+		got.ReleaseEpoch != releaseEpoch || got.ReleaseOperation != "" {
 		t.Fatalf("reconciled workspace=%+v", got)
 	}
 	var assignments int

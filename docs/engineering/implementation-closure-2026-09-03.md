@@ -236,6 +236,12 @@ Move and sleep use a two-phase release:
 5. a lost response is retried by operation ID, while an abort acknowledgement
    is required before the node resumes a failed release.
 
+The operation ID is only exact-retry identity. Control durably increments a
+separate per-workspace release epoch before each cycle, and the node requires a
+greater epoch before replacing an abort-published same-generation tombstone.
+Delayed requests from older cycles therefore fail before session stop,
+filesystem fencing, or source cleanup.
+
 Timer firing and explicit wake serialize with release. Destroyed workspaces
 cannot be resurrected by stale move, sleep, wake, idempotency, or node messages.
 
@@ -365,7 +371,7 @@ while diagnostics expose current/limit pairs and retention watermarks.
 | RM-004 | **Verified fixed.** Affirmative renewals and node self-fencing stop local service after authority loss; `TestRejectedRenewalFencesAndRetainsFilesystem` covers the boundary. |
 | RM-005 | **Verified fixed.** Ready is a strict expected-node/generation transition; rejected ready fences and retains the local copy. |
 | RM-006 | **Verified fixed.** Keyed lifecycle serialization plus the central transition table prevents overlapping stale operations; exhaustive/property/fuzz tests cover legal orderings. |
-| RM-007 | **Verified fixed.** Release is checkpoint-before-destroy with durable commit/abort; `TestReleaseSnapshotFailureRestoresSourceWithoutDestroy` and control release tests cover failures. |
+| RM-007 | **Verified fixed.** Release is checkpoint-before-destroy with durable commit/abort and ordered release-cycle authority; node and simulation regressions cover source retention, exact retries, and delayed stale requests after abort publication. |
 | RM-008 | **Verified fixed.** Durable holder/generation survive restart and matching node state is adopted; `TestRestartPreservesHolderAndReleasedRecovery` plus live local/E2B restart tests cover it. |
 | RM-009 | **Verified fixed.** Authoritative checkpoint uploads and commits `LastSnapshot`; live snapshots are explicitly non-authoritative. |
 | RM-010 | **Verified fixed.** State/result persistence errors propagate and success is not returned before commit; strict persistence tests use failing stores. |
