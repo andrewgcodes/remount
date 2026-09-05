@@ -297,8 +297,9 @@ type flyConfig struct {
 }
 
 type flyProcess struct {
-	Entrypoint []string    `json:"entrypoint"`
-	Secrets    []flySecret `json:"secrets"`
+	Entrypoint       []string    `json:"entrypoint"`
+	IgnoreAppSecrets bool        `json:"ignore_app_secrets"`
+	Secrets          []flySecret `json:"secrets"`
 }
 
 type flySecret struct {
@@ -339,7 +340,10 @@ func (d *Driver) createBody(request provision.Request, secretName string, secret
 	}
 	return flyCreate{Name: request.Name, Region: request.Region, MinSecretsVersion: secretVersion, Config: flyConfig{
 		Image: d.image, Env: env, Metadata: metadata, Guest: guest, Restart: flyRestart{Policy: "always"},
-		Processes: []flyProcess{{Entrypoint: []string{d.bootstrap}, Secrets: []flySecret{{EnvVar: "REMOUNT_ENROLL_TOKEN", Name: secretName}}}},
+		Processes: []flyProcess{{
+			Entrypoint: []string{d.bootstrap}, IgnoreAppSecrets: true,
+			Secrets: []flySecret{{EnvVar: "REMOUNT_ENROLL_TOKEN", Name: secretName}},
+		}},
 	}}, nil
 }
 
