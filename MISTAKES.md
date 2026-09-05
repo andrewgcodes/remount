@@ -1416,3 +1416,91 @@ and the child-Agent simulation still inherits `read-only` from its parent.
 **Lesson.** A CLI default is not a protocol invariant. Normalize optional wire
 fields at the authoritative boundary before persisting or dispatching them,
 after applying any inheritance that should outrank the default.
+
+---
+
+## 55. An existing bound workspace lost the Agent's provider environment
+
+A real Codex ACP Agent on an ix.dev node failed before `initialize` because its
+launcher ran under `set -u` without `OPENAI_API_KEY`. The workspace correctly
+had binding `b_openai`, but it had been created directly with `ws create
+--binding`; unlike `remount run`, that path did not add the launch-only
+`remount.bindings` label. The node reconstructed provider environment names
+from that label alone, so attachment authority existed without the recipe
+metadata needed to name its placeholder.
+
+Agents now persist non-secret `ID:PRESET` binding declarations in
+`AgentSpec.binding_specs`. The control plane parses them, refuses IDs not
+already attached to the target workspace, preserves them through copies and
+forks, and allows children to inherit but not expand them. Nodes prefer those
+declarations and retain the workspace-label path for older Agents. Duplicate
+binding IDs or provider presets are refused rather than producing an
+order-dependent environment.
+
+**Proof.** A focused standalone regression creates a workspace with an attached
+binding and no launch label, then observes a fake ACP harness finish with its
+provider placeholder environment. Compatibility tests cover old and new wire
+shapes. The rebuilt candidate ran a real Codex ACP Agent on ix.dev; the Agent
+wrote and read a two-line file, an independent Remount read matched it, OpenAI
+egress was durably recorded, and Agent destruction left no adapter process.
+
+**Lesson.** Binding attachment and recipe interpretation are separate facts.
+Persist both at the durable Agent boundary, validate interpretation against
+attachment authority, and do not try to recover launch intent from optional
+workspace labels.
+
+---
+
+## 56. A different release operation ID was mistaken for a newer cycle
+
+After a failed release was restored and published, the node retained the
+abort-published journal record. It allowed another same-generation cycle when
+the new request's operation ID merely differed from that record. The operation
+ID was exact-retry identity, not ordering proof. A delayed request from an
+older cycle could therefore replace a later tombstone, stop new sessions, and
+fence a workspace control had already restored.
+
+Workspaces now retain a monotonically increasing release epoch. Control
+increments and persists it with the lifecycle transition before sending the
+release request. The node requires a greater epoch to replace an
+abort-published same-generation tombstone and still requires every field to
+match for an exact retry.
+
+**Proof.** A whole-system simulation drives three real release/abort cycles,
+injects the first release frame after the second abort publication, and proves
+the restored workspace still accepts filesystem work and keeps a fresh session
+running. The third ordered cycle remains authorized. Protocol compatibility
+tests cover old records that decode with epoch zero. A prepared-release
+regression rejects operation-ID reuse with another epoch before the journal
+path, generated-schema checks expose the field to typed SDK consumers, and a
+failover fixture proves an abort-published record advances the restored
+workspace epoch before the next release.
+
+**Lesson.** Uniqueness is not recency. When delayed destructive requests are
+possible, successor authority must be durably ordered or explicitly linked;
+opaque idempotency identifiers cannot supply that relationship. Enforce the
+same request identity at every retry cache, regenerate every public projection
+of an additive field, and reconcile ordering metadata from all authenticated
+representations of one live resource.
+
+---
+
+## 57. Symlink validation interpreted backslashes differently from restore
+
+Archive validation replaced backslashes with slashes before checking whether a
+relative symlink escaped the root, but Linux restore preserved those
+backslashes as literal filename bytes. A mixed-separator target could therefore
+validate as contained and resolve outside the archive tree when restored.
+
+Archive symlink targets are now slash-only. Producers normalize native Windows
+separators before validation, Unix links containing literal backslashes fail
+closed, and restore rejects non-portable backslash targets.
+
+**Proof.** A producer-side fuzz target found the mixed-separator discrepancy
+and now checks every accepted rewrite for relative, archive-contained,
+destination-preserving output. A fixed fuzz seed and restore unit test
+cover the minimal escaping form, and `make fuzz` runs the target.
+
+**Lesson.** Portability normalization must not make validation and use assign
+different path semantics. Canonicalize once into the wire format or reject the
+ambiguous input.

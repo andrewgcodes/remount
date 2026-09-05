@@ -110,3 +110,29 @@ func TestOldNodeServesLocalWorkspacesOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestSuccessorReleaseRequiresNegotiatedReleaseEpochCapability(t *testing.T) {
+	f := newControlFixture(t, "", nil)
+	old := oldNodeHello(t, "n_old", "node-token", processNodeInfo(1024))
+	f.c.PeerConnected(context.Background(), old.Peer, &old)
+
+	workspace := &proto.Workspace{ID: "ws_release", Node: old.Peer}
+	if err := f.c.requireReleaseEpochCapabilityLocked(old.Peer, workspace); err != nil {
+		t.Fatalf("legacy first release refused: %v", err)
+	}
+	workspace.ReleaseEpoch = observedReleaseEpoch(proto.WSReleaseReq{})
+	if workspace.ReleaseEpoch != 1 || observedReleaseEpoch(proto.WSReleaseReq{ReleaseEpoch: 7}) != 7 {
+		t.Fatal("recovery did not retain a release-cycle floor")
+	}
+	err := f.c.requireReleaseEpochCapabilityLocked(old.Peer, workspace)
+	var pe *proto.Error
+	if !errors.As(err, &pe) || pe.Code != proto.CodeUnsupported || !strings.Contains(pe.Msg, proto.CapabilityReleaseEpoch) {
+		t.Fatalf("legacy successor release accepted: %v", err)
+	}
+
+	connectNode(t, f.c, "n_new", processNodeInfo(1024))
+	workspace.Node = "n_new"
+	if err := f.c.requireReleaseEpochCapabilityLocked(workspace.Node, workspace); err != nil {
+		t.Fatalf("current successor release refused: %v", err)
+	}
+}

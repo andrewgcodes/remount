@@ -460,6 +460,9 @@ func TestRestoreRejectsRelativeSymlinkEscapeAndHardLinks(t *testing.T) {
 		"relative symlink": buildTarEntries(t,
 			testTarEntry{header: tar.Header{Name: "dir/escape", Typeflag: tar.TypeSymlink, Linkname: "../../outside", Mode: 0o777}},
 		),
+		"mixed-separator symlink": buildTarEntries(t,
+			testTarEntry{header: tar.Header{Name: "escape", Typeflag: tar.TypeSymlink, Linkname: `safe\child/../..`, Mode: 0o777}},
+		),
 		"hard link": buildTarEntries(t,
 			testTarEntry{header: tar.Header{Name: "hard", Typeflag: tar.TypeLink, Linkname: "target", Mode: 0o644}},
 		),
@@ -469,6 +472,68 @@ func TestRestoreRejectsRelativeSymlinkEscapeAndHardLinks(t *testing.T) {
 				t.Fatal("hostile entry accepted")
 			}
 		})
+	}
+}
+
+func TestSnapshotRewritesInternalAbsoluteSymlink(t *testing.T) {
+	src := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(src, ".npm", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(src, ".codex", "tmp", "arg0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(src, ".npm", "bin", "tool")
+	if err := os.WriteFile(target, []byte("portable"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := filepath.Join(src, ".codex", "tmp", "arg0", "apply_patch")
+	if err := os.Symlink(target, linkPath); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	for _, prefix := range []string{"", "workspace"} {
+		t.Run(prefix, func(t *testing.T) {
+			var archive bytes.Buffer
+			if _, err := SnapshotTrees([]Tree{{Prefix: prefix, Root: src}}, &archive); err != nil {
+				t.Fatal(err)
+			}
+			dst := t.TempDir()
+			if err := Restore(dst, bytes.NewReader(archive.Bytes())); err != nil {
+				t.Fatal(err)
+			}
+			restoredLink := filepath.Join(dst, prefix, ".codex", "tmp", "arg0", "apply_patch")
+			link, err := os.Readlink(restoredLink)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if filepath.IsAbs(link) {
+				t.Fatalf("restored link is absolute: %q", link)
+			}
+			body, err := os.ReadFile(restoredLink)
+			if err != nil || string(body) != "portable" {
+				t.Fatalf("restored link body = %q, %v", body, err)
+			}
+		})
+	}
+}
+
+func TestSnapshotRejectsExternalAbsoluteSymlink(t *testing.T) {
+	src := t.TempDir()
+	external := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(external, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(src, "escape")); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if err := Snapshot(src, nil, io.Discard); err == nil || !strings.Contains(err.Error(), "invalid target") {
+		t.Fatalf("Snapshot external absolute symlink error = %v", err)
 	}
 }
 

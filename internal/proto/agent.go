@@ -111,8 +111,12 @@ type AgentSpec struct {
 	Task      string   `cbor:"task" json:"task"`
 	Providers []string `cbor:"providers,omitempty" json:"providers,omitempty"`
 	Primary   string   `cbor:"primary,omitempty" json:"primary,omitempty"`
-	Model     string   `cbor:"model,omitempty" json:"model,omitempty"`
-	Sandbox   string   `cbor:"sandbox,omitempty" json:"sandbox,omitempty"`
+	// BindingSpecs are the non-secret ID:preset declarations the client used.
+	// They let a recipe recover provider environment names when it adopts an
+	// existing workspace whose bindings were attached without launch labels.
+	BindingSpecs []string `cbor:"binding_specs,omitempty" json:"binding_specs,omitempty"`
+	Model        string   `cbor:"model,omitempty" json:"model,omitempty"`
+	Sandbox      string   `cbor:"sandbox,omitempty" json:"sandbox,omitempty"`
 	// ACPCommand overrides the recipe's acp.command (remount agent create
 	// custom --acp-cmd). It runs in the workspace like everything else.
 	ACPCommand []string `cbor:"acp_command,omitempty" json:"acp_command,omitempty"`

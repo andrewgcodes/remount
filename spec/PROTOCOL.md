@@ -135,6 +135,7 @@ in the canonical order of the table below, `v1` first.
 | `session-cap` | principal-bound session capabilities | leave a revoked principal's session open |
 | `chunked-artifacts` | verified chunked artifact transfer | restore a truncated artifact as complete |
 | `tiered-session-logs` | durable sealed session ranges | lose completed output after node loss |
+| `release-epoch` | durably ordered workspace release cycles | let a delayed older cycle fence a restored workspace |
 | `identity-admin` | production tenant/principal onboarding operations | assume an unavailable management API exists |
 | `approvals` | held operations awaiting a decision | proceed while an approval is pending |
 | `encrypted-artifacts` | artifacts encrypted at rest | write or read a plaintext snapshot |
@@ -145,8 +146,9 @@ promise the profile makes. `local` requires none, so an older node keeps
 working there. `isolated` and `multi_tenant` require every named capability
 this release implements; a capability is added to that requirement in the
 same release that implements it on both sides. This release implements
-`authz-push`, `controller-epoch`, and `session-cap`; the remaining identifiers are reserved and
-are neither offered nor required yet.
+`authz-push`, `controller-epoch`, `session-cap`, `chunked-artifacts`,
+`tiered-session-logs`, `release-epoch`, and `identity-admin`. The remaining
+identifiers are reserved and are neither offered nor required yet.
 
 | Deployment security floor | Peer offers `v1` only | Peer offers this release's set |
 |---|---|---|
@@ -590,10 +592,14 @@ grow or become unbounded.
 `full`. An omitted value becomes `workspace-write` before persistence or
 dispatch. With `parent`, it makes a child of a live agent the caller may
 execute (a fork is a child too). A child inherits what it does not name —
-`providers`, `primary`, `sandbox`, the workspace `bindings`, the security
-profile — before the sandbox default is applied, and may never hold more than
-the parent: a provider or binding the parent lacks is `denied`, as is a wider
-policy. Trees are at most three deep.
+`providers`, `primary`, `binding_specs`, `sandbox`, the workspace `bindings`,
+the security profile — before the sandbox default is applied, and may never
+hold more than the parent: a provider, binding declaration or workspace
+binding the parent lacks is `denied`, as is a wider policy. Trees are at most
+three deep. `binding_specs` is a non-secret list of `ID:PRESET` declarations
+used to construct the recipe environment. Every ID MUST be present in the
+target workspace's `bindings`. When omitted, nodes resolve the legacy
+`remount.bindings` workspace label.
 When a child reaches `failed`, `finished` or `destroyed`, the control plane
 appends one `kind: child` message to the parent's inbox whose text is a
 `ChildSummary{child, name, status, reason, turns, ws, url}` JSON document,
@@ -768,7 +774,7 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `ws.info` | `WSGetReq{id}` → `WSInfoRes{ws, backend, root, sessions, broker}` |
 | `node.status` | → `NodeStatus` |
 | `node.diag` | `NodeDiagReq{ws, verify}` → node diagnostics |
-| `ws.release` | control only: `WSReleaseReq{ws, gen, operation, snapshot, reason, tenant, backend, spec}` → `WSReleasedReq`; `operation` is a control-generated lifecycle epoch, the recovery fields are control-derived and include exact pinned volumes, and `preparing:true` means poll with the identical request |
+| `ws.release` | control only: `WSReleaseReq{ws, gen, release_epoch?, operation, snapshot, reason, tenant, backend, spec}` → `WSReleasedReq`; `release_epoch` is the durable monotonically increasing ordering authority for release cycles, `operation` is the opaque identity for exact retries, the recovery fields are control-derived and include exact pinned volumes, and `preparing:true` means poll with the identical request |
 | `ws.release.commit` | control only: `WSReleaseCommitReq{id, gen, operation, snapshot}` → `{}` and authorizes source deletion only for the exact prepared lifecycle epoch |
 | `ws.release.abort` | control only: `WSReleaseCommitReq{id, gen, operation}` → `{}`; restores the retained source and exact volume pins but keeps it inert |
 | `ws.release.abort.commit` | control only: `WSReleaseCommitReq{id, gen, operation}` → `{}`; after control durably commits `claiming`, authorizes publication of that exact restored source. Control publishes `claimed` only after this acknowledgement |
@@ -776,6 +782,22 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `ws.quarantine.commit` | control only: `WSQuarantineCommitReq{operation, ws, gen, backend, snapshot}` → `{}` and authorizes deletion only after an exact durable phase-one proof |
 
 Session kinds are `exec`, `pty` and `port`.
+
+Control persists the incremented workspace `release_epoch` before sending
+`ws.release`. A node accepts an exact retry only when generation, epoch,
+operation, and release parameters match either its in-memory prepared release
+or its durable journal. A
+same-generation request may replace an `abort-published` tombstone only when
+its nonzero epoch is greater and its operation ID is distinct. One operation
+ID cannot identify multiple epochs, and operation-ID inequality alone
+establishes no ordering. Higher generations may replace committed tombstones.
+An older peer that omits `release_epoch` can finish an initial release, but
+cannot safely start a successor after abort publication and is rejected.
+Recovery treats any observed legacy release record as a completed first cycle,
+so a missing epoch cannot reopen that initial-cycle exception. When a node
+reports both a live restored workspace and its abort-published release record,
+recovery retains the greatest observed epoch and clears the completed
+operation identity before authorizing the next lifecycle operation.
 
 `fs.edit` is atomic across all edits in one request. Each edit's `old` must
 match exactly once unless `all` is set. If any edit fails to apply, the file is

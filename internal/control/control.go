@@ -405,6 +405,17 @@ func (c *Control) requireDeploymentCapabilities(role string, negotiated []string
 	return proto.Err(proto.CodeUnsupported, "%s lacks protocol capabilities %s required by security profile %q", role, strings.Join(missing, ","), c.opts.SecurityProfileFloor)
 }
 
+func (c *Control) requireReleaseEpochCapabilityLocked(node string, workspace *proto.Workspace) error {
+	if workspace.ReleaseEpoch == 0 {
+		return nil
+	}
+	state := c.nodes[node]
+	if state != nil && proto.HasCapability(state.Status.Protocol, proto.CapabilityReleaseEpoch) {
+		return nil
+	}
+	return proto.Err(proto.CodeUnsupported, "node %s lacks protocol capability %q required for a successor release cycle", node, proto.CapabilityReleaseEpoch)
+}
+
 type tailState struct {
 	cancel context.CancelFunc
 }
@@ -3679,12 +3690,25 @@ func (c *Control) wsDestroy(ctx context.Context, principal, id, idem string) err
 	tenant := ws.Tenant
 	wasHeld := held(ws.State)
 	releaseOperation := ws.ReleaseOperation
+	releaseEpoch := ws.ReleaseEpoch
 	if wasHeld && (node == "" || c.send == nil || !c.send.Online(node)) {
 		c.mu.Unlock()
 		return proto.Err(proto.CodeUnreachable, "workspace source node %s is unavailable; destroy remains uncommitted", node)
 	}
+	if wasHeld {
+		if err := c.requireReleaseEpochCapabilityLocked(node, ws); err != nil {
+			c.mu.Unlock()
+			return err
+		}
+	}
 	beforeDestroy := ws.State
 	if wasHeld {
+		var epochErr error
+		releaseEpoch, epochErr = nextReleaseEpoch(ws)
+		if epochErr != nil {
+			c.mu.Unlock()
+			return epochErr
+		}
 		releaseOperation = ids.New("rel")
 		transition := lifecycleTransition{
 			operation: transitionDestroyBegin, actor: actorControl, to: proto.WSDestroying,
@@ -3695,6 +3719,7 @@ func (c *Control) wsDestroy(ctx context.Context, principal, id, idem string) err
 			c.mu.Unlock()
 			return transitionErr
 		}
+		next.ReleaseEpoch = releaseEpoch
 		next.ReleaseOperation = releaseOperation
 		if err := c.persistWS(&next, c.transitionEvent(beforeDestroy, &next, transition)); err != nil {
 			c.mu.Unlock()
@@ -3708,7 +3733,8 @@ func (c *Control) wsDestroy(ctx context.Context, principal, id, idem string) err
 		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		var err error
 		prepared, err = c.prepareRelease(rctx, node, proto.WSReleaseReq{
-			WS: id, Gen: gen, OperationID: releaseOperation, Snapshot: false, Reason: "destroy", Tenant: tenant, Backend: backend, Spec: releaseSpec,
+			WS: id, Gen: gen, ReleaseEpoch: releaseEpoch, OperationID: releaseOperation,
+			Snapshot: false, Reason: "destroy", Tenant: tenant, Backend: backend, Spec: releaseSpec,
 		})
 		cancel()
 		if err != nil {
@@ -3812,6 +3838,13 @@ func (c *Control) completeDestroyedWorkspaceCleanup(ctx context.Context, princip
 	return nil
 }
 
+func nextReleaseEpoch(workspace *proto.Workspace) (uint64, error) {
+	if workspace.ReleaseEpoch == ^uint64(0) {
+		return 0, proto.Err(proto.CodeResourceExhausted, "workspace release epoch exhausted")
+	}
+	return workspace.ReleaseEpoch + 1, nil
+}
+
 // release asks the current node to give a workspace up (optionally with a
 // snapshot) and moves it to the given state. It is used by move, sleep and
 // destroy. Returns the snapshot artifact id if one was taken.
@@ -3868,6 +3901,10 @@ func (c *Control) release(ctx context.Context, id string, snapshot bool, reason 
 	releaseSpec := ws.Spec
 	releaseSpec.Volumes = append([]proto.VolumeMount(nil), ws.Spec.Volumes...)
 	tenant := ws.Tenant
+	if err := c.requireReleaseEpochCapabilityLocked(node, ws); err != nil {
+		c.mu.Unlock()
+		return "", err
+	}
 	begin := lifecycleTransition{
 		operation: transitionReleaseBegin, actor: actorControl, to: proto.WSQuiescing,
 		expectGeneration: true, generation: gen, expectNode: true, node: node,
@@ -3877,6 +3914,12 @@ func (c *Control) release(ctx context.Context, id string, snapshot bool, reason 
 		c.mu.Unlock()
 		return "", transitionErr
 	}
+	releaseEpoch, epochErr := nextReleaseEpoch(ws)
+	if epochErr != nil {
+		c.mu.Unlock()
+		return "", epochErr
+	}
+	next.ReleaseEpoch = releaseEpoch
 	next.ReleaseOperation = ids.New("rel")
 	if err := c.persistWS(&next, c.transitionEvent(proto.WSClaimed, &next, begin)); err != nil {
 		c.mu.Unlock()
@@ -3889,7 +3932,8 @@ func (c *Control) release(ctx context.Context, id string, snapshot bool, reason 
 	defer cancel()
 	var err error
 	res, err = c.prepareRelease(rctx, node, proto.WSReleaseReq{
-		WS: id, Gen: gen, OperationID: next.ReleaseOperation, Snapshot: snapshot, Reason: reason, Tenant: tenant, Backend: backend, Spec: releaseSpec,
+		WS: id, Gen: gen, ReleaseEpoch: next.ReleaseEpoch, OperationID: next.ReleaseOperation,
+		Snapshot: snapshot, Reason: reason, Tenant: tenant, Backend: backend, Spec: releaseSpec,
 	})
 	if err != nil {
 		err = c.abortPreparedRelease(ctx, id, node, gen, proto.WSQuiescing, err)

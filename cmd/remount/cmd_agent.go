@@ -263,6 +263,9 @@ func (p *agentPlan) create(ctx context.Context, cl *client.Client, acpCmd []stri
 		Policy: p.policy,
 		Parent: p.parent,
 	}
+	for _, binding := range p.opts.Bindings {
+		req.Spec.BindingSpecs = append(req.Spec.BindingSpecs, binding.String())
+	}
 	if p.opts.WS != "" {
 		req.WS = p.opts.WS
 	} else {
@@ -502,7 +505,7 @@ func startAgentUI(ctx context.Context, cl *client.Client, a *proto.Agent) (int, 
 	if err != nil {
 		return 0, err
 	}
-	bindings, err := launch.BindingsFromLabels(ws.Spec.Labels)
+	bindings, err := launch.BindingsForWorkspace(a.Spec.BindingSpecs, ws.Spec.Labels, ws.Spec.Bindings)
 	if err != nil {
 		return 0, err
 	}

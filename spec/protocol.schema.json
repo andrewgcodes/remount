@@ -695,6 +695,12 @@
         "auth": {
           "type": "string"
         },
+        "binding_specs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "mode": {
           "type": "string"
         },
@@ -6192,6 +6198,9 @@
         "reason": {
           "type": "string"
         },
+        "release_epoch": {
+          "type": "integer"
+        },
         "snapshot": {
           "type": "boolean"
         },
@@ -6503,6 +6512,9 @@
           "type": "string"
         },
         "quarantined_at": {
+          "type": "integer"
+        },
+        "release_epoch": {
           "type": "integer"
         },
         "release_operation": {
