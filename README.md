@@ -7,6 +7,11 @@ machine — your laptop, a Mac mini, a bare-metal GPU box, a cloud VM — into a
 place where an AI agent can run through one small exec / filesystem / session
 interface.
 
+**Using Remount:** start with [`docs/using-remount.md`](docs/using-remount.md).
+It is the maintained user and coding-agent entry point for running harnesses,
+retrieving modified files, operating durable Agents, and deploying the Modal
+reference.
+
 The agent's computer is a **workspace**, and Remount treats it as a movable value
 rather than a machine. Its files can be snapshotted, paused for days at
 storage-only cost, resumed on a different node, and reattached mid-command, while

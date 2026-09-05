@@ -5,6 +5,13 @@ description: "Use when operating a live Remount deployment: creating or moving w
 
 # Operating Remount
 
+`docs/using-remount.md` is the canonical user journey. Read it first and use
+this skill for the deeper operating details. If a command, recipe, provider,
+deployment, security behavior, file-transfer rule, or lifecycle outcome
+changes, update that guide and the relevant detailed document, run
+`make docs`, and verify `make lint`; never edit generated `llms.txt` or
+`llms-full.txt` by hand.
+
 Every command needs a server URL and a token. Set them once.
 
 ```sh

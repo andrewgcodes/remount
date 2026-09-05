@@ -21,6 +21,7 @@ make race     # the suite under the race detector
 make cover    # coverage summary
 make dist     # linux/darwin × amd64/arm64 static binaries in dist/
 make demo     # remount standalone on 127.0.0.1:7443
+make docs     # regenerate the machine-readable user documentation bundle
 
 make verify       # every ci.yml gate, locally — run this before pushing
 make verify-fast  # the same without the race lane and conformance; reported as a subset
@@ -44,6 +45,13 @@ KVM, vendors, MinIO, MCP, release) are not mirrored.
 Cross-vetting all three `GOOS` values matters more than it looks: the Windows
 lane has caught defects a darwin-only vet cannot see, including tests that
 shell out to POSIX scripts and a comparison that only fails on CRLF.
+
+`docs/using-remount.md` is the canonical entry point for users and coding
+agents operating Remount. A change to commands, recipes, providers,
+deployment, security behavior, file transfer, or lifecycle semantics must
+update that user journey and the detailed document it links in the same
+change. Run `make docs`; `make lint` rejects stale `llms.txt` and
+`llms-full.txt`.
 
 **Tests must pass under `-race`.** Three real bugs in this codebase were only
 visible there: a live pointer escaping the control-plane mutex, a lease
@@ -97,7 +105,7 @@ This tree may have another agent writing to it:
 | `internal/sim` | the whole system in one process with fault injection; the failure model lives here |
 | `internal/ids` | prefixed, time-sortable ids |
 | `spec/PROTOCOL.md` | the normative wire protocol |
-| `docs/` | design, tutorial, operations, harness integration, ADRs |
+| `docs/` | canonical usage guide, design, tutorial, operations, harness integration, ADRs |
 | `.agents/skills/` | repo-scoped Codex workflows; keep the detailed engineering truth in `docs/` |
 | `.claude/skills/` | repo-scoped Claude development and operating workflows |
 | `examples/` | a minimal real agent loop against the SDK |
@@ -155,6 +163,7 @@ Check your own change against every line here before calling it done.
 | add a CLI subcommand | `cmd/remount/main.go`; parse flags with `parse(fs, args)`, never `fs.Parse` |
 | add a metric | a named var in `internal/metrics/metrics.go`, then increment it at the site |
 | record a design decision | a new file in `docs/adr/`, never an edit to an existing one |
+| change a user-visible command, recipe or workflow | `docs/using-remount.md`, the linked detailed guide, then `make docs` |
 
 ## Testing philosophy
 
