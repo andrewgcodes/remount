@@ -35,7 +35,17 @@ async with Client("https://remount.example", token="...") as remount:
     async for chunk in session:
         print(chunk.data.decode(), end="")
     snapshot = await remount.snapshot_workspace(workspace_id, authoritative=True)
-    await remount.sleep_workspace(workspace_id)
+    await remount.sleep_workspace(
+        workspace_id,
+        on_event="example.workspace.resume",
+        match={"workspace": workspace_id},
+    )
+    await remount.post_event(
+        "example.workspace.resume",
+        stream=workspace_id,
+        payload={"workspace": workspace_id},
+    )
+    await remount.wait_workspace(workspace_id)
 ```
 
 Package publication and live-provider validation are release gates; this tree
