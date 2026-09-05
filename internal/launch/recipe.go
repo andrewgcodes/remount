@@ -23,6 +23,7 @@ import (
 	"text/template"
 
 	"remount.dev/remount/internal/launch/yamlite"
+	"remount.dev/remount/internal/proto"
 )
 
 //go:embed recipes/*.yaml
@@ -46,9 +47,9 @@ const (
 
 // Sandbox levels map onto egress policy and a harness-visible hint.
 const (
-	SandboxReadOnly       = "read-only"
-	SandboxWorkspaceWrite = "workspace-write"
-	SandboxFull           = "full"
+	SandboxReadOnly       = proto.AgentSandboxReadOnly
+	SandboxWorkspaceWrite = proto.AgentSandboxWorkspaceWrite
+	SandboxFull           = proto.AgentSandboxFull
 )
 
 // Approval policies for hosts outside the binding set.

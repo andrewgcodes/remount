@@ -115,6 +115,10 @@ agent from a recipe is:
 }
 ```
 
+`spec.sandbox` accepts `read-only`, `workspace-write`, or `full`. An omitted
+value is normalized to `workspace-write` before the Agent is persisted or
+dispatched. A child Agent first inherits an omitted sandbox from its parent.
+
 `ws` adopts an existing workspace instead of `workspace`. The task text goes
 into the inbox as the first message; events carry its hash, never the text.
 
