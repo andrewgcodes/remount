@@ -583,6 +583,11 @@ Filesystem mutations are jailed to the workspace root:
 ./remount fs rm "$WS" archive/notes.md
 ```
 
+The Python SDK's `write_file` helper splits large values into wire-safe
+chunks. If a later chunk fails, the destination contains the acknowledged
+prefix; retry the same bytes with the same explicit `idempotency_key` to
+continue without duplicating that prefix.
+
 Long-running session output is a sequenced log. Ctrl-C detaches unless the
 caller explicitly requests termination:
 

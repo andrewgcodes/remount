@@ -230,7 +230,7 @@ func TestApplyTarAtPath(t *testing.T) {
 	if err := c.Mkdir(ctx, ws.ID, "workspace"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.ApplyTarAt(ctx, ws.ID, overlay, "workspace", client.WithIdempotencyKey("nested-restore")); err != nil {
+	if _, err := c.ApplyTarAt(ctx, ws.ID, overlay, "/workspace/.", client.WithIdempotencyKey("nested-restore")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.ReadFile(ctx, ws.ID, "resume-proof.txt"); err == nil {

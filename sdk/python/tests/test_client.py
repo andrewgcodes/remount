@@ -6,7 +6,12 @@ import httpx
 import pytest
 
 from remount import Client, ProtocolError
-from remount.client import PEER_CAPABILITIES, Session
+from remount.client import (
+    MAX_FILE_CHUNK_BYTES,
+    MAX_FRAME_BYTES,
+    PEER_CAPABILITIES,
+    Session,
+)
 
 
 def test_decodes_go_protocol_golden_fixture():
@@ -367,7 +372,7 @@ async def test_workspace_lifecycle_helpers_encode_control_operations():
         return socket
 
     client = Client("https://cp.example", "token", connector=connector)
-    workspace = await client.wait_workspace("ws_1", timeout=0)
+    workspace = await client.wait_workspace("ws_1", timeout=1)
     timer = await client.sleep_workspace(
         "ws_1", after_sec=30, on_event="job.done", match={"id": "job_1"}
     )
@@ -393,10 +398,55 @@ async def test_workspace_lifecycle_helpers_encode_control_operations():
 
 
 @pytest.mark.asyncio
+async def test_workspace_wait_timeout_bounds_stalled_requests():
+    socket = FakeSocket()
+    original_send = socket.send
+
+    async def send(wire):
+        frame = cbor2.loads(wire)
+        if frame["t"] == "hello":
+            await original_send(wire)
+
+    socket.send = send
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client(
+        "https://cp.example",
+        "token",
+        connector=connector,
+        retries=1,
+        request_timeout=0.01,
+    )
+    loop = __import__("asyncio").get_running_loop()
+    started = loop.time()
+    with pytest.raises(TimeoutError, match="did not reach"):
+        await client.wait_workspace("ws_1", timeout=0.05, poll_interval=0.001)
+    assert 0.04 <= loop.time() - started < 0.5
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_workspace_wait_validates_inputs():
+    client = Client("https://cp.example", "token")
+    with pytest.raises(ValueError, match="at least one state"):
+        await client.wait_workspace("ws_1", states=())
+    with pytest.raises(ValueError, match="must be positive"):
+        await client.wait_workspace("ws_1", timeout=0)
+    with pytest.raises(ValueError, match="must be positive"):
+        await client.wait_workspace("ws_1", poll_interval=0)
+
+
+@pytest.mark.asyncio
 async def test_sleep_workspace_requires_wake_trigger():
     client = Client("https://cp.example", "token", connector=FakeSocket)
     with pytest.raises(ValueError, match="requires"):
         await client.sleep_workspace("ws_1")
+    with pytest.raises(ValueError, match="must not be negative"):
+        await client.sleep_workspace("ws_1", after_sec=-1)
+    with pytest.raises(ValueError, match="must not be negative"):
+        await client.sleep_workspace("ws_1", at_millis=-1)
 
 
 @pytest.mark.asyncio
@@ -433,6 +483,75 @@ async def test_file_helpers_chunk_reads_and_idempotent_writes():
     assert write_body["idem"] == "idem_file:0"
     assert write_body["append"] is False
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_write_file_chunks_stay_below_transport_frame_limit():
+    socket = FakeSocket({"fs.write": {}})
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client("https://cp.example", "token", connector=connector)
+    data = b"x" * (MAX_FILE_CHUNK_BYTES + 17)
+    await client.write_file(
+        "ws_1",
+        "workspace/large.bin",
+        data,
+        idempotency_key="idem_large",
+    )
+
+    frames = [frame for frame in socket.sent if frame.get("op") == "fs.write"]
+    bodies = [cbor2.loads(frame["body"]) for frame in frames]
+    assert len(frames) == 2
+    assert all(len(cbor2.dumps(frame)) <= MAX_FRAME_BYTES for frame in frames)
+    assert b"".join(body["d"] for body in bodies) == data
+    assert [body["append"] for body in bodies] == [False, True]
+    assert [body["idem"] for body in bodies] == ["idem_large:0", "idem_large:1"]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_write_file_retry_does_not_duplicate_acknowledged_prefix(monkeypatch):
+    client = Client("https://cp.example", "token")
+    data = b"a" * MAX_FILE_CHUNK_BYTES + b"b" * MAX_FILE_CHUNK_BYTES + b"c"
+    completed = set()
+    destination = bytearray()
+    fail_once = True
+
+    async def node_call(_workspace, operation, body):
+        nonlocal fail_once
+        assert operation == "fs.write"
+        key = body["idem"]
+        if key == "idem_partial:1" and fail_once:
+            fail_once = False
+            raise ProtocolError("unreachable", "injected failure")
+        if key in completed:
+            return {}
+        if body["append"]:
+            destination.extend(body["d"])
+        else:
+            destination[:] = body["d"]
+        completed.add(key)
+        return {}
+
+    monkeypatch.setattr(client, "_node_call", node_call)
+    with pytest.raises(ProtocolError, match="injected failure"):
+        await client.write_file(
+            "ws_1",
+            "workspace/large.bin",
+            data,
+            idempotency_key="idem_partial",
+        )
+    assert bytes(destination) == data[:MAX_FILE_CHUNK_BYTES]
+
+    await client.write_file(
+        "ws_1",
+        "workspace/large.bin",
+        data,
+        idempotency_key="idem_partial",
+    )
+    assert bytes(destination) == data
 
 
 @pytest.mark.asyncio

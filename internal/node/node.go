@@ -4081,6 +4081,10 @@ func (n *Node) applyTar(ctx context.Context, w *ws, id, format, target, client s
 	if rel == EnvFileDir || strings.HasPrefix(rel, EnvFileDir+string(filepath.Separator)) {
 		return nil, proto.Err(proto.CodeDenied, "fs.apply_tar: destination is node-owned")
 	}
+	eventPath := filepath.ToSlash(rel)
+	if rel == "." {
+		eventPath = ""
+	}
 	info, err := os.Lstat(root)
 	if err != nil {
 		return nil, proto.Err(proto.CodeBadRequest, "fs.apply_tar: destination: %v", err)
@@ -4099,11 +4103,11 @@ func (n *Node) applyTar(ctx context.Context, w *ws, id, format, target, client s
 	if len(res.Paths) > 0 || res.Dirs > 0 {
 		n.emit(proto.EvFSApplyTar, w.ID, w.Spec.Principal, map[string]any{
 			"artifact": id, "files": len(res.Paths), "dirs": res.Dirs, "bytes": res.Bytes, "client": client,
-			"path": target, "complete": err == nil,
+			"path": eventPath, "complete": err == nil,
 		})
 		for _, p := range res.Paths {
 			n.emit(proto.EvFSWrite, w.ID, w.Spec.Principal, map[string]any{
-				"path": path.Join(target, p), "artifact": id, "client": client,
+				"path": path.Join(eventPath, p), "artifact": id, "client": client,
 			})
 		}
 	}
