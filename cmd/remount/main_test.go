@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"remount.dev/remount/internal/client"
+	"remount.dev/remount/internal/launch"
 	"remount.dev/remount/internal/proto"
 )
 
@@ -631,8 +632,152 @@ func TestRunQueueFlagsValidateBeforeDialing(t *testing.T) {
 	}
 }
 
+func TestPrepareHandoffDetectsRecipeBeforeDefaultBindings(t *testing.T) {
+	for _, p := range launch.Presets() {
+		if p.KeyEnv != "" {
+			t.Setenv(p.KeyEnv, "")
+		}
+	}
+	for _, tc := range []struct {
+		name     string
+		recipe   string
+		state    string
+		key      string
+		binding  string
+		useHome  bool
+		explicit bool
+	}{
+		{"claude explicit home", "claude", ".claude", "ANTHROPIC_API_KEY", "b_anthropic", true, false},
+		{"claude default home", "claude", ".claude", "ANTHROPIC_API_KEY", "b_anthropic", false, false},
+		{"codex explicit home", "codex", ".codex", "OPENAI_API_KEY", "b_openai", true, false},
+		{"codex default home", "codex", ".codex", "OPENAI_API_KEY", "b_openai", false, false},
+		{"explicit recipe and binding", "claude", ".claude", "ANTHROPIC_API_KEY", "b_anthropic", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			if err := os.Mkdir(filepath.Join(home, tc.state), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			envHome := home
+			if tc.useHome {
+				envHome = t.TempDir()
+			}
+			t.Setenv("HOME", envHome)
+			t.Setenv("USERPROFILE", envHome)
+			t.Setenv(tc.key, "fake-handoff-key-not-a-credential")
+			o := launch.HandoffOptions{Dir: t.TempDir()}
+			if tc.useHome {
+				o.Home = home
+			}
+			if tc.explicit {
+				r, err := launch.Load(tc.recipe)
+				if err != nil {
+					t.Fatal(err)
+				}
+				o.Recipe = r
+				b, err := launch.ParseBinding("b_mine:anthropic")
+				if err != nil {
+					t.Fatal(err)
+				}
+				o.Run.Bindings = []launch.Binding{b}
+			}
+			calls := 0
+			err := prepareHandoff(&o, func() []localBinding {
+				calls++
+				if o.Recipe == nil || o.Recipe.Name != tc.recipe {
+					t.Fatalf("recipe was not resolved before binding lookup: %+v", o.Recipe)
+				}
+				local := envBindings()
+				if len(local) != 1 || local[0].ID != tc.binding || local[0].Secret != "$"+tc.key {
+					t.Fatalf("local bindings = %+v", local)
+				}
+				return local
+			})
+			if runtime.GOOS == "windows" {
+				if err == nil || !strings.Contains(err.Error(), "mount_path") {
+					t.Fatalf("Windows path-keyed handoff error = %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			want := tc.binding
+			if tc.explicit {
+				want = "b_mine"
+			}
+			if calls != 1 || o.Home != home || o.Recipe == nil || o.Recipe.Name != tc.recipe || len(o.Run.Bindings) != 1 || o.Run.Bindings[0].ID != want {
+				t.Fatalf("prepared handoff = %+v, binding lookups = %d", o, calls)
+			}
+			if o.Run.Recipe != nil || o.Run.Dir != "" || o.Run.RestoreFrom != "" {
+				t.Fatalf("preparation populated fields reserved for launch.Handoff: %+v", o.Run)
+			}
+		})
+	}
+}
+
+func TestPrepareHandoffRejectsUnresolvedRecipeBeforeBindingLookup(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		states []string
+		want   string
+	}{
+		{"no state", nil, "no harness state"},
+		{"ambiguous state", []string{".claude", ".codex"}, "several harnesses"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			for _, state := range tc.states {
+				if err := os.Mkdir(filepath.Join(home, state), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			o := launch.HandoffOptions{Dir: t.TempDir(), Home: home}
+			err := prepareHandoff(&o, func() []localBinding {
+				t.Fatal("binding lookup ran before recipe detection succeeded")
+				return nil
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestPrepareHandoffRequiresPortableAuthentication(t *testing.T) {
+	for _, name := range []string{"claude", "codex"} {
+		r, err := launch.Load(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o := launch.HandoffOptions{Dir: t.TempDir(), Home: t.TempDir(), Recipe: r}
+		if err := prepareHandoff(&o, func() []localBinding { return nil }); err == nil || !strings.Contains(err.Error(), "provider --binding") {
+			t.Fatalf("%s preflight auth: %v", name, err)
+		}
+	}
+}
+
+func TestPrepareHandoffAllowsCustomRecipeWithoutBinding(t *testing.T) {
+	home := t.TempDir()
+	if err := os.Mkdir(filepath.Join(home, ".fake"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r := &launch.Recipe{
+		Name: "fake", Auth: launch.AuthWorkspaceResident,
+		Command: []string{"true"}, ResumeCommand: []string{"true"}, StateDirs: []string{".fake"},
+	}
+	o := launch.HandoffOptions{Dir: t.TempDir(), Home: home, Candidates: []*launch.Recipe{r}}
+	if err := prepareHandoff(&o, func() []localBinding { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if o.Recipe != r || len(o.Run.Bindings) != 0 {
+		t.Fatalf("custom handoff = %+v", o)
+	}
+}
+
 func TestHandoffAndResumeValidateBeforeDialing(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	t.Setenv("REMOUNT_AUTOSTART", "0")
+	t.Setenv("REMOUNT_SERVER", "http://127.0.0.1:1")
 	home := t.TempDir()
 	for _, tc := range []struct {
 		name string
@@ -644,6 +789,15 @@ func TestHandoffAndResumeValidateBeforeDialing(t *testing.T) {
 		{"unknown recipe", []string{"--recipe", "nope", "--home", home}, "nope"},
 		{"negative timeout", []string{"--timeout", "-1s", "--home", home}, "negative"},
 		{"bad binding", []string{"--binding", "b_x:nopreset", "--home", home}, "nopreset"},
+		{"no state", []string{"--home", home}, "no harness state"},
+		{"no resume", []string{"--recipe", "custom", "--home", home}, "no resume_command"},
+		{"missing provider binding", []string{"--recipe", "claude", "--home", home}, "provider --binding"},
+		{"bad sandbox", []string{"--recipe", "claude", "--binding", "b_anthropic", "--home", home, "--sandbox", "loose"}, "--sandbox"},
+		{"bad approve", []string{"--recipe", "claude", "--binding", "b_anthropic", "--home", home, "--approve", "always"}, "--approve"},
+		{"bad security", []string{"--recipe", "claude", "--binding", "b_anthropic", "--home", home, "--security", "paranoid"}, "--security"},
+		{"foreign provider", []string{"--recipe", "claude", "--binding", "b_openai", "--home", home}, "does not consume"},
+		{"duplicate binding", []string{"--recipe", "claude", "--binding", "b_anthropic", "--binding", "b_anthropic", "--home", home}, "twice"},
+		{"missing directory", []string{"--recipe", "claude", "--binding", "b_anthropic", "--home", home, "--dir", filepath.Join(home, "missing-checkout")}, "missing-checkout"},
 	} {
 		t.Run("handoff "+tc.name, func(t *testing.T) {
 			err := cmdHandoff(ctx, tc.args)

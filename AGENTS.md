@@ -297,3 +297,19 @@ A check that cannot run must never render as a pass. `doctor` emits
   is static and 13 MB; keep it that way.
 - Prefer a sim test to a mock. If the behavior involves two peers, it belongs in
   `internal/sim`.
+
+## Live local-to-cloud handoff verification
+
+`scripts/live-handoff.py` tests installed Claude/Codex with isolated synthetic
+conversations and a disposable Modal VM. Read its CLI help and the handoff entry
+in `docs/engineering/verification-2026-09.md` first. Live modes require explicit
+`--execute`, authorized provider/model credentials, frozen native/Linux binaries,
+and verified cleanup. Never substitute the user's real home or repository for
+the generated fixtures. Its offline safety tests run with
+`python scripts/test_live_handoff.py`.
+
+Codex 0.152.1 needs `openai_base_url` configuration, not just `OPENAI_BASE_URL`;
+`exec resume --last` also filters by provider. Handoff must preserve the selected
+UUID and use explicit resume. A Docker host may block Codex's nested sandbox:
+the live driver's opt-in security relaxation is only for disposable test
+containers, never a production-default workaround.
