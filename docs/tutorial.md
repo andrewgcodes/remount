@@ -6,17 +6,20 @@ something differs, `remount help` is the authority.
 
 ## 1. Build
 
-Remount is one Go binary with no runtime dependencies.
+The core is one Go binary; selected backends and harness recipes have additional
+runtime prerequisites. Use an accessible checkout and the Go version required
+by `go.mod` (currently 1.27.1). Public installation has separate
+[release prerequisites](releases.md).
 
 ```sh
-git clone https://github.com/remount-dev/remount
+git clone https://github.com/andrewgcodes/remount.git
 cd remount
-go build -o remount ./cmd/remount
+make build
 ./remount version
 ```
 
 ```
-remount dev
+remount <source-revision>
 ```
 
 ## 2. One command
@@ -256,7 +259,7 @@ Your files are there:
 gpu-box-01
 ```
 
-Running processes do not move; only files do. The generation number bumped
+On this process/Docker filesystem move, running processes do not move. The generation number bumped
 from 1 to 2, which is how every stale grant and stale session from the old
 node is refused.
 
@@ -334,7 +337,9 @@ Inside the workspace `git fetch` and `git push` route through
 ## 8. Sleep and wake
 
 A sleeping workspace has no node. Its last snapshot is kept, its timers are
-durable, and it costs only storage.
+durable, and it retains storage rather than a workspace compute assignment.
+The provider can still charge for an idle node until that node is scaled down
+or terminated.
 
 ```sh
 ./remount ws sleep $WS --after 2m

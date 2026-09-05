@@ -9,9 +9,10 @@ change goes.
 Remount is a protocol and a single Go binary that gives an AI agent a computer
 it can run on from anywhere. The agent's computer is a **workspace**: a
 filesystem plus processes that can be snapshotted, moved to another node, put
-to sleep, and reattached mid-command without losing output. The workspace never
-holds a credential; the node's broker substitutes real secrets at the network
-edge and every decision lands in one event log.
+to sleep, and reattached within explicit output-retention limits. Broker-managed
+credentials stay outside the workspace; the node substitutes secrets at the
+network edge and records its decisions. Explicit harness-native login is a
+separate, workspace-resident trust choice; see `docs/harness-integration.md`.
 
 ## Build and test
 
@@ -19,7 +20,7 @@ edge and every decision lands in one event log.
 make          # vet + test + build a static binary
 make race     # the suite under the race detector
 make cover    # coverage summary
-make dist     # linux/darwin × amd64/arm64 static binaries in dist/
+make dist     # linux/darwin/windows × amd64/arm64 static binaries in dist/
 make demo     # remount standalone on 127.0.0.1:7443
 make docs     # regenerate the machine-readable user documentation bundle
 
@@ -28,9 +29,9 @@ make verify-fast  # the same without the race lane and conformance; reported as 
 ```
 
 **Verify locally before you push.** This repository is private, so Actions
-minutes are metered, and it is expensive per push: ten workflows fire on every
-push to `main`, `ci.yml`'s matrix includes macOS at 10x billing and a Windows
-job at 2x. A push that fails CI costs minutes and teaches nothing that
+minutes are metered, and multiple workflows can fire on a push. Triggers and
+path filters vary by workflow; cross-platform jobs add to the cost. A push
+that fails CI costs minutes and teaches nothing that
 `make verify` would not have told you for free. It runs gofmt, `go vet` for
 darwin, linux and windows, the lock-discipline lint, the suite, `make dist`,
 `go mod verify`/`tidy -diff`, staticcheck, govulncheck, the seeded fuzz corpus,
@@ -58,8 +59,9 @@ visible there: a live pointer escaping the control-plane mutex, a lease
 expiring during a slow restore, and a renew interval longer than the lease.
 If `make race` is red, the change is not done.
 
-Go 1.27, `CGO_ENABLED=0` everywhere. SQLite is `modernc.org/sqlite`, pure Go,
-so the binary stays static.
+Use the Go version required by `go.mod` (currently 1.27.1). Distribution builds
+use `CGO_ENABLED=0`; race tests require cgo and a supported C toolchain. SQLite
+is `modernc.org/sqlite`, pure Go, so distribution binaries stay static.
 
 ## Before changing a moving checkout
 
@@ -92,7 +94,7 @@ This tree may have another agent writing to it:
 | `internal/transport` | `Conn` and `Peer`: WebSocket, in-memory pipe with fault injection, request correlation |
 | `internal/session` | the sequenced output log with spill, cursors, exec/pty/port runners, the session manager |
 | `internal/fsops` | jailed filesystem operations, server-side search, atomic multi-edit |
-| `internal/workspace` | the `Backend` interface, `process` and `docker` backends |
+| `internal/workspace` | the `Backend` interface; `process`, `docker`, `gvisor`, and `firecracker` backends |
 | `internal/artifact` | content-addressed blob store, deterministic tar.gz snapshots and restore |
 | `internal/eventlog` | the canonical log, memory and SQLite stores, subscriptions with backfill |
 | `internal/broker` | the egress credential broker: substitution, leak blocking, allow lists, audit |
@@ -302,8 +304,9 @@ A check that cannot run must never render as a pass. `doctor` emits
 - Errors that cross the wire carry a stable `proto` code. Use `proto.Err(code,
   format, ...)`; callers match on `Code`, never on message text.
 - One idea per function. `dispatch` is a switch that calls named methods.
-- No new dependencies without a reason written in the pull request. The binary
-  is static and 13 MB; keep it that way.
+- No new dependencies without a reason written in the pull request. Keep the
+  distribution static and measure binary-size changes; size varies by target
+  and revision.
 - Prefer a sim test to a mock. If the behavior involves two peers, it belongs in
   `internal/sim`.
 
