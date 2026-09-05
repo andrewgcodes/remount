@@ -463,6 +463,48 @@ async def test_snapshot_archive_and_apply_tar_helpers_encode_node_operations():
 
 
 @pytest.mark.asyncio
+async def test_session_lifecycle_helpers_encode_node_operations():
+    socket = FakeSocket(
+        {
+            "s.list": {
+                "sessions": [
+                    {
+                        "info": {
+                            "id": "s_1",
+                            "ws": "ws_1",
+                            "kind": "exec",
+                            "opened_at": 1,
+                        },
+                        "exited": False,
+                        "next": 2,
+                        "oldest": 0,
+                    }
+                ]
+            },
+            "s.close": {},
+        }
+    )
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client("https://cp.example", "token", connector=connector)
+    sessions = await client.list_sessions("ws_1")
+    await client.close_session("ws_1", "s_1", kill=True)
+
+    assert sessions[0]["info"]["id"] == "s_1"
+    bodies = {
+        frame["op"]: cbor2.loads(frame["body"])
+        for frame in socket.sent
+        if frame.get("op") in {"s.list", "s.close"}
+    }
+    assert bodies["s.list"]["ws"] == "ws_1"
+    assert bodies["s.close"]["s"] == "s_1"
+    assert bodies["s.close"]["kill"] is True
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_authoritative_snapshot_requires_upload():
     client = Client("https://cp.example", "token")
     with pytest.raises(ValueError, match="must be uploaded"):

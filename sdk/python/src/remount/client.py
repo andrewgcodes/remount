@@ -15,7 +15,15 @@ import cbor2
 import httpx
 from websockets.asyncio.client import connect as websocket_connect
 
-from .types import FSApplyTarRes, FSEntry, FSReadRes, Timer, Workspace, WSSnapshotRes
+from .types import (
+    FSApplyTarRes,
+    FSEntry,
+    FSReadRes,
+    SessionStatus,
+    Timer,
+    Workspace,
+    WSSnapshotRes,
+)
 
 PROTOCOL_VERSION = 1
 CONTROL = "control"
@@ -645,6 +653,21 @@ class Client:
             workspace, "fs.list", {"ws": workspace, "path": path}
         )
         return cast(list[FSEntry], response["entries"])
+
+    async def list_sessions(self, workspace: str) -> list[SessionStatus]:
+        response = await self._node_call(
+            workspace, "s.list", {"ws": workspace}
+        )
+        return cast(list[SessionStatus], response["sessions"])
+
+    async def close_session(
+        self, workspace: str, session_id: str, *, kill: bool = False
+    ) -> None:
+        await self._node_call(
+            workspace,
+            "s.close",
+            {"s": session_id, "kill": kill},
+        )
 
     async def apply_tar(
         self,
