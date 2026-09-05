@@ -16,7 +16,7 @@ npm test
 npm run build
 npm run check:dist
 npx playwright install chromium
-npx playwright test
+npm run test:e2e
 ```
 
 The production build is in `web/dist`. `dist.sha256` is the committed manifest
@@ -41,11 +41,11 @@ content is workspace-controlled and currently shares this origin.
 
 ## Server integration contract
 
-The browser client is complete against the following adapter. These routes
-must authenticate at the server, constrain reads to the subject's tenant, and
-require `operator` for every mutation. A wildcard operator is the only subject
+The server implements the following adapter in `internal/server/console*.go`.
+These routes authenticate at the server, constrain reads to the subject's tenant, and
+require `operator` for mutations. A wildcard operator is the only subject
 that may cross tenants. JSON errors use the protocol's stable error shape.
-Mutation adapters must add or require an idempotency key before calling the
+Mutation adapters add or require an idempotency key before calling the
 existing protocol operation.
 
 All timestamps are RFC 3339 strings. Counts and cursors are JSON integers.
@@ -148,9 +148,11 @@ type.
 ## Verification
 
 Unit tests cover fail-closed runtime configuration, bearer transport, stable
-errors, hostile text rendering, and approval actions. The Playwright flow uses
-a stateful mock adapter and proves create → exec/terminal → read/write →
-snapshot → move → reattach plus `leak_blocked` visibility and approval. The
+errors, hostile text rendering, and approval actions. Playwright starts real
+Go servers and nodes through `web/tests/e15/global-setup.mjs`; it does not
+replace the HTTP or WebSocket data path with a mock adapter. It covers
+create → exec/terminal → read/write → snapshot → move → reattach,
+`leak_blocked` visibility, approvals, and tenant/role boundaries. The
 sim-backed Go E15 additionally drives two real nodes through create, exec,
 forced disconnect and cursor reattach, file CAS, checkpoint, move and the
 canonical timeline so authorization, generation fencing and replay are proved

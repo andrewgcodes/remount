@@ -4,7 +4,7 @@
 
 # Remount
 
-**Any agent, any machine, never holding the keys, never losing its place.**
+**Portable agent workspaces, brokered credentials, durable sessions.**
 
 Remount is an open protocol and a single Go binary that turns a supported
 machine — your laptop, a Mac mini, a bare-metal GPU box, a cloud VM — into a
@@ -17,15 +17,18 @@ retrieving modified files, operating durable Agents, and deploying the Modal
 reference.
 
 The agent's computer is a **workspace**, and Remount treats it as a movable value
-rather than a machine. Its files can be snapshotted, paused for days at
-storage-only cost, resumed on a different node, and reattached mid-command, while
-the agent sees one unbroken stream with output replayed from where it left off.
+rather than a machine. Its files can be snapshotted, put to sleep, and restored
+on a compatible node. A client can detach mid-command and reattach to retained
+execution without losing output; if retention has evicted bytes, the gap is
+explicit. Moving a filesystem does not move a running process.
 
 The workspace process receives credential references rather than reusable
 secrets. The node's egress broker swaps a reference for the real value only on
 an authorized TLS request, with a TTL and audit trail. This removes static keys
 from the workspace, but it does not make an authorized API harmless: a
-compromised workspace can still abuse capabilities it was granted.
+compromised workspace can still abuse capabilities it was granted. This applies
+to brokered API keys, not harness-native subscription logins, whose credentials
+remain workspace-resident; see [authentication modes](docs/harness-integration.md#two-kinds-of-auth-stated-plainly).
 
 ```
    your laptop                  control plane                 a GPU box
@@ -46,7 +49,10 @@ handler does not interpret their bodies.
 
 ---
 
-## Try it in 60 seconds
+## Quick start from source
+
+Use the Go version declared in `go.mod` (currently 1.27.1). Repository access
+is required; public package publication is a separate release gate.
 
 One command runs a coding harness in a fresh workspace against a key it never
 sees. With nothing listening on the default local address, `remount run` starts
@@ -54,19 +60,21 @@ sees. With nothing listening on the default local address, `remount run` starts
 your environment into a brokered binding, and picks the one the recipe uses.
 
 ```sh
-go build -o remount ./cmd/remount
+make build
 export OPENAI_API_KEY=sk-...
-./remount run opencode --dir . -- 'add a README'
+./remount run opencode --dir . --model openai/gpt-4o-mini -- 'add a README'
 ```
 
 ```
 started remount standalone in the background (pid 4242, data ~/.local/share/remount, ...)
 using binding b_openai ($OPENAI_API_KEY) for opencode
-workspace ws_06g6d1z9g849pkqcxxfy7z99m4 created
+...
 ```
 
 The key stays in the standalone's process environment; the workspace gets a
-placeholder and `remount events WS` shows every `cred.used`. Set
+placeholder and `remount events --ws WS` shows every `cred.used`. The default
+ACP-capable recipe runs as a durable Agent; inspect its transcript and files
+to verify completion. Set
 `REMOUNT_AUTOSTART=0` or `REMOUNT_SERVER` to opt out of the background start.
 
 The pieces underneath:
@@ -97,15 +105,18 @@ output replays from where you left off:
 
 ```sh
 # On the second machine:
-./remount up --server https://your-server --token $REMOUNT_TOKEN --label zone=gpu
+# REMOUNT_TOKEN is already exported in this shell; do not put it on argv.
+./remount up --server https://your-server --label zone=gpu
 
 # From anywhere:
 ./remount ws move $WS --label zone=gpu
 ```
 
 The filesystem is snapshotted, the workspace is re-queued, a node in that zone
-claims it, and your files are there. Sessions are restarted by the harness from
-the event log; the workspace identity, its files and its policy travel with it.
+claims it, and your files are there. Plain exec/PTY processes are not restarted
+from the event log. Use the durable Agent lifecycle or `remount resume` to
+continue a supported harness from its saved state. Workspace identity, files
+and policy travel with it.
 Files are portable between compatible backends; installed tools, running
 processes, permissions and architecture-specific binaries are not magically
 portable.
@@ -120,15 +131,17 @@ uploads the artifact, and commits the reference before returning success.
 ./remount ws snapshot $WS --authoritative # quiesced and durably committed
 ```
 
-## Sleep for days at storage-only cost
+## Sleep and wake
 
 ```sh
 ./remount ws sleep $WS --after 72h
 ./remount ws sleep $WS --on github.pr.merged     # wake on an event instead
 ```
 
-A sleeping workspace has no node and costs nothing but storage. Wake it with a
-webhook:
+A sleeping workspace has no assigned node; its retained artifacts still use
+storage. Provisioned nodes can keep incurring compute charges until separately
+scaled down or terminated. On an authenticated server, wake it with a webhook
+(or use `remount ws wake "$WS"`):
 
 ```sh
 curl -X POST $REMOUNT_SERVER/v1/events -H "Authorization: Bearer $REMOUNT_TOKEN" \
@@ -283,11 +296,20 @@ verdict. See [docs/observability.md](docs/observability.md).
 Working and tested: exec and pty sessions with replayable reconnect, workspace
 filesystem with server-side search and atomic edits, snapshots and cross-node
 moves, sleep and wake with durable timers, the credential broker, the claim
-queue with leases, the event log, port forwarding, and both `process` and
-`docker` backends. Typed broker policy can restrict host, port, HTTP method,
-path and request/response budgets. Both built-in backends provide cooperative
-proxying rather than non-bypassable egress, so production security profiles
-reject them.
+queue with leases, the event log, port forwarding, durable Agents with
+fork/child composition, Python/TypeScript/Go SDKs, and an embedded
+[operator console](docs/console.md). Typed broker policy can restrict host,
+port, HTTP method, path and request/response budgets. The `process` and
+`docker` backends provide cooperative proxying, so `isolated` and
+`multi_tenant` security profiles reject them.
+
+Linux `gvisor` and `firecracker` backends are implemented with enforced
+networking and fail-closed runtime probes. Their availability and security
+claims depend on the actual host; see [security profiles](docs/security-profiles.md)
+and [backend setup](docs/operations.md#choosing-a-backend). Optional
+[warm-standby control failover](docs/operations.md#controller-availability)
+uses an object-store lease and controller epochs while retaining one active
+SQLite writer.
 
 Package retrieval can be granted separately with a
 `connector:"package"` egress rule. The managed HTTPS endpoint is read-only,
@@ -303,11 +325,15 @@ retention are observable in diagnostics and metrics. See the
 [operations guide](docs/operations.md#capacity-quotas-and-retention) before
 changing those limits.
 
-Not built yet, and honestly named as such: a production backend with enforced
-egress, automated multi-controller high availability, microVM backends
-(Firecracker, Apple Virtualization), the display and browser session kinds,
-and the web UI.
-See [docs/design.md](docs/design.md#not-built-yet).
+Not delivered as general-purpose features: Apple Virtualization, display and
+browser sessions, direct peer-to-peer transport, or an end-user chat UI. Relay
+payload encryption has a tested internal implementation but is not wired into
+the stock CLI/SDK connection path. Public releases and production qualification
+remain separate gates. See [current implementation status](docs/engineering/current-status.md)
+and [design limits](docs/design.md#10-current-limitations).
+
+External browser and VNC stacks can still run as ordinary workspace processes;
+see [virtual desktop workloads](docs/harness-integration.md#browser-and-virtual-desktop-workloads).
 
 ## License
 
@@ -346,15 +372,21 @@ the documentation drift. The wire-level authority is
 | Operate a production control plane or node fleet | [`operations.md`](operations.md) |
 | Integrate a custom harness or model provider | [`harness-integration.md`](harness-integration.md) |
 | Call the Agent HTTP API | [`api.md`](api.md) and [`examples/agent-api`](../examples/agent-api/README.md) |
+| Inspect the fleet in a browser | [Operator console](console.md) |
+| Distinguish implemented features from dated verification | [Current implementation status](engineering/current-status.md) |
 
 ## Build and select a server
 
-From a repository checkout:
+From an accessible repository checkout, with the Go version required by
+`go.mod` (currently 1.27.1):
 
 ```sh
 make build
 ./remount version
 ```
+
+Public release, package and installer availability is a separate gate; see
+[releases and installation](releases.md) before relying on published artifacts.
 
 Client commands use `http://127.0.0.1:7443` by default. There are three common
 ways to select a deployment:
@@ -413,6 +445,9 @@ Important behavior:
   Recipes apply their corresponding harness-native PTY flags and, when
   configured, ACP session mode before the first prompt.
 - `--approve` is `never` (default) or `on-request`.
+- With `--ws`, an explicit `--security` is a minimum-profile assertion on
+  the existing workspace, not an upgrade to its isolation. A weaker workspace
+  is rejected; the flag cannot make a cooperative backend enforce isolation.
 - Ctrl-C detaches by default; it does not kill the agent. Use
   `--kill-on-interrupt` only when termination is intended.
 - `--detach` prints the Agent/workspace identifiers and returns immediately.
@@ -539,7 +574,9 @@ ignore and conflict behavior is documented in
 A normal snapshot is a live export and may observe concurrent writes. An
 authoritative snapshot quiesces Remount-managed execution and commits the
 failover checkpoint before returning. A move transfers filesystem state, not
-arbitrary process memory or architecture-specific binaries.
+arbitrary process memory or architecture-specific binaries. This describes
+filesystem checkpoints; the Linux [Firecracker full-checkpoint path](../integration/firecracker/README.md)
+has separate host and guest compatibility requirements.
 
 ## Use workspace primitives directly
 
@@ -697,6 +734,11 @@ as production multi-tenant isolation; Remount rejects security profiles a
 backend cannot enforce. See [`security-profiles.md`](security-profiles.md) and
 [`operations.md`](operations.md#choosing-a-backend).
 
+Linux gVisor and Firecracker backends implement enforced-gateway networking.
+They require host prerequisites and exact-host conformance; merely selecting
+the backend is not a production qualification. gVisor can satisfy `isolated`;
+`multi_tenant` additionally requires the Firecracker microVM capability.
+
 ## Deploy the Modal reference
 
 `deploy/modal_app.py` is a reference deployment of
@@ -824,7 +866,9 @@ For a coding-agent task, verify at least:
    imports were removed.
 
 `doctor` is three-valued: pass, fail, or unavailable. Unavailable checks are
-not evidence of health.
+not evidence of health. Read individual findings even when the command exits
+zero or JSON says `ok: true`: warnings such as `tenant.residency_unavailable`
+mean that named policy was not checked.
 
 ## Documentation map and maintenance
 
@@ -854,17 +898,20 @@ something differs, `remount help` is the authority.
 
 ## 1. Build
 
-Remount is one Go binary with no runtime dependencies.
+The core is one Go binary; selected backends and harness recipes have additional
+runtime prerequisites. Use an accessible checkout and the Go version required
+by `go.mod` (currently 1.27.1). Public installation has separate
+[release prerequisites](releases.md).
 
 ```sh
-git clone https://github.com/remount-dev/remount
+git clone https://github.com/andrewgcodes/remount.git
 cd remount
-go build -o remount ./cmd/remount
+make build
 ./remount version
 ```
 
 ```
-remount dev
+remount <source-revision>
 ```
 
 ## 2. One command
@@ -1104,7 +1151,7 @@ Your files are there:
 gpu-box-01
 ```
 
-Running processes do not move; only files do. The generation number bumped
+On this process/Docker filesystem move, running processes do not move. The generation number bumped
 from 1 to 2, which is how every stale grant and stale session from the old
 node is refused.
 
@@ -1182,7 +1229,9 @@ Inside the workspace `git fetch` and `git push` route through
 ## 8. Sleep and wake
 
 A sleeping workspace has no node. Its last snapshot is kept, its timers are
-durable, and it costs only storage.
+durable, and it retains storage rather than a workspace compute assignment.
+The provider can still charge for an idle node until that node is scaled down
+or terminated.
 
 ```sh
 ./remount ws sleep $WS --after 2m
@@ -1951,6 +2000,10 @@ itself worked, we planted the real key in a canary file, scanned again, found
 exactly one match, and deleted the canary. The only process holding the secret
 was the control plane, which is where it belongs.
 
+That paragraph records the historical test, not a safe procedure to repeat.
+For new tests, validate the scanner with a synthetic non-credential canary in
+a disposable fixture. Never plant a real provider key in a workspace or log.
+
 ## The general pattern for any harness
 
 Every harness has a variable for where the model lives and a variable for the
@@ -1965,8 +2018,8 @@ a byte leaves the machine.
 | Harness | Base URL setting | Key setting | Auth header it sends | Status |
 |---|---|---|---|---|
 | Codex CLI | `base_url` in `.codex/config.toml` | `env_key` names an env var | `Authorization: Bearer` | Verified here, 0.152.1 |
-| Claude Code | `ANTHROPIC_BASE_URL` | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` | `x-api-key` and, on newer builds, `Authorization: Bearer` | Documented upstream, not tested here |
-| OpenCode | `provider.<id>.options.baseURL` in `opencode.json` | provider `apiKey` or env | SDK dependent, `x-api-key` for Anthropic | Verified via `remount run opencode` (docker lane, 1.18.x) |
+| Claude Code | `ANTHROPIC_BASE_URL` | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` | `x-api-key` and, on newer builds, `Authorization: Bearer` | 2.1.260 exercised on a disposable Modal VM; [dated evidence](engineering/verification-2026-09.md#2026-09-05--pr-30-live-functional-regression-verification) |
+| OpenCode | `provider.<id>.options.baseURL` in `opencode.json` | provider `apiKey` or env | SDK dependent, `x-api-key` for Anthropic | 1.18.29 exercised on Docker with OpenAI; [dated evidence](engineering/verification-2026-09.md#2026-09-05--pr-30-live-functional-regression-verification) |
 | aider | `OPENAI_API_BASE` | `OPENAI_API_KEY` | `Authorization: Bearer` | Documented upstream, not tested here |
 
 The broker matches on the placeholder string wherever it appears in a header,
@@ -2081,6 +2134,9 @@ c, err := client.New(client.Options{
 	Server: "https://remount.example",
 	Token:  os.Getenv("REMOUNT_TOKEN"),
 })
+if err != nil {
+	return err
+}
 defer c.Close()
 ```
 
@@ -2096,11 +2152,18 @@ ws, err := c.CreateWorkspace(ctx, api.WorkspaceSpec{
 		"OPENAI_BASE_URL": "${REMOUNT_BROKER}/d/api.openai.com/v1",
 	},
 })
+if err != nil {
+	return err
+}
 ws, err = c.WaitClaimed(ctx, ws.ID)
+if err != nil {
+	return err
+}
 ```
 
-Run a command and read its output as sequenced chunks. The channel closes after
-the exit chunk, and `Exit` then holds the code.
+Run a command and copy its sequenced output with the gap-aware helper. Check
+errors before using the returned exit information; a disconnected or evicted
+stream is not successful completion.
 
 ```go
 s, err := c.Exec(ctx, api.SessionOpenRequest{
@@ -2109,14 +2172,18 @@ s, err := c.Exec(ctx, api.SessionOpenRequest{
 	Program:        []string{"sh", "-c", "make test 2>&1"},
 	IdempotencyKey: "build-42",
 })
-for ch := range s.Chunks() {
-	switch ch.Stream {
-	case api.StreamStdout, api.StreamStderr:
-		os.Stdout.Write(ch.Data)
-	}
+if err != nil {
+	return err
 }
-fmt.Println("exit", s.Exit().Code)
+exit, err := client.Copy(ctx, s, os.Stdout, os.Stderr)
+if err != nil {
+	return err
+}
+fmt.Println("exit", exit.Code)
 ```
+
+`client.Copy` and `c.Run` return `api.CodeEvicted` for incomplete output. Raw
+`s.Chunks()` consumers must handle gap chunks and check `s.Err()` themselves.
 
 For the common case there is a one-call form.
 
@@ -2153,7 +2220,7 @@ timer, err := c.SleepWorkspace(ctx, api.SleepRequest{ID: ws.ID, OnEvent: "github
 ## What a harness gets for free
 
 Truthful bounded replay. Every output chunk carries a sequence number, the node
-keeps a bounded ring plus a spill file per session, and a client resumes from
+keeps bounded memory, disk spill and optional blob-backed ranges, and a client resumes from
 the last sequence it delivered. If the client's connection drops mid-command,
 the SDK redials, reattaches, and the caller's channel simply continues. If the
 gap is genuinely unrecoverable, the stream carries an explicit gap marker
@@ -2183,9 +2250,10 @@ chat integration, anything that wants to create an agent, follow its
 conversation, look at its files, approve a tool call or open the preview it
 is serving. The CLI's `remount agent ...` commands use the SDK over the frame
 protocol; the HTTP API is a thin translation of the same SDK calls, so both
-surfaces have the same authorization, the same idempotency and the same
-events. Nothing is authorized in the HTTP layer; the control plane and the
-node decide exactly as they would for the CLI.
+surfaces share the protocol's resource authorization, idempotency and events.
+The HTTP layer authenticates requests and enforces route, origin and body
+constraints; the control plane and node enforce resource authority as they do
+for the CLI.
 
 The normative operation semantics are in `spec/PROTOCOL.md` §6.1–6.3. This
 document is the HTTP shape.
@@ -2285,13 +2353,17 @@ agent from a recipe is:
 {
   "name": "fix-ci",
   "workspace": {"name": "fix-ci", "repo": {"url": "https://github.com/o/r", "ref": "main"},
-                "labels": {"remount.binding.b_openai": "..."}},
-  "spec": {"recipe": "opencode", "recipe_yaml": "...", "task": "make CI green",
+                "bindings": ["b_openai"]},
+  "spec": {"recipe": "opencode", "task": "make CI green",
            "model": "openai/gpt-4o-mini", "sandbox": "workspace-write",
            "providers": ["openai"], "binding_specs": ["b_openai:openai"]},
   "policy": {"approve": "on-request", "max_turns": 50, "sleep_after_sec": 900}
 }
 ```
+
+Replace the example repository URL and configure `b_openai` on the server.
+Built-in recipes are resolved by name; `recipe_yaml`, when supplied for a
+custom recipe, must contain a complete valid recipe, not a placeholder.
 
 `spec.sandbox` accepts `read-only`, `workspace-write`, or `full`. An omitted
 value is normalized to `workspace-write` before the Agent is persisted or

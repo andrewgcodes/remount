@@ -6,9 +6,10 @@ chat integration, anything that wants to create an agent, follow its
 conversation, look at its files, approve a tool call or open the preview it
 is serving. The CLI's `remount agent ...` commands use the SDK over the frame
 protocol; the HTTP API is a thin translation of the same SDK calls, so both
-surfaces have the same authorization, the same idempotency and the same
-events. Nothing is authorized in the HTTP layer; the control plane and the
-node decide exactly as they would for the CLI.
+surfaces share the protocol's resource authorization, idempotency and events.
+The HTTP layer authenticates requests and enforces route, origin and body
+constraints; the control plane and node enforce resource authority as they do
+for the CLI.
 
 The normative operation semantics are in `spec/PROTOCOL.md` §6.1–6.3. This
 document is the HTTP shape.
@@ -108,13 +109,17 @@ agent from a recipe is:
 {
   "name": "fix-ci",
   "workspace": {"name": "fix-ci", "repo": {"url": "https://github.com/o/r", "ref": "main"},
-                "labels": {"remount.binding.b_openai": "..."}},
-  "spec": {"recipe": "opencode", "recipe_yaml": "...", "task": "make CI green",
+                "bindings": ["b_openai"]},
+  "spec": {"recipe": "opencode", "task": "make CI green",
            "model": "openai/gpt-4o-mini", "sandbox": "workspace-write",
            "providers": ["openai"], "binding_specs": ["b_openai:openai"]},
   "policy": {"approve": "on-request", "max_turns": 50, "sleep_after_sec": 900}
 }
 ```
+
+Replace the example repository URL and configure `b_openai` on the server.
+Built-in recipes are resolved by name; `recipe_yaml`, when supplied for a
+custom recipe, must contain a complete valid recipe, not a placeholder.
 
 `spec.sandbox` accepts `read-only`, `workspace-write`, or `full`. An omitted
 value is normalized to `workspace-write` before the Agent is persisted or

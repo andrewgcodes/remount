@@ -113,6 +113,10 @@ through the model reverse proxy or CONNECT.
 
 ## Pointing a harness at the broker
 
+Prefer the built-in recipes in `docs/harness-integration.md` for current
+launches. The manual Codex example below records the 0.152-era configuration;
+it is not a compatibility claim for an unpinned future CLI.
+
 The broker's address is per node and per materialize. Read it from
 `.remount/env` inside the workspace at start-up rather than copying it into a
 config file, so the same launcher works after a move.
@@ -179,7 +183,8 @@ only when `REMOUNT_SERVER` uses HTTPS. Never publish that listener directly.
 Keep the desktop supervisor in the foreground of a Remount exec session so
 another client can attach and replay its output after the initiator disconnects.
 
-Disconnect preserves the remote session and processes. Move, sleep, failover,
+Disconnect preserves the remote session within lease and retention bounds.
+On the process/Docker filesystem path, move, sleep, failover,
 or restore preserves files only: restart X11, the window manager, browser, VNC,
 and application after materialization. A process or Docker backend remains a
 cooperative boundary regardless of the remote desktop stack. The full recipe
@@ -194,7 +199,7 @@ remount ws move $WS --node n_…            # this node, ignoring earlier labels
 remount ws move $WS --label zone=gpu       # any node with that label
 ```
 
-A move snapshots the filesystem, releases the workspace, re-queues it, and
+A filesystem move snapshots the filesystem, releases the workspace, re-queues it, and
 waits for the new node to report ready. Files travel. Processes do not; restart
 them. The generation increments, so an old grant is refused and clients refresh
 automatically.
@@ -244,8 +249,9 @@ curl -X POST $REMOUNT_SERVER/v1/events -H "Authorization: Bearer $REMOUNT_TOKEN"
      -d '{"type":"github.pr.merged","payload":{"pr":42}}'
 ```
 
-A sleeping workspace has no node and costs only storage. Waking restores from
-the snapshot taken at sleep and waits for `claimed`.
+A sleeping workspace has no assigned node and retains its storage. Provisioned
+idle nodes can still incur compute charges until scaled down or terminated.
+Waking restores from the snapshot taken at sleep and waits for `claimed`.
 
 ## Incident containment
 

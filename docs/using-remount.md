@@ -28,15 +28,21 @@ the documentation drift. The wire-level authority is
 | Operate a production control plane or node fleet | [`operations.md`](operations.md) |
 | Integrate a custom harness or model provider | [`harness-integration.md`](harness-integration.md) |
 | Call the Agent HTTP API | [`api.md`](api.md) and [`examples/agent-api`](../examples/agent-api/README.md) |
+| Inspect the fleet in a browser | [Operator console](console.md) |
+| Distinguish implemented features from dated verification | [Current implementation status](engineering/current-status.md) |
 
 ## Build and select a server
 
-From a repository checkout:
+From an accessible repository checkout, with the Go version required by
+`go.mod` (currently 1.27.1):
 
 ```sh
 make build
 ./remount version
 ```
+
+Public release, package and installer availability is a separate gate; see
+[releases and installation](releases.md) before relying on published artifacts.
 
 Client commands use `http://127.0.0.1:7443` by default. There are three common
 ways to select a deployment:
@@ -95,6 +101,9 @@ Important behavior:
   Recipes apply their corresponding harness-native PTY flags and, when
   configured, ACP session mode before the first prompt.
 - `--approve` is `never` (default) or `on-request`.
+- With `--ws`, an explicit `--security` is a minimum-profile assertion on
+  the existing workspace, not an upgrade to its isolation. A weaker workspace
+  is rejected; the flag cannot make a cooperative backend enforce isolation.
 - Ctrl-C detaches by default; it does not kill the agent. Use
   `--kill-on-interrupt` only when termination is intended.
 - `--detach` prints the Agent/workspace identifiers and returns immediately.
@@ -221,7 +230,9 @@ ignore and conflict behavior is documented in
 A normal snapshot is a live export and may observe concurrent writes. An
 authoritative snapshot quiesces Remount-managed execution and commits the
 failover checkpoint before returning. A move transfers filesystem state, not
-arbitrary process memory or architecture-specific binaries.
+arbitrary process memory or architecture-specific binaries. This describes
+filesystem checkpoints; the Linux [Firecracker full-checkpoint path](../integration/firecracker/README.md)
+has separate host and guest compatibility requirements.
 
 ## Use workspace primitives directly
 
@@ -379,6 +390,11 @@ as production multi-tenant isolation; Remount rejects security profiles a
 backend cannot enforce. See [`security-profiles.md`](security-profiles.md) and
 [`operations.md`](operations.md#choosing-a-backend).
 
+Linux gVisor and Firecracker backends implement enforced-gateway networking.
+They require host prerequisites and exact-host conformance; merely selecting
+the backend is not a production qualification. gVisor can satisfy `isolated`;
+`multi_tenant` additionally requires the Firecracker microVM capability.
+
 ## Deploy the Modal reference
 
 `deploy/modal_app.py` is a reference deployment of
@@ -506,7 +522,9 @@ For a coding-agent task, verify at least:
    imports were removed.
 
 `doctor` is three-valued: pass, fail, or unavailable. Unavailable checks are
-not evidence of health.
+not evidence of health. Read individual findings even when the command exits
+zero or JSON says `ok: true`: warnings such as `tenant.residency_unavailable`
+mean that named policy was not checked.
 
 ## Documentation map and maintenance
 
