@@ -59,6 +59,9 @@ func (c *Control) ReconcileRecovery(ctx context.Context) error {
 	seen := make(map[string]string)
 	for _, report := range reports {
 		for _, observed := range report.Workspaces {
+			if err := mergePublishedReleaseEpoch(report.Node, &observed.Workspace, report.Releases); err != nil {
+				return err
+			}
 			if prior := seen[observed.Workspace.ID]; prior != "" && prior != report.Node {
 				return proto.Err(proto.CodeConflict, "workspace %s is live on both %s and %s", observed.Workspace.ID, prior, report.Node)
 			}
@@ -172,12 +175,17 @@ func (c *Control) reconcileObservedWorkspace(ctx context.Context, node string, o
 	}
 	next.Node = node
 	next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
+	if next.ReleaseEpoch < observed.ReleaseEpoch {
+		next.ReleaseEpoch = observed.ReleaseEpoch
+	}
 	if release != nil {
 		releaseEpoch := observedReleaseEpoch(release.Request)
 		if next.ReleaseEpoch < releaseEpoch {
 			next.ReleaseEpoch = releaseEpoch
 		}
 		next.ReleaseOperation = release.OperationID
+	} else {
+		next.ReleaseOperation = ""
 	}
 	event := c.wsEvent(&next, proto.EvControlReconciled, "", node, map[string]any{
 		"observed_generation": observed.Generation, "restored_generation": restoredGeneration,
@@ -204,4 +212,23 @@ func observedReleaseEpoch(request proto.WSReleaseReq) uint64 {
 		return 1
 	}
 	return request.ReleaseEpoch
+}
+
+func mergePublishedReleaseEpoch(node string, observed *proto.Workspace, releases []proto.ControllerReleaseState) error {
+	for index := range releases {
+		release := releases[index]
+		if release.State != "published" || release.Request.WS != observed.ID {
+			continue
+		}
+		if release.Request.Gen != observed.Generation ||
+			(release.Request.Tenant != "" && release.Request.Tenant != observed.Tenant) {
+			return proto.Err(proto.CodeConflict,
+				"node %s reported incompatible published release authority for workspace %s", node, observed.ID)
+		}
+		releaseEpoch := observedReleaseEpoch(release.Request)
+		if observed.ReleaseEpoch < releaseEpoch {
+			observed.ReleaseEpoch = releaseEpoch
+		}
+	}
+	return nil
 }

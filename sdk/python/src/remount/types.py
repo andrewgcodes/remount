@@ -1773,6 +1773,7 @@ WSReleaseCommitReq = TypedDict("WSReleaseCommitReq", {
 WSReleaseReq = TypedDict("WSReleaseReq", {
     "ws": Required[str],
     "gen": Required[int],
+    "release_epoch": NotRequired[int],
     "operation": NotRequired[str],
     "snapshot": Required[bool],
     "reason": NotRequired[str],
@@ -1870,6 +1871,7 @@ Workspace = TypedDict("Workspace", {
     "authz_revision": NotRequired[int],
     "revocations": NotRequired[list["AuthzRevocation"]],
     "revocation_floor": NotRequired[int],
+    "release_epoch": NotRequired[int],
     "release_operation": NotRequired[str],
     "quarantine_operation": NotRequired[str],
     "quarantined_at": NotRequired[int],

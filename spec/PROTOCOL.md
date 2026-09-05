@@ -785,7 +785,8 @@ Session kinds are `exec`, `pty` and `port`.
 
 Control persists the incremented workspace `release_epoch` before sending
 `ws.release`. A node accepts an exact retry only when generation, epoch,
-operation, and release parameters match its durable journal. A
+operation, and release parameters match either its in-memory prepared release
+or its durable journal. A
 same-generation request may replace an `abort-published` tombstone only when
 its nonzero epoch is greater and its operation ID is distinct. One operation
 ID cannot identify multiple epochs, and operation-ID inequality alone
@@ -793,7 +794,10 @@ establishes no ordering. Higher generations may replace committed tombstones.
 An older peer that omits `release_epoch` can finish an initial release, but
 cannot safely start a successor after abort publication and is rejected.
 Recovery treats any observed legacy release record as a completed first cycle,
-so a missing epoch cannot reopen that initial-cycle exception.
+so a missing epoch cannot reopen that initial-cycle exception. When a node
+reports both a live restored workspace and its abort-published release record,
+recovery retains the greatest observed epoch and clears the completed
+operation identity before authorizing the next lifecycle operation.
 
 `fs.edit` is atomic across all edits in one request. Each edit's `old` must
 match exactly once unless `all` is set. If any edit fails to apply, the file is

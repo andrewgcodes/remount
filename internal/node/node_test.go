@@ -860,6 +860,35 @@ func TestReleaseSnapshotFailureRestoresSourceWithoutDestroy(t *testing.T) {
 	}
 }
 
+func TestReleasePreparedRetryRequiresSameEpoch(t *testing.T) {
+	n := newTestNode(t, nil)
+	request := proto.WSReleaseReq{
+		WS: "ws_prepared", Gen: 3, ReleaseEpoch: 7, OperationID: "rel_prepared",
+		Snapshot: true, Reason: "sleep", Tenant: "local", Backend: "process",
+	}
+	n.mu.Lock()
+	n.prepared[request.WS] = &preparedRelease{request: request, done: make(chan struct{})}
+	n.mu.Unlock()
+	defer func() {
+		n.mu.Lock()
+		delete(n.prepared, request.WS)
+		n.mu.Unlock()
+	}()
+
+	retry := request
+	retry.ReleaseEpoch++
+	if _, err := n.release(context.Background(), &retry); !errors.Is(err, &proto.Error{Code: proto.CodeConflict}) {
+		t.Fatalf("prepared retry with another epoch error = %v, want conflict", err)
+	}
+	out, err := n.release(context.Background(), &request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released := out.(proto.WSReleasedReq); !released.Preparing || released.OperationID != request.OperationID {
+		t.Fatalf("exact prepared retry = %+v", released)
+	}
+}
+
 func TestSnapshotAdmissionBoundsExplicitWorkWithoutBlockingLifecycle(t *testing.T) {
 	n := newTestNode(t, func(opts *Options) {
 		opts.MaxConcurrentSnapshots = 1

@@ -1770,6 +1770,7 @@ export interface WSReleaseCommitReq {
 export interface WSReleaseReq {
   "ws": string;
   "gen": number;
+  "release_epoch"?: number;
   "operation"?: string;
   "snapshot": boolean;
   "reason"?: string;
@@ -1867,6 +1868,7 @@ export interface Workspace {
   "authz_revision"?: number;
   "revocations"?: Array<AuthzRevocation>;
   "revocation_floor"?: number;
+  "release_epoch"?: number;
   "release_operation"?: string;
   "quarantine_operation"?: string;
   "quarantined_at"?: number;

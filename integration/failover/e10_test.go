@@ -143,11 +143,14 @@ func TestWarmStandbyFailoverE10(t *testing.T) {
 		t.Fatal(err)
 	}
 	workspace := proto.Workspace{ID: "ws_e10", Tenant: "local", Owner: "operator", AuthzRevision: 1, Generation: 7, Node: "n_e10", State: proto.WSClaimed, LeaseUntil: now.Add(time.Minute).UnixMilli(), Spec: proto.WorkspaceSpec{Principal: "operator"}}
-	if _, err := activeSQLite.DB().Exec(`INSERT INTO workspaces(id,data) VALUES(?,?)`, workspace.ID, proto.MustMarshal(workspace)); err != nil {
-		t.Fatal(err)
-	}
-	if err := activeSQLite.Append(ctx, &proto.Event{At: now.UnixMilli(), Type: proto.EvWSClaimed, Workspace: workspace.ID, Generation: workspace.Generation, Node: workspace.Node, ControllerEpoch: 1}); err != nil {
-		t.Fatal(err)
+	publishedWorkspace := proto.Workspace{ID: "ws_e10_published", Tenant: "local", Owner: "operator", AuthzRevision: 1, Generation: 11, Node: workspace.Node, State: proto.WSClaimed, LeaseUntil: workspace.LeaseUntil, Spec: workspace.Spec}
+	for _, initial := range []proto.Workspace{workspace, publishedWorkspace} {
+		if _, err := activeSQLite.DB().Exec(`INSERT INTO workspaces(id,data) VALUES(?,?)`, initial.ID, proto.MustMarshal(initial)); err != nil {
+			t.Fatal(err)
+		}
+		if err := activeSQLite.Append(ctx, &proto.Event{At: now.UnixMilli(), Type: proto.EvWSClaimed, Workspace: initial.ID, Generation: initial.Generation, Node: initial.Node, ControllerEpoch: 1}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	source, err := replicate.NewSQLiteSource(activeSQLite.DB(), activePath, directory, 16<<20, 16<<20, func() time.Time { return now })
 	if err != nil {
@@ -195,7 +198,16 @@ func TestWarmStandbyFailoverE10(t *testing.T) {
 	defer promoted.Stop()
 	defer promotedLog.Close()
 	const releaseEpoch = 7
-	node := &recoveryNode{report: proto.ControllerNodeState{Node: workspace.Node, Epoch: recovery.Epoch, Releases: []proto.ControllerReleaseState{{Request: proto.WSReleaseReq{WS: workspace.ID, Gen: workspace.Generation, ReleaseEpoch: releaseEpoch, OperationID: operationID, Tenant: workspace.Tenant, Spec: workspace.Spec}, OperationID: operationID, State: "prepared"}}}}
+	const publishedReleaseEpoch = 9
+	const publishedOperationID = "op_e10_published"
+	node := &recoveryNode{report: proto.ControllerNodeState{
+		Node: workspace.Node, Epoch: recovery.Epoch,
+		Workspaces: []proto.ControllerWorkspace{{Workspace: publishedWorkspace}},
+		Releases: []proto.ControllerReleaseState{
+			{Request: proto.WSReleaseReq{WS: workspace.ID, Gen: workspace.Generation, ReleaseEpoch: releaseEpoch, OperationID: operationID, Tenant: workspace.Tenant, Spec: workspace.Spec}, OperationID: operationID, State: "prepared"},
+			{Request: proto.WSReleaseReq{WS: publishedWorkspace.ID, Gen: publishedWorkspace.Generation, ReleaseEpoch: publishedReleaseEpoch, OperationID: publishedOperationID, Tenant: publishedWorkspace.Tenant, Spec: publishedWorkspace.Spec}, OperationID: publishedOperationID, State: "published"},
+		},
+	}}
 	promoted.Attach(node)
 	if err := promoted.ReconcileRecovery(ctx); err != nil {
 		t.Fatal(err)
@@ -215,9 +227,22 @@ func TestWarmStandbyFailoverE10(t *testing.T) {
 		got.ReleaseEpoch != releaseEpoch || got.ReleaseOperation != "" {
 		t.Fatalf("reconciled workspace=%+v", got)
 	}
+	if err := promotedSQLite.DB().QueryRow(`SELECT data FROM workspaces WHERE id=?`, publishedWorkspace.ID).Scan(&encoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := proto.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.State != proto.WSClaimed || got.Generation != publishedWorkspace.Generation || got.Node != publishedWorkspace.Node ||
+		got.ReleaseEpoch != publishedReleaseEpoch || got.ReleaseOperation != "" {
+		t.Fatalf("reconciled published-abort workspace=%+v", got)
+	}
 	var assignments int
 	if err := promotedSQLite.DB().QueryRow(`SELECT count(*) FROM assignments WHERE workspace=? AND generation=?`, workspace.ID, workspace.Generation).Scan(&assignments); err != nil || assignments != 1 {
 		t.Fatalf("assignments=%d err=%v, want exactly one", assignments, err)
+	}
+	if err := promotedSQLite.DB().QueryRow(`SELECT count(*) FROM assignments WHERE workspace=? AND generation=?`, publishedWorkspace.ID, publishedWorkspace.Generation).Scan(&assignments); err != nil || assignments != 1 {
+		t.Fatalf("published-abort assignments=%d err=%v, want exactly one", assignments, err)
 	}
 	events, err := promotedLog.Read(ctx, 1, "", 100)
 	if err != nil {

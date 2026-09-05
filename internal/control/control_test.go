@@ -852,6 +852,68 @@ func TestReleaseFailureRetainsAuthoritativeSource(t *testing.T) {
 	}
 }
 
+func TestRecoveredPublishedReleaseAdvancesNextEpoch(t *testing.T) {
+	f := newControlFixture(t, "", nil)
+	const (
+		nodeID         = "n_one"
+		publishedEpoch = 9
+	)
+	var releaseRequest proto.WSReleaseReq
+	sender := &fakeSender{
+		online: map[string]bool{nodeID: true},
+		request: func(_ context.Context, _ string, op string, body, out any) error {
+			switch op {
+			case proto.OpWSRelease:
+				releaseRequest = body.(proto.WSReleaseReq)
+				*out.(*proto.WSReleasedReq) = proto.WSReleasedReq{
+					ID: releaseRequest.WS, Gen: releaseRequest.Gen,
+					OperationID: releaseRequest.OperationID, Reason: releaseRequest.Reason,
+				}
+			case proto.OpWSReleaseCommit:
+			default:
+				t.Fatalf("unexpected operation %q", op)
+			}
+			return nil
+		},
+	}
+	f.c.Attach(sender)
+	connectNode(t, f.c, nodeID, processNodeInfo(4096))
+	created := createWorkspace(t, f.c, localSubject(), proto.WorkspaceSpec{})
+	claim, err := f.c.wsClaim(context.Background(), nodeID, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.c.wsReady(context.Background(), nodeID, &proto.WSReadyReq{ID: created.ID, Gen: claim.Workspace.Generation}); err != nil {
+		t.Fatal(err)
+	}
+
+	observed := *f.c.snapshotWS(created.ID)
+	published := proto.ControllerReleaseState{
+		Request: proto.WSReleaseReq{
+			WS: observed.ID, Gen: observed.Generation, ReleaseEpoch: publishedEpoch,
+			OperationID: "rel_published", Tenant: observed.Tenant, Spec: observed.Spec,
+		},
+		OperationID: "rel_published",
+		State:       "published",
+	}
+	if err := mergePublishedReleaseEpoch(nodeID, &observed, []proto.ControllerReleaseState{published}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.c.reconcileObservedWorkspace(context.Background(), nodeID, observed, nil, 0, &RecoveryState{PreviousEpoch: 1}); err != nil {
+		t.Fatal(err)
+	}
+	recovered := f.c.snapshotWS(created.ID)
+	if recovered.ReleaseEpoch != publishedEpoch || recovered.ReleaseOperation != "" {
+		t.Fatalf("recovered release authority = %+v", recovered)
+	}
+	if _, err := f.c.release(context.Background(), created.ID, false, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if releaseRequest.ReleaseEpoch != publishedEpoch+1 {
+		t.Fatalf("next release epoch = %d, want %d", releaseRequest.ReleaseEpoch, publishedEpoch+1)
+	}
+}
+
 func TestReleaseRetriesLostResponse(t *testing.T) {
 	f := newControlFixture(t, "", nil)
 	sender := &fakeSender{online: map[string]bool{"n_one": true}}
