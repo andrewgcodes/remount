@@ -902,9 +902,11 @@ type Tree struct {
 func SnapshotTrees(trees []Tree, w io.Writer) (SnapshotStats, error) {
 	var stats SnapshotStats
 	type entry struct {
-		root  *os.Root // nil for a synthesized prefix directory
-		name  string   // path inside root, OS separators
-		isDir bool
+		root   *os.Root // nil for a synthesized prefix directory
+		base   string
+		prefix string
+		name   string // path inside root, OS separators
+		isDir  bool
 	}
 	entries := map[string]entry{}
 	var paths []string
@@ -967,7 +969,10 @@ func SnapshotTrees(trees []Tree, w io.Writer) (SnapshotStats, error) {
 			if prefix != "" {
 				archive = prefix + "/" + rel
 			}
-			return add(archive, entry{root: rr, name: filepath.FromSlash(p), isDir: d.IsDir()})
+			return add(archive, entry{
+				root: rr, base: root, prefix: prefix,
+				name: filepath.FromSlash(p), isDir: d.IsDir(),
+			})
 		})
 		if err != nil {
 			return stats, err
@@ -998,10 +1003,10 @@ func SnapshotTrees(trees []Tree, w io.Writer) (SnapshotStats, error) {
 			if err != nil {
 				return writeErr(err)
 			}
-			if err := validateSymlinkTarget(rel, link); err != nil {
+			link, err = PortableSymlinkTarget(rel, link, e.base, e.prefix)
+			if err != nil {
 				return writeErr(err)
 			}
-			link = filepath.ToSlash(link)
 		}
 		var file *os.File
 		if info.Mode().IsRegular() {
@@ -1508,6 +1513,32 @@ func validateSymlinkTarget(name, target string) error {
 		return fmt.Errorf("artifact: symlink %q escapes root", name)
 	}
 	return nil
+}
+
+// PortableSymlinkTarget preserves safe relative links and rewrites absolute
+// links whose targets remain inside sourceRoot into portable archive links.
+func PortableSymlinkTarget(name, target, sourceRoot, archivePrefix string) (string, error) {
+	if !filepath.IsAbs(target) && !path.IsAbs(target) && filepath.VolumeName(target) == "" {
+		target = filepath.ToSlash(target)
+		return target, validateSymlinkTarget(name, target)
+	}
+	targetRel, err := filepath.Rel(sourceRoot, filepath.Clean(target))
+	if err != nil || targetRel == ".." || strings.HasPrefix(targetRel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("artifact: symlink %q has invalid target %q", name, target)
+	}
+	archiveTarget := filepath.ToSlash(targetRel)
+	if archivePrefix != "" {
+		archiveTarget = path.Join(archivePrefix, archiveTarget)
+	}
+	portable, err := filepath.Rel(filepath.FromSlash(path.Dir(name)), filepath.FromSlash(archiveTarget))
+	if err != nil {
+		return "", fmt.Errorf("artifact: symlink %q has invalid target %q", name, target)
+	}
+	portable = filepath.ToSlash(portable)
+	if err := validateSymlinkTarget(name, portable); err != nil {
+		return "", err
+	}
+	return portable, nil
 }
 
 func rejectSymlinkParents(root *os.Root, name string) error {

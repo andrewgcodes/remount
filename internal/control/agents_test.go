@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -328,6 +329,33 @@ func TestAgentCreateIsIdempotentAndValidates(t *testing.T) {
 	}
 	if got := af.c.snapshotWS(first.WS); got == nil || got.State == proto.WSDestroyed {
 		t.Fatal("a rejected create must not destroy the adopted workspace")
+	}
+}
+
+func TestAgentBindingSpecsAreValidatedAndCopied(t *testing.T) {
+	af := newAgentFixture(t, "", func(opts *Options) {
+		opts.Bindings = []Binding{{ID: "b_team", Secret: "test-only", Destinations: []string{"api.openai.com"}}}
+	})
+	spec := agentSpec("hello")
+	spec.Providers = []string{"openai"}
+	spec.Primary = "openai"
+	spec.BindingSpecs = []string{"b_team:openai"}
+	a := af.create(t, localSubject(), proto.AgentCreateReq{
+		Spec:      spec,
+		Workspace: &proto.WorkspaceSpec{Bindings: []string{"b_team"}},
+	})
+	a.Spec.BindingSpecs[0] = "b_other:anthropic"
+	got := af.agent(t, a.ID)
+	if len(got.Spec.BindingSpecs) != 1 || got.Spec.BindingSpecs[0] != "b_team:openai" {
+		t.Fatalf("stored binding specs = %v", got.Spec.BindingSpecs)
+	}
+
+	bad := agentSpec("")
+	bad.BindingSpecs = []string{"b_other:openai"}
+	if _, err := af.c.agentCreate(context.Background(), localSubject(), &proto.AgentCreateReq{
+		Spec: bad, Workspace: &proto.WorkspaceSpec{Bindings: []string{"b_team"}},
+	}); codeOf(err) != proto.CodeBadRequest {
+		t.Fatalf("unattached binding = %v, want bad_request", err)
 	}
 }
 
@@ -689,10 +717,19 @@ func TestAgentSleepAndWakeOnMessage(t *testing.T) {
 }
 
 func TestAgentForkSnapshotsAndInheritsPolicy(t *testing.T) {
-	af := newAgentFixture(t, "", nil)
+	af := newAgentFixture(t, "", func(opts *Options) {
+		opts.Bindings = []Binding{{ID: "b_team", Secret: "test-only", Destinations: []string{"api.openai.com"}}}
+	})
 	a := af.create(t, localSubject(), proto.AgentCreateReq{
-		Spec: agentSpec("task"), Policy: proto.AgentPolicy{MaxTurns: 10},
-		Workspace: &proto.WorkspaceSpec{Repo: proto.RepoSpec{URL: "https://github.com/acme/repo.git"}},
+		Spec: proto.AgentSpec{
+			Recipe: "pi", Task: "task", Providers: []string{"openai"},
+			Primary: "openai", BindingSpecs: []string{"b_team:openai"},
+		},
+		Policy: proto.AgentPolicy{MaxTurns: 10},
+		Workspace: &proto.WorkspaceSpec{
+			Repo:     proto.RepoSpec{URL: "https://github.com/acme/repo.git"},
+			Bindings: []string{"b_team"},
+		},
 	})
 	if _, err := af.c.agentFork(context.Background(), localSubject(), &proto.AgentForkReq{ID: a.ID}); codeOf(err) != proto.CodeConflict {
 		t.Fatalf("fork of a pending workspace without a snapshot = %v, want conflict", err)
@@ -720,6 +757,9 @@ func TestAgentForkSnapshotsAndInheritsPolicy(t *testing.T) {
 	}
 	if child.Policy.Approve != proto.ApproveOnRequest {
 		t.Fatalf("fork approve = %q", child.Policy.Approve)
+	}
+	if !slices.Equal(child.Spec.BindingSpecs, []string{"b_team:openai"}) {
+		t.Fatalf("fork binding specs = %v", child.Spec.BindingSpecs)
 	}
 	ws, err := af.c.wsGet(child.WS)
 	if err != nil {
@@ -1449,7 +1489,10 @@ func TestChildSecurityNeverWeakerThanParent(t *testing.T) {
 		}
 	}
 
-	parent := &proto.Agent{Spec: proto.AgentSpec{Providers: []string{"p"}, Primary: "p", Sandbox: proto.AgentSandboxReadOnly}}
+	parent := &proto.Agent{Spec: proto.AgentSpec{
+		Providers: []string{"p"}, Primary: "p", BindingSpecs: []string{"b_team:openai"},
+		Sandbox: proto.AgentSandboxReadOnly,
+	}}
 	pws := &proto.Workspace{Spec: proto.WorkspaceSpec{Security: isolated}}
 	req := &proto.AgentCreateReq{Workspace: &proto.WorkspaceSpec{}}
 	if err := inheritFromParent(req, parent, pws); err != nil {
@@ -1460,6 +1503,15 @@ func TestChildSecurityNeverWeakerThanParent(t *testing.T) {
 	}
 	if req.Spec.Sandbox != proto.AgentSandboxReadOnly {
 		t.Fatalf("unset child sandbox = %q, want the parent's read-only", req.Spec.Sandbox)
+	}
+	if len(req.Spec.BindingSpecs) != 1 || req.Spec.BindingSpecs[0] != "b_team:openai" {
+		t.Fatalf("unset child binding specs = %v, want the parent's", req.Spec.BindingSpecs)
+	}
+	expanded := &proto.AgentCreateReq{Spec: proto.AgentSpec{
+		Providers: []string{"p"}, BindingSpecs: []string{"b_other:openai"},
+	}, Workspace: &proto.WorkspaceSpec{}}
+	if err := inheritFromParent(expanded, parent, pws); !errors.Is(err, &proto.Error{Code: proto.CodeDenied}) {
+		t.Fatalf("expanded child binding specs: err = %v, want denied", err)
 	}
 	req = &proto.AgentCreateReq{Workspace: &proto.WorkspaceSpec{Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Default: proto.NetworkDefaultAllow}}}}
 	if err := inheritFromParent(req, parent, pws); !errors.Is(err, &proto.Error{Code: proto.CodeDenied}) {

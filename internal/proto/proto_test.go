@@ -153,6 +153,38 @@ func TestSessionSubscriptionFieldIsWireCompatible(t *testing.T) {
 	}
 }
 
+func TestAgentBindingSpecsAreWireCompatible(t *testing.T) {
+	type legacyAgentSpec struct {
+		Recipe    string   `cbor:"recipe"`
+		Task      string   `cbor:"task"`
+		Providers []string `cbor:"providers,omitempty"`
+		Primary   string   `cbor:"primary,omitempty"`
+		Sandbox   string   `cbor:"sandbox,omitempty"`
+	}
+
+	var old legacyAgentSpec
+	if err := Unmarshal(MustMarshal(AgentSpec{
+		Recipe: "codex", Task: "work", Providers: []string{"openai"}, Primary: "openai",
+		BindingSpecs: []string{"b_team:openai"}, Sandbox: AgentSandboxWorkspaceWrite,
+	}), &old); err != nil {
+		t.Fatal(err)
+	}
+	if old.Recipe != "codex" || old.Primary != "openai" || old.Sandbox != AgentSandboxWorkspaceWrite {
+		t.Fatalf("legacy agent spec = %+v", old)
+	}
+
+	var current AgentSpec
+	if err := Unmarshal(MustMarshal(legacyAgentSpec{
+		Recipe: "codex", Task: "work", Providers: []string{"openai"},
+		Primary: "openai", Sandbox: AgentSandboxWorkspaceWrite,
+	}), &current); err != nil {
+		t.Fatal(err)
+	}
+	if len(current.BindingSpecs) != 0 {
+		t.Fatalf("legacy binding specs = %v", current.BindingSpecs)
+	}
+}
+
 func TestDecodeRejectsUnsupportedVersion(t *testing.T) {
 	for _, version := range []uint8{0, Version + 1} {
 		b, err := cbor.Marshal(Frame{V: version, T: KindReq, Op: "test"})

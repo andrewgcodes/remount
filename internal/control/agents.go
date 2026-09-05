@@ -13,6 +13,7 @@ import (
 
 	"remount.dev/remount/internal/eventlog"
 	"remount.dev/remount/internal/ids"
+	"remount.dev/remount/internal/launch"
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 )
@@ -56,6 +57,7 @@ func copyAgent(a *proto.Agent) *proto.Agent {
 	cp.Inbox = append([]proto.AgentMessage(nil), a.Inbox...)
 	cp.Runs = append([]proto.AgentRun(nil), a.Runs...)
 	cp.Spec.Providers = append([]string(nil), a.Spec.Providers...)
+	cp.Spec.BindingSpecs = append([]string(nil), a.Spec.BindingSpecs...)
 	cp.Spec.ACPCommand = append([]string(nil), a.Spec.ACPCommand...)
 	if a.Capabilities != nil {
 		caps := *a.Capabilities
@@ -277,6 +279,11 @@ func inheritFromParent(req *proto.AgentCreateReq, parent *proto.Agent, parentWS 
 	} else if extra := subtractSet(req.Spec.Providers, parent.Spec.Providers); len(extra) > 0 {
 		return proto.Err(proto.CodeDenied, "spec.providers %v are not among the parent's", extra)
 	}
+	if len(req.Spec.BindingSpecs) == 0 {
+		req.Spec.BindingSpecs = append([]string(nil), parent.Spec.BindingSpecs...)
+	} else if extra := subtractSet(req.Spec.BindingSpecs, parent.Spec.BindingSpecs); len(extra) > 0 {
+		return proto.Err(proto.CodeDenied, "spec.binding_specs %v are not among the parent's", extra)
+	}
 	if req.Spec.Primary != "" && !slices.Contains(req.Spec.Providers, req.Spec.Primary) {
 		return proto.Err(proto.CodeBadRequest, "spec.primary %q is not in spec.providers", req.Spec.Primary)
 	}
@@ -412,6 +419,14 @@ func validateAgentSpec(spec *proto.AgentSpec) error {
 	for _, p := range spec.Providers {
 		if strings.ContainsAny(p, " \t\n=") || p == "" {
 			return proto.Err(proto.CodeBadRequest, "spec.providers has an invalid binding name %q", p)
+		}
+	}
+	if len(spec.BindingSpecs) > 64 {
+		return proto.Err(proto.CodeBadRequest, "spec.binding_specs has more than 64 entries")
+	}
+	for _, binding := range spec.BindingSpecs {
+		if binding == "" || len(binding) > 256 || strings.ContainsRune(binding, 0) {
+			return proto.Err(proto.CodeBadRequest, "spec.binding_specs has an invalid entry")
 		}
 	}
 	for _, arg := range spec.ACPCommand {
@@ -573,6 +588,12 @@ func (c *Control) agentCreate(ctx context.Context, subject Subject, req *proto.A
 			_ = c.wsDestroy(ctx, subject.ID, ws.ID, derivedIdem(req.IdempotencyKey, "ws-undo"))
 		}
 		return nil, proto.Err(proto.CodeDenied, "policy.approve auto needs an isolated workspace (docker backend or a security profile above local)")
+	}
+	if _, err := launch.BindingsForWorkspace(req.Spec.BindingSpecs, ws.Spec.Labels, ws.Spec.Bindings); err != nil {
+		if ownsWS {
+			_ = c.wsDestroy(ctx, subject.ID, ws.ID, derivedIdem(req.IdempotencyKey, "ws-undo"))
+		}
+		return nil, proto.Err(proto.CodeBadRequest, "spec.binding_specs: %v", err)
 	}
 	now := c.now().UnixMilli()
 	a := &proto.Agent{

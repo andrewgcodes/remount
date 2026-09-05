@@ -48,6 +48,13 @@ a YAML pull request, not Go.
 | `pi` | pi coding agent | key | anthropic, openai, openrouter, google, groq, xai, mistral | harness default | `.pi/` |
 | `custom` | anything after `--` | key or login | every preset | env only | none |
 
+OpenCode's checked-in fetch hosts are `registry.npmjs.org`, `models.dev`,
+`models.opencode.ai`, and `opencode.ai`. The last host is required by default
+model selection even when model requests use a separately bound provider.
+Automatic local standalone derives these allowances from the recipe; when an
+operator starts a server explicitly, each host must be supplied with
+`--allow`.
+
 #### Agents: structured or PTY transcript
 
 An Agent (`remount agent create`, ADR 0043) runs the recipe's harness as an
@@ -59,6 +66,13 @@ degraded one: the harness runs on a pseudo-terminal, the transcript is the
 terminal log, and a follow-up message is typed at the prompt through the
 recipe's `prompt_template`. The table says which you get; the API reports it as
 `mode: acp | pty` so a client never has to guess.
+
+For `agent create --ws`, the workspace binding ID and the recipe's provider
+preset are separate facts. Repeat `--binding ID:PRESET` on the Agent command.
+The client persists that non-secret declaration in `AgentSpec.binding_specs`;
+the control plane verifies that each ID is attached to the target workspace,
+and the node uses it to construct the recipe environment. Agents created by
+older clients fall back to the launch metadata in `remount.bindings`.
 
 | Recipe | Transcript | `acp.command` | `load_session` | Adapter | `ui` |
 |---|---|---|---|---|---|

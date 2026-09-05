@@ -203,6 +203,7 @@ export interface AgentSpec {
   "task": string;
   "providers"?: Array<string>;
   "primary"?: string;
+  "binding_specs"?: Array<string>;
   "model"?: string;
   "sandbox"?: string;
   "acp_command"?: Array<string>;

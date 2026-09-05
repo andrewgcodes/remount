@@ -825,6 +825,21 @@ func TestReleaseSnapshotFailureRestoresSourceWithoutDestroy(t *testing.T) {
 	if restored != w {
 		t.Fatal("abort commit did not publish restored source")
 	}
+	record, ok = n.releaseRecord(w.ID)
+	if !ok || record.State != releasePublished {
+		t.Fatalf("release abort publication state=%+v present=%v", record, ok)
+	}
+	const nextOperation = "rel_next"
+	out, err := n.release(context.Background(), &proto.WSReleaseReq{
+		WS: w.ID, Gen: w.Generation, OperationID: nextOperation, Reason: "retry",
+	})
+	if err != nil {
+		t.Fatalf("later release cycle: %v", err)
+	}
+	released := out.(proto.WSReleasedReq)
+	if released.OperationID != nextOperation {
+		t.Fatalf("later release operation = %q", released.OperationID)
+	}
 }
 
 func TestSnapshotAdmissionBoundsExplicitWorkWithoutBlockingLifecycle(t *testing.T) {

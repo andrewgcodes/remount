@@ -437,6 +437,21 @@ inspection and interaction commands:
 ./remount agent diff AGENT_ID --stat
 ```
 
+To run an Agent in a workspace you created separately, repeat the workspace's
+binding with its provider preset:
+
+```sh
+WS=$(./remount ws create --binding b_team)
+./remount agent create codex --ws "$WS" --binding b_team:openai -- \
+  'Inspect the repository and fix the failing test.'
+```
+
+The Agent persists the non-secret `b_team:openai` declaration so the node can
+construct the recipe's `OPENAI_API_KEY` and `OPENAI_BASE_URL` placeholder
+environment. The control plane rejects a declaration whose binding ID is not
+attached to that workspace. Custom binding IDs and parameterized presets, such
+as `b_az:azure-openai?host=myres`, must be repeated exactly.
+
 `message` queues a follow-up. `--steer` requests a mid-turn interruption when
 the adapter supports it; otherwise the message remains a follow-up.
 
@@ -601,13 +616,21 @@ export OPENAI_API_KEY=...
   --data ./data \
   --bindings ./bindings.json \
   --allow api.openai.com \
-  --allow registry.npmjs.org
+  --allow registry.npmjs.org \
+  --allow models.dev \
+  --allow models.opencode.ai \
+  --allow opencode.ai
 ```
 
 A recipe binding such as `--binding b_openai` gives the workspace a
 shape-preserving placeholder and a broker URL. The node substitutes the real
 credential only for an authorized destination and records `cred.used`.
 Sending that placeholder to another host is blocked and recorded.
+The additional hosts above are the OpenCode recipe's install and model-catalog
+destinations. OpenCode's default model selection reaches `opencode.ai`; an
+explicit model does not remove the need to allow the other checked-in recipe
+hosts. Automatic local standalone derives these allowances from the recipe,
+but an explicitly started server must receive them through `--allow`.
 
 The process backend provides no host isolation. The built-in Docker backend is
 container isolation with cooperative proxy egress. Neither may be described
@@ -1404,6 +1427,13 @@ a YAML pull request, not Go.
 | `pi` | pi coding agent | key | anthropic, openai, openrouter, google, groq, xai, mistral | harness default | `.pi/` |
 | `custom` | anything after `--` | key or login | every preset | env only | none |
 
+OpenCode's checked-in fetch hosts are `registry.npmjs.org`, `models.dev`,
+`models.opencode.ai`, and `opencode.ai`. The last host is required by default
+model selection even when model requests use a separately bound provider.
+Automatic local standalone derives these allowances from the recipe; when an
+operator starts a server explicitly, each host must be supplied with
+`--allow`.
+
 #### Agents: structured or PTY transcript
 
 An Agent (`remount agent create`, ADR 0043) runs the recipe's harness as an
@@ -1415,6 +1445,13 @@ degraded one: the harness runs on a pseudo-terminal, the transcript is the
 terminal log, and a follow-up message is typed at the prompt through the
 recipe's `prompt_template`. The table says which you get; the API reports it as
 `mode: acp | pty` so a client never has to guess.
+
+For `agent create --ws`, the workspace binding ID and the recipe's provider
+preset are separate facts. Repeat `--binding ID:PRESET` on the Agent command.
+The client persists that non-secret declaration in `AgentSpec.binding_specs`;
+the control plane verifies that each ID is attached to the target workspace,
+and the node uses it to construct the recipe environment. Agents created by
+older clients fall back to the launch metadata in `remount.bindings`.
 
 | Recipe | Transcript | `acp.command` | `load_session` | Adapter | `ui` |
 |---|---|---|---|---|---|
@@ -2034,7 +2071,8 @@ agent from a recipe is:
   "workspace": {"name": "fix-ci", "repo": {"url": "https://github.com/o/r", "ref": "main"},
                 "labels": {"remount.binding.b_openai": "..."}},
   "spec": {"recipe": "opencode", "recipe_yaml": "...", "task": "make CI green",
-           "model": "openai/gpt-4o-mini", "sandbox": "workspace-write", "providers": ["openai"]},
+           "model": "openai/gpt-4o-mini", "sandbox": "workspace-write",
+           "providers": ["openai"], "binding_specs": ["b_openai:openai"]},
   "policy": {"approve": "on-request", "max_turns": 50, "sleep_after_sec": 900}
 }
 ```
@@ -2042,6 +2080,10 @@ agent from a recipe is:
 `spec.sandbox` accepts `read-only`, `workspace-write`, or `full`. An omitted
 value is normalized to `workspace-write` before the Agent is persisted or
 dispatched. A child Agent first inherits an omitted sandbox from its parent.
+`spec.binding_specs` contains non-secret `ID:PRESET` declarations. Every ID
+must occur in the target workspace's `bindings`; the node uses the declarations
+to construct recipe environment placeholders. Omission retains compatibility
+with workspaces carrying the older `remount.bindings` launch label.
 
 `ws` adopts an existing workspace instead of `workspace`. The task text goes
 into the inbox as the first message; events carry its hash, never the text.
