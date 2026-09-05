@@ -1897,3 +1897,89 @@ reported as passing.
 
 No credential values were written to this ledger, repositories, workspaces, or
 provider logs by the test harnesses.
+
+## 2026-09-04 — local Claude/Codex conversations handed off to a Modal VM
+
+**Verified, with an explicit runtime qualification.** Candidate
+`99d3b0f-handoff-r2` is the uncommitted handoff correction on base `99d3b0f`.
+The exact frozen binaries were uploaded and their version and SHA-256 verified:
+
+| Binary | SHA-256 |
+|---|---|
+| macOS arm64 | `de414799fdd9d3ffcede45dede9ddae49b432b086d987d6e89148fe7cf342d9f` |
+| Linux amd64 | `bf6c939ad1621028f337d0ac8aa66cd3de36a768f5553608e2dd8757b69a42ef` |
+
+`scripts/live-handoff.py` created synthetic conversations with the locally
+installed Claude Code `2.1.260` and Codex `0.152.1`, in isolated homes and
+checkouts. No personal conversation history or Keychain login was read or
+transferred. Seeds used Anthropic/OpenAI API authentication, and remote model
+requests used Remount bindings and placeholders. Claude used
+`claude-haiku-4-5-20251001`; Codex used `gpt-5-mini`.
+
+The remote host was a real Modal VM with Docker, 4 GiB memory, one requested
+physical CPU and a two-CPU limit, and a 30-minute TTL. A dedicated Docker wrapper
+applied `seccomp=unconfined` only to labeled handoff containers using the test
+image, after explicit operator approval. AppArmor was not relaxed, privileged
+containers were not used, and Codex's own sandbox remained enabled. A hermetic
+probe proved an in-workspace write succeeded while a write to `/etc` remained
+denied. **This is not evidence that stock Docker supports Codex's nested
+sandbox, and no Remount production default was weakened.**
+
+| Proof | Claude | Codex |
+|---|---|---|
+| Local conversation UUID preserved | `6853709a-b946-4184-80ba-e968062c2008` | `01a06f64-2d8c-7590-9199-18e393b4aebb` |
+| Conversation-only nonce recalled and written remotely | passed | passed |
+| Linux execution at canonical macOS checkout path | passed | passed |
+| Live client interrupted, reconnected, identical replay | passed | passed |
+| Original transcript extended | 4,571 → 23,917 bytes | 36,314 → 66,294 bytes |
+| Broker audit | 2 `cred.used`, 2 `egress.allowed` | 1 `cred.used`, 1 `egress.allowed` |
+| Real credential matches in workspace/environment and pulled result | zero | zero |
+| Pull recovered the correct result | passed | passed |
+
+Deep doctor and metrics collection passed. The final workspaces were
+`ws_06g6z3x60ke3maptwvg3nez7g4` and `ws_06g6z3ysd3efav44ejxzj3js18`.
+Both were destroyed, workspace inventory was verified empty, sandbox
+`sb-sKaQqYRpMUR6hmO9prkUtm` disappeared from inventory, its tunnel stopped
+serving, app `ap-LtfbJMeVKn6h7EBqxmXaA0` was stopped, and the generated local
+Remount token was removed. There are no retained cloud resources from the runs.
+
+Earlier attempts are not relabeled as passes: the first driver used an invalid
+`node ls` command and failed readiness; a corrected run passed Claude but found
+Codex's provider-filtered `--last` lookup and nested namespace denial; a later
+hermetic probe initially omitted its synthetic `CODEX_HOME`. Each earlier VM
+was cleaned. Explicit UUID continuation fixed the product lookup defect, and
+the approved test-only runtime profile resolved the separate namespace
+prerequisite. No additional model calls were needed to recreate local seeds.
+
+Reproduction uses the opt-in `seed`, `prepare`, `test`, `summarize`, and `cleanup`
+modes of `scripts/live-handoff.py`, with explicit frozen binary paths, candidate
+identifier, and `--nested-sandbox-test-profile` on both preparation and test.
+Dependencies are Modal Python SDK and python-dotenv in a separate environment.
+The driver consumes only allowlisted values from the explicitly named repository
+`.env`, redacts evidence, and rejects implicit VM/test retries. `--keep-on-failure`
+retains a failed test VM only until its fixed TTL and requires explicit cleanup.
+The offline safety suite is `python scripts/test_live_handoff.py`.
+
+Local detailed evidence remains under ignored
+`remount-data/handoff-live-20260905-r4/`, including binary manifests, provider
+state, per-step command results, security-profile checks and `summary.json`.
+The public record above deliberately contains no credential values or model
+conversation text. Model usage was observed but this test does not claim a
+hard total dollar cap, production multi-tenant isolation, or E2B/ix.dev coverage.
+
+Local verification of the final candidate passed the full race suite with
+`GOFLAGS=-p=1 make race`, the public SDK test, twelve offline driver safety
+tests, focused repeated handoff regressions, Linux/Windows cross-vet of affected
+packages, module verification/tidy, and the handoff metadata fuzz target. The
+binary conformance runner reported 60 passed, zero failed and eight explicitly
+unavailable requirements; all 53 required requirements passed and cleanup was
+verified. `make lint` passed using a temporary index containing regenerated
+`llms` documents; the real staging index was unchanged, and a second generation
+produced identical document hashes.
+
+The initial parallel `make race` run failed the existing gVisor inherited-output
+timing assertion at 1.335 seconds against its one-second bound. Five isolated
+race repetitions and the complete serialized race rerun passed without changing
+that test or its implementation. The serialized simulation package completed in
+401.060 seconds. This failure is retained as timing-sensitive evidence, not
+silently omitted from the record.

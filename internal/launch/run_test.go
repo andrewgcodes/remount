@@ -7,6 +7,35 @@ import (
 	"remount.dev/remount/internal/proto"
 )
 
+func TestConversationOptionsValidate(t *testing.T) {
+	r, err := Load("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "11111111-1111-4111-8111-111111111111"
+	transcript := ".codex/sessions/2026/09/04/rollout-2026-09-04T12-00-00-" + id + ".jsonl"
+	for _, conversation := range []string{id, "../session", "latest", "--last", strings.Repeat("z", 36)} {
+		o := Options{Recipe: r, Resume: true, Task: "continue", Conversation: conversation, ConversationPath: transcript}
+		plan, err := o.Validate()
+		if conversation == id {
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.Spec.Labels["remount.conversation"] != id || plan.Spec.Labels["remount.conversation.path"] != transcript {
+				t.Errorf("conversation labels not persisted: %v", plan.Spec.Labels)
+			}
+		} else if err == nil {
+			t.Errorf("invalid conversation %q accepted", conversation)
+		}
+	}
+	for _, badPath := range []string{"", "../" + transcript, ".codex/auth.json", strings.ReplaceAll(transcript, id, "22222222-2222-4222-8222-222222222222")} {
+		o := Options{Recipe: r, Resume: true, Task: "continue", Conversation: id, ConversationPath: badPath}
+		if _, err := o.Validate(); err == nil {
+			t.Errorf("invalid conversation transcript %q accepted", badPath)
+		}
+	}
+}
+
 func TestEgressPolicyBySandboxAndProfile(t *testing.T) {
 	r := &Recipe{Name: "x", Hosts: []string{"registry.npmjs.org"}}
 	b, err := ParseBinding("b_openai")

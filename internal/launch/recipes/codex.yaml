@@ -10,10 +10,16 @@ install: |
   export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
   command -v codex >/dev/null 2>&1 || npm install -g @openai/codex
 env:
-  CODEX_MODEL: "{{.Model}}"
+  CODEX_API_KEY: "{{if .Primary}}{{key .Primary}}{{end}}"
   PATH: "${NPM_CONFIG_PREFIX:-$HOME/.local}/bin:$PATH"
-command: ["codex", "exec", "--skip-git-repo-check", "{{.Task}}"]
-resume_command: ["codex", "exec", "resume", "--last", "--skip-git-repo-check", "{{.Task}}"]
+configure:
+  - path: .remount/launch/codex-driver
+    content: |
+      set -eu
+      exec codex{{if .Primary}} -c "openai_base_url=\"\{{baseURL .Primary}}\""{{end}} "\$@"
+command: ["sh", ".remount/launch/codex-driver", "exec", "--skip-git-repo-check", "{{.Task}}"]
+resume_command: ["sh", ".remount/launch/codex-driver", "exec", "resume", "{{if .Conversation}}{{.Conversation}}{{else}}--last{{end}}", "--skip-git-repo-check", "{{.Task}}"]
+model_flags: ["--model", "{{.Model}}"]
 sandbox_flags:
   read-only: ["--sandbox", "read-only"]
   workspace-write: ["--sandbox", "workspace-write"]

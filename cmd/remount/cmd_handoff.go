@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"golang.org/x/term"
@@ -18,6 +19,61 @@ import (
 // ---------------------------------------------------------------------------
 
 const handoffUsage = "handoff [--recipe R] [--task \"continue\"] [--dir .] [--home ~] [--binding ID[:PRESET]]... [--security P] [--sandbox M] [--approve M] [--name N] [--backend B] [--image IMG] [--attach]"
+
+func prepareHandoff(o *launch.HandoffOptions, localBindings func() []localBinding) error {
+	if o.Dir == "" {
+		o.Dir = "."
+	}
+	dir, err := filepath.Abs(o.Dir)
+	if err != nil {
+		return err
+	}
+	dir, err = filepath.EvalSymlinks(dir)
+	if err != nil {
+		return err
+	}
+	if st, err := os.Stat(dir); err != nil {
+		return err
+	} else if !st.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	o.Dir = dir
+	if o.Home == "" {
+		o.Home, err = os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+	}
+	if o.Recipe == nil {
+		o.Recipe, err = launch.DetectRecipe(o.Home, o.Candidates)
+		if err != nil {
+			return err
+		}
+	}
+	if len(o.Recipe.ResumeCommand) == 0 {
+		return fmt.Errorf("recipe %s has no resume_command; it cannot continue a conversation", o.Recipe.Name)
+	}
+	if o.Recipe.CommandFromArgs {
+		return fmt.Errorf("recipe %s takes its command from the arguments and has no conversation to hand off", o.Recipe.Name)
+	}
+	if o.Run.Bindings, err = defaultBindings(o.Recipe, o.Run.Bindings, localBindings()); err != nil {
+		return err
+	}
+	if (o.Recipe.Name == "claude" || o.Recipe.Name == "codex") && len(o.Run.Bindings) == 0 {
+		return fmt.Errorf("%s handoff requires a provider --binding; local login credentials are not transferred", o.Recipe.Name)
+	}
+	probe := o.Run
+	probe.Recipe = o.Recipe
+	probe.Resume = true
+	if probe.Task == "" {
+		probe.Task = launch.DefaultResumeTask
+	}
+	if o.Recipe.PathKeyed {
+		probe.MountPath = dir
+	}
+	_, err = probe.Validate()
+	return err
+}
 
 func cmdHandoff(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("handoff", flag.ExitOnError)
@@ -81,11 +137,8 @@ func cmdHandoff(ctx context.Context, args []string) error {
 			o.Run.Cols, o.Run.Rows = uint16(w), uint16(h)
 		}
 	}
-	if o.Recipe != nil {
-		var err error
-		if o.Run.Bindings, err = defaultBindings(o.Recipe, o.Run.Bindings, c.localBindings(ctx)); err != nil {
-			return err
-		}
+	if err := prepareHandoff(&o, func() []localBinding { return c.localBindings(ctx) }); err != nil {
+		return err
 	}
 	if _, err := c.ensureLocalServer(ctx); err != nil {
 		return err

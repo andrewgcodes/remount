@@ -1,16 +1,25 @@
 package sim
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"remount.dev/remount/internal/client"
+	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/launch"
 	"remount.dev/remount/internal/proto"
 )
@@ -242,6 +251,340 @@ func TestHandoffThenResumeCarriesHarnessState(t *testing.T) {
 	var pe *proto.Error
 	if err := c.DestroyWorkspace(ctx, bad.Workspace.ID); err != nil && !(errors.As(err, &pe) && pe.Code == proto.CodeNotFound) {
 		t.Fatal(err)
+	}
+}
+
+func handoffFixtureFile(t *testing.T, home, name, content string, modified time.Time) string {
+	t.Helper()
+	p := filepath.Join(home, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !modified.IsZero() {
+		if err := os.Chtimes(p, modified, modified); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return p
+}
+
+func handoffFixtureSession(t *testing.T, home, recipe, dir, id string, modified time.Time) (string, string) {
+	t.Helper()
+	cwd, err := json.Marshal(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var name, content string
+	if recipe == "claude" {
+		key := strings.Map(func(r rune) rune {
+			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+				return r
+			}
+			return '-'
+		}, dir)
+		name = ".claude/projects/" + key + "/" + id + ".jsonl"
+		content = fmt.Sprintf("{\"type\":\"user\",\"cwd\":%s,\"sessionId\":%q,\"message\":{\"role\":\"user\",\"content\":\"remember synthetic conversation\"}}\n", cwd, id)
+	} else {
+		name = ".codex/sessions/2026/09/04/rollout-2026-09-04T12-00-00-" + id + ".jsonl"
+		content = fmt.Sprintf("{\"type\":\"session_meta\",\"payload\":{\"cwd\":%s,\"id\":%q}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"remember synthetic conversation\"}]}}\n", cwd, id)
+	}
+	handoffFixtureFile(t, home, name, content, modified)
+	return name, content
+}
+
+func handoffFixtureRecipe(t *testing.T, name string) (*launch.Recipe, launch.Binding) {
+	t.Helper()
+	r, err := launch.Load(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Install, r.PathKeyed, r.Configure = "", false, nil
+	r.ResumeCommand = []string{"sh", "-c", "echo synthetic-resume"}
+	preset := "openai"
+	if name == "claude" {
+		preset = "anthropic"
+	}
+	b, err := launch.ParseBinding("b_handoff:" + preset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r, b
+}
+
+func TestBuiltinHandoffSelectsOnlyLatestCheckoutConversation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: recipe launchers require a POSIX shell in process workspaces")
+	}
+	for _, recipe := range []string{"claude", "codex"} {
+		t.Run(recipe, func(t *testing.T) {
+			r, binding := handoffFixtureRecipe(t, recipe)
+			w := newWorld(t, control.Binding{ID: binding.ID, Secret: "synthetic-provider-secret", Destinations: binding.Preset.Hosts, TTLSec: 60})
+			w.node("n1", nil)
+			c := w.client("c1")
+			ctx := ctxT(t, 60*time.Second)
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			home := t.TempDir()
+			now := time.Now()
+			latest, latestContent := handoffFixtureSession(t, home, recipe, dir, "11111111-1111-4111-8111-111111111111", now)
+			older, _ := handoffFixtureSession(t, home, recipe, dir, "22222222-2222-4222-8222-222222222222", now.Add(-time.Hour))
+			other, _ := handoffFixtureSession(t, home, recipe, filepath.Join(dir, "other-project"), "33333333-3333-4333-8333-333333333333", now.Add(time.Hour))
+			for _, p := range []string{".claude.json", ".claude/.credentials.json", ".claude/settings.json", ".codex/auth.json", ".codex/config.toml", ".env", ".env.local", "nested/.env.production", "nested/.claude/config.json", "nested/.codex/auth.json", "nested/.claude.json", ".git/.env", ".git/.claude/auth.json"} {
+				handoffFixtureFile(t, dir, p, "checkout-private-sentinel", time.Time{})
+				handoffFixtureFile(t, home, p, "home-private-sentinel", time.Time{})
+			}
+			handoffFixtureFile(t, dir, latest, "checkout-private-sentinel", time.Time{})
+			handoffFixtureFile(t, dir, "main.go", "package main\n", time.Time{})
+			kept := map[string]string{latest: latestContent, "main.go": "package main\n"}
+			if recipe == "claude" {
+				sub := strings.TrimSuffix(latest, ".jsonl") + "/subagents/agent-worker.jsonl"
+				handoffFixtureFile(t, home, sub, latestContent, time.Time{})
+				kept[sub] = latestContent
+				handoffFixtureFile(t, home, strings.TrimSuffix(latest, ".jsonl")+"/.env", "home-private-sentinel", time.Time{})
+			}
+			res, err := launch.Handoff(ctx, c, launch.HandoffOptions{Dir: dir, Home: home, Recipe: r, Run: launch.Options{Bindings: []launch.Binding{binding}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out := readOut(t, res.Session); !strings.Contains(out, "synthetic-resume") {
+				t.Fatalf("resume output %q", out)
+			}
+			for p, want := range kept {
+				got, err := c.ReadFile(ctx, res.Workspace.ID, p)
+				if err != nil || string(got) != want {
+					t.Errorf("carried %s = %q, %v; want %q", p, got, err, want)
+				}
+			}
+			for _, p := range []string{older, other, ".claude.json", ".claude/.credentials.json", ".claude/settings.json", ".codex/auth.json", ".codex/config.toml", ".env", ".env.local", "nested/.env.production", "nested/.claude/config.json", "nested/.codex/auth.json", "nested/.claude.json", ".git/.env", ".git/.claude/auth.json"} {
+				if got, err := c.ReadFile(ctx, res.Workspace.ID, p); err == nil {
+					t.Errorf("forbidden path %s carried: %q", p, got)
+				}
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, w.http.URL+"/v1/artifacts/"+res.Artifact, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer tok")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("artifact response: %s", resp.Status)
+			}
+			gz, err := gzip.NewReader(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer gz.Close()
+			tr := tar.NewReader(gz)
+			for {
+				h, err := tr.Next()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				data, err := io.ReadAll(tr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if bytes.Contains(data, []byte("private-sentinel")) {
+					t.Errorf("private data uploaded in %s", h.Name)
+				}
+			}
+		})
+	}
+}
+
+func TestBuiltinHandoffPinsConversationAcrossResume(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: recipe launchers require POSIX sh")
+	}
+	const id = "11111111-1111-4111-8111-111111111111"
+	for _, name := range []string{"claude", "codex"} {
+		t.Run(name, func(t *testing.T) {
+			r, binding := handoffFixtureRecipe(t, name)
+			w := newWorld(t, control.Binding{ID: binding.ID, Secret: "synthetic-provider-secret", Destinations: binding.Preset.Hosts, TTLSec: 60})
+			w.node("n1", nil)
+			c := w.client("c1")
+			ctx := ctxT(t, 90*time.Second)
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			home := t.TempDir()
+			transcript, contents := handoffFixtureSession(t, home, name, dir, id, time.Now())
+			if name == "codex" {
+				contents = strings.Replace(contents, `"payload":{`, `"payload":{"model_provider":"handoff",`, 1)
+				handoffFixtureFile(t, home, transcript, contents, time.Time{})
+			}
+			r.ResumeCommand = []string{"sh", "-c", `if [ "$1" = "11111111-1111-4111-8111-111111111111" ]; then echo recalled-selected; else echo fresh-provider-filtered; fi`, "mock", "{{.Conversation}}"}
+			res, err := launch.Handoff(ctx, c, launch.HandoffOptions{Dir: dir, Home: home, Recipe: r, Run: launch.Options{Bindings: []launch.Binding{binding}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := res.Workspace.Spec.Labels["remount.conversation"]; got != id {
+				t.Errorf("conversation label = %q, want %q", got, id)
+			}
+			if out := readOut(t, res.Session); !strings.Contains(out, "recalled-selected") {
+				t.Fatalf("initial handoff lost conversation: %q", out)
+			}
+			if _, err := c.SleepWorkspace(ctx, proto.WSSleepReq{ID: res.Workspace.ID, OnEvent: "test.resume"}); err != nil {
+				t.Fatal(err)
+			}
+			rr, err := launch.Resume(ctx, c, launch.ResumeOptions{WS: res.Workspace.ID, Recipe: r})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out := readOut(t, rr.Session); !strings.Contains(out, "recalled-selected") {
+				t.Fatalf("durable resume lost conversation: %q", out)
+			}
+			for _, damaged := range []string{"", "malformed", strings.ReplaceAll(contents, id, "22222222-2222-4222-8222-222222222222")} {
+				if damaged == "" {
+					err = c.Remove(ctx, res.Workspace.ID, transcript, false)
+				} else {
+					err = c.WriteFile(ctx, res.Workspace.ID, transcript, []byte(damaged), 0o600)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := launch.Resume(ctx, c, launch.ResumeOptions{WS: res.Workspace.ID, Recipe: r}); err == nil {
+					t.Fatal("missing or invalid selected transcript silently resumed")
+				}
+			}
+		})
+	}
+}
+
+func TestBuiltinHandoffUnavailableBackendDoesNotUpload(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: path-keyed workspaces require a POSIX mount path")
+	}
+	for _, recipe := range []string{"claude", "codex"} {
+		t.Run(recipe, func(t *testing.T) {
+			r, binding := handoffFixtureRecipe(t, recipe)
+			r.PathKeyed = true
+			w := newWorld(t, control.Binding{ID: binding.ID, Secret: "synthetic-provider-secret", Destinations: binding.Preset.Hosts, TTLSec: 60})
+			w.node("n1", nil)
+			var uploads atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				uploads.Add(1)
+				http.Error(w, "upload must not happen", http.StatusForbidden)
+			}))
+			defer srv.Close()
+			c := client.New(client.Options{Dialer: w.dialer("c1"), Token: "tok", Principal: "a_c1", ArtifactURL: srv.URL})
+			defer c.Close()
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			home := t.TempDir()
+			handoffFixtureSession(t, home, recipe, dir, "11111111-1111-4111-8111-111111111111", time.Now())
+			_, err = launch.Handoff(ctxT(t, 30*time.Second), c, launch.HandoffOptions{Dir: dir, Home: home, Recipe: r, Run: launch.Options{Bindings: []launch.Binding{binding}}})
+			if err == nil || !strings.Contains(err.Error(), "namespaced backend") || uploads.Load() != 0 {
+				t.Fatalf("backend preflight: %v; uploads %d", err, uploads.Load())
+			}
+		})
+	}
+}
+
+func TestBuiltinHandoffRejectsBeforeUpload(t *testing.T) {
+	for _, recipe := range []string{"claude", "codex"} {
+		for _, scenario := range []string{"no-binding", "wrong-provider", "no-state", "wrong-cwd", "wrong-id", "invalid-uuid", "exclude-state", "exclude-transcript", "symlink-file", "symlink-state", "backend", "mount-path"} {
+			t.Run(recipe+"/"+scenario, func(t *testing.T) {
+				if runtime.GOOS == "windows" && (strings.HasPrefix(scenario, "symlink") || scenario == "backend") {
+					t.Skip("unavailable: symlinks need Windows privileges and path-keyed workspaces need POSIX mount paths")
+				}
+				r, binding := handoffFixtureRecipe(t, recipe)
+				dir, err := filepath.EvalSymlinks(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				home := t.TempDir()
+				cwd := dir
+				if scenario == "wrong-cwd" {
+					cwd = filepath.Join(dir, "elsewhere")
+				}
+				name, content := handoffFixtureSession(t, home, recipe, cwd, "11111111-1111-4111-8111-111111111111", time.Now())
+				local := filepath.Join(home, filepath.FromSlash(name))
+				if scenario == "wrong-id" {
+					handoffFixtureFile(t, home, name, strings.ReplaceAll(content, "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"), time.Time{})
+				}
+				if scenario == "invalid-uuid" {
+					bad := strings.Repeat("z", 36)
+					handoffFixtureFile(t, home, strings.ReplaceAll(name, "11111111-1111-4111-8111-111111111111", bad), strings.ReplaceAll(content, "11111111-1111-4111-8111-111111111111", bad), time.Time{})
+					if err := os.Remove(local); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if scenario == "no-state" {
+					if err := os.Remove(local); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if scenario == "symlink-file" {
+					outside := handoffFixtureFile(t, t.TempDir(), filepath.Base(local), content, time.Time{})
+					if err := os.Remove(local); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(outside, local); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if scenario == "symlink-state" {
+					state := filepath.Join(home, "."+recipe)
+					outside := filepath.Join(t.TempDir(), "state")
+					if err := os.Rename(state, outside); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(outside, state); err != nil {
+						t.Fatal(err)
+					}
+				}
+				run := launch.Options{Bindings: []launch.Binding{binding}}
+				want := "saved"
+				switch scenario {
+				case "exclude-state":
+					run.Exclude, want = []string{"." + recipe}, "exclude"
+				case "exclude-transcript":
+					run.Exclude, want = []string{name}, "exclude"
+				case "no-binding":
+					run.Bindings, want = nil, "binding"
+				case "wrong-provider":
+					wrong, err := launch.ParseBinding("b_wrong:google")
+					if err != nil {
+						t.Fatal(err)
+					}
+					run.Bindings, want = []launch.Binding{wrong}, "does not consume"
+				case "backend":
+					r.PathKeyed, run.Backend, want = true, "process", "mount namespace"
+				case "mount-path":
+					r.PathKeyed, run.MountPath, want = true, "/different", "must stay"
+				}
+				var uploads atomic.Int32
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					uploads.Add(1)
+					http.Error(w, "upload must not happen", http.StatusForbidden)
+				}))
+				defer srv.Close()
+				c := client.New(client.Options{ArtifactURL: srv.URL})
+				_, err = launch.Handoff(ctxT(t, 15*time.Second), c, launch.HandoffOptions{Dir: dir, Home: home, Recipe: r, Run: run})
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %v; want %q", err, want)
+				}
+				if uploads.Load() != 0 {
+					t.Errorf("invalid handoff uploaded %d artifacts", uploads.Load())
+				}
+			})
+		}
 	}
 }
 
