@@ -230,6 +230,152 @@ and `multi_tenant` refuse such a launch. Remount never proxies or rewrites a
 subscription token; their terms restrict third-party use and the broker is not
 the place to argue with that.
 
+## Browser and virtual desktop workloads
+
+Remount supervises filesystem and process sessions; it does not implement a
+display server or VNC protocol. A node can nevertheless host a desktop stack,
+and the session log remains available when the initiating client disconnects.
+The following composition was exercised on a Modal-hosted Linux process node:
+
+| Layer | Exercised implementation | Responsibility |
+|---|---|---|
+| display | `Xvfb :99 -screen 0 1280x720x24 -nolisten tcp -ac` | virtual X11 framebuffer |
+| window manager | Openbox | window placement and focus |
+| browser | Chromium with `DISPLAY=:99` | rendered application |
+| direct input | xdotool/XTEST | X11 pointer and keyboard events |
+| remote display | x11vnc on `127.0.0.1:5900` | RFB framebuffer and input |
+| client transport | `remount port` | authenticated path to workspace loopback |
+
+For a Debian-derived node image, the exercised package set was
+`xvfb openbox chromium x11vnc xdotool scrot x11-utils fonts-liberation`.
+Package names vary by distribution. Install them while building the node image:
+an isolated workspace may intentionally lack package-manager egress, and a
+provider credential binding does not authorize arbitrary package traffic.
+
+Create the workspace with reproducible dependencies and the disposable browser
+profile excluded from every snapshot:
+
+```sh
+WS=$(remount ws create --name desktop \
+  --exclude node_modules \
+  --exclude .chromium-profile)
+```
+
+An application-specific supervisor can use this process shape:
+
+```sh
+#!/bin/sh
+set -eu
+
+cleanup() {
+  for pid in "${browser_pid:-}" "${vnc_pid:-}" "${app_pid:-}" \
+    "${wm_pid:-}" "${xvfb_pid:-}"; do
+    [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+  done
+}
+trap cleanup EXIT INT TERM
+
+Xvfb :99 -screen 0 1280x720x24 -nolisten tcp -ac &
+xvfb_pid=$!
+export DISPLAY=:99
+
+i=0
+until xdpyinfo -display :99 >/dev/null 2>&1; do
+  i=$((i + 1))
+  [ "$i" -lt 50 ] || exit 1
+  sleep 0.1
+done
+
+openbox &
+wm_pid=$!
+
+# Start the application on workspace loopback before the browser.
+./start-app.sh &
+app_pid=$!
+i=0
+until curl -fsS http://127.0.0.1:4173/ >/dev/null; do
+  i=$((i + 1))
+  [ "$i" -lt 50 ] || exit 1
+  sleep 0.1
+done
+
+x11vnc -display :99 -rfbport 5900 -localhost -nopw -forever -shared \
+  -noxdamage -quiet &
+vnc_pid=$!
+
+chromium --no-sandbox --disable-dev-shm-usage --no-first-run \
+  --user-data-dir="$PWD/.chromium-profile" \
+  --window-size=1280,720 --start-maximized \
+  --app=http://127.0.0.1:4173 &
+browser_pid=$!
+
+wait "$browser_pid"
+```
+
+The exact Chromium sandbox flags depend on the backend. `--no-sandbox` was
+required by the exercised cooperative process container and weakens the browser
+boundary; do not copy it to a backend where Chromium sandboxing works. Keep the
+supervisor in the foreground so Remount owns a live sequenced session instead
+of a shell that exits while untracked children remain.
+
+Run the supervisor through Remount, then use a separate client for the VNC
+tunnel:
+
+```sh
+remount exec "$WS" -- ./desktop-run.sh
+remount port "$WS" 5900 --local 127.0.0.1:5900
+```
+
+`-localhost -nopw` is acceptable only for a disposable listener when workspace
+loopback is not otherwise exposed. On an authenticated HTTPS deployment,
+`remount port` carries it through Remount's authenticated TLS connection; it
+inherits a plaintext connection when `REMOUNT_SERVER` is `http://`. Never
+publish the listener directly. `remount port` is a live client process; it does
+not provide an always-on web or phone UI.
+
+Computer-use harnesses may capture screenshots from the VNC framebuffer and
+inject RFB pointer/key events, or use xdotool for direct XTEST input. A
+screenshot-driven model loop must return the new framebuffer after each action
+group and correlate it with the model's original call identifier. Keep the loop
+bounded, assert an application-side result rather than trusting the screenshot
+alone, and reset server-side result state before every run so stale success
+cannot produce a false positive.
+
+Model credentials follow the normal binding rules. The controller can call a
+provider through `${REMOUNT_BROKER}/d/HOST/...` with a placeholder credential;
+the reusable provider key must not be written to the browser profile, workspace,
+screenshot metadata, or test report.
+
+The persistence boundary is deliberate:
+
+- Killing or disconnecting the initiating CLI does not kill the remote exec
+  session. A fresh client can `remount attach WS SESSION --from 0` and replay
+  its sequenced output.
+- Snapshot, move, sleep, and node failover preserve filesystem state, not X11,
+  VNC, browser, or application process memory. Restart the supervisor after the
+  workspace is materialized.
+- An excluded browser profile is intentionally absent after materialization.
+  Persistent application state belongs in ordinary portable files, not
+  Chromium singleton locks or host-specific symlinks.
+- `remount pull` snapshots the whole workspace. Chromium profiles can contain
+  unsafe singleton symlinks, and artifact validation correctly rejects them.
+  Exclude the profile at workspace creation or stop Chromium and remove
+  disposable profile state before pulling; never relax symlink validation.
+
+Verify a desktop run with evidence from both sides of the boundary:
+
+1. a framebuffer screenshot showing the expected rendered result;
+2. an application-side file or API result matching the screenshot;
+3. session replay from a fresh client after disconnect;
+4. direct `fs read` and `pull` artifacts compared byte-for-byte;
+5. `inspect`, `events`, and `doctor --deep` results;
+6. destruction of the workspace and disposable provider resources.
+
+This composition proves that Remount can host and reconnect to a virtual
+desktop. It does not make the process backend a production multi-tenant
+boundary, turn plaintext VNC into a secure public service, or supply a mobile
+client.
+
 ## Verified: OpenAI Codex CLI
 
 We ran Codex CLI 0.152.1 inside a Remount workspace on macOS with the
