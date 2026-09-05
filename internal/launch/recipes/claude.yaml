@@ -33,3 +33,7 @@ acp:
   command: ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
   adapter: "@agentclientprotocol/claude-agent-acp"
   load_session: true
+  sandbox_modes:
+    read-only: plan
+    workspace-write: acceptEdits
+    full: bypassPermissions

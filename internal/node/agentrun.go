@@ -1225,6 +1225,7 @@ func (r *agentRun) handshake(client *acp.Client) error {
 		CloseSession: client.CanCloseSession(), AdditionalDirectories: client.SupportsAdditionalDirectories(),
 	}
 	loaded := false
+	var modes *acp.SessionModeState
 	sid := acp.SessionId(r.req.ACPSessionID)
 	if sid != "" && (caps.ResumeSession || caps.LoadSession) {
 		r.setReplaying(caps.LoadSession && !caps.ResumeSession)
@@ -1232,6 +1233,7 @@ func (r *agentRun) handshake(client *acp.Client) error {
 		r.setReplaying(false)
 		if rerr == nil {
 			loaded = true
+			modes = res.Modes
 		} else {
 			// The harness forgot the session (a fresh tree, a pruned store).
 			// A new one is the right answer; the control plane records the
@@ -1249,6 +1251,19 @@ func (r *agentRun) handshake(client *acp.Client) error {
 			return fmt.Errorf("acp session/new: %w", nerr)
 		}
 		sid = res.SessionID
+		modes = res.Modes
+	}
+	mode, err := r.acpSandboxMode()
+	if err != nil {
+		return err
+	}
+	if mode != "" && (modes == nil || modes.CurrentModeID != acp.SessionModeId(mode)) {
+		if _, err := client.SetMode(ctx, acp.SetSessionModeRequest{
+			SessionID: sid,
+			ModeID:    acp.SessionModeId(mode),
+		}); err != nil {
+			return fmt.Errorf("acp session/set_mode %s: %w", mode, err)
+		}
 	}
 	r.mu.Lock()
 	r.sessionID = sid
@@ -1259,6 +1274,20 @@ func (r *agentRun) handshake(client *acp.Client) error {
 		rep.Loaded = loaded
 	})
 	return nil
+}
+
+func (r *agentRun) acpSandboxMode() (string, error) {
+	if len(r.req.Spec.ACPCommand) > 0 {
+		return "", nil
+	}
+	recipe, _, err := r.recipe()
+	if err != nil {
+		return "", err
+	}
+	if recipe.ACP == nil {
+		return "", nil
+	}
+	return recipe.ACP.SandboxModes[r.req.Spec.Sandbox], nil
 }
 
 func (r *agentRun) setReplaying(v bool) {

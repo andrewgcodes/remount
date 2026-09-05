@@ -15,6 +15,7 @@ import (
 
 	"remount.dev/remount/internal/acp"
 	"remount.dev/remount/internal/acp/acptest"
+	"remount.dev/remount/internal/launch"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/session"
 	"remount.dev/remount/internal/workspace"
@@ -144,6 +145,17 @@ func fakeACPConfig(mode string) acptest.Config {
 		cfg.Capabilities = acp.AgentCapabilities{LoadSession: true}
 		cfg.Rewind = func(ctx context.Context, s *acptest.Session, req acp.LoadSessionRequest) error {
 			return s.Text("replayed-history-for-" + string(req.SessionID))
+		}
+	case "mode":
+		cfg.Modes = &acp.SessionModeState{
+			CurrentModeID: "default",
+			AvailableModes: []acp.SessionMode{
+				{ID: "default", Name: "Manual"},
+				{ID: "acceptEdits", Name: "Accept edits"},
+			},
+		}
+		cfg.Turn = func(ctx context.Context, s *acptest.Session, req acp.PromptRequest) (acp.StopReason, error) {
+			return acp.StopReasonEndTurn, s.Text("mode:" + string(s.Mode()))
 		}
 	case "resume":
 		cfg.Capabilities = acp.AgentCapabilities{SessionCapabilities: &acp.SessionCapabilities{Resume: &acp.SessionResumeCapabilities{}}}
@@ -363,6 +375,56 @@ func TestAgentRunEchoTurnsAndCancel(t *testing.T) {
 		t.Fatalf("transcript exit = %+v", exit)
 	}
 	f.assertMirrored(t, s)
+}
+
+func TestAgentRunAppliesRecipeACPSandboxMode(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		custom   bool
+		wantMode string
+	}{
+		{name: "recipe command", wantMode: "acceptEdits"},
+		{name: "custom command", custom: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAgentFixture(t)
+			req := f.request(t, "mode", "check mode")
+			if !tc.custom {
+				req.Spec.ACPCommand = nil
+			}
+			req.Spec.Recipe = "fake"
+			req.Spec.RecipeYAML = fmt.Sprintf(`name: fake
+auth: workspace_resident
+command: ["unused"]
+acp:
+  command: [%q]
+  env:
+    %s: "1"
+    %s: "mode"
+  sandbox_modes:
+    workspace-write: acceptEdits
+`, exe, fakeACPEnv, fakeACPModeEnv)
+			req.Spec.Sandbox = launch.SandboxWorkspaceWrite
+			if _, err := f.n.agentRunStart(context.Background(), nil, &req); err != nil {
+				t.Fatal(err)
+			}
+			started := f.next(t, proto.AgentReportStarted)
+			f.next(t, proto.AgentReportSession)
+			f.next(t, proto.AgentReportTurnStarted)
+			f.next(t, proto.AgentReportTurnFinished)
+			if got := string(f.transcript(t, started.Transcript)); !strings.Contains(got, `"text":"mode:`+tc.wantMode+`"`) {
+				t.Fatalf("transcript does not show mode %s:\n%s", tc.wantMode, got)
+			}
+			if err := f.n.agentRunCancel(&proto.AgentRunCancelReq{Agent: req.Agent, Run: req.Run, Reason: "test"}); err != nil {
+				t.Fatal(err)
+			}
+			f.waitDone(t)
+		})
+	}
 }
 
 // assertMirrored checks the transcript reports the node sent reproduce the

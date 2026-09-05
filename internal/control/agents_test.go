@@ -296,6 +296,9 @@ func TestAgentCreateIsIdempotentAndValidates(t *testing.T) {
 	if first.ID != second.ID || first.WS != second.WS {
 		t.Fatalf("replay made a new agent: %s/%s vs %s/%s", first.ID, first.WS, second.ID, second.WS)
 	}
+	if first.Spec.Sandbox != proto.AgentSandboxWorkspaceWrite {
+		t.Fatalf("default sandbox = %q, want workspace-write", first.Spec.Sandbox)
+	}
 	list, err := af.c.agentList(context.Background(), localSubject(), &proto.AgentListReq{})
 	if err != nil || len(list.Agents) != 1 {
 		t.Fatalf("list = %+v, %v", list, err)
@@ -307,6 +310,11 @@ func TestAgentCreateIsIdempotentAndValidates(t *testing.T) {
 		Spec: agentSpec(""), Policy: proto.AgentPolicy{Approve: "sometimes"},
 	}); codeOf(err) != proto.CodeBadRequest {
 		t.Fatalf("bad approve policy = %v", err)
+	}
+	if _, err := af.c.agentCreate(context.Background(), localSubject(), &proto.AgentCreateReq{
+		Spec: proto.AgentSpec{Recipe: "pi", Sandbox: "unconfined"},
+	}); codeOf(err) != proto.CodeBadRequest {
+		t.Fatalf("bad sandbox = %v", err)
 	}
 	if _, err := af.c.agentCreate(context.Background(), localSubject(), &proto.AgentCreateReq{
 		Spec: agentSpec(""), Policy: proto.AgentPolicy{Approve: proto.ApproveAuto},
@@ -1441,7 +1449,7 @@ func TestChildSecurityNeverWeakerThanParent(t *testing.T) {
 		}
 	}
 
-	parent := &proto.Agent{Spec: proto.AgentSpec{Providers: []string{"p"}, Primary: "p"}}
+	parent := &proto.Agent{Spec: proto.AgentSpec{Providers: []string{"p"}, Primary: "p", Sandbox: proto.AgentSandboxReadOnly}}
 	pws := &proto.Workspace{Spec: proto.WorkspaceSpec{Security: isolated}}
 	req := &proto.AgentCreateReq{Workspace: &proto.WorkspaceSpec{}}
 	if err := inheritFromParent(req, parent, pws); err != nil {
@@ -1449,6 +1457,9 @@ func TestChildSecurityNeverWeakerThanParent(t *testing.T) {
 	}
 	if req.Workspace.Security.Profile != proto.SecurityIsolated || len(req.Workspace.Security.Network.Rules) != 1 {
 		t.Fatalf("unset child security = %+v, want the parent's", req.Workspace.Security)
+	}
+	if req.Spec.Sandbox != proto.AgentSandboxReadOnly {
+		t.Fatalf("unset child sandbox = %q, want the parent's read-only", req.Spec.Sandbox)
 	}
 	req = &proto.AgentCreateReq{Workspace: &proto.WorkspaceSpec{Security: proto.SecuritySpec{Network: proto.NetworkPolicy{Default: proto.NetworkDefaultAllow}}}}
 	if err := inheritFromParent(req, parent, pws); !errors.Is(err, &proto.Error{Code: proto.CodeDenied}) {

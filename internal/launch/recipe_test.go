@@ -409,6 +409,24 @@ func TestCodexACPSandboxMode(t *testing.T) {
 	}
 }
 
+func TestClaudeACPSandboxMode(t *testing.T) {
+	r, err := Load("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for sandbox, mode := range map[string]string{
+		SandboxReadOnly:       "plan",
+		SandboxWorkspaceWrite: "acceptEdits",
+		SandboxFull:           "bypassPermissions",
+	} {
+		t.Run(sandbox, func(t *testing.T) {
+			if got := r.ACP.SandboxModes[sandbox]; got != mode {
+				t.Fatalf("ACP mode = %q, want %q", got, mode)
+			}
+		})
+	}
+}
+
 func TestCodexModelFlags(t *testing.T) {
 	r, err := Load("codex")
 	if err != nil {

@@ -23,6 +23,7 @@ import (
 	"text/template"
 
 	"remount.dev/remount/internal/launch/yamlite"
+	"remount.dev/remount/internal/proto"
 )
 
 //go:embed recipes/*.yaml
@@ -46,9 +47,9 @@ const (
 
 // Sandbox levels map onto egress policy and a harness-visible hint.
 const (
-	SandboxReadOnly       = "read-only"
-	SandboxWorkspaceWrite = "workspace-write"
-	SandboxFull           = "full"
+	SandboxReadOnly       = proto.AgentSandboxReadOnly
+	SandboxWorkspaceWrite = proto.AgentSandboxWorkspaceWrite
+	SandboxFull           = proto.AgentSandboxFull
 )
 
 // Approval policies for hosts outside the binding set.
@@ -133,6 +134,9 @@ type ACPSpec struct {
 	// Env is extra environment for the ACP process, exported after the
 	// recipe's Env. Never a credential: keys arrive as broker placeholders.
 	Env map[string]string `json:"env,omitempty"`
+	// SandboxModes maps Remount sandbox levels to ACP session mode ids. When
+	// set, the node selects the mode before sending the first prompt.
+	SandboxModes map[string]string `json:"sandbox_modes,omitempty"`
 	// LoadSession is the recipe's claim that the agent advertises
 	// session/load. The runner verifies it against Initialize and records a
 	// mismatch rather than trusting either side blindly.
@@ -324,6 +328,16 @@ func (r *Recipe) Validate() error {
 		for k := range r.ACP.Env {
 			if !envNamePattern.MatchString(k) {
 				return fmt.Errorf("recipe %s: acp.env name %q is not a valid identifier", r.Name, k)
+			}
+		}
+		for level, mode := range r.ACP.SandboxModes {
+			switch level {
+			case SandboxReadOnly, SandboxWorkspaceWrite, SandboxFull:
+			default:
+				return fmt.Errorf("recipe %s: acp.sandbox_modes key %q is not a sandbox level", r.Name, level)
+			}
+			if strings.TrimSpace(mode) == "" {
+				return fmt.Errorf("recipe %s: acp.sandbox_modes[%s] is empty", r.Name, level)
 			}
 		}
 	}
