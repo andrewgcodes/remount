@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -48,6 +50,51 @@ func fuzzArchiveSeed() []byte {
 		panic(err)
 	}
 	return output.Bytes()
+}
+
+func FuzzPortableSymlinkTarget(f *testing.F) {
+	sourceRoot, err := filepath.Abs("fuzz-workspace")
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(".codex/tmp/arg0/apply_patch", "../../.npm/bin/tool", "")
+	f.Add(".codex/tmp/arg0/apply_patch", filepath.Join(sourceRoot, ".npm", "bin", "tool"), "")
+	f.Add("bin/tool", filepath.Join(filepath.Dir(sourceRoot), "external"), "")
+	f.Add("workspace/bin/tool", filepath.Join(sourceRoot, "lib", "tool"), "workspace")
+	f.Add("escape", "../../outside", "")
+	f.Add("escape", `safe\child/../..`, "")
+	f.Fuzz(func(t *testing.T, name, target, archivePrefix string) {
+		portable, err := PortableSymlinkTarget(name, target, sourceRoot, archivePrefix)
+		if err != nil {
+			return
+		}
+		if filepath.IsAbs(portable) || path.IsAbs(portable) || filepath.VolumeName(portable) != "" {
+			t.Fatalf("portable target is absolute: %q", portable)
+		}
+		resolved := path.Clean(path.Join(path.Dir(filepath.ToSlash(name)), portable))
+		if resolved == ".." || strings.HasPrefix(resolved, "../") {
+			t.Fatalf("portable target escaped archive: name=%q target=%q result=%q", name, target, portable)
+		}
+		absolute := filepath.IsAbs(target) || path.IsAbs(target) || filepath.VolumeName(target) != ""
+		if !absolute {
+			if portable != filepath.ToSlash(target) {
+				t.Fatalf("relative target changed: target=%q result=%q", target, portable)
+			}
+			return
+		}
+		targetRel, relErr := filepath.Rel(sourceRoot, filepath.Clean(target))
+		if relErr != nil || targetRel == ".." || strings.HasPrefix(targetRel, ".."+string(filepath.Separator)) {
+			t.Fatalf("external absolute target accepted: %q", target)
+		}
+		want := filepath.ToSlash(targetRel)
+		if archivePrefix != "" {
+			want = path.Join(archivePrefix, want)
+		}
+		if resolved != path.Clean(want) {
+			t.Fatalf("absolute target changed: name=%q target=%q prefix=%q result=%q resolved=%q want=%q",
+				name, target, archivePrefix, portable, resolved, want)
+		}
+	})
 }
 
 // FuzzApplyOverlay checks that no archive can make an overlay write outside

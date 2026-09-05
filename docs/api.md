@@ -110,7 +110,8 @@ agent from a recipe is:
   "workspace": {"name": "fix-ci", "repo": {"url": "https://github.com/o/r", "ref": "main"},
                 "labels": {"remount.binding.b_openai": "..."}},
   "spec": {"recipe": "opencode", "recipe_yaml": "...", "task": "make CI green",
-           "model": "openai/gpt-4o-mini", "sandbox": "workspace-write", "providers": ["openai"]},
+           "model": "openai/gpt-4o-mini", "sandbox": "workspace-write",
+           "providers": ["openai"], "binding_specs": ["b_openai:openai"]},
   "policy": {"approve": "on-request", "max_turns": 50, "sleep_after_sec": 900}
 }
 ```
@@ -118,6 +119,10 @@ agent from a recipe is:
 `spec.sandbox` accepts `read-only`, `workspace-write`, or `full`. An omitted
 value is normalized to `workspace-write` before the Agent is persisted or
 dispatched. A child Agent first inherits an omitted sandbox from its parent.
+`spec.binding_specs` contains non-secret `ID:PRESET` declarations. Every ID
+must occur in the target workspace's `bindings`; the node uses the declarations
+to construct recipe environment placeholders. Omission retains compatibility
+with workspaces carrying the older `remount.bindings` launch label.
 
 `ws` adopts an existing workspace instead of `workspace`. The task text goes
 into the inbox as the first message; events carry its hash, never the text.

@@ -929,7 +929,7 @@ func (r *agentRun) bindingEnv() (map[string]string, error) {
 	if spec.Recipe == "" && len(spec.ACPCommand) == 0 {
 		return nil, proto.Err(proto.CodeBadRequest, "agent has neither a recipe nor an acp command")
 	}
-	bindings, err := workspaceBindings(r.w.Spec.Labels)
+	bindings, err := agentBindings(spec, r.w.Spec)
 	if err != nil {
 		return nil, err
 	}
@@ -1080,8 +1080,8 @@ func (r *agentRun) record(stream uint8, data []byte) {
 
 // workspaceBindings reads the bindings `remount run` recorded on the
 // workspace so a run resolves the same placeholders a session would.
-func workspaceBindings(labels map[string]string) ([]launch.Binding, error) {
-	out, err := launch.BindingsFromLabels(labels)
+func agentBindings(spec proto.AgentSpec, wsSpec proto.WorkspaceSpec) ([]launch.Binding, error) {
+	out, err := launch.BindingsForWorkspace(spec.BindingSpecs, wsSpec.Labels, wsSpec.Bindings)
 	if err != nil {
 		return nil, proto.Err(proto.CodeBadRequest, "%v", err)
 	}

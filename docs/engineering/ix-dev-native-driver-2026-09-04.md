@@ -103,3 +103,44 @@ errors in `us-west-1`, which is ix.dev's default region, and that these VMs get
 no public IPv4 — so the node must dial out, and the binary upload path must not
 depend on `ix shell` stdin. If the default region misbehaves, set
 `REMOUNT_IX_REGION=us-east-1`; the driver passes it through as `IX_REGION`.
+
+## Live Agent validation, 2026-09-05
+
+A disposable ix.dev VM in `us-east-1` successfully ran a candidate Remount
+process node, dialed out to the Modal control plane, and claimed an existing
+workspace. Repeated Codex ACP launches then failed before `initialize`; debug
+node logs showed the generated launcher exiting under `set -u` because
+`OPENAI_API_KEY` was unset. The workspace had binding `b_openai`, but a direct
+`ws create --binding` had no `remount.bindings` launch label, so the node could
+not reconstruct the recipe environment even though `.remount/env` correctly
+contained `REMOUNT_REF_OPENAI`.
+
+The protocol now carries non-secret binding declarations on `AgentSpec`.
+`agent create --ws ... --binding ID:PRESET` preserves custom IDs and
+parameterized presets, the control plane verifies each ID is already attached
+to the workspace, child Agents inherit only declarations their parent held,
+and nodes retain the old workspace-label fallback.
+
+The rebuilt candidate was deployed to both the Modal control plane and the
+ix.dev node. A new Codex ACP Agent then initialized, completed one turn, wrote
+`IX_AGENT_PROOF.md`, read it itself, and stopped with `end_turn`. An independent
+`remount fs read` returned exactly:
+
+```text
+ix-agent-real
+binding-propagation-fixed
+```
+
+The Agent response retained `binding_specs: ["b_openai:openai"]`; the workspace
+still had binding `b_openai` and no launch labels. Durable events recorded the
+run, session, OpenAI egress, turn, destruction, and session exit. Destroying
+the Agent joined its ACP process, and a direct process check on the ix.dev VM
+found no remaining Codex adapter.
+
+The ix.dev base image had Codex but not its ACP adapter. Its first adapter fetch
+through the workspace proxy stalled at the npm registry, while direct VM
+network access worked, so the adapter was preinstalled into the disposable
+workspace before the successful Agent run. This validates a real remote
+Codex/API-key Agent and the binding-propagation fix; it does not validate
+on-demand npm bootstrap on ix.dev, other recipes, or production isolation. The
+node used the cooperative process backend.

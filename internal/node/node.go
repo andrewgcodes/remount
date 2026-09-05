@@ -4780,7 +4780,7 @@ func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error
 	defer n.releaseReconcileMu.Unlock()
 	n.mu.Lock()
 	if existing := n.prepared[req.WS]; existing != nil {
-		if existing.request.Gen != req.Gen || existing.request.OperationID != req.OperationID || existing.request.Snapshot != req.Snapshot || existing.request.Reason != req.Reason {
+		if !sameReleaseRequest(existing.request, *req) {
 			n.mu.Unlock()
 			return nil, proto.Err(proto.CodeConflict, "release retry does not match prepared operation")
 		}
@@ -4797,9 +4797,9 @@ func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error
 	}
 	n.mu.Unlock()
 	if record, ok := n.releaseRecord(req.WS); ok {
-		if record.State == releaseCommitted && req.Gen > record.Request.Gen {
-			// A higher control generation is authority to start the next release;
-			// beginRelease atomically replaces the older commit tombstone.
+		if startsNewReleaseCycle(record, *req) {
+			// A newer control epoch is authority to start the next release;
+			// beginRelease atomically replaces the older tombstone.
 		} else if !sameReleaseRequest(record.Request, *req) {
 			return nil, proto.Err(proto.CodeConflict, "release retry does not match durable operation")
 		} else {

@@ -27,6 +27,7 @@ race:
 fuzz:
 	go test ./internal/proto -run='^$$' -fuzz=FuzzDecodeFrame -fuzztime=$(FUZZTIME)
 	go test ./internal/artifact -run='^$$' -fuzz=FuzzRestore -fuzztime=$(FUZZTIME)
+	go test ./internal/artifact -run='^$$' -fuzz=FuzzPortableSymlinkTarget -fuzztime=$(FUZZTIME)
 	go test ./internal/fsops -run='^$$' -fuzz=FuzzResolve -fuzztime=$(FUZZTIME)
 	go test ./internal/broker -run='^$$' -fuzz=FuzzDestinationParsing -fuzztime=$(FUZZTIME)
 	go test ./internal/control -run='^$$' -fuzz=FuzzVerifyGrant -fuzztime=$(FUZZTIME)

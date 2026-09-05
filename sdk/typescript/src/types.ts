@@ -203,6 +203,7 @@ export interface AgentSpec {
   "task": string;
   "providers"?: Array<string>;
   "primary"?: string;
+  "binding_specs"?: Array<string>;
   "model"?: string;
   "sandbox"?: string;
   "acp_command"?: Array<string>;
@@ -1769,6 +1770,7 @@ export interface WSReleaseCommitReq {
 export interface WSReleaseReq {
   "ws": string;
   "gen": number;
+  "release_epoch"?: number;
   "operation"?: string;
   "snapshot": boolean;
   "reason"?: string;
@@ -1866,6 +1868,7 @@ export interface Workspace {
   "authz_revision"?: number;
   "revocations"?: Array<AuthzRevocation>;
   "revocation_floor"?: number;
+  "release_epoch"?: number;
   "release_operation"?: string;
   "quarantine_operation"?: string;
   "quarantined_at"?: number;

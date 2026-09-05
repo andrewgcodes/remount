@@ -207,6 +207,9 @@ const (
 	// CapabilityTieredSessionLogs: sealed session ranges are durably recorded
 	// as tenant-local blobs and can be replayed after node restart or handoff.
 	CapabilityTieredSessionLogs = "tiered-session-logs"
+	// CapabilityReleaseEpoch: release requests carry durable ordering authority
+	// so a delayed older cycle cannot replace an abort-published tombstone.
+	CapabilityReleaseEpoch = "release-epoch"
 	// CapabilityIdentityAdmin advertises the principal and tenant onboarding
 	// management operations. It is not a workspace enforcement requirement.
 	CapabilityIdentityAdmin = "identity-admin"
@@ -227,6 +230,7 @@ var knownCapabilities = []string{
 	CapabilitySessionCap,
 	CapabilityChunkedArtifacts,
 	CapabilityTieredSessionLogs,
+	CapabilityReleaseEpoch,
 	CapabilityIdentityAdmin,
 	CapabilityApprovals,
 	CapabilityEncryptedArtifacts,
@@ -251,6 +255,7 @@ var implementedCapabilities = []string{
 	CapabilitySessionCap,
 	CapabilityChunkedArtifacts,
 	CapabilityTieredSessionLogs,
+	CapabilityReleaseEpoch,
 	CapabilityIdentityAdmin,
 }
 
@@ -267,8 +272,8 @@ func PeerCapabilities() []string {
 // hole those profiles promise is closed.
 var profileCapabilities = map[string][]string{
 	SecurityLocal:       nil,
-	SecurityIsolated:    {CapabilityAuthzPush, CapabilityControllerEpoch, CapabilitySessionCap, CapabilityChunkedArtifacts, CapabilityTieredSessionLogs},
-	SecurityMultiTenant: {CapabilityAuthzPush, CapabilityControllerEpoch, CapabilitySessionCap, CapabilityChunkedArtifacts, CapabilityTieredSessionLogs},
+	SecurityIsolated:    {CapabilityAuthzPush, CapabilityControllerEpoch, CapabilitySessionCap, CapabilityChunkedArtifacts, CapabilityTieredSessionLogs, CapabilityReleaseEpoch},
+	SecurityMultiTenant: {CapabilityAuthzPush, CapabilityControllerEpoch, CapabilitySessionCap, CapabilityChunkedArtifacts, CapabilityTieredSessionLogs, CapabilityReleaseEpoch},
 }
 
 // SecurityCapabilities returns the named capabilities a peer must have

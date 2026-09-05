@@ -158,6 +158,64 @@ func TestSnapshotRestoreAndTarInteropAreByteIdentical(t *testing.T) {
 	}
 }
 
+func TestSnapshotRewritesInternalAbsoluteSymlink(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	target := filepath.Join(root, ".npm", "bin", "tool")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("portable"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, ".codex", "tmp", "arg0", "apply_patch")
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	store := newBlobStore(t)
+	result, err := Snapshot(ctx, store, root, SnapshotOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := filepath.Join(t.TempDir(), "restored")
+	if err := os.Mkdir(restored, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Restore(ctx, store, result.ManifestID, restored, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	restoredLink := filepath.Join(restored, ".codex", "tmp", "arg0", "apply_patch")
+	got, err := os.Readlink(restoredLink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.IsAbs(got) {
+		t.Fatalf("restored link is absolute: %q", got)
+	}
+	body, err := os.ReadFile(restoredLink)
+	if err != nil || string(body) != "portable" {
+		t.Fatalf("restored link body = %q, %v", body, err)
+	}
+}
+
+func TestSnapshotRejectsExternalAbsoluteSymlink(t *testing.T) {
+	root := t.TempDir()
+	external := filepath.Join(t.TempDir(), "external")
+	if err := os.WriteFile(external, []byte("external"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(root, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Snapshot(context.Background(), newBlobStore(t), root, SnapshotOptions{}); err == nil {
+		t.Fatal("snapshot accepted external absolute symlink")
+	}
+}
+
 func TestSnapshotUsesHeadAndSecondLargeSnapshotUploadsUnderOneMiB(t *testing.T) {
 	if testing.Short() {
 		t.Skip("500 MB generated acceptance fixture")

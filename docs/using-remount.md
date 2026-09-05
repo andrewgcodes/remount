@@ -119,6 +119,21 @@ inspection and interaction commands:
 ./remount agent diff AGENT_ID --stat
 ```
 
+To run an Agent in a workspace you created separately, repeat the workspace's
+binding with its provider preset:
+
+```sh
+WS=$(./remount ws create --binding b_team)
+./remount agent create codex --ws "$WS" --binding b_team:openai -- \
+  'Inspect the repository and fix the failing test.'
+```
+
+The Agent persists the non-secret `b_team:openai` declaration so the node can
+construct the recipe's `OPENAI_API_KEY` and `OPENAI_BASE_URL` placeholder
+environment. The control plane rejects a declaration whose binding ID is not
+attached to that workspace. Custom binding IDs and parameterized presets, such
+as `b_az:azure-openai?host=myres`, must be repeated exactly.
+
 `message` queues a follow-up. `--steer` requests a mid-turn interruption when
 the adapter supports it; otherwise the message remains a follow-up.
 
@@ -254,6 +269,11 @@ Workspace lifecycle:
 ./remount ws destroy "$WS"
 ```
 
+Release, move, sleep, and destroy cycles are ordered by a durable
+control-plane release epoch. Exact retries remain idempotent, while a delayed
+request from an older aborted cycle cannot fence or stop work in the restored
+workspace.
+
 The complete walkthrough, including bases, repository seeding, event-triggered
 wake, ACLs, and moves between two machines, is
 [`tutorial.md`](tutorial.md).
@@ -283,13 +303,21 @@ export OPENAI_API_KEY=...
   --data ./data \
   --bindings ./bindings.json \
   --allow api.openai.com \
-  --allow registry.npmjs.org
+  --allow registry.npmjs.org \
+  --allow models.dev \
+  --allow models.opencode.ai \
+  --allow opencode.ai
 ```
 
 A recipe binding such as `--binding b_openai` gives the workspace a
 shape-preserving placeholder and a broker URL. The node substitutes the real
 credential only for an authorized destination and records `cred.used`.
 Sending that placeholder to another host is blocked and recorded.
+The additional hosts above are the OpenCode recipe's install and model-catalog
+destinations. OpenCode's default model selection reaches `opencode.ai`; an
+explicit model does not remove the need to allow the other checked-in recipe
+hosts. Automatic local standalone derives these allowances from the recipe,
+but an explicitly started server must receive them through `--allow`.
 
 The process backend provides no host isolation. The built-in Docker backend is
 container isolation with cooperative proxy egress. Neither may be described

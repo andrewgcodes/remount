@@ -798,7 +798,9 @@ func TestReleaseSnapshotFailureRestoresSourceWithoutDestroy(t *testing.T) {
 	n.workspaces[w.ID] = w
 	n.deadlines[w.ID] = n.started.AddDate(1, 0, 0)
 	n.mu.Unlock()
-	if _, err := n.release(context.Background(), &proto.WSReleaseReq{WS: w.ID, Gen: 7, Snapshot: true}); err == nil {
+	if _, err := n.release(context.Background(), &proto.WSReleaseReq{
+		WS: w.ID, Gen: 7, ReleaseEpoch: 1, OperationID: "rel_first", Snapshot: true,
+	}); err == nil {
 		t.Fatal("release succeeded after snapshot failure")
 	}
 	n.mu.Lock()
@@ -824,6 +826,66 @@ func TestReleaseSnapshotFailureRestoresSourceWithoutDestroy(t *testing.T) {
 	n.mu.Unlock()
 	if restored != w {
 		t.Fatal("abort commit did not publish restored source")
+	}
+	record, ok = n.releaseRecord(w.ID)
+	if !ok || record.State != releasePublished {
+		t.Fatalf("release abort publication state=%+v present=%v", record, ok)
+	}
+	if _, err := n.release(context.Background(), &proto.WSReleaseReq{
+		WS: w.ID, Gen: w.Generation, ReleaseEpoch: 1, OperationID: "rel_delayed", Reason: "delayed",
+	}); !errors.Is(err, &proto.Error{Code: proto.CodeConflict}) {
+		t.Fatalf("same-epoch different operation accepted: %v", err)
+	}
+	if _, err := n.release(context.Background(), &proto.WSReleaseReq{
+		WS: w.ID, Gen: w.Generation, ReleaseEpoch: 2, OperationID: record.OperationID, Reason: "reused",
+	}); !errors.Is(err, &proto.Error{Code: proto.CodeConflict}) {
+		t.Fatalf("new epoch reused old operation identity: %v", err)
+	}
+	n.mu.Lock()
+	restored = n.workspaces[w.ID]
+	n.mu.Unlock()
+	if restored != w || h.destroyed.Load() != 0 {
+		t.Fatalf("stale release changed restored source: workspace=%p destroyed=%d", restored, h.destroyed.Load())
+	}
+	const nextOperation = "rel_next"
+	out, err := n.release(context.Background(), &proto.WSReleaseReq{
+		WS: w.ID, Gen: w.Generation, ReleaseEpoch: 2, OperationID: nextOperation, Reason: "retry",
+	})
+	if err != nil {
+		t.Fatalf("later release cycle: %v", err)
+	}
+	released := out.(proto.WSReleasedReq)
+	if released.OperationID != nextOperation {
+		t.Fatalf("later release operation = %q", released.OperationID)
+	}
+}
+
+func TestReleasePreparedRetryRequiresSameEpoch(t *testing.T) {
+	n := newTestNode(t, nil)
+	request := proto.WSReleaseReq{
+		WS: "ws_prepared", Gen: 3, ReleaseEpoch: 7, OperationID: "rel_prepared",
+		Snapshot: true, Reason: "sleep", Tenant: "local", Backend: "process",
+	}
+	n.mu.Lock()
+	n.prepared[request.WS] = &preparedRelease{request: request, done: make(chan struct{})}
+	n.mu.Unlock()
+	defer func() {
+		n.mu.Lock()
+		delete(n.prepared, request.WS)
+		n.mu.Unlock()
+	}()
+
+	retry := request
+	retry.ReleaseEpoch++
+	if _, err := n.release(context.Background(), &retry); !errors.Is(err, &proto.Error{Code: proto.CodeConflict}) {
+		t.Fatalf("prepared retry with another epoch error = %v, want conflict", err)
+	}
+	out, err := n.release(context.Background(), &request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released := out.(proto.WSReleasedReq); !released.Preparing || released.OperationID != request.OperationID {
+		t.Fatalf("exact prepared retry = %+v", released)
 	}
 }
 

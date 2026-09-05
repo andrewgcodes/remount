@@ -234,6 +234,11 @@ claims it and restores the snapshot.
 ./remount ws move $WS --label zone=gpu
 ```
 
+Control durably orders each release attempt before it reaches the node. Exact
+retries are idempotent, but a delayed request from an older aborted move,
+sleep, or destroy cycle cannot fence a workspace that has already been
+restored.
+
 ```
 moved: node=n_06g67csz3wmes8mengggemdaa4 gen=2 restored_from=art_sha256:6768a59fbdbb1c26f4…
 ```
