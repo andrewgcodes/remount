@@ -29,6 +29,12 @@ once. Every launch is bracketed by `run.started{recipe, task_hash, sandbox,
 auth}` and `run.finished{exit}` in the event log; the task text is never
 logged.
 
+When reusing `--ws`, `--security` is a minimum profile assertion, not an
+instruction to change the workspace. A weaker existing profile is rejected
+with `denied` before installing the harness, writing the launcher, or opening
+a session. A stronger existing profile remains unchanged. Omitting the flag
+uses the local minimum; it never downgrades the existing workspace policy.
+
 ### Recipes
 
 A recipe is a YAML file embedded in the binary (`internal/launch/recipes/`).

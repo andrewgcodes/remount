@@ -187,6 +187,11 @@ Session input has the same rule at byte-stream scale. A sequence advances only
 after every byte and requested EOF action succeeds. Advancing it after a short
 write would cause a retry to be deduplicated and silently lose the unwritten
 suffix.
+Not advancing the sequence is necessary but insufficient: resending the entire
+buffer duplicates the prefix already accepted by a partial write. Keep one
+bounded fingerprint and byte offset until the exact input and EOF complete.
+The regression must retry against the same writer; replacing it with an empty
+buffer conceals the duplicated effect.
 
 ## Lesson 6: bounded means every stage and every index
 

@@ -365,6 +365,13 @@ func Start(ctx context.Context, cl *client.Client, o Options) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
+		security, err := proto.NormalizeSecurity(ws.Spec.Security)
+		if err != nil {
+			return nil, err
+		}
+		if proto.ProfileRank(security.Profile) < proto.ProfileRank(o.Security) {
+			return nil, proto.Err(proto.CodeDenied, "workspace %s has security profile %s, below requested %s; create a workspace with the required profile", ws.ID, security.Profile, o.Security)
+		}
 		for _, b := range o.Bindings {
 			if !contains(ws.Spec.Bindings, b.ID) {
 				return nil, fmt.Errorf("workspace %s does not carry binding %s; bindings are fixed at ws create", ws.ID, b.ID)

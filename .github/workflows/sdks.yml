@@ -73,6 +73,9 @@ jobs:
           node -e 'require("@remount/sdk")'
           node --input-type=module -e 'import("@remount/sdk")'
 
+      - name: Verify strict-profile protocol interoperability
+        run: REMOUNT_SDK_CHECK=1 go test -race -count=1 -v ./integration/sdks
+
   live-e12:
     if: vars.REMOUNT_E12_URL != ''
     runs-on: ubuntu-latest
