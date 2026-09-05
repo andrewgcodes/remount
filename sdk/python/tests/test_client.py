@@ -440,6 +440,7 @@ async def test_snapshot_archive_and_apply_tar_helpers_encode_node_operations():
     socket = FakeSocket(
         {
             "fs.list": {"entries": [{"name": "file.txt", "size": 1, "mode": 0o644, "dir": False, "mtime": 0}]},
+            "fs.mkdir": {},
             "fs.apply_tar": {"files": 1, "dirs": 0, "bytes": 1},
             "ws.snapshot": {
                 "artifact": "art_sha256:" + "0" * 64,
@@ -461,6 +462,7 @@ async def test_snapshot_archive_and_apply_tar_helpers_encode_node_operations():
 
     client = Client("https://cp.example", "token", connector=connector)
     entries = await client.list_files("ws_1", "workspace")
+    await client.mkdir("ws_1", "state", idempotency_key="idem_mkdir")
     applied = await client.apply_tar("ws_1", "art_sha256:" + "2" * 64, path="state")
     snapshot = await client.snapshot_workspace("ws_1", authoritative=True)
     archive = await client.archive_path("ws_1", "workspace")
@@ -472,8 +474,10 @@ async def test_snapshot_archive_and_apply_tar_helpers_encode_node_operations():
     bodies = {
         frame["op"]: cbor2.loads(frame["body"])
         for frame in socket.sent
-        if frame.get("op") in {"fs.apply_tar", "ws.snapshot", "volume.archive"}
+        if frame.get("op") in {"fs.mkdir", "fs.apply_tar", "ws.snapshot", "volume.archive"}
     }
+    assert bodies["fs.mkdir"]["path"] == "state"
+    assert bodies["fs.mkdir"]["idem"] == "idem_mkdir"
     assert bodies["fs.apply_tar"]["format"] == "tar"
     assert bodies["fs.apply_tar"]["path"] == "state"
     assert bodies["ws.snapshot"]["upload"] is True
