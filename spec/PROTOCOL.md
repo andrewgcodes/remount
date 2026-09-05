@@ -776,7 +776,7 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `fs.rename` | `FSRenameReq{ws, old, new, idem}` → `{}` |
 | `fs.search` | `FSSearchReq{ws, path, pattern, glob, max}` → `FSSearchRes{matches, truncated}` |
 | `fs.edit` | `FSEditReq{ws, path, edits, idem}` → `FSEditRes{replacements}` |
-| `fs.apply_tar` | `FSApplyTarReq{ws, artifact, format, idem}` → `FSApplyTarRes{files, dirs, bytes}`; `format` is the artifact's representation (§10) and an absent value means the legacy `tar` |
+| `fs.apply_tar` | `FSApplyTarReq{ws, artifact, path?, format, idem}` → `FSApplyTarRes{files, dirs, bytes}`; `path` is an existing destination directory and defaults to the workspace root; `format` is the artifact's representation (§10) and an absent value means the legacy `tar` |
 | `ws.snapshot` | `WSSnapshotReq{ws, upload, authoritative, idem}` → `WSSnapshotRes{artifact, bytes, consistency, authoritative}` |
 | `volume.archive` | `VolumeArchiveReq{ws, path, upload, idem}` → `WSSnapshotRes`; creates a non-authoritative artifact for a jailed subdirectory |
 | `volume.publish` | `VolumePublishPathReq{ws, path, volume, expected_version, idem}` → `Volume`; holds the tree boundary through the control-plane CAS |
@@ -812,10 +812,14 @@ operation identity before authorizing the next lifecycle operation.
 match exactly once unless `all` is set. If any edit fails to apply, the file is
 not written and the response is `conflict`.
 
-`fs.apply_tar` overlays an artifact (§10) onto the workspace tree. The node
-fetches and fully validates the archive under the same limits as a restore
-before it touches the tree; every regular file then lands by rename into its
-final path, so a reader never sees a partially written file. Paths the archive
+`fs.apply_tar` overlays an artifact (§10) onto the workspace tree, or into the
+existing workspace directory named by `path`. The empty path selects the
+workspace root. The destination is resolved through the workspace jail after
+the tree boundary is acquired; node-owned `.remount/` destinations are refused.
+The node fetches and fully validates the archive under the same limits as a
+restore before it touches the tree; every regular file then lands by rename
+into its final path, so a reader never sees a partially written file. Paths the
+archive
 does not name are left in place, `.remount/` is refused, and an entry that
 would replace a directory with a file, or write through a symlinked parent,
 fails the whole request with `bad_request`. The response counts what was

@@ -2413,6 +2413,9 @@
         "idem": {
           "type": "string"
         },
+        "path": {
+          "type": "string"
+        },
         "ws": {
           "type": "string"
         }

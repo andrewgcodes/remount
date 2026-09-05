@@ -48,9 +48,12 @@ func TestMCPGatewayCarriesApplyArtifactFormat(t *testing.T) {
 	}
 
 	gateway := &mcp.ClientGateway{Client: c}
+	if err := c.Mkdir(ctx, ws.ID, "state"); err != nil {
+		t.Fatal(err)
+	}
 	invoke := func(format string) (any, error) {
 		raw, err := json.Marshal(proto.FSApplyTarReq{
-			WS: ws.ID, Artifact: result.ManifestID, Format: format,
+			WS: ws.ID, Artifact: result.ManifestID, Path: "state", Format: format,
 			IdempotencyKey: "apply-" + format,
 		})
 		if err != nil {
@@ -73,7 +76,7 @@ func TestMCPGatewayCarriesApplyArtifactFormat(t *testing.T) {
 		"lib/util.go":  "package lib\n",
 		"docs/read.md": "hello from the chunked representation\n",
 	} {
-		got, err := c.ReadFile(context.Background(), ws.ID, path)
+		got, err := c.ReadFile(context.Background(), ws.ID, "state/"+path)
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}

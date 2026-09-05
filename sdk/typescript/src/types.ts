@@ -709,6 +709,7 @@ export interface ExitInfo {
 export interface FSApplyTarReq {
   "ws": string;
   "artifact": string;
+  "path"?: string;
   "format"?: string;
   "idem"?: string;
   "grant"?: Grant | null;

@@ -301,6 +301,12 @@ WS=$(./remount ws create --dir ~/src/myapp --json | jq -r .id)
 atomically; `pull` never deletes local files either and reports the ones it
 left in place.
 
+Applications using a workspace as several independent subtrees can target an
+uploaded overlay at one existing directory through the public SDK. Python uses
+`apply_tar(..., path="state")`; Go uses `ApplyTarAt(..., "state")`. The node
+resolves the destination through the workspace jail and keeps the existing
+root-overlay behavior when the path is empty.
+
 ### Bases: a prepared workspace many runs start from
 
 Once a workspace has the toolchain installed and the repo cloned, pin its
