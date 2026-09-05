@@ -269,6 +269,11 @@ Workspace lifecycle:
 ./remount ws destroy "$WS"
 ```
 
+Release, move, sleep, and destroy cycles are ordered by a durable
+control-plane release epoch. Exact retries remain idempotent, while a delayed
+request from an older aborted cycle cannot fence or stop work in the restored
+workspace.
+
 The complete walkthrough, including bases, repository seeding, event-triggered
 wake, ACLs, and moves between two machines, is
 [`tutorial.md`](tutorial.md).

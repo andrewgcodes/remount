@@ -185,6 +185,57 @@ func TestAgentBindingSpecsAreWireCompatible(t *testing.T) {
 	}
 }
 
+func TestReleaseEpochIsWireCompatible(t *testing.T) {
+	type legacyWorkspace struct {
+		ID               string `cbor:"id"`
+		Generation       uint64 `cbor:"gen"`
+		ReleaseOperation string `cbor:"release_operation,omitempty"`
+	}
+	type legacyReleaseRequest struct {
+		WS          string `cbor:"ws"`
+		Gen         uint64 `cbor:"gen"`
+		OperationID string `cbor:"operation,omitempty"`
+	}
+
+	var oldWorkspace legacyWorkspace
+	if err := Unmarshal(MustMarshal(Workspace{
+		ID: "ws_1", Generation: 4, ReleaseEpoch: 9, ReleaseOperation: "rel_9",
+	}), &oldWorkspace); err != nil {
+		t.Fatal(err)
+	}
+	if oldWorkspace.ID != "ws_1" || oldWorkspace.Generation != 4 || oldWorkspace.ReleaseOperation != "rel_9" {
+		t.Fatalf("legacy workspace = %+v", oldWorkspace)
+	}
+	var currentWorkspace Workspace
+	if err := Unmarshal(MustMarshal(legacyWorkspace{
+		ID: "ws_1", Generation: 4, ReleaseOperation: "rel_legacy",
+	}), &currentWorkspace); err != nil {
+		t.Fatal(err)
+	}
+	if currentWorkspace.ReleaseEpoch != 0 {
+		t.Fatalf("legacy workspace release epoch = %d", currentWorkspace.ReleaseEpoch)
+	}
+
+	var oldRequest legacyReleaseRequest
+	if err := Unmarshal(MustMarshal(WSReleaseReq{
+		WS: "ws_1", Gen: 4, ReleaseEpoch: 9, OperationID: "rel_9",
+	}), &oldRequest); err != nil {
+		t.Fatal(err)
+	}
+	if oldRequest.WS != "ws_1" || oldRequest.Gen != 4 || oldRequest.OperationID != "rel_9" {
+		t.Fatalf("legacy release request = %+v", oldRequest)
+	}
+	var currentRequest WSReleaseReq
+	if err := Unmarshal(MustMarshal(legacyReleaseRequest{
+		WS: "ws_1", Gen: 4, OperationID: "rel_legacy",
+	}), &currentRequest); err != nil {
+		t.Fatal(err)
+	}
+	if currentRequest.ReleaseEpoch != 0 {
+		t.Fatalf("legacy release request epoch = %d", currentRequest.ReleaseEpoch)
+	}
+}
+
 func TestDecodeRejectsUnsupportedVersion(t *testing.T) {
 	for _, version := range []uint8{0, Version + 1} {
 		b, err := cbor.Marshal(Frame{V: version, T: KindReq, Op: "test"})

@@ -1448,3 +1448,30 @@ egress was durably recorded, and Agent destruction left no adapter process.
 Persist both at the durable Agent boundary, validate interpretation against
 attachment authority, and do not try to recover launch intent from optional
 workspace labels.
+
+---
+
+## 56. A different release operation ID was mistaken for a newer cycle
+
+After a failed release was restored and published, the node retained the
+abort-published journal record. It allowed another same-generation cycle when
+the new request's operation ID merely differed from that record. The operation
+ID was exact-retry identity, not ordering proof. A delayed request from an
+older cycle could therefore replace a later tombstone, stop new sessions, and
+fence a workspace control had already restored.
+
+Workspaces now retain a monotonically increasing release epoch. Control
+increments and persists it with the lifecycle transition before sending the
+release request. The node requires a greater epoch to replace an
+abort-published same-generation tombstone and still requires every field to
+match for an exact retry.
+
+**Proof.** A whole-system simulation drives three real release/abort cycles,
+injects the first release frame after the second abort publication, and proves
+the restored workspace still accepts filesystem work and keeps a fresh session
+running. The third ordered cycle remains authorized. Protocol compatibility
+tests cover old records that decode with epoch zero.
+
+**Lesson.** Uniqueness is not recency. When delayed destructive requests are
+possible, successor authority must be durably ordered or explicitly linked;
+opaque idempotency identifiers cannot supply that relationship.

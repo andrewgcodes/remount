@@ -78,7 +78,8 @@ func (c *Control) ReconcileRecovery(ctx context.Context) error {
 			seen[release.Request.WS] = report.Node
 			workspace := proto.Workspace{
 				ID: release.Request.WS, Tenant: release.Request.Tenant, Generation: release.Request.Gen,
-				Node: report.Node, State: proto.WSClaiming, Spec: release.Request.Spec, ReleaseOperation: release.OperationID,
+				Node: report.Node, State: proto.WSClaiming, Spec: release.Request.Spec,
+				ReleaseEpoch: observedReleaseEpoch(release.Request), ReleaseOperation: release.OperationID,
 			}
 			workspace.Spec.Requires.Backend = release.Request.Backend
 			if err := c.reconcileObservedWorkspace(ctx, report.Node, workspace, &release, 0, recovery); err != nil {
@@ -172,6 +173,10 @@ func (c *Control) reconcileObservedWorkspace(ctx context.Context, node string, o
 	next.Node = node
 	next.LeaseUntil = c.now().Add(time.Duration(c.opts.LeaseSec) * time.Second).UnixMilli()
 	if release != nil {
+		releaseEpoch := observedReleaseEpoch(release.Request)
+		if next.ReleaseEpoch < releaseEpoch {
+			next.ReleaseEpoch = releaseEpoch
+		}
 		next.ReleaseOperation = release.OperationID
 	}
 	event := c.wsEvent(&next, proto.EvControlReconciled, "", node, map[string]any{
@@ -192,4 +197,11 @@ func (c *Control) reconcileObservedWorkspace(ctx context.Context, node string, o
 		return c.finishReleaseAbort(ctx, next.ID, node, next.Generation, release.OperationID)
 	}
 	return nil
+}
+
+func observedReleaseEpoch(request proto.WSReleaseReq) uint64 {
+	if request.ReleaseEpoch == 0 {
+		return 1
+	}
+	return request.ReleaseEpoch
 }

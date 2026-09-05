@@ -62,6 +62,7 @@ type world struct {
 
 	mu          sync.Mutex
 	conns       []*fault // every live pipe end handed to a dialer
+	serverConns map[string]transport.Conn
 	nodeCancels map[string]context.CancelFunc
 	nodeDone    map[string]<-chan error
 	// peerHooks and serverHooks rewrite or drop frames sent by, respectively,
@@ -99,7 +100,8 @@ func newWorldWith(t *testing.T, adjust func(*server.Options)) *world {
 	w := &world{
 		t: t, artifactDir: filepath.Join(dataDir, "artifacts"), srv: srv,
 		http: hs, ctx: ctx, cancel: cancel, nodeCancels: make(map[string]context.CancelFunc), nodeDone: make(map[string]<-chan error),
-		peerHooks: make(map[string]func(*proto.Frame) bool), serverHooks: make(map[string]func(*proto.Frame) bool),
+		serverConns: make(map[string]transport.Conn),
+		peerHooks:   make(map[string]func(*proto.Frame) bool), serverHooks: make(map[string]func(*proto.Frame) bool),
 	}
 	t.Cleanup(func() {
 		cancel()
@@ -120,6 +122,7 @@ func (w *world) dialer(who string) transport.Dialer {
 		if hook := w.serverHooks[who]; hook != nil {
 			transport.SetHook(b, hook)
 		}
+		w.serverConns[who] = b
 		w.mu.Unlock()
 		go w.srv.AcceptConn(w.ctx, b)
 		f := &fault{Conn: a, who: who}
@@ -128,6 +131,16 @@ func (w *world) dialer(who string) transport.Dialer {
 		w.mu.Unlock()
 		return f, nil
 	})
+}
+
+func (w *world) sendToPeer(ctx context.Context, who string, frame *proto.Frame) error {
+	w.mu.Lock()
+	conn := w.serverConns[who]
+	w.mu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("peer %s has no server connection", who)
+	}
+	return conn.Send(ctx, frame)
 }
 
 // cut closes every live connection belonging to who.
