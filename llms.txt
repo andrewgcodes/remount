@@ -30,6 +30,7 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/re
 - [Operate a durable Agent](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#operate-a-durable-agent): An Agent owns a workspace and a durable transcript.
 - [Retrieve modified files](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#retrieve-modified-files): Agent changes live in the workspace, not automatically in the original host checkout.
 - [Use workspace primitives directly](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#use-workspace-primitives-directly): Start a manual local deployment:
+- [Run browser and virtual desktop workloads](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#run-browser-and-virtual-desktop-workloads): Remount does not ship a browser, display server, window manager, VNC server, or mobile client.
 - [Broker provider credentials](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#broker-provider-credentials): Provider keys belong in the server or node environment, never in a workspace or committed bindings file.
 - [Deploy the Modal reference](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#deploy-the-modal-reference): `deploy/modal_app.py` is a reference deployment of one control plane and one process-backend node in one Modal container.
 - [Provider-backed nodes are not credential checks](https://github.com/remount-dev/remount/blob/main/docs/using-remount.md#provider-backed-nodes-are-not-credential-checks): Fly, E2B, Modal, ix.dev, and SSH pool drivers create whole Remount nodes.
@@ -53,6 +54,7 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/re
 ## Harness integration
 
 - [`remount run`: one command from a checkout to a working agent](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#remount-run-one-command-from-a-checkout-to-a-working-agent): `run` creates a workspace from `--dir` (or `--base NAME`, or reuses `--ws WS`), installs the harness if the image lacks it, writes a launcher under `.remount/launch/`, and opens a session that runs it.
+- [Browser and virtual desktop workloads](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#browser-and-virtual-desktop-workloads): Remount supervises filesystem and process sessions; it does not implement a display server or VNC protocol.
 - [Verified: OpenAI Codex CLI](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#verified-openai-codex-cli): We ran Codex CLI 0.152.1 inside a Remount workspace on macOS with the `process` backend.
 - [The general pattern for any harness](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#the-general-pattern-for-any-harness): Every harness has a variable for where the model lives and a variable for the key.
 - [HTTP_PROXY mode](https://github.com/remount-dev/remount/blob/main/docs/harness-integration.md#http_proxy-mode): The broker is also an ordinary HTTP forward proxy.

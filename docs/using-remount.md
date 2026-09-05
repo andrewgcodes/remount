@@ -23,6 +23,7 @@ the documentation drift. The wire-level authority is
 | Keep a structured agent alive across disconnects, sleep, or node loss | [Durable Agents](#operate-a-durable-agent) |
 | Read or bring back files an agent changed | [Retrieve modified files](#retrieve-modified-files) |
 | Use workspaces directly as remote filesystems and process hosts | [Workspace primitives](#use-workspace-primitives-directly) |
+| Run Chromium on a virtual X11 desktop or through VNC | [Browser and desktop workloads](#run-browser-and-virtual-desktop-workloads) |
 | Try the checked-in deployment on Modal | [Modal reference deployment](#deploy-the-modal-reference) |
 | Operate a production control plane or node fleet | [`operations.md`](operations.md) |
 | Integrate a custom harness or model provider | [`harness-integration.md`](harness-integration.md) |
@@ -278,6 +279,59 @@ The complete walkthrough, including bases, repository seeding, event-triggered
 wake, ACLs, and moves between two machines, is
 [`tutorial.md`](tutorial.md).
 
+## Run browser and virtual desktop workloads
+
+Remount does not ship a browser, display server, window manager, VNC server, or
+mobile client. It can host those processes when the selected node image already
+contains them. A validated Linux composition is Xvfb, Openbox, Chromium, and
+x11vnc, with xdotool available for direct XTEST input.
+
+Install desktop packages in the node image rather than assuming a locked-down
+workspace can run the operating-system package manager. Keep ephemeral browser
+state out of snapshots:
+
+```sh
+WS=$(./remount ws create --name desktop \
+  --exclude .chromium-profile \
+  --exclude node_modules)
+./remount exec "$WS" -- ./desktop-run.sh
+```
+
+`desktop-run.sh` should keep its supervisor in the foreground. Ctrl-C detaches
+the initiating client while the Remount session and desktop processes continue.
+A fresh client can replay the supervisor output:
+
+```sh
+./remount attach "$WS" SESSION_ID --from 0
+```
+
+If x11vnc listens only on workspace loopback, expose it to the current client
+with a loopback-only Remount tunnel:
+
+```sh
+./remount port "$WS" 5900 --local 127.0.0.1:5900
+```
+
+That tunnel exists only while the client command runs. Phone access after a
+laptop shuts down therefore requires a separate authenticated web or mobile
+client that opens the Remount port/session; Remount is the durable workspace
+and transport substrate, not that finished UI.
+
+Do not expose `x11vnc -nopw` beyond workspace loopback. VNC without an
+authenticated encrypted outer transport is not safe for production. A process
+or Docker backend also does not become hardened multi-tenant isolation merely
+because the desktop is remote.
+
+Browser profile directories commonly contain host- or process-specific
+singleton symlinks. Snapshot and `pull` correctly reject unsafe symlinks rather
+than exporting them. Put the profile under an exclusion chosen when the
+workspace is created, or stop the browser and remove disposable profile state
+before snapshotting. Do not weaken symlink validation.
+
+The exact process layout, persistence boundaries, broker rules, and verification
+checklist are in
+[`harness-integration.md`](harness-integration.md#browser-and-virtual-desktop-workloads).
+
 ## Broker provider credentials
 
 Provider keys belong in the server or node environment, never in a workspace
@@ -461,7 +515,7 @@ contracts:
 
 - [`tutorial.md`](tutorial.md): exact first-use and workspace walkthrough.
 - [`harness-integration.md`](harness-integration.md): recipes, ACP/PTY behavior,
-  provider bindings, handoff, queues, and custom harnesses.
+  provider bindings, handoff, queues, custom harnesses, and virtual desktops.
 - [`operations.md`](operations.md): production deployment and fleet operation.
 - [`api.md`](api.md): Agent HTTP API.
 - [`spec/PROTOCOL.md`](../spec/PROTOCOL.md): normative protocol.
