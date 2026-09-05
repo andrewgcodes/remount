@@ -1470,11 +1470,18 @@ match for an exact retry.
 injects the first release frame after the second abort publication, and proves
 the restored workspace still accepts filesystem work and keeps a fresh session
 running. The third ordered cycle remains authorized. Protocol compatibility
-tests cover old records that decode with epoch zero.
+tests cover old records that decode with epoch zero. A prepared-release
+regression rejects operation-ID reuse with another epoch before the journal
+path, generated-schema checks expose the field to typed SDK consumers, and a
+failover fixture proves an abort-published record advances the restored
+workspace epoch before the next release.
 
 **Lesson.** Uniqueness is not recency. When delayed destructive requests are
 possible, successor authority must be durably ordered or explicitly linked;
-opaque idempotency identifiers cannot supply that relationship.
+opaque idempotency identifiers cannot supply that relationship. Enforce the
+same request identity at every retry cache, regenerate every public projection
+of an additive field, and reconcile ordering metadata from all authenticated
+representations of one live resource.
 
 ---
 

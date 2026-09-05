@@ -26,7 +26,8 @@ the ordered epoch and an opaque operation ID.
 The node applies these rules:
 
 - an exact retry must match generation, release epoch, operation ID, and all
-  release parameters;
+  release parameters, whether the release is still in memory or has reached
+  the durable journal;
 - a same-generation request may replace an abort-published tombstone only when
   its nonzero release epoch is greater and its operation ID is distinct;
 - a higher generation may replace a committed tombstone;
@@ -35,7 +36,9 @@ The node applies these rules:
 
 Abort publication clears only the active operation ID in control state. The
 release epoch remains durable across restoration, restart, re-adoption, move,
-sleep, and destroy.
+sleep, and destroy. Promotion reconciles the greatest epoch present in either
+the live workspace report or its abort-published release record before
+authorizing another lifecycle operation.
 
 ## Consequences
 
@@ -43,6 +46,8 @@ sleep, and destroy.
 - Exact request and acknowledgement retries remain idempotent.
 - A control-authorized later cycle can safely replace an abort-published
   tombstone.
+- The generated protocol schema and Python and TypeScript SDK types expose the
+  epoch on both workspaces and release requests.
 - The additive field decodes as zero for older records and peers. A legacy
   first cycle remains readable, but a legacy successor after abort publication
   fails closed because it carries no ordering proof. Recovery assigns an

@@ -6198,6 +6198,9 @@
         "reason": {
           "type": "string"
         },
+        "release_epoch": {
+          "type": "integer"
+        },
         "snapshot": {
           "type": "boolean"
         },
@@ -6509,6 +6512,9 @@
           "type": "string"
         },
         "quarantined_at": {
+          "type": "integer"
+        },
+        "release_epoch": {
           "type": "integer"
         },
         "release_operation": {
