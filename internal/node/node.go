@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -3003,7 +3004,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		clean.Grant = nil
 		key := n.mutationKey(f.From, w.ID, proto.OpFSApplyTar, req.IdempotencyKey)
 		raw, err := n.runMutation(ctx, key, clean, func() ([]byte, error) {
-			return n.applyTar(ctx, w, req.Artifact, req.Format, f.From)
+			return n.applyTar(ctx, w, req.Artifact, req.Format, req.Path, f.From)
 		})
 		if err != nil {
 			return nil, err
@@ -4038,7 +4039,7 @@ func (n *Node) authorizeArtifactRequest(ctx context.Context, w *proto.Workspace,
 // into the one interoperable archive and handed to the same ApplyOverlay, so
 // there is exactly one implementation of the containment, validate-before-
 // rename and atomic-landing rules.
-func (n *Node) applyTar(ctx context.Context, w *ws, id, format, client string) ([]byte, error) {
+func (n *Node) applyTar(ctx context.Context, w *ws, id, format, target, client string) ([]byte, error) {
 	format, err := proto.NormalizeArtifactFormat(format)
 	if err != nil {
 		return nil, err
@@ -4069,7 +4070,29 @@ func (n *Node) applyTar(ctx context.Context, w *ws, id, format, client string) (
 	if !ok {
 		return nil, proto.Err(proto.CodeUnsupported, "backend %s has no host filesystem for archive apply", w.handle.Backend())
 	}
-	res, err := artifact.ApplyOverlay(host.Root(), rc, limits)
+	root, err := host.Resolve(target)
+	if err != nil {
+		return nil, err
+	}
+	rel, err := filepath.Rel(host.Root(), root)
+	if err != nil {
+		return nil, proto.Err(proto.CodeBadRequest, "fs.apply_tar: resolve destination: %v", err)
+	}
+	if rel == EnvFileDir || strings.HasPrefix(rel, EnvFileDir+string(filepath.Separator)) {
+		return nil, proto.Err(proto.CodeDenied, "fs.apply_tar: destination is node-owned")
+	}
+	eventPath := filepath.ToSlash(rel)
+	if rel == "." {
+		eventPath = ""
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		return nil, proto.Err(proto.CodeBadRequest, "fs.apply_tar: destination: %v", err)
+	}
+	if !info.IsDir() {
+		return nil, proto.Err(proto.CodeBadRequest, "fs.apply_tar: destination must be a directory")
+	}
+	res, err := artifact.ApplyOverlay(root, rc, limits)
 	// Close joins the archive producer. A reconstruction goroutine that is
 	// merely asked to stop can still be running after this operation returns.
 	if closeErr := rc.Close(); err == nil {
@@ -4080,10 +4103,12 @@ func (n *Node) applyTar(ctx context.Context, w *ws, id, format, client string) (
 	if len(res.Paths) > 0 || res.Dirs > 0 {
 		n.emit(proto.EvFSApplyTar, w.ID, w.Spec.Principal, map[string]any{
 			"artifact": id, "files": len(res.Paths), "dirs": res.Dirs, "bytes": res.Bytes, "client": client,
-			"complete": err == nil,
+			"path": eventPath, "complete": err == nil,
 		})
 		for _, p := range res.Paths {
-			n.emit(proto.EvFSWrite, w.ID, w.Spec.Principal, map[string]any{"path": p, "artifact": id, "client": client})
+			n.emit(proto.EvFSWrite, w.ID, w.Spec.Principal, map[string]any{
+				"path": path.Join(eventPath, p), "artifact": id, "client": client,
+			})
 		}
 	}
 	if err != nil {

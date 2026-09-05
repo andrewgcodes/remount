@@ -20,6 +20,39 @@ agent states or pending approvals with explicit deadlines, and attaches the
 terminal WebSocket. A terminal exposes `session` and `next_seq`; pass both to
 `connect_terminal` after a disconnect to resume retained output.
 
+The lower-level workspace client exposes the lifecycle and filesystem
+operations needed by custom harnesses:
+
+```python
+from remount import Client
+
+async with Client("https://remount.example", token="...") as remount:
+    workspace = await remount.create_workspace({"requires": {"backend": "gvisor"}})
+    workspace_id = workspace["id"]
+    await remount.wait_workspace(workspace_id)
+    await remount.write_file(workspace_id, "workspace/input.txt", b"hello")
+    await remount.mkdir(workspace_id, "state")
+    session = await remount.exec(workspace_id, ["cat", "input.txt"], cwd="workspace")
+    async for chunk in session:
+        print(chunk.data.decode(), end="")
+    snapshot = await remount.snapshot_workspace(workspace_id, authoritative=True)
+    await remount.sleep_workspace(
+        workspace_id,
+        on_event="example.workspace.resume",
+        match={"workspace": workspace_id},
+    )
+    await remount.post_event(
+        "example.workspace.resume",
+        stream=workspace_id,
+        payload={"workspace": workspace_id},
+    )
+    await remount.wait_workspace(workspace_id)
+```
+
+`write_file` splits large values into wire-safe chunks. If a later chunk
+fails, the workspace contains the acknowledged prefix; retry the same bytes
+with the same explicit `idempotency_key` to continue without duplicating it.
+
 Package publication and live-provider validation are release gates; this tree
 only builds and tests the package locally.
 

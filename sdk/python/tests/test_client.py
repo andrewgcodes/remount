@@ -6,7 +6,12 @@ import httpx
 import pytest
 
 from remount import Client, ProtocolError
-from remount.client import PEER_CAPABILITIES, Session
+from remount.client import (
+    MAX_FILE_CHUNK_BYTES,
+    MAX_FRAME_BYTES,
+    PEER_CAPABILITIES,
+    Session,
+)
 
 
 def test_decodes_go_protocol_golden_fixture():
@@ -19,7 +24,7 @@ def test_decodes_go_protocol_golden_fixture():
 
 
 class FakeSocket:
-    def __init__(self):
+    def __init__(self, responses=None):
         self.incoming = __import__("asyncio").Queue()
         self.closed = False
         self.sent = []
@@ -27,6 +32,7 @@ class FakeSocket:
         self.caps = ["v1"]
         self.epoch = 0
         self.early_frames = []
+        self.responses = responses or {}
 
     async def send(self, wire):
         frame = cbor2.loads(wire)
@@ -44,7 +50,8 @@ class FakeSocket:
             self.attached.set()
             body = {"s": "s_1", "next": 4}
         else:
-            body = {}
+            configured = self.responses.get(frame["op"], {})
+            body = configured(frame) if callable(configured) else configured
         await self.incoming.put(cbor2.dumps({"v": 1, "t": "res", "controller_epoch": self.epoch, "id": frame["id"], "op": frame.get("op", ""), "from": frame.get("to", ""), "body": cbor2.dumps(body)}))
 
     async def close(self):
@@ -154,6 +161,25 @@ async def test_artifact_download_verifies_digest():
         client = Client("https://cp.example", "token", http_client=http)
         with pytest.raises(ProtocolError, match="digest mismatch"):
             await client.download_artifact(artifact_id)
+
+
+@pytest.mark.asyncio
+async def test_artifact_http_omits_empty_bearer_token():
+    payload = b"artifact"
+    artifact_id = "art_sha256:" + hashlib.sha256(payload).hexdigest()
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = Client("https://cp.example", "", http_client=http)
+        assert await client.download_artifact(artifact_id) == payload
+        assert await client.upload_artifact(payload) == (artifact_id, len(payload))
+
+    assert [request.method for request in requests] == ["GET", "PUT"]
+    assert all("authorization" not in request.headers for request in requests)
 
 
 @pytest.mark.asyncio
@@ -329,3 +355,300 @@ async def test_orphan_routing_metadata_is_charged_to_the_byte_limit(monkeypatch)
     assert socket.closed
     assert not client._orphans and client._orphan_bytes == 0
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_workspace_lifecycle_helpers_encode_control_operations():
+    socket = FakeSocket(
+        {
+            "ws.get": {"id": "ws_1", "state": "claimed"},
+            "ws.sleep": {"id": "timer_1"},
+            "events.post": {},
+            "ws.wake": {"id": "ws_1", "state": "claiming"},
+        }
+    )
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client("https://cp.example", "token", connector=connector)
+    workspace = await client.wait_workspace("ws_1", timeout=1)
+    timer = await client.sleep_workspace(
+        "ws_1", after_sec=30, on_event="job.done", match={"id": "job_1"}
+    )
+    await client.post_event("job.done", stream="ws_1", payload={"id": "job_1"})
+    waking = await client.wake_workspace("ws_1")
+
+    assert workspace["state"] == "claimed"
+    assert timer["id"] == "timer_1"
+    assert waking["state"] == "claiming"
+    bodies = {
+        frame["op"]: cbor2.loads(frame["body"])
+        for frame in socket.sent
+        if frame.get("op") in {"ws.sleep", "events.post", "ws.wake"}
+    }
+    assert bodies["ws.sleep"]["after_sec"] == 30
+    assert bodies["ws.sleep"]["match"] == {"id": "job_1"}
+    posted = bodies["events.post"]["events"][0]
+    assert posted["type"] == "job.done"
+    assert posted["stream"] == "ws_1"
+    assert cbor2.loads(posted["payload"]) == {"id": "job_1"}
+    assert bodies["ws.wake"]["id"] == "ws_1"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_workspace_wait_timeout_bounds_stalled_requests():
+    socket = FakeSocket()
+    original_send = socket.send
+
+    async def send(wire):
+        frame = cbor2.loads(wire)
+        if frame["t"] == "hello":
+            await original_send(wire)
+
+    socket.send = send
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client(
+        "https://cp.example",
+        "token",
+        connector=connector,
+        retries=1,
+        request_timeout=0.01,
+    )
+    loop = __import__("asyncio").get_running_loop()
+    started = loop.time()
+    with pytest.raises(TimeoutError, match="did not reach"):
+        await client.wait_workspace("ws_1", timeout=0.05, poll_interval=0.001)
+    assert 0.04 <= loop.time() - started < 0.5
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_workspace_wait_validates_inputs():
+    client = Client("https://cp.example", "token")
+    with pytest.raises(ValueError, match="at least one state"):
+        await client.wait_workspace("ws_1", states=())
+    with pytest.raises(ValueError, match="must be positive"):
+        await client.wait_workspace("ws_1", timeout=0)
+    with pytest.raises(ValueError, match="must be positive"):
+        await client.wait_workspace("ws_1", poll_interval=0)
+
+
+@pytest.mark.asyncio
+async def test_sleep_workspace_requires_wake_trigger():
+    client = Client("https://cp.example", "token", connector=FakeSocket)
+    with pytest.raises(ValueError, match="requires"):
+        await client.sleep_workspace("ws_1")
+    with pytest.raises(ValueError, match="must not be negative"):
+        await client.sleep_workspace("ws_1", after_sec=-1)
+    with pytest.raises(ValueError, match="must not be negative"):
+        await client.sleep_workspace("ws_1", at_millis=-1)
+
+
+@pytest.mark.asyncio
+async def test_file_helpers_chunk_reads_and_idempotent_writes():
+    reads = iter(
+        [
+            {"d": b"abc", "size": 5, "eof": False},
+            {"d": b"de", "size": 5, "eof": True},
+        ]
+    )
+    socket = FakeSocket({"fs.read": lambda _frame: next(reads), "fs.write": {}})
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client("https://cp.example", "token", connector=connector)
+    assert await client.read_file("ws_1", "workspace/report.txt", chunk_bytes=3) == b"abcde"
+    await client.write_file(
+        "ws_1",
+        "workspace/empty.txt",
+        b"",
+        idempotency_key="idem_file",
+    )
+
+    node_frames = [
+        frame
+        for frame in socket.sent
+        if frame.get("op") in {"fs.read", "fs.write"}
+    ]
+    read_bodies = [cbor2.loads(frame["body"]) for frame in node_frames if frame["op"] == "fs.read"]
+    write_body = next(cbor2.loads(frame["body"]) for frame in node_frames if frame["op"] == "fs.write")
+    assert [body["offset"] for body in read_bodies] == [0, 3]
+    assert write_body["d"] == b""
+    assert write_body["idem"] == "idem_file:0"
+    assert write_body["append"] is False
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_write_file_chunks_stay_below_transport_frame_limit():
+    socket = FakeSocket({"fs.write": {}})
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client("https://cp.example", "token", connector=connector)
+    data = b"x" * (MAX_FILE_CHUNK_BYTES + 17)
+    await client.write_file(
+        "ws_1",
+        "workspace/large.bin",
+        data,
+        idempotency_key="idem_large",
+    )
+
+    frames = [frame for frame in socket.sent if frame.get("op") == "fs.write"]
+    bodies = [cbor2.loads(frame["body"]) for frame in frames]
+    assert len(frames) == 2
+    assert all(len(cbor2.dumps(frame)) <= MAX_FRAME_BYTES for frame in frames)
+    assert b"".join(body["d"] for body in bodies) == data
+    assert [body["append"] for body in bodies] == [False, True]
+    assert [body["idem"] for body in bodies] == ["idem_large:0", "idem_large:1"]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_write_file_retry_does_not_duplicate_acknowledged_prefix(monkeypatch):
+    client = Client("https://cp.example", "token")
+    data = b"a" * MAX_FILE_CHUNK_BYTES + b"b" * MAX_FILE_CHUNK_BYTES + b"c"
+    completed = set()
+    destination = bytearray()
+    fail_once = True
+
+    async def node_call(_workspace, operation, body):
+        nonlocal fail_once
+        assert operation == "fs.write"
+        key = body["idem"]
+        if key == "idem_partial:1" and fail_once:
+            fail_once = False
+            raise ProtocolError("unreachable", "injected failure")
+        if key in completed:
+            return {}
+        if body["append"]:
+            destination.extend(body["d"])
+        else:
+            destination[:] = body["d"]
+        completed.add(key)
+        return {}
+
+    monkeypatch.setattr(client, "_node_call", node_call)
+    with pytest.raises(ProtocolError, match="injected failure"):
+        await client.write_file(
+            "ws_1",
+            "workspace/large.bin",
+            data,
+            idempotency_key="idem_partial",
+        )
+    assert bytes(destination) == data[:MAX_FILE_CHUNK_BYTES]
+
+    await client.write_file(
+        "ws_1",
+        "workspace/large.bin",
+        data,
+        idempotency_key="idem_partial",
+    )
+    assert bytes(destination) == data
+
+
+@pytest.mark.asyncio
+async def test_snapshot_archive_and_apply_tar_helpers_encode_node_operations():
+    socket = FakeSocket(
+        {
+            "fs.list": {"entries": [{"name": "file.txt", "size": 1, "mode": 0o644, "dir": False, "mtime": 0}]},
+            "fs.mkdir": {},
+            "fs.apply_tar": {"files": 1, "dirs": 0, "bytes": 1},
+            "ws.snapshot": {
+                "artifact": "art_sha256:" + "0" * 64,
+                "bytes": 1,
+                "consistency": "quiesced",
+                "authoritative": True,
+            },
+            "volume.archive": {
+                "artifact": "art_sha256:" + "1" * 64,
+                "bytes": 1,
+                "consistency": "live",
+                "authoritative": False,
+            },
+        }
+    )
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client("https://cp.example", "token", connector=connector)
+    entries = await client.list_files("ws_1", "workspace")
+    await client.mkdir("ws_1", "state", idempotency_key="idem_mkdir")
+    applied = await client.apply_tar("ws_1", "art_sha256:" + "2" * 64, path="state")
+    snapshot = await client.snapshot_workspace("ws_1", authoritative=True)
+    archive = await client.archive_path("ws_1", "workspace")
+
+    assert entries[0]["name"] == "file.txt"
+    assert applied["files"] == 1
+    assert snapshot["authoritative"] is True
+    assert archive["authoritative"] is False
+    bodies = {
+        frame["op"]: cbor2.loads(frame["body"])
+        for frame in socket.sent
+        if frame.get("op") in {"fs.mkdir", "fs.apply_tar", "ws.snapshot", "volume.archive"}
+    }
+    assert bodies["fs.mkdir"]["path"] == "state"
+    assert bodies["fs.mkdir"]["idem"] == "idem_mkdir"
+    assert bodies["fs.apply_tar"]["format"] == "tar"
+    assert bodies["fs.apply_tar"]["path"] == "state"
+    assert bodies["ws.snapshot"]["upload"] is True
+    assert bodies["ws.snapshot"]["authoritative"] is True
+    assert bodies["volume.archive"]["path"] == "workspace"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_session_lifecycle_helpers_encode_node_operations():
+    socket = FakeSocket(
+        {
+            "s.list": {
+                "sessions": [
+                    {
+                        "info": {
+                            "id": "s_1",
+                            "ws": "ws_1",
+                            "kind": "exec",
+                            "opened_at": 1,
+                        },
+                        "exited": False,
+                        "next": 2,
+                        "oldest": 0,
+                    }
+                ]
+            },
+            "s.close": {},
+        }
+    )
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client("https://cp.example", "token", connector=connector)
+    sessions = await client.list_sessions("ws_1")
+    await client.close_session("ws_1", "s_1", kill=True)
+
+    assert sessions[0]["info"]["id"] == "s_1"
+    bodies = {
+        frame["op"]: cbor2.loads(frame["body"])
+        for frame in socket.sent
+        if frame.get("op") in {"s.list", "s.close"}
+    }
+    assert bodies["s.list"]["ws"] == "ws_1"
+    assert bodies["s.close"]["s"] == "s_1"
+    assert bodies["s.close"]["kill"] is True
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_authoritative_snapshot_requires_upload():
+    client = Client("https://cp.example", "token")
+    with pytest.raises(ValueError, match="must be uploaded"):
+        await client.snapshot_workspace("ws_1", upload=False, authoritative=True)

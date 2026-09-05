@@ -7,16 +7,27 @@ import hashlib
 import json
 import secrets
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, cast
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import cbor2
 import httpx
 from websockets.asyncio.client import connect as websocket_connect
 
+from .types import (
+    FSApplyTarRes,
+    FSEntry,
+    FSReadRes,
+    SessionStatus,
+    Timer,
+    Workspace,
+    WSSnapshotRes,
+)
+
 PROTOCOL_VERSION = 1
 CONTROL = "control"
-MAX_FRAME_BYTES = 16 << 20
+MAX_FRAME_BYTES = 4 << 20
+MAX_FILE_CHUNK_BYTES = 3 << 20
 MAX_PENDING = 4096
 MAX_ORPHAN_SESSIONS = 256
 MAX_ORPHAN_CHUNKS = 16_384
@@ -509,6 +520,258 @@ class Client:
     async def destroy_workspace(self, workspace: str, idempotency_key: str | None = None) -> None:
         await self.call("ws.destroy", {"id": workspace, "idem": idempotency_key or _idempotency_key()})
 
+    async def wait_workspace(
+        self,
+        workspace: str,
+        *,
+        states: tuple[str, ...] = ("claimed",),
+        timeout: float = 60,
+        poll_interval: float = 0.1,
+    ) -> Workspace:
+        if not states:
+            raise ValueError("workspace wait requires at least one state")
+        if timeout <= 0 or poll_interval <= 0:
+            raise ValueError("workspace wait timeout and poll interval must be positive")
+        try:
+            async with asyncio.timeout(timeout):
+                while True:
+                    try:
+                        current = cast(Workspace, await self.get_workspace(workspace))
+                    except TimeoutError:
+                        continue
+                    if current["state"] in states:
+                        return current
+                    await asyncio.sleep(poll_interval)
+        except TimeoutError:
+            raise TimeoutError(f"workspace {workspace} did not reach {states}") from None
+
+    async def sleep_workspace(
+        self,
+        workspace: str,
+        *,
+        after_sec: int = 0,
+        at_millis: int = 0,
+        on_event: str = "",
+        match: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> Timer:
+        if after_sec < 0 or at_millis < 0:
+            raise ValueError("workspace sleep times must not be negative")
+        if after_sec == 0 and at_millis == 0 and not on_event:
+            raise ValueError(
+                "workspace sleep requires after_sec, at_millis, or on_event"
+            )
+        body: dict[str, object] = {
+            "id": workspace,
+            "idem": idempotency_key or _idempotency_key(),
+        }
+        if after_sec:
+            body["after_sec"] = after_sec
+        if at_millis:
+            body["at"] = at_millis
+        if on_event:
+            body["on"] = on_event
+        if match:
+            body["match"] = match
+        return cast(Timer, await self.call("ws.sleep", body))
+
+    async def post_event(
+        self,
+        event_type: str,
+        *,
+        stream: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        event: dict[str, object] = {"seq": 0, "at": 0, "type": event_type}
+        if stream:
+            event["stream"] = stream
+        if payload is not None:
+            event["payload"] = cbor2.dumps(payload, canonical=True)
+        await self.call("events.post", {"events": [event]})
+
+    async def wake_workspace(
+        self, workspace: str, idempotency_key: str | None = None
+    ) -> Workspace:
+        return cast(
+            Workspace,
+            await self.call(
+                "ws.wake",
+                {"id": workspace, "idem": idempotency_key or _idempotency_key()},
+            ),
+        )
+
+    async def read_file(
+        self,
+        workspace: str,
+        path: str,
+        *,
+        max_bytes: int = 512 << 20,
+        chunk_bytes: int = MAX_FILE_CHUNK_BYTES,
+    ) -> bytes:
+        if max_bytes < 0 or chunk_bytes <= 0 or chunk_bytes > MAX_FILE_CHUNK_BYTES:
+            raise ValueError("invalid file read limits")
+        chunks: list[bytes] = []
+        offset = 0
+        while True:
+            response = cast(
+                FSReadRes,
+                await self._node_call(
+                    workspace,
+                    "fs.read",
+                    {"ws": workspace, "path": path, "offset": offset, "limit": chunk_bytes},
+                ),
+            )
+            data = _wire_bytes(response["d"], "file data")
+            if offset + len(data) > max_bytes or response["size"] > max_bytes:
+                raise ProtocolError("resource_exhausted", "file exceeds configured download limit")
+            chunks.append(data)
+            offset += len(data)
+            if response["eof"]:
+                return b"".join(chunks)
+            if not data:
+                raise ProtocolError("internal", "file read made no progress")
+
+    async def write_file(
+        self,
+        workspace: str,
+        path: str,
+        data: bytes,
+        *,
+        mode: int = 0,
+        mkdirp: bool = True,
+        idempotency_key: str | None = None,
+    ) -> None:
+        """Replace a file using retry-stable, bounded chunks.
+
+        If a later chunk fails, the destination contains the acknowledged
+        prefix. Repeating the call with the same idempotency key replays that
+        prefix without appending it twice.
+        """
+        key = idempotency_key or _idempotency_key()
+        chunks = range(0, max(len(data), 1), MAX_FILE_CHUNK_BYTES)
+        for index, offset in enumerate(chunks):
+            chunk = data[offset : offset + MAX_FILE_CHUNK_BYTES]
+            body: dict[str, object] = {
+                "ws": workspace,
+                "path": path,
+                "d": chunk,
+                "append": index > 0,
+                "mkdirp": mkdirp,
+                "idem": f"{key}:{index}",
+            }
+            if mode:
+                body["mode"] = mode
+            await self._node_call(workspace, "fs.write", body)
+
+    async def list_files(self, workspace: str, path: str) -> list[FSEntry]:
+        response = await self._node_call(
+            workspace, "fs.list", {"ws": workspace, "path": path}
+        )
+        return cast(list[FSEntry], response["entries"])
+
+    async def mkdir(
+        self,
+        workspace: str,
+        path: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> None:
+        await self._node_call(
+            workspace,
+            "fs.mkdir",
+            {
+                "ws": workspace,
+                "path": path,
+                "idem": idempotency_key or _idempotency_key(),
+            },
+        )
+
+    async def list_sessions(self, workspace: str) -> list[SessionStatus]:
+        response = await self._node_call(
+            workspace, "s.list", {"ws": workspace}
+        )
+        return cast(list[SessionStatus], response["sessions"])
+
+    async def close_session(
+        self, workspace: str, session_id: str, *, kill: bool = False
+    ) -> None:
+        await self._node_call(
+            workspace,
+            "s.close",
+            {"s": session_id, "kill": kill},
+        )
+
+    async def apply_tar(
+        self,
+        workspace: str,
+        artifact: str,
+        *,
+        path: str = "",
+        format: str = "tar",
+        idempotency_key: str | None = None,
+    ) -> FSApplyTarRes:
+        body = {
+            "ws": workspace,
+            "artifact": artifact,
+            "format": format,
+            "idem": idempotency_key or _idempotency_key(),
+        }
+        if path:
+            body["path"] = path
+        return cast(
+            FSApplyTarRes,
+            await self._node_call(
+                workspace,
+                "fs.apply_tar",
+                body,
+            ),
+        )
+
+    async def snapshot_workspace(
+        self,
+        workspace: str,
+        *,
+        upload: bool = True,
+        authoritative: bool = False,
+        idempotency_key: str | None = None,
+    ) -> WSSnapshotRes:
+        if authoritative and not upload:
+            raise ValueError("authoritative snapshots must be uploaded")
+        return cast(
+            WSSnapshotRes,
+            await self._node_call(
+                workspace,
+                "ws.snapshot",
+                {
+                    "ws": workspace,
+                    "upload": upload,
+                    "authoritative": authoritative,
+                    "idem": idempotency_key or _idempotency_key(),
+                },
+            ),
+        )
+
+    async def archive_path(
+        self,
+        workspace: str,
+        path: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> WSSnapshotRes:
+        return cast(
+            WSSnapshotRes,
+            await self._node_call(
+                workspace,
+                "volume.archive",
+                {
+                    "ws": workspace,
+                    "path": path,
+                    "upload": True,
+                    "idem": idempotency_key or _idempotency_key(),
+                },
+            ),
+        )
+
     async def exec(
         self,
         workspace: str,
@@ -548,10 +811,13 @@ class Client:
         digest = hashlib.sha256(data).hexdigest()
         artifact_id = "art_sha256:" + digest
         client = await self._http_client()
+        headers = {"Content-Type": "application/gzip"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
         async with client.stream(
             "PUT",
             f"{self.base_url}/v1/artifacts/{quote(artifact_id, safe=':')}",
-            headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/gzip"},
+            headers=headers,
             content=data,
         ) as response:
             await self._raise_http(response)
@@ -562,7 +828,12 @@ class Client:
         if len(artifact_digest) != 64 or any(char not in "0123456789abcdef" for char in artifact_digest):
             raise ValueError("invalid artifact id")
         client = await self._http_client()
-        async with client.stream("GET", f"{self.base_url}/v1/artifacts/{quote(artifact_id, safe=':')}", headers={"Authorization": f"Bearer {self.token}"}) as response:
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        async with client.stream(
+            "GET",
+            f"{self.base_url}/v1/artifacts/{quote(artifact_id, safe=':')}",
+            headers=headers,
+        ) as response:
             await self._raise_http(response)
             chunks: list[bytes] = []
             size = 0

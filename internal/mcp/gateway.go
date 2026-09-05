@@ -545,7 +545,10 @@ func (g *ClientGateway) invokeProtocol(ctx context.Context, op string, raw json.
 		// chunked manifest as though it were a tar archive: the node fails
 		// closed on the header rather than corrupting the tree, but the
 		// operation would be unusable through MCP for any non-tar format.
-		return g.Client.ApplyArtifact(ctx, req.WS, req.Artifact, req.Format, operationOption(req.IdempotencyKey)...)
+		return g.Client.ApplyArtifactAt(
+			ctx, req.WS, req.Artifact, req.Format, req.Path,
+			operationOption(req.IdempotencyKey)...,
+		)
 	case proto.OpWSSnapshot:
 		req, err := decode[proto.WSSnapshotReq](raw)
 		if err != nil {
