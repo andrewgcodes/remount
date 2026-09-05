@@ -775,10 +775,13 @@ class Client:
         digest = hashlib.sha256(data).hexdigest()
         artifact_id = "art_sha256:" + digest
         client = await self._http_client()
+        headers = {"Content-Type": "application/gzip"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
         async with client.stream(
             "PUT",
             f"{self.base_url}/v1/artifacts/{quote(artifact_id, safe=':')}",
-            headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/gzip"},
+            headers=headers,
             content=data,
         ) as response:
             await self._raise_http(response)
@@ -789,7 +792,12 @@ class Client:
         if len(artifact_digest) != 64 or any(char not in "0123456789abcdef" for char in artifact_digest):
             raise ValueError("invalid artifact id")
         client = await self._http_client()
-        async with client.stream("GET", f"{self.base_url}/v1/artifacts/{quote(artifact_id, safe=':')}", headers={"Authorization": f"Bearer {self.token}"}) as response:
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        async with client.stream(
+            "GET",
+            f"{self.base_url}/v1/artifacts/{quote(artifact_id, safe=':')}",
+            headers=headers,
+        ) as response:
             await self._raise_http(response)
             chunks: list[bytes] = []
             size = 0
