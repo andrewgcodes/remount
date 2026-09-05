@@ -760,8 +760,9 @@ The same reasoning applies to any platform that scales on request volume. Run
 one control plane, give it persistent storage, and scale nodes instead.
 
 The checked-in deployment also requires a named Modal secret containing
-`REMOUNT_TOKEN`, pins Node 22 and Python 3.12, checks Node/npm/the Remount binary
-before advertising readiness, supervises both child processes, and provides
+`REMOUNT_TOKEN`, optionally accepts separately named OpenAI and Anthropic
+secrets, pins Node 22 and Python 3.12, checks Node/npm/the Remount binary before
+advertising readiness, supervises both child processes, and provides
 `make modal-smoke`. The smoke uses `modal.Function.from_name` to resolve the
 deployed function explicitly; testing the ephemeral `modal run` copy would be
 a false positive. Modal Volumes commit periodically and at container shutdown,

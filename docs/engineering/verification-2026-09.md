@@ -1983,3 +1983,51 @@ race repetitions and the complete serialized race rerun passed without changing
 that test or its implementation. The serialized simulation package completed in
 401.060 seconds. This failure is retained as timing-sensitive evidence, not
 silently omitted from the record.
+
+## 2026-09-05 — Claude Code local and Modal ACP permission validation
+
+**Verified on an uncommitted candidate based on `68df7f1`.** A disposable local
+repository was exercised through both Claude Code transports. PTY mode created
+`CLAUDE_LOCAL.txt`; ACP initially reached Anthropic through `b_anthropic` but
+could not write because the adapter remained in its default permission mode.
+After the recipe and node applied `acceptEdits` through ACP
+`session/set_mode`, the same workspace-write launch created
+`CLAUDE_ACP_LOCAL.txt`. Both files were read through `remount fs read`, not
+inferred from model output. Local events recorded successful credential
+substitution and allowed egress to `api.anthropic.com`.
+
+The exact Linux candidate was then deployed as the uniquely named Modal app
+`remount-claude-0c59ef2b` in the `dev` environment with a unique volume,
+control secret, and Anthropic secret. Authenticated `nodes --json` showed one
+online Modal process node running `68df7f1-dirty`. Claude ACP created
+`CLAUDE_ACP_MODAL.txt` containing `claude-acp-modal-ok`; `remount fs read`
+confirmed the bytes. The Agent reported a structured ACP session and one
+completed turn. Durable events recorded four successful `cred.used` decisions
+for `b_anthropic` to `api.anthropic.com:443/v1/messages` with HTTP 200, plus
+the accompanying `egress.allowed` events.
+
+This run also verified the deployment change that accepts an optional,
+separately named Anthropic Modal secret and constructs `b_anthropic`; the
+previous reference deployment could broker only OpenAI. The disposable Agent
+and owned workspace reached `destroyed`. The Modal app was stopped and its
+volume and test-only secrets were deleted; provider inventory verified that
+all uniquely named resources were absent.
+
+No credential value was placed in a command argument, workspace, repository,
+or this ledger. The Modal reference still uses Remount's process backend and
+cooperative proxy egress; this point-in-time test is not production
+multi-tenant isolation evidence.
+
+The first full local verification run also exposed a test-isolation defect:
+`TestRunValidatesBeforeDialing` discovered the active local `b_anthropic`
+binding, selected API-key authentication for its Claude case, launched a real
+Agent, and reached the package timeout instead of exercising the expected
+pre-dial error. The test now uses an empty temporary `REMOUNT_DATA` directory.
+The formerly hanging case then passed in 0.008 seconds while the live local
+binding still existed. With an empty verification data directory, all 17
+portable `make verify` gates then passed, including the full suite, race,
+conformance, bounded fuzzing, static analysis, vulnerability scan, generated
+documentation check, and cross-platform vetting. Four pending Agents created by
+the diagnostic reruns were explicitly destroyed, their owned workspaces were
+absent from the active workspace list, and the disposable standalone process
+was stopped.

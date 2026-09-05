@@ -89,6 +89,8 @@ Important behavior:
   by default; use `--include-git=false` to omit it.
 - ACP-capable recipes run as durable Agents unless `--pty` is supplied.
 - `--sandbox` is `read-only`, `workspace-write` (default), or `full`.
+  Recipes apply their corresponding harness-native PTY flags and, when
+  configured, ACP session mode before the first prompt.
 - `--approve` is `never` (default) or `on-request`.
 - Ctrl-C detaches by default; it does not kill the agent. Use
   `--kill-on-interrupt` only when termination is intended.
@@ -304,10 +306,12 @@ resource or secret names.
 Prerequisites:
 
 - Modal CLI authenticated to the intended workspace.
+- The Modal CLI environment includes `python-dotenv`, which
+  `modal secret create --from-dotenv` requires.
 - `MODAL_ENVIRONMENT` set explicitly.
 - A named Modal secret containing `REMOUNT_TOKEN`.
-- Optionally, a second named secret containing `OPENAI_API_KEY` for model
-  calls through `b_openai`.
+- Optionally, named secrets containing `OPENAI_API_KEY` or
+  `ANTHROPIC_API_KEY` for model calls through `b_openai` or `b_anthropic`.
 
 Use unique names for disposable validation:
 
@@ -317,10 +321,12 @@ export REMOUNT_MODAL_APP=remount-example
 export REMOUNT_MODAL_VOLUME=remount-example-data
 export REMOUNT_MODAL_SECRET=remount-example-control
 export REMOUNT_MODAL_MODEL_SECRET=remount-example-openai
+export REMOUNT_MODAL_ANTHROPIC_SECRET=remount-example-anthropic
 ```
 
-Create secrets without placing values in process arguments. The files below
-must be mode 0600 and deleted immediately after import:
+Create only the provider secrets the deployment needs, without placing values
+in process arguments. The files below must be mode 0600 and deleted
+immediately after import:
 
 ```sh
 umask 077
@@ -333,6 +339,11 @@ MODEL_ENV=$(mktemp)
 printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" > "$MODEL_ENV"
 modal secret create "$REMOUNT_MODAL_MODEL_SECRET" --from-dotenv "$MODEL_ENV"
 rm -f "$MODEL_ENV"
+
+ANTHROPIC_ENV=$(mktemp)
+printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_API_KEY" > "$ANTHROPIC_ENV"
+modal secret create "$REMOUNT_MODAL_ANTHROPIC_SECRET" --from-dotenv "$ANTHROPIC_ENV"
+rm -f "$ANTHROPIC_ENV"
 ```
 
 Deploy and run the smoke test:
@@ -370,6 +381,7 @@ modal app stop "$REMOUNT_MODAL_APP" -y
 modal volume delete "$REMOUNT_MODAL_VOLUME" -y --allow-missing
 modal secret delete "$REMOUNT_MODAL_SECRET" -y --allow-missing
 modal secret delete "$REMOUNT_MODAL_MODEL_SECRET" -y --allow-missing
+modal secret delete "$REMOUNT_MODAL_ANTHROPIC_SECRET" -y --allow-missing
 ```
 
 Do not delete a shared model secret. Modal singleton, persistence, readiness,

@@ -37,7 +37,7 @@ a YAML pull request, not Go.
 
 | Recipe | Harness | Auth | Providers | `--sandbox` mapping | State that travels |
 |---|---|---|---|---|---|
-| `claude` | Claude Code | key or login | anthropic | `--permission-mode plan` / `acceptEdits` / `--dangerously-skip-permissions` | `.claude/`, `.claude.json` |
+| `claude` | Claude Code | key or login | anthropic | PTY: `--permission-mode plan` / `acceptEdits` / `--dangerously-skip-permissions`; ACP: `plan` / `acceptEdits` / `bypassPermissions` session mode | `.claude/`, `.claude.json` |
 | `codex` | Codex CLI | key or login | openai, azure-openai, openrouter | `--sandbox read-only` / `workspace-write` / `danger-full-access` | `.codex/` |
 | `opencode` | OpenCode | key or login | anthropic, openai, google, openrouter, groq, deepseek, xai, mistral | `permission.edit/bash/webfetch` in a generated config | `.local/share/opencode/` |
 | `openhands` | OpenHands CLI | key | anthropic, openai, google, openrouter, groq, together, fireworks, deepseek, xai, mistral | harness default | `.openhands/` |
@@ -79,6 +79,12 @@ when an agent cannot reopen a session, a woken Agent starts a fresh one and the
 event says so. `session_id_from` (opencode: newest
 `.local/share/opencode/storage/session/*/ses_*.json`, key `id`) lets a handoff
 continue the laptop conversation on the node with `session/load`.
+
+An ACP recipe may map each Remount sandbox level through
+`acp.sandbox_modes`. The node applies that mode with `session/set_mode` after
+new, load, or resume and before the first prompt. A configured mode that the
+adapter rejects fails the run rather than silently weakening the requested
+sandbox behavior.
 
 Every backend sets `HOME` to the workspace root, so the state column is where
 the harness's `~/.something` actually lands: inside the workspace, in every
