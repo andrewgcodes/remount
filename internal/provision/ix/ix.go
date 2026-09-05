@@ -35,10 +35,9 @@ type Driver struct {
 	mu     sync.Mutex
 }
 
-// New validates config. A helper is mandatory because ix.dev publishes SDKs
-// and a CLI but no stable REST contract, and its documented machine surface
-// has no list call — pool reconciliation needs one, so the helper owns it
-// rather than this driver guessing a private HTTP shape.
+// New validates config. The helper owns the provider-to-Remount inventory
+// mapping: ix ls exists, but native tenant/pool ownership encoding is not
+// implemented here. See docs/engineering/ix-dev-native-driver-2026-09-04.md.
 func New(config Config) (*Driver, error) {
 	if config.Helper == "" || config.APIKey == "" || config.Tenant == "" {
 		return nil, fmt.Errorf("%w: ix helper, API key, and tenant are required", provision.ErrUnavailable)

@@ -508,6 +508,10 @@ itself worked, we planted the real key in a canary file, scanned again, found
 exactly one match, and deleted the canary. The only process holding the secret
 was the control plane, which is where it belongs.
 
+That paragraph records the historical test, not a safe procedure to repeat.
+For new tests, validate the scanner with a synthetic non-credential canary in
+a disposable fixture. Never plant a real provider key in a workspace or log.
+
 ## The general pattern for any harness
 
 Every harness has a variable for where the model lives and a variable for the
@@ -522,8 +526,8 @@ a byte leaves the machine.
 | Harness | Base URL setting | Key setting | Auth header it sends | Status |
 |---|---|---|---|---|
 | Codex CLI | `base_url` in `.codex/config.toml` | `env_key` names an env var | `Authorization: Bearer` | Verified here, 0.152.1 |
-| Claude Code | `ANTHROPIC_BASE_URL` | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` | `x-api-key` and, on newer builds, `Authorization: Bearer` | Documented upstream, not tested here |
-| OpenCode | `provider.<id>.options.baseURL` in `opencode.json` | provider `apiKey` or env | SDK dependent, `x-api-key` for Anthropic | Verified via `remount run opencode` (docker lane, 1.18.x) |
+| Claude Code | `ANTHROPIC_BASE_URL` | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` | `x-api-key` and, on newer builds, `Authorization: Bearer` | 2.1.260 exercised on a disposable Modal VM; [dated evidence](engineering/verification-2026-09.md#2026-09-05--pr-30-live-functional-regression-verification) |
+| OpenCode | `provider.<id>.options.baseURL` in `opencode.json` | provider `apiKey` or env | SDK dependent, `x-api-key` for Anthropic | 1.18.29 exercised on Docker with OpenAI; [dated evidence](engineering/verification-2026-09.md#2026-09-05--pr-30-live-functional-regression-verification) |
 | aider | `OPENAI_API_BASE` | `OPENAI_API_KEY` | `Authorization: Bearer` | Documented upstream, not tested here |
 
 The broker matches on the placeholder string wherever it appears in a header,
@@ -638,6 +642,9 @@ c, err := client.New(client.Options{
 	Server: "https://remount.example",
 	Token:  os.Getenv("REMOUNT_TOKEN"),
 })
+if err != nil {
+	return err
+}
 defer c.Close()
 ```
 
@@ -653,11 +660,18 @@ ws, err := c.CreateWorkspace(ctx, api.WorkspaceSpec{
 		"OPENAI_BASE_URL": "${REMOUNT_BROKER}/d/api.openai.com/v1",
 	},
 })
+if err != nil {
+	return err
+}
 ws, err = c.WaitClaimed(ctx, ws.ID)
+if err != nil {
+	return err
+}
 ```
 
-Run a command and read its output as sequenced chunks. The channel closes after
-the exit chunk, and `Exit` then holds the code.
+Run a command and copy its sequenced output with the gap-aware helper. Check
+errors before using the returned exit information; a disconnected or evicted
+stream is not successful completion.
 
 ```go
 s, err := c.Exec(ctx, api.SessionOpenRequest{
@@ -666,14 +680,18 @@ s, err := c.Exec(ctx, api.SessionOpenRequest{
 	Program:        []string{"sh", "-c", "make test 2>&1"},
 	IdempotencyKey: "build-42",
 })
-for ch := range s.Chunks() {
-	switch ch.Stream {
-	case api.StreamStdout, api.StreamStderr:
-		os.Stdout.Write(ch.Data)
-	}
+if err != nil {
+	return err
 }
-fmt.Println("exit", s.Exit().Code)
+exit, err := client.Copy(ctx, s, os.Stdout, os.Stderr)
+if err != nil {
+	return err
+}
+fmt.Println("exit", exit.Code)
 ```
+
+`client.Copy` and `c.Run` return `api.CodeEvicted` for incomplete output. Raw
+`s.Chunks()` consumers must handle gap chunks and check `s.Err()` themselves.
 
 For the common case there is a one-call form.
 
@@ -710,7 +728,7 @@ timer, err := c.SleepWorkspace(ctx, api.SleepRequest{ID: ws.ID, OnEvent: "github
 ## What a harness gets for free
 
 Truthful bounded replay. Every output chunk carries a sequence number, the node
-keeps a bounded ring plus a spill file per session, and a client resumes from
+keeps bounded memory, disk spill and optional blob-backed ranges, and a client resumes from
 the last sequence it delivered. If the client's connection drops mid-command,
 the SDK redials, reattaches, and the caller's channel simply continues. If the
 gap is genuinely unrecoverable, the stream carries an explicit gap marker

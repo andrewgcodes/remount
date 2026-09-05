@@ -1,27 +1,28 @@
 # Remount: the design
 
-This is the architecture in full. The short version is in the
+This is the architecture overview. The short version is in the
 [README](../README.md); the wire format is in [the spec](../spec/PROTOCOL.md);
-the reasoning behind individual choices is in [the ADRs](adr/).
+the reasoning behind individual choices is in [the ADRs](adr/). Implementation
+boundaries and dated proof are indexed in [current status](engineering/current-status.md).
 
 ---
 
 ## 1. The problem
 
-An agent needs a computer. Today it gets one of two bad deals.
+An agent needs a computer, but its execution lifetime, filesystem, credentials
+and client connection need not share one failure boundary. Remount separates
+them: a workspace can be checkpointed and placed on a compatible node, brokered
+provider keys stay outside it, and clients can reconnect to retained sessions.
+This is execution and lifecycle infrastructure beneath a harness, with a durable
+Agent layer for conversation and task coordination. It is not itself a model
+or an end-user chat product.
 
-Either the computer is the machine the harness happens to be running on, in
-which case the agent dies with the laptop lid, cannot be given a bigger box, and
-holds your API keys in the same process it has root in.
+Those properties have limits: replay is bounded, filesystem moves do not
+transfer arbitrary running processes, and explicit harness-native login keeps
+credentials in the workspace. Backend isolation and provider portability need
+their own compatibility and conformance proof.
 
-Or the computer belongs to a sandbox vendor, in which case it is fast and clean
-and completely trapped: you cannot move it to your GPU box, your on-prem host,
-or another vendor, and the agent still holds your keys.
-
-Remount is the third deal. The agent's computer is a value that can move, the
-credentials are never in it, and losing the connection loses nothing.
-
-## 2. Seven resources
+## 2. Core resources
 
 | Resource | Is |
 |---|---|
@@ -33,7 +34,11 @@ credentials are never in it, and losing the connection loses nothing.
 | **Timer** | a durable wake: at a time, after a duration, or on an event |
 | **Principal** | who acts: a human, an agent, a node |
 
-Everything else in the system is a verb on one of these.
+These are the original primitives, not an exhaustive resource count. The
+protocol also defines durable Agents, queues, approvals, budgets, tenants,
+identity credentials, node pools, shared volumes and export cursors. An Agent
+adds conversation and task lifecycle on top of a workspace; it is not the
+workspace itself.
 
 ## 3. Shape
 
@@ -101,10 +106,16 @@ not: the request is **blocked**, not forwarded, and recorded as `leak_blocked`.
 
 ### 4.3 The computer moves
 
-A snapshot is a deterministic tarball of the filesystem. Files, not memory,
-because files can be portable across compatible nodes and backends, and memory
-images are not. Processes, installed host tools and architecture-specific
-binaries do not travel; identity, files and policy do. A user-requested live
+A filesystem snapshot is a deterministic archive or chunked manifest with
+content-addressed blobs. Files can travel across compatible nodes and backends;
+host-installed tools and architecture-specific binaries are not automatically
+portable. Process/Docker/gVisor filesystem moves do not transfer memory;
+execution must be resumed or restarted by a supported harness/Agent lifecycle.
+Firecracker additionally implements full disk/state/memory
+checkpoints, whose restore needs compatible host, VMM, guest and CPU metadata;
+it is not arbitrary cross-platform process migration. See
+[ADR 0063](adr/0063-firecracker-checkpoints.md) and
+[ADR 0072](adr/0072-chunked-snapshots.md). A user-requested live
 snapshot is labeled `live` and never silently becomes failover state. An
 authoritative checkpoint fences Remount-managed execution, archives under an
 exclusive tree lock, uploads the artifact, and commits its digest in control
@@ -166,15 +177,16 @@ not lose the workspace it is restoring.
 | Component | Trusted with | If compromised |
 |---|---|---|
 | control plane | policy, bindings, grant signing key | everything; true of every system in this category |
-| node supervisor and broker | real credentials, egress decisions | that node's workspaces, and its leases until TTL |
-| relay | routing metadata | metadata, and today frame contents |
+| node supervisor and broker | real credentials, egress decisions | its workspace data and every reusable credential visible to it; broker TTLs do not revoke an exfiltrated provider key |
+| relay | routing metadata and plaintext payloads on stock connections | metadata and frame contents; the internal E2EE guard protects payloads only when explicitly integrated |
 | **workspace** | its files, references and granted capabilities | workspace data and abuse of those capabilities; broker-held secrets remain outside it |
 
 Concretely enforced:
 
-- **Filesystem jail.** Paths resolve through symlinks and anything landing
+- **Filesystem API jail.** Paths resolve through symlinks and anything landing
   outside the workspace root is denied, including a symlink inside the workspace
   that points out of it. Archive extraction refuses parent-directory components.
+  This does not isolate a process-backend command from the host filesystem.
 - **Broker policy.** Explicit typed rules default deny and constrain protocol,
   host, port, method, path, request counts and body sizes. With no typed policy,
   local mode permits reverse-proxy destinations named by a used binding or the
@@ -193,15 +205,15 @@ One recovery path. "Graceful shutdown" is a snapshot followed by a crash.
 
 | Failure | Behavior | At risk |
 |---|---|---|
-| client disconnects | session keeps running; reattach replays from last seq | nothing |
-| relay dies | both sides redial; sessions resume by seq | nothing |
-| node uplink flaps | sessions keep running; workspaces demote to `claiming`, promote back on reconnect | nothing |
+| client disconnects | session keeps running; reattach replays from last seq | output beyond configured retention is an explicit gap |
+| relay dies | both sides redial; sessions resume by seq if authority remains valid | an outage beyond the lease causes node self-fencing; retained-output limits still apply |
+| node uplink flaps | workspaces demote to `claiming`, promote back after reconciliation | sessions can continue only while the lease remains valid; longer outages fence execution |
 | node dies | lease expires, workspace returns to pending with its last snapshot, another node claims | work since the last snapshot |
-| node restarts | it re-adopts its local copies at the same generation, so outstanding grants stay valid | nothing |
+| node restarts | it re-adopts local copies when durable authority agrees; generation may change after lease expiry | running processes are not generally preserved; retained files/logs depend on their durable state |
 | control plane restarts | recorded holders remain reserved for a recovery grace period; the same node re-adopts at the same generation; ambiguous transitional states become `failed` | no workspace bytes from control restart alone; control events since the last durable commit |
-| materialize fails | node releases the claim; another node tries | nothing |
+| materialize fails | readiness is withheld; cleanup/release or retained-source reconciliation follows the failure boundary | availability; an ambiguous destructive operation retains and fences its source |
 | workspace compromised | cannot read broker-held keys; broker requests are scoped and recorded | its files, granted destinations, and—on cooperative built-in backends—direct network access |
-| node compromised | leases are short; certs and secrets bounded by TTL | that node's workspaces |
+| node compromised | quarantine fences broker/workspace authority; rotate any exposed upstream credentials | that node's workspaces and credentials; provider revocation is separate from broker lease expiry |
 | relay compromised | metadata, and today frame contents | see gaps below |
 
 Core lifecycle rows above have tests in `internal/sim`, driven through
@@ -227,7 +239,14 @@ not substitute for backend-specific hostile-workspace conformance tests.
 | Managed HTTPS package connector with read-only policy, digest provenance and scope-private immutable cache references | built, direct/race/hostile-workspace simulation tested |
 | Event log, SQLite and in-memory, subscriptions with backfill | built, tested |
 | Grants: ed25519, expiry, generation binding | built, tested |
-| Backends: process and docker | built, tested |
+| Backends: process and docker | built, tested; local/cooperative egress only |
+| Linux gVisor and Firecracker | implemented with runtime probes and host-gated conformance; see the live verification ledger |
+| Durable Agents, children/forks, queues and approvals | implemented; HTTP/frame APIs, CLI and simulator coverage |
+| Operator console | embedded at `/console/`; unit and real-server Playwright coverage |
+| Python and TypeScript SDKs | built and locally tested, including strict-profile negotiation; public publication is separate |
+| Warm-standby controller failover | implemented with conditional object-store lease, epoch fencing and reconciliation; one active SQLite writer, nonzero potential RPO |
+| Relay payload confidentiality | internal E2EE guard and adversarial simulations implemented; stock client/node integration remains open |
+| Identity, encryption at rest, governance, pools and shared volumes | implemented; capability and external-provider requirements remain deployment-specific |
 | CLI: server, up, standalone, ws, exec, sh, attach, fs, port, nodes, events, timers | built, exercised live |
 | Public Go API and reconnecting client | built; compiled and tested from a separate module |
 | Live snapshots and authoritative checkpoints | built; consistency is explicit and control commit is required for authority |
@@ -243,60 +262,65 @@ shell command through the session layer, and wrote the file. The workspace's
 zero copies of the real key, while the same scan found a deliberately planted
 canary, which is what makes the zero meaningful.
 
-## 10. Not built yet
+## 10. Current limitations
 
 Named honestly, because a roadmap presented as a feature list is a lie.
 
-- **microVM backends.** Firecracker on Linux, Apple Virtualization on macOS.
-  Today the strongest isolation is a container. The `process` backend is
-  `isolation: none` and is only appropriate on a machine you own.
-- **A built-in enforced-egress backend.** The policy and backend controller
-  contract exist and production profiles reject weaker descriptors, but the
-  shipped process and Docker implementations are cooperative proxies. Neither
-  is a firewall or a non-bypassable multi-tenant boundary.
+- **Host-qualified isolation.** Linux gVisor and Firecracker are implemented,
+  not automatically available on every host. Registration probes and exact-host
+  conformance must pass. Process and Docker remain cooperative, and Apple
+  Virtualization is not implemented.
 - **Display and browser sessions.** The protocol has the session kind reserved
-  and the shape is understood, but there is no implementation.
-- **End-to-end encryption through the relay.** Frames are TLS to the relay, so a
-  compromised relay can read them. Noise IK inside the frame stream is the fix
-  and the protocol has room for it because the relay already ignores bodies.
+  but no native implementation. External browser/X11/VNC stacks can run as
+  ordinary exec workloads; see [virtual desktops](harness-integration.md#browser-and-virtual-desktop-workloads).
+- **Stock relay-confidentiality integration.** `internal/e2ee` implements
+  authenticated key exchange and sealed peer payloads, with mutation/replay/
+  reconnect tests. The control-plane binding operation and stock client/node
+  opt-in are still pending. Normal CLI/SDK connections therefore remain TLS
+  to the relay, not end-to-end encrypted through it. See
+  [the B6 implementation boundary](engineering/plan-b-b6-relay-confidentiality.md).
 - **Credential substitution inside CONNECT.** Would require a CA in the
   workspace, which we declined in v0. Model traffic uses the reverse-proxy path.
-- **Web and phone UI.** Remount ships no end-user UI (ADR 0046). It provides
-  the device-neutral Agent API: any client, the developer's own web app, the
+- **End-user chat and phone UI.** Remount ships an operator console, not a
+  general-purpose agent chat product. It provides the device-neutral Agent
+  API: any client, the developer's own web app, the
   reference app in `examples/diy-devin`, a vendor mobile app, or the harness's
   own web UI reached through the preview proxy, is a client of the same Agent.
 - **Direct peer-to-peer.** Every session byte goes through the relay today.
-- **Automated controller high availability.** The supported topology is one
-  SQLite writer. Active/passive failover is an operator procedure, not a
-  leader-elected service.
-- **Subagent composition and RL fan-out.** Fork-from-snapshot is one call away
-  given artifacts, but there is no API for it yet.
+- **Multi-writer and zero-RPO control.** Optional warm standby can acquire an
+  expired object-store lease and promote automatically after reconciliation.
+  It is not consensus replication or multiple active SQLite writers; unshipped
+  writes may be lost. See [controller availability](operations.md#controller-availability).
+- **General RL orchestration.** Agent forks and policy-constrained children
+  exist; a dedicated training or reinforcement-learning scheduler does not.
 
 ## 11. Performance
 
-Targets to measure rather than promises. Current numbers are from a laptop with
-both sides in one process, so they bound the protocol overhead, not a WAN.
+Performance measurements need a candidate, host, backend and workload. The
+early sub-millisecond exec and 13 MB binary figures do not describe the current
+durable session path or all distribution targets. Use the dated
+[benchmark report](benchmarks.md) and its raw JSON, and remeasure the candidate
+before making latency, throughput or size claims. Historical results are not
+an SLA or current-release proof.
 
-| Thing | Target | Observed locally |
-|---|---|---|
-| exec round trip through the relay | < 30 ms intra-region | sub-millisecond in-process |
-| workspace create and claim | < 500 ms warm | ~1 ms, process backend |
-| snapshot, release, restore, re-claim on another node | < 2 s for a small tree | ~200 ms |
-| paused workspace cost | storage only | storage only |
-| session log memory | 2 MiB per session | configurable 2 MiB memory plus 128 MiB spill by default |
-| binary size | < 30 MB | 13 MB, static, no CGO |
+The default per-session hot tiers are 2 MiB memory and 128 MiB spill; immutable
+blob tiers add retained replay under their own limits. A paused workspace has
+no assigned node, but retained artifacts consume storage and a provisioned
+idle node may continue incurring compute charges. Distribution builds are
+static (`CGO_ENABLED=0`); measure each artifact produced by `make dist` rather
+than treating a historical binary size as an invariant.
 
 ## 12. Principles, and what each one decided
 
 | Principle | Decided |
 |---|---|
 | Data dominates | the spec is a data model plus an event log; code follows |
-| Interfaces are the design | seven resources, one frame type, about thirty operations |
+| Interfaces are the design | explicit resource schemas and one versioned frame envelope; the protocol catalog owns the operation inventory |
 | Minimal core, conservative growth | no plugin ABI, no framework, no prompt format |
 | Don't complect | identity, placement, policy and transport are separate; a session is not a connection |
 | Durable truth is explicit | transactional resource rows recover authority; the ordered log records audit/observation history |
 | Crash-only | recovery is the normal path; graceful shutdown is snapshot then crash |
-| End-to-end argument | relays are dumb, the control plane never sees stdout |
+| End-to-end argument | the relay routes session frames; control handlers do not interpret them, but the colocated server can see stock plaintext payloads |
 | Define errors out of existence | exec does not fail with "connection dropped"; idempotency keys everywhere |
 | Small trusted computing base | the workspace is trusted with nothing |
 | Brute force first | a Postgres-shaped claim queue in SQLite, not a scheduler |
@@ -311,7 +335,7 @@ internal/proto         frames, types, operation names, event names
 internal/transport     Conn, Peer, WebSocket, in-memory pipe with fault injection
 internal/session       the log, the cursor, exec/pty/port, the manager
 internal/fsops         jailed filesystem operations, search, atomic edit
-internal/workspace     Backend interface, process and docker backends
+internal/workspace     Backend interface, process, docker, gvisor and firecracker
 internal/artifact      content-addressed store, deterministic snapshots
 internal/eventlog      the canonical log, memory and SQLite, subscriptions
 internal/broker        the egress credential broker
@@ -320,6 +344,13 @@ internal/control       claim queue, leases, timers, bindings, grants
 internal/node          the supervisor
 internal/client        SDK implementation and wire/reconnect machinery
 internal/server        HTTP surface: /v1/link, /v1/artifacts, /v1/events
+internal/identity      principals, tenants, signed credentials and enrollment
+internal/control/replicate fenced warm-standby database publication and recovery
+internal/e2ee          opt-in peer payload confidentiality (not stock CLI wiring)
+internal/provision     provider-backed whole-node lifecycle drivers
+internal/volume        immutable shared artifact versions
+sdk/python, sdk/typescript public non-Go clients
+web                    embedded operator console
 internal/sim           the whole system in one process, with fault injection
 spec/PROTOCOL.md       the wire protocol
 docs/adr/              why, and what it cost

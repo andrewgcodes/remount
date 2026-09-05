@@ -86,7 +86,8 @@ The world's lease is two seconds so failover tests finish quickly. Give contexts
 sixty seconds anyway; the race detector makes everything several times slower
 and the `go test -timeout` is the real bound.
 
-Assert on events, not internal state. `c.ReadEvents(ctx, 1, ws.ID)` returns the
+Assert the observable resource postcondition and its events, not merely an
+internal flag. `c.ReadEvents(ctx, 1, ws.ID)` returns the
 workspace's history. If the event you expect is missing, the state change did
 not emit it, which is itself the bug.
 
@@ -157,13 +158,15 @@ request never reached the relay.
 dumps every goroutine. Look for the test goroutine and read what it is parked
 on. `chan receive` inside `range s.Chunks()` means the exit chunk never arrived.
 
-**Something passes without `-race` and fails with it.** Timing, not logic. Look
-for a lease, a renew interval, or a state that is set before the work it
-describes is finished.
+**Something passes without `-race` and fails with it.** Treat it as a real
+failure: inspect race reports, ownership and ordering before attributing it to
+instrumentation overhead. Check leases, renew intervals and state published
+before the work it describes is finished.
 
-**A scan for a secret says clean.** Prove the scan works. Plant a copy of the
-secret in a file, run the same scan, and confirm it finds exactly one. Do not
-pipe `grep` into `head` inside an `if`; `head` always exits 0.
+**A scan for a secret says clean.** Prove the scan works with a synthetic,
+non-credential canary in a disposable fixture; the same scan must find it.
+Never plant a real credential in a workspace or fixture. Preserve the scanner's
+exit status rather than testing the status of a trailing pipeline command.
 
 **A scripted edit reports success and the build disagrees.** Assert the
 postcondition. `gofmt` realigns const blocks, so a patch matching
@@ -246,7 +249,8 @@ plane. Check that exactly one server is running behind the URL.
 
 Comments say why. Exported identifiers have doc comments. Errors across the wire
 use `proto.Err(code, ...)` with a stable code. No new dependencies without a
-written reason; the binary is static and 13 MB.
+written reason; keep distribution binaries static and measure size changes
+against the same target and toolchain.
 
 ## Before you commit
 

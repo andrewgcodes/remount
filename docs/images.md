@@ -5,11 +5,14 @@ image Remount ships and for any image you substitute.
 
 ## The default image
 
-`ghcr.io/andrewgcodes/remount-workspace:<version>` is built by CI from
+The workspace-image workflow is configured to build
+`ghcr.io/andrewgcodes/remount-workspace:<version>` from
 [`images/workspace/Dockerfile`](../images/workspace/Dockerfile) on every
-release tag and, as `:latest`, on every push to `main`. A release binary
-defaults to the tag built alongside it; a development build (`remount version`
-prints `dev`) defaults to `:latest`. Either way, `remount up --image` and a
+release tag and, as `:latest`, on qualifying pushes to `main` (documentation-only
+pushes are excluded). Workflow configuration is not proof that an image is
+published or accessible: check the registry, or build locally below. A release binary
+defaults to the tag built alongside it; a non-release source build defaults to
+`:latest`. Either way, `remount up --image` and a
 workspace spec's `image` field override it.
 
 | Layer | What is in it | Why |
@@ -24,25 +27,28 @@ mount), npm's update notifier off. The image runs as root; `--user` is a
 backend option for a later phase and the isolation story is the backend's, not
 the image's (see `remount doctor` and `docs/design.md`).
 
-Size: about 410 MB uncompressed for `linux/amd64`. Both `linux/amd64` and
-`linux/arm64` are published.
+The workflow targets `linux/amd64` and `linux/arm64`. Measure size on the exact
+digest and platform; layer contents and size change with source revisions.
+The Dockerfile pins its upstream image digests. Docker's `--init` option,
+set by the backend, supplies the running container's init process.
 
 ## What every image must provide
 
 The node needs exactly this from an image, and nothing else:
 
-1. `sleep` on `PATH` — the container's only process until a session opens.
+1. `sleep` on `PATH` — the long-running command beneath Docker's init until a session opens.
 2. `sh` — `remount sh` and recipe `prompt_template`s run through it.
-3. A writable `/work` — the node bind-mounts the workspace root there and
+3. A writable `/work` (or the configured mount path) — the node bind-mounts the workspace root there and
    sets it as the working directory of every session. Do not bake files into
    `/work`; the mount hides them.
 4. Nothing that reads `/work/.remount/env` at build time. That file is written
    by the node on every materialize and carries the broker address, which is
    different on every node and after every move.
 
-`ubuntu:24.04`, `debian:bookworm-slim`, `alpine:3.20` and `node:22-bookworm`
-all satisfy this and are exercised in the docker lane. `--image ubuntu:24.04`
-gives you the pre-0.6 default unchanged.
+Distro images can satisfy this core contract without providing a working
+harness environment. Check shell behavior, libc, runtime versions and recipe
+dependencies in the exact image you select; the core contract is not a claim
+that every distro or architecture has passed the Docker lane.
 
 ## Building your own
 
@@ -56,5 +62,7 @@ docker run --rm my-workspace sh -c 'git --version && node --version && uv --vers
 remount up --backend docker --image my-workspace
 ```
 
-An image is not a credential boundary. Secrets never enter the image or the
-workspace; the broker substitutes them at the network edge (ADR 10).
+An image is not a credential boundary. Keep secrets out of image layers and
+workspaces; broker-managed keys are substituted at the network edge (ADR 10).
+Explicit harness-native login stores credentials in the workspace and changes
+that trust model; see [harness integration](harness-integration.md).

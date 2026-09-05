@@ -1,5 +1,11 @@
 # Releases and installation
 
+As of 2026-09-05, the repository is private and its authenticated GitHub release
+inventory is empty. Build from an accessible checkout with `make build`; see
+[Using Remount](using-remount.md#build-and-select-a-server). The commands below
+describe the release workflow and its verification contract, not currently
+available public artifacts. `v0.1.0` is illustrative, not a published release.
+
 Remount releases are six static binaries: Linux, macOS and Windows on amd64
 and arm64. A tag is not considered complete merely because files appeared on
 a GitHub release. E18 requires the binary version, checksum signature, SBOM,
@@ -21,14 +27,11 @@ bash -o pipefail -c \
    REMOUNT_REQUIRE_SIGNATURE=1 sh'
 ```
 
-That hostname is not live yet; do not publish this command as working until its
-TLS endpoint serves the repository's `install.sh`. Until then, download the
-script from the source repository, inspect it, and execute it locally:
+Do not advertise this command as working until its TLS endpoint and the chosen
+release pass the maintainer proof below. Once a release exists, inspect
+`install.sh` in your accessible checkout and execute it locally:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSLO \
-  https://raw.githubusercontent.com/andrewgcodes/remount/main/install.sh
-chmod +x install.sh
 REMOUNT_REQUIRE_SIGNATURE=1 ./install.sh
 ```
 
@@ -124,9 +127,9 @@ E18 has **not** been exercised. No `v0.1.0` release was created in this work,
 and no package, formula or tag was published. Two external publication
 prerequisites are still open:
 
-- `remount.dev` and `get.remount.dev` do not currently resolve, so public
-  versioned `go install` fails before module discovery and the short installer
-  URL is not live;
+- the 2026-09-03 check found `remount.dev` and `get.remount.dev` did not resolve;
+  public Go import metadata and the short installer endpoint must be verified
+  again as part of publication;
 - the Homebrew tap repository/formula publication has not been created or
   verified.
 
