@@ -16,6 +16,7 @@ import (
 
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/trace"
 	"remount.dev/remount/internal/transport"
 )
 
@@ -340,6 +341,10 @@ func (r *Relay) Request(ctx context.Context, to, op string, body, out any) error
 	r.pending[id] = relayPending{from: to, op: op, ch: ch}
 	r.pendMu.Unlock()
 	f := proto.NewReq(id, to, op, body)
+	// A control-originated request carries the caller's trace context so the
+	// node's span for this op is a child of the control span. Both are empty
+	// unless an operator configured a collector.
+	f.Trace, f.Span = trace.Context(ctx)
 	if err := r.Send(ctx, f); err != nil {
 		r.pendMu.Lock()
 		delete(r.pending, id)

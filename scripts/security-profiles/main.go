@@ -86,6 +86,9 @@ func generate() ([]byte, error) {
 			return nil, fmt.Errorf("security-profile backend %q is not registered by buildNode", name)
 		}
 	}
+	if err := checkOSCoverage(registry.Descriptors()); err != nil {
+		return nil, err
+	}
 	var out bytes.Buffer
 	fmt.Fprint(&out, `# Security profiles
 
@@ -149,6 +152,7 @@ explicitly approved for multi-tenant placement.
 			descriptor.Name, s.Isolation, r.Snapshots, s.EgressMode, s.BrokerIdentity, s.FilesystemBoundary,
 			yesNo(s.NetworkNamespace), yesNo(s.DeviceIsolation), yesNo(s.SiblingIsolation), yesNo(s.MultiTenant))
 	}
+	writeSupportMatrix(&out, registry.Descriptors())
 	fmt.Fprint(&out, `
 ## What the rows mean
 
@@ -162,11 +166,13 @@ explicitly approved for multi-tenant placement.
   It satisfies `+"`isolated`"+` but not the microVM requirement of
   `+"`multi_tenant`"+`.
 
-The Firecracker descriptor shown here is the fail-closed, unverified zero
-value. A live node advertises its microVM capabilities only after construction
-probes its KVM, jailer, guest, volume and network adapters. Vendor provisioners
-do not change these rows: caps come from the backend inside a machine, and
-vendor pools remain one tenant per VM.
+The Firecracker descriptor in the enforcement table above is the fail-closed,
+unverified zero value; the support matrix additionally shows the verified row,
+labelled as such. A live node advertises its microVM capabilities only after
+construction probes its KVM, jailer, guest, volume and network adapters, and
+the verified row is what those capabilities would mean, not evidence that any
+host passed. Vendor provisioners do not change these rows: caps come from the
+backend inside a machine, and vendor pools remain one tenant per VM.
 
 ## Operational proof
 
@@ -247,4 +253,10 @@ func yesNo(value bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+// verifiedFirecracker is the descriptor a Firecracker node advertises once its
+// host probes pass, normalized through the same function a live registry uses.
+func verifiedFirecracker() proto.BackendDescriptor {
+	return workspace.DescriptorFor("firecracker", firecracker.VerifiedCaps())
 }

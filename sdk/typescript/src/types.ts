@@ -1109,6 +1109,8 @@ export interface Frame {
   "op"?: string;
   "body"?: Uint8Array;
   "err"?: Error | null;
+  "trace"?: string;
+  "span"?: string;
 }
 
 export interface Gap {
@@ -2270,6 +2272,54 @@ export interface WorkspaceSpec {
   "repo"?: RepoSpec;
   "volumes"?: Array<VolumeMount>;
 }
+
+// Reason is the stable sub-classification an error carries beside its code.
+// ./errors.ts maps each value to one error class; an unknown value degrades
+// to the base ProtocolError rather than to an unhandled case.
+export type Reason =
+  | "approval_required"
+  | "backend_unsupported"
+  | "binding_missing"
+  | "browser_crashed"
+  | "display_unavailable"
+  | "download_blocked"
+  | "egress_denied"
+  | "generation_mismatch"
+  | "grant_expired"
+  | "input_rejected"
+  | "lifecycle_deadline_expired"
+  | "navigation_denied"
+  | "output_evicted"
+  | "permission_denied"
+  | "profile_corrupt"
+  | "profile_unschedulable"
+  | "quota_exceeded"
+  | "revoked"
+  | "workspace_moved"
+  | "workspace_not_ready";
+
+export const REASONS: readonly Reason[] = [
+  "approval_required",
+  "backend_unsupported",
+  "binding_missing",
+  "browser_crashed",
+  "display_unavailable",
+  "download_blocked",
+  "egress_denied",
+  "generation_mismatch",
+  "grant_expired",
+  "input_rejected",
+  "lifecycle_deadline_expired",
+  "navigation_denied",
+  "output_evicted",
+  "permission_denied",
+  "profile_corrupt",
+  "profile_unschedulable",
+  "quota_exceeded",
+  "revoked",
+  "workspace_moved",
+  "workspace_not_ready",
+] as const;
 
 export const OPERATIONS = {
   "agent.approval.decided": { constant: "OpAgentApprovalDecided", request: "AgentApprovalDecidedReq", response: "" },

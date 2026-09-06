@@ -49,6 +49,42 @@ explicitly approved for multi-tenant placement.
 | `gvisor` | `container` | `fs` | `enforced_gateway` | `per_session_capability` | `bind_mount` | yes | yes | yes | no |
 | `firecracker` | `none` | `fs` | `open` | `none` | `` | no | no | no | no |
 
+## Operating systems
+
+Which role a host can fill, and which backends can run a workspace there. A
+backend compiles for every platform `make dist` builds; this table is about
+what actually runs.
+
+| OS | Client | Node | Backends that run there | Notes |
+|---|---|---|---|---|
+| Linux | yes | yes | `docker`, `firecracker`, `gvisor`, `process` | the only host for `gvisor` and `firecracker`; the E4 isolation and KVM lanes run here |
+| macOS | yes | yes | `docker`, `process` | no `runsc` and no network namespaces, so isolation backends need a Linux VM; read-only volume mounts are unavailable (`internal/volume/mount_other.go`) |
+| Windows | yes | yes, reduced | `docker`, `process` | no PTY sessions (no ConPTY runner), no POSIX-shell recipe/ACP launchers, no read-only volume mounts, no parent-directory fsync, and no host memory figure; the CI Windows lane names each one |
+
+The installer (`install.sh`) serves Linux and macOS; a Windows host takes a
+binary from `make dist`, which builds linux, darwin and windows on amd64 and
+arm64. gVisor and Firecracker are Linux kernel mechanisms: on a macOS or
+Windows machine they run inside a Linux VM with nested virtualization, not on
+the host GOOS.
+
+## Feature availability by backend
+
+Every cell is derived from the backend's own advertised capabilities. The four
+right-hand columns are `internal/profile` evaluated against that backend alone
+with no host evidence, which is what documentation can honestly prove: a
+`pass` here means the capabilities satisfy the profile, and
+`unavailable` means a host check has to run before anything may be
+claimed. An unavailable profile is never a pass, and only
+`remount doctor --profile` against a live node settles it.
+
+| Backend | Sleep/wake | Move | Memory snapshot | Computer session | Brokered credentials | Enforced egress | Artifacts | dev | trusted-single-tenant | multi-tenant-isolated | microvm |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|
+| `process` | yes | yes | no | yes | yes | no | yes | `pass` | `fail` | `fail` | `fail` |
+| `docker` | yes | yes | no | yes | yes | no | yes | `pass` | `pass` | `fail` | `fail` |
+| `gvisor` | yes | yes | no | yes | yes | yes | yes | `pass` | `pass` | `pass` | `fail` |
+| `firecracker` (unverified) | yes | yes | no | no | no | no | yes | `pass` | `fail` | `fail` | `fail` |
+| `firecracker` (verified) | yes | yes | yes | yes | yes | yes | yes | `pass` | `pass` | `pass` | `unavailable` |
+
 ## What the rows mean
 
 - `process` is a filesystem jail and cooperative proxy. It is useful for
@@ -61,11 +97,13 @@ explicitly approved for multi-tenant placement.
   It satisfies `isolated` but not the microVM requirement of
   `multi_tenant`.
 
-The Firecracker descriptor shown here is the fail-closed, unverified zero
-value. A live node advertises its microVM capabilities only after construction
-probes its KVM, jailer, guest, volume and network adapters. Vendor provisioners
-do not change these rows: caps come from the backend inside a machine, and
-vendor pools remain one tenant per VM.
+The Firecracker descriptor in the enforcement table above is the fail-closed,
+unverified zero value; the support matrix additionally shows the verified row,
+labelled as such. A live node advertises its microVM capabilities only after
+construction probes its KVM, jailer, guest, volume and network adapters, and
+the verified row is what those capabilities would mean, not evidence that any
+host passed. Vendor provisioners do not change these rows: caps come from the
+backend inside a machine, and vendor pools remain one tenant per VM.
 
 ## Operational proof
 

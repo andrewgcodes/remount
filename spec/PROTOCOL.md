@@ -40,6 +40,8 @@ Frame {
   op:   string      req: operation name; ev: event type
   body: bytes       CBOR payload, shape determined by t and op
   err:  Error?      res only, non-nil on failure
+  trace: string?    optional trace id (16 bytes, lowercase hex)
+  span:  string?    optional parent span id (8 bytes, lowercase hex)
 }
 
 Error { code: string, msg: string, oldest: uint64, reason: string? }
@@ -70,6 +72,18 @@ field ignores it, and a code without a reason is still complete. Reasons:
 `display_unavailable`, `input_rejected`, `navigation_denied`,
 `profile_corrupt`, `download_blocked`, and `profile_unschedulable`. The
 sections that introduce an operation name the reasons it sends.
+
+`trace` and `span` are an optional trace context. A peer whose operator has
+configured an OTLP collector stamps them on a request it originates so the
+receiver's span is a child of the sender's; a peer that sends neither is
+untraced, and a peer that receives them and does not trace ignores them. They
+carry no authority: nothing is authorized, ordered, fenced or routed by them,
+and a receiver that finds a malformed value starts a fresh trace rather than
+refusing the frame. They are absent by default because Remount runs no hosted
+service and exports nothing to an endpoint an operator did not configure. A
+sealed frame (`e2ee-payloads`, below) carries neither: the sealed envelope lists
+the clear fields exactly, so a trace context is dropped rather than exposed to
+the relay, and a sealed peer's spans are roots.
 
 When two peers negotiate `e2ee-payloads` (§3.1), every frame between them
 carries `op: "e2ee.sealed"` and a body of:

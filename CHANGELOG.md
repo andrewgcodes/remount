@@ -85,6 +85,32 @@ tests and engineering notes do not.
   it, renew once, watch the control plane sleep the workspace on its own, read
   the exit reason and the events, then wake it and confirm the filesystem
   survived.
+- Typed errors in all three languages. `api` re-exports every `Reason*`
+  constant and adds `api.Is(err, code, reason)`. `remount.errors` (Python) and
+  `@remount/sdk`'s `errors` module (TypeScript) define one exception class per
+  reason — `EgressDenied`/`EgressDeniedError` and the rest — all deriving from
+  `ProtocolError`, which now carries `reason`. An unrecognised reason degrades
+  to `ProtocolError` rather than failing, so an older client keeps working
+  against a newer server. `cmd/protogen` generates the reason vocabulary into
+  `remount.types.REASONS` and `Reason` in `@remount/sdk`.
+- The agent HTTP API's error body carries `reason` alongside `code` and
+  `message` when the server set one. The field is omitted when empty.
+- A generated support matrix in `docs/security-profiles.md`: which operating
+  system can host a client and a node, which backends run there, and per
+  backend the availability of sleep/wake, move, memory snapshot, computer
+  sessions, brokered credentials, enforced egress and artifacts, plus the
+  status of each runtime profile. Derived from the backends' own advertised
+  capabilities; linked from `README.md` and `docs/compatibility-policy.md`.
+- Optional OpenTelemetry tracing with no new dependency. `--otlp-endpoint` on
+  `remount server`, `up` and `standalone`, or `REMOUNT_OTLP_ENDPOINT`, exports
+  one span per request as OTLP/HTTP JSON to a collector the operator runs.
+  There is no default endpoint: unset means nothing is recorded and nothing
+  leaves the process. Node spans are children of the control span that caused
+  them, carried by additive optional `trace` and `span` fields on the wire
+  frame (`spec/PROTOCOL.md` §2). New counters
+  `remount_trace_spans_exported_total` and
+  `remount_trace_export_failures_total`; documented in
+  `docs/observability.md`.
 
 ### Changed
 
@@ -93,6 +119,14 @@ tests and engineering notes do not.
   `"workspace released"`, and the node gives it `SIGTERM` plus a bounded grace
   (five seconds by default) before `SIGKILL`. On Windows the grace degrades to
   immediate termination; the recorded reason is the same.
+- `internal/client` decides whether a stale-grant `unauthorized` answer is
+  worth retrying from the error's stable `reason` (`revoked`,
+  `generation_mismatch`) instead of its message text. A node too old to send a
+  reason at that site now surfaces `unauthorized` to the caller rather than
+  being retried.
+- Structured logs are scrubbed for credential shapes: every message and string
+  attribute passes through the same redaction the broker and agent transcript
+  use before it reaches the log.
 
 ### Fixed
 
@@ -115,8 +149,8 @@ the change it actually shipped, or deletes if it did not land.
   principal APIs, provider-neutral schemas, revocation and audit.
 - Browser and computer-use sessions: screenshot, click, type, key, scroll,
   navigation, downloads and reconnect, with broker-aware browser egress.
-- SDK, conformance and observability polish: typed errors across languages,
-  metrics and traces for control-plane operations, and attachable conformance
-  evidence.
+- SDK, conformance and observability polish: attachable conformance evidence.
+  Typed errors, the support matrix, tracing and log redaction have landed and
+  are listed above.
 
 [Unreleased]: https://github.com/andrewgcodes/remount/commits/main

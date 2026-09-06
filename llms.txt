@@ -37,6 +37,7 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/an
 - [Choose a runtime profile](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#choose-a-runtime-profile): A runtime profile is what a **machine** claims, as distinct from `security.profile`, which is what one **workspace** requires.
 - [Provider-backed nodes are not credential checks](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#provider-backed-nodes-are-not-credential-checks): Fly, E2B, Modal, ix.dev, and SSH pool drivers create whole Remount nodes.
 - [Verify outcomes and clean up](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#verify-outcomes-and-clean-up): Use the resource state and durable evidence, not a successful client call alone:
+- [Public API, errors and tracing](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#public-api-errors-and-tracing): Remount's public surface is the Go `api` and `client` packages, the `remount` Python package, the `@remount/sdk` npm package, the wire protocol, and the documented CLI flags and `--json` shapes.
 - [Documentation map and maintenance](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#documentation-map-and-maintenance): This guide owns the supported **user journeys** and links to their detailed contracts:
 
 ## Tutorial

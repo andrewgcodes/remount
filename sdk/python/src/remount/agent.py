@@ -11,7 +11,8 @@ from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 import httpx
 from websockets.asyncio.client import connect as websocket_connect
 
-from .client import ConnectionClosed, ProtocolError
+from .client import ConnectionClosed
+from .errors import ProtocolError, raise_for
 from .types import Agent, AgentCreateReq, AgentMessageRes, Approval
 
 MAX_HTTP_RESPONSE_BYTES = 16 << 20
@@ -201,7 +202,7 @@ class AgentClient:
             message = str(detail.get("message", f"HTTP {status}"))
             if self.token:
                 message = message.replace(self.token, "[redacted]")
-            raise ProtocolError(str(detail.get("code", "internal")), message)
+            raise_for(str(detail.get("code", "internal")), str(detail.get("reason", "")), message)
         if status == 204:
             return None
         try:

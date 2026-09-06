@@ -1157,10 +1157,21 @@ func (c *Client) nodeCall(ctx context.Context, wsID, op string, body func(g *pro
 	}
 }
 
+// staleGrantAuthority reports whether an unauthorized response is the kind a
+// fresh grant fixes: the node has moved past the authority this grant was
+// minted under, either its authorization revision (ReasonRevoked, which is
+// what advances that revision) or the control plane's writer epoch
+// (ReasonGenerationMismatch). It matches on the stable Reason rather than on
+// message text; an unauthorized answer carrying neither reason - a grant for
+// the wrong workspace, a bad signature - is final and is returned to the
+// caller instead of being retried.
 func staleGrantAuthority(err *proto.Error) bool {
-	return err.Msg == "grant authorization revision or tenant is stale" ||
-		err.Msg == "grant authorization revision is stale" ||
-		err.Msg == "grant controller epoch is stale"
+	switch err.Reason {
+	case proto.ReasonRevoked, proto.ReasonGenerationMismatch:
+		return true
+	default:
+		return false
+	}
 }
 
 // ---------------------------------------------------------------------------

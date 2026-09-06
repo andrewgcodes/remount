@@ -44,6 +44,7 @@ import (
 	"remount.dev/remount/internal/profile"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/session"
+	"remount.dev/remount/internal/trace"
 	"remount.dev/remount/internal/transport"
 	"remount.dev/remount/internal/volume"
 	"remount.dev/remount/internal/workspace"
@@ -1745,7 +1746,7 @@ func (n *Node) confirmOpenAuthz(w *ws, claims proto.GrantClaims, s *session.Sess
 		return nil
 	}
 	n.sessions.Terminate(s.ID, proto.ExitReasonRevoked)
-	return proto.Err(proto.CodeUnauthorized, "grant authorization revision is stale")
+	return proto.ErrReason(proto.CodeUnauthorized, proto.ReasonRevoked, "grant authorization revision is stale")
 }
 
 func (n *Node) closeRevokedSessions(r *revocation) {
@@ -2618,7 +2619,9 @@ func (n *Node) dropClient(client string) {
 }
 
 func (n *Node) handleReq(ctx context.Context, p *transport.Peer, f *proto.Frame) {
-	body, err := n.dispatch(ctx, p, f)
+	reqCtx, span := trace.StartRemote(ctx, f.Op, f.Trace, f.Span)
+	body, err := n.dispatch(reqCtx, p, f)
+	finishNodeSpan(span, f, err)
 	if err != nil {
 		var pe *proto.Error
 		if !errors.As(err, &pe) {
@@ -2628,6 +2631,25 @@ func (n *Node) handleReq(ctx context.Context, p *transport.Peer, f *proto.Frame)
 		return
 	}
 	_ = p.Respond(ctx, f, body)
+}
+
+// finishNodeSpan records the routing facts of one dispatched node request and
+// ends its span. The calling peer id is the principal a node can name without
+// consulting the control plane; nothing here is a token, a body, or free text
+// that could carry one.
+func finishNodeSpan(span *trace.Span, f *proto.Frame, err error) {
+	if span == nil {
+		return
+	}
+	span.Set("remount.peer", f.From)
+	span.Set("remount.ws", proto.WorkspaceOf(f))
+	span.Set("remount.session", f.S)
+	var pe *proto.Error
+	if errors.As(err, &pe) {
+		span.Set("remount.code", pe.Code)
+		span.Set("remount.reason", pe.Reason)
+	}
+	span.End(err)
 }
 
 func decode[T any](f *proto.Frame) (*T, error) {
@@ -2676,7 +2698,12 @@ func (n *Node) authorizeClaims(client, wsID string, g *proto.Grant) (*ws, proto.
 			"node authorization revision %d is behind grant revision %d", w.AuthzRevision, g.Claims.AuthzRevision)
 	}
 	if proto.HasCapability(n.protocol, proto.CapabilityControllerEpoch) && g.Claims.ControllerEpoch != n.currentControllerEpoch() {
-		return nil, proto.GrantClaims{}, proto.Err(proto.CodeUnauthorized, "grant controller epoch is stale")
+		// The controller epoch is the control plane's writer-lease generation,
+		// so a grant minted under an older epoch is a stale generation in
+		// exactly the sense ReasonGenerationMismatch names. The reason is what
+		// the SDK retries on; the code is unchanged.
+		return nil, proto.GrantClaims{}, proto.ErrReason(proto.CodeUnauthorized, proto.ReasonGenerationMismatch,
+			"grant controller epoch is stale")
 	}
 	n.grants[key] = g
 	return w, g.Claims, nil

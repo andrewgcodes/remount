@@ -553,7 +553,13 @@ func cmdServer(ctx context.Context, args []string) error {
 	maxAPIClients := fs.Int("max-api-clients", 256, "maximum distinct HTTP API credentials with a live in-process client")
 	webhookSecret := fs.String("webhook-secret", os.Getenv("REMOUNT_WEBHOOK_SECRET"), "HMAC-SHA256 secret that signs POST /v1/events (X-Remount-Signature / X-Hub-Signature-256)")
 	webhookToken := fs.String("webhook-token", os.Getenv("REMOUNT_WEBHOOK_TOKEN"), "credential signed webhooks act as when they create or wake agents (default: append-only)")
+	otlpEndpoint := fs.String("otlp-endpoint", envOr("REMOUNT_OTLP_ENDPOINT", ""), otlpEndpointUsage)
 	parse(fs, args)
+	stopTracing, err := configureTracing(*otlpEndpoint, "remount-control")
+	if err != nil {
+		return err
+	}
+	defer stopTracing()
 	if *publicURL != "" {
 		u, err := url.Parse(*publicURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
@@ -720,7 +726,13 @@ func cmdUp(ctx context.Context, args []string) error {
 	var allow, allowPrivate listFlag
 	fs.Var(&allow, "allow", "host pattern workspaces may reach without a credential (repeatable)")
 	fs.Var(&allowPrivate, "allow-private", "host pattern allowed to resolve to a private address (repeatable)")
+	otlpEndpoint := fs.String("otlp-endpoint", envOr("REMOUNT_OTLP_ENDPOINT", ""), otlpEndpointUsage)
 	parse(fs, args)
+	stopTracing, err := configureTracing(*otlpEndpoint, "remount-node")
+	if err != nil {
+		return err
+	}
+	defer stopTracing()
 	dataDir, err := absFlagPath("data", *data)
 	if err != nil {
 		return err
@@ -770,7 +782,13 @@ func cmdStandalone(ctx context.Context, args []string) error {
 	fs.Var(&allow, "allow", "host pattern reachable without a credential")
 	agentUI := fs.String("agent-ui", envOr("REMOUNT_AGENT_UI", ""), "operator UI URL that /a/{id} redirects to; {id} is replaced, else appended")
 	cors := fs.String("cors", envOr("REMOUNT_CORS", ""), "comma-separated browser origins allowed to call the HTTP API; the standalone has no token, so any listed page may act on it")
+	otlpEndpoint := fs.String("otlp-endpoint", envOr("REMOUNT_OTLP_ENDPOINT", ""), otlpEndpointUsage)
 	parse(fs, args)
+	stopTracing, err := configureTracing(*otlpEndpoint, "remount")
+	if err != nil {
+		return err
+	}
+	defer stopTracing()
 	b, err := loadBindings(*bindings)
 	if err != nil {
 		return err
@@ -1884,8 +1902,11 @@ func (t *tabwriter) Flush() {
 }
 
 func init() {
-	// Quieter default logging for the CLI; server/node set their own.
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: levelFromEnv()})))
+	// Quieter default logging for the CLI; server/node set their own. Every
+	// message and string attribute passes through internal/redact first, so a
+	// credential-shaped value that reached a log argument by accident never
+	// reaches the log.
+	slog.SetDefault(slog.New(newRedactingHandler(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: levelFromEnv()}))))
 	_ = http.DefaultClient
 }
 
