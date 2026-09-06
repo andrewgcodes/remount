@@ -6,7 +6,7 @@
 
 <img src="docs/assets/remount-banner.svg" alt="Remount" width="820">
 
-<h1>vMotion for AI agents.</h1>
+<h1>vMotion for agents.</h1>
 
 <p><b>Infrastructure for cloud agents that survive anything: a dropped connection, a dead node, a control-plane restart, a revoked key. Pause, move, resume, reattach, on machines you own.</b></p>
 
