@@ -42,7 +42,7 @@ Frame {
   err:  Error?      res only, non-nil on failure
 }
 
-Error { code: string, msg: string, oldest: uint64 }
+Error { code: string, msg: string, oldest: uint64, reason: string? }
 ```
 
 Rules that make version skew survivable:
@@ -59,6 +59,17 @@ Rules that make version skew survivable:
 Error codes are stable: `bad_request`, `not_found`, `unsupported`,
 `unauthorized`, `conflict`, `evicted`, `unreachable`, `internal`, `timeout`,
 `closed`, `denied`, and `resource_exhausted`.
+
+`reason`, when present, is a stable sub-classification within `code` that a
+client may act on; `msg` is never to be matched. A peer that predates the
+field ignores it, and a code without a reason is still complete. Reasons:
+`permission_denied`, `egress_denied`, `approval_required`, `binding_missing`,
+`grant_expired`, `revoked`, `quota_exceeded`, `workspace_not_ready`,
+`workspace_moved`, `generation_mismatch`, `backend_unsupported`,
+`output_evicted`, `lifecycle_deadline_expired`, `browser_crashed`,
+`display_unavailable`, `input_rejected`, `navigation_denied`,
+`profile_corrupt`, `download_blocked`, and `profile_unschedulable`. The
+sections that introduce an operation name the reasons it sends.
 
 When two peers negotiate `e2ee-payloads` (§3.1), every frame between them
 carries `op: "e2ee.sealed"` and a body of:
