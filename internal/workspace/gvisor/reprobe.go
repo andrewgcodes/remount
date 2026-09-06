@@ -32,10 +32,10 @@ func (b *Backend) Reprobe(ctx context.Context) []proto.Finding {
 			"runsc answers --version",
 			"reinstall runsc or fix PATH; the node is advertising a sandbox it can no longer start",
 			b.runtime.probe(ctx)),
-		workspace.CheckFinding(CheckRootFS, b.rootfs,
+		workspace.CheckFinding(CheckRootFS, b.rootfsSubject(),
 			"the immutable rootfs is present",
 			"restore REMOUNT_GVISOR_ROOTFS; without it no workspace can be materialized",
-			rootfsPresent(b.rootfs)),
+			rootfsPresent(b.rootfsSubject())),
 	}
 	if b.network == nil {
 		out = append(out, workspace.UnavailableFinding(CheckNetwork, "",
@@ -48,6 +48,16 @@ func (b *Backend) Reprobe(ctx context.Context) []proto.Finding {
 		"restore CAP_NET_ADMIN/CAP_SYS_ADMIN and netlink access; enforced egress cannot be set up without them",
 		b.network.Probe(ctx)))
 	return out
+}
+
+// rootfsSubject is the path drift is measured against: the one the operator
+// configured, which is what an operator can repair. A backend built before
+// the configured path was recorded separately falls back to the resolved one.
+func (b *Backend) rootfsSubject() string {
+	if b.rootfsPath != "" {
+		return b.rootfsPath
+	}
+	return b.rootfs
 }
 
 func rootfsPresent(rootfs string) error {

@@ -2815,3 +2815,336 @@ One host, one architecture, one Chromium build, and the docker backend only.
 gVisor and firecracker computer sessions are untested here. Docker remains
 cooperative isolation. `linux/amd64`, a published browser image, and any CI
 lane for this gate are absent.
+
+**Superseded by the 2026-09-05 entry below**, which runs `E26`, `B28` and the
+whole `multi-tenant-isolated` profile against a real gVisor node in a local
+Colima Linux VM. Both of the two defects that entry found are invisible to
+darwin and to the scripted-backend half of the loop.
+
+---
+
+## 2026-09-05 - live gVisor isolation, profile and drift lanes in a Colima VM
+
+**Status: E4, E5, B28 and E26 verified on a real gVisor host; the
+`multi-tenant-isolated` profile verified end to end through a live control
+plane and node, including drift and recovery; B29 Firecracker recorded below.
+Two defects were found and fixed, both of which made a required lane fail and
+neither of which is reachable on darwin.**
+
+Commit under test: `ced0f0064e2ad183f16da807c5a3558391bc4d95`
+(`claude/gap-brief-2026-09-06`), plus the two fixes this entry describes. The
+binary reported `remount v0.0.0-20260906021425-ced0f0064e2a+dirty`.
+
+Host: a Colima Ubuntu aarch64 VM on macOS/arm64 (Apple silicon), started
+earlier with `colima start --nested-virtualization --arch aarch64 --cpu 4
+--memory 6 --disk 20`. Kernel `6.8.0-117-generic`, 4 vCPU, 5910 MiB.
+Go `1.27.1 linux/arm64` at `/usr/local/go/bin/go`. Docker server `29.5.2`
+inside the VM. gVisor `runsc version release-20260831.0`, spec `1.2.1`,
+platform `systrap` (no KVM needed, which is why gVisor runs here at all).
+Firecracker and jailer `v1.16.1`. The repository is visible inside the VM at
+the same absolute path through the virtiofs home mount, so every lane ran
+against this worktree rather than a copy.
+
+### Per-lane verdicts
+
+| Lane | Command | Verdict |
+|---|---|---|
+| linux/arm64 build | `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o dist/remount-linux-arm64 ./cmd/remount`; `colima ssh -- <repo>/dist/remount-linux-arm64 version` | **verified** — `remount v0.0.0-20260906021425-ced0f0064e2a+dirty` |
+| E4 denial + failed-setup cleanup | `./scripts/gvisor-conformance.sh e4` | **verified** — exit 0, 38 s |
+| E5 sibling and tenant isolation | `./scripts/gvisor-conformance.sh all` (E5 half) | **verified** — exit 0 |
+| B28 aggregate | `./scripts/gvisor-conformance.sh all` | **verified after fixes** — exit 0, 55 s (**failed** before: exit 1, 345 s) |
+| E26 drift | `./scripts/gvisor-conformance.sh drift` | **verified after fixes** — exit 0, 5.22 s (**failed** before: 300.05 s timeout) |
+| profile gate + `doctor --profile` | live `remount server` + `remount up --backend gvisor --profile multi-tenant-isolated` | **verified** — node started, `doctor --profile multi-tenant-isolated` exit 0, `--profile microvm` exit 1 |
+| profile conformance | `remount conformance --profile multi-tenant-isolated --backend gvisor` | **verified** — 78 checks, 64 passed, 0 failed, 14 unavailable, exit 0 |
+| live drift and recovery | rootfs prerequisite removed and restored out of band | **verified** — see below |
+| B29 Firecracker | `./scripts/firecracker-conformance.sh` | see the Firecracker section below |
+
+### Prerequisites: what was present and what had to be built
+
+`runsc` was **absent** at the start of this session — the 2026-09-04 install
+did not survive — and was reinstalled from the gVisor apt repository and
+registered with Docker (`sudo runsc install --runtime=runsc`, daemon
+restarted; `docker info` then lists `"runsc": {"path": "/usr/bin/runsc"}`).
+`REMOUNT_GVISOR_ROOTFS` was **absent** and was rebuilt from
+`alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce`
+via `docker export` into `/var/tmp/remount-lane-gvisor-rootfs`, with
+`rawprobe` and `udpprobe` cross-compiled on the macOS host for `linux/arm64`
+and installed 0755. `ripgrep` was **absent** and was installed, because
+`scripts/firecracker-conformance.sh` uses `rg` for its cleanup assertions.
+
+Present without work: `/usr/sbin/nft`, `/usr/sbin/iptables`, `/dev/kvm`
+(`crw-rw---- root:kvm`, readable and writable by root), `firecracker` and
+`jailer` v1.16.1 in `/usr/local/bin`, the btrfs pool `/var/tmp/fcpool.img`
+mounted at `/srv/fc`, the guest kernel `/var/tmp/fc-kernel`, the guest
+manifest `/var/tmp/guest-manifest.json` (protocol 1, vsock port 10789,
+workspace `/workspace`), and passwordless `sudo`.
+
+The VM also still held leaked host state from 2026-09-04: the netns bind
+mounts `/run/remount/netns/rm-1421-1` and `rm-3aae-1`, their veths `rmh1421`
+and `rmh3aae`, two nsfs mounts, and the cgroups
+`/sys/fs/cgroup/remount-e2e-1` and `-2` with three `rm-*` children. **The
+first gVisor backend this session constructed reclaimed all of the netns and
+veth state by itself**, which is the startup reaper from the 2026-09-04
+finding working on leftovers it did not create: `/run/remount/netns` empty,
+no `rm*` links, nsfs mounts 2 → 1. The Firecracker cgroups are not reclaimed
+by that path and were left alone; they belong to the earlier session.
+
+### Defect 1: a gVisor workspace whose sandbox never started could never be materialized again
+
+Found by `./scripts/gvisor-conformance.sh all`, which failed E26 at the 300 s
+timeout on `the parked workspace was not placed after the prerequisite came
+back`. The node log showed the same line 14 times with exponential backoff:
+
+```
+ERROR materialize failed; releasing ws=ws_06g7933tg7t24tdw594qzw9ye8
+  err="not_found: workspace ws_06g7933tg7t24tdw594qzw9ye8 has no retained network metadata"
+```
+
+`handle.ApplyNetworkPolicy` writes `network.json` only after the sandbox has
+started and the policy is applied; its deferred cleanup revokes the boundary
+on any failure. So a materialization that dies inside that method leaves the
+bundle and its `work` tree on disk with no metadata file. The node then
+quarantines the workspace — deliberately retaining the filesystem, because
+those bytes may exist nowhere else — and every retry arrives with
+`adopt=true`. `internal/node.materializeWithReadyHook` then runs Adopt,
+Create, Adopt: `Adopt` refused with `CodeNotFound` because `network.json` was
+missing, `Create` refused with `CodeConflict` because the bundle existed, and
+the second `Adopt` refused again and became the reported error. The workspace
+was wedged permanently and the message named the wrong problem — the same
+shape as the Firecracker quarantine defect in
+`docs/engineering/gvisor-egress-finding-2026-09-04.md`.
+
+Fixed in `internal/workspace/gvisor/gvisor.go`. `Create` now records
+`{"generation": 0, "mount": …}` as soon as the tree exists, where generation 0
+means "created, never started"; `Adopt` treats missing or generation-0
+metadata as a retained tree with no boundary to re-attach to and returns a
+fresh handle over it, exactly the one `Create` would have built, keeping the
+mount path so the workspace cannot be silently served at a different path.
+Regression tests (unprivileged, on darwin):
+`TestAdoptRecoversATreeWhoseSandboxNeverStarted` and
+`TestAdoptHonoursTheMountPathOfATreeThatNeverStarted`. Both were watched
+failing with the exact production message before the fix.
+
+### Defect 2: a symlinked `REMOUNT_GVISOR_ROOTFS` breaks every materialization
+
+With defect 1 fixed the retries got further and hit the real cause, on every
+attempt, twenty seconds after the drift lever had been restored:
+
+```
+apply enforced network policy: runsc --network=sandbox: creating container:
+  cannot create sandbox: cannot read client sync file:
+  waiting for sandbox to start: EOF: exit status 128
+```
+
+A four-way experiment on this host settled it — the rootfs is the variable and
+the binary is not:
+
+| OCI `root.path` | `runsc` invoked as | `runsc create` |
+|---|---|---|
+| real directory | real path | OK |
+| **symlink to it** | real path | **fails** |
+| real directory | symlink | OK |
+| **symlink to it** | symlink | **fails** |
+
+`runsc` release-20260831.0 cannot serve a bundle whose `root.path` is a
+symlink, and says nothing about the rootfs when it refuses. Nothing in Remount
+refused the configuration either: `os.Stat` follows symlinks, so `gvisor.New`
+verified the rootfs, the node registered `gvisor`, advertised
+`enforced_gateway`, satisfied `multi-tenant-isolated` and then failed **every
+single materialization**. This was reproduced in the product, not only in the
+experiment: a live node started with
+`REMOUNT_GVISOR_ROOTFS=/tmp/remount-lane-e2e/links/rootfs` enrolled, passed the
+startup gate and could not materialize one workspace.
+
+Pointing that variable at a symlink is the ordinary way to swap an immutable
+image atomically, so resolving it is the fix rather than refusing it. Fixed in
+`internal/workspace/gvisor/gvisor.go` and `reprobe.go`: `resolveRootFS` returns
+both the configured path and the resolved directory; the OCI bundle names the
+resolved directory, while the drift probe keeps watching the path the operator
+configured, because that path disappearing is the rootfs going away whatever
+survives at the far end of it. Regression test:
+`TestRootFSGivenAsASymlinkIsResolvedForTheSandbox`, which asserts both halves
+of that split. **This is what E26 was always going to catch**: the lever the
+test uses is a symlink it owns, so the test could never have passed against a
+real host, and the scripted-backend half of the loop cannot see it.
+
+### The gVisor lanes, after the fixes
+
+```sh
+export REMOUNT_GVISOR_INTEGRATION=1
+export REMOUNT_GVISOR_ROOTFS=/var/tmp/remount-lane-gvisor-rootfs
+export REMOUNT_CHAOS_IMAGE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+./scripts/gvisor-conformance.sh all      # exit 0, 55 s
+./scripts/gvisor-conformance.sh drift    # exit 0, 5.22 s
+```
+
+`integration/chaos/backend-gates.sh --probe` reported
+`gvisor status=available runtime=runsc`. `scripts/gvisor-spike.sh` passed the
+broker positive control, the UDP positive control and all nine denials
+including the post-revoke one, with packet policy `guest-egress` (the
+traffic-control classifier on the guest veth, not the host-ingress fallback).
+`TestE4DenialConformance` passed in 17.66 s over its six subtests plus the
+in-flight revoke; `TestE4FailedSetupCleanupConformance` in 0.12 s;
+`TestE5SiblingTenantsCannotReachEachOther` in 9.73 s over its three subtests;
+`TestE5TenantIsolationConformance` in 0.32 s;
+`TestE26ProfileDriftMakesNodeUnschedulable` in 5.22 s over both levers.
+
+### The `multi-tenant-isolated` profile, end to end on a live deployment
+
+A real two-process deployment inside the VM, everything under
+`/tmp/remount-lane-e2e`:
+
+```sh
+remount server --mode standalone --token <local throwaway> --listen 127.0.0.1:7460 --data <lane>/server
+REMOUNT_GVISOR_ROOTFS=<lane>/links/rootfs REMOUNT_RUNSC=<lane>/links/runsc \
+  remount up --server http://127.0.0.1:7460 --token <local throwaway> \
+    --data <lane>/node --backend gvisor --profile multi-tenant-isolated \
+    --profile-health-interval 2s
+```
+
+The node **started** — the fail-closed startup gate accepted it — and enrolled.
+The descriptor it advertised is the real one derived from `gvisor.Caps`:
+`isolation=container`, `multi_tenant=false`, `sibling_isolation=true`,
+`egress_mode=enforced_gateway`, `broker_identity=per_session_capability`,
+`network_namespace=true`, `device_isolation=true`, with three runtime checks
+(`gvisor.network`, `gvisor.rootfs`, `gvisor.runsc`) all `pass`.
+
+**ADR 0089's claim holds against the real host.** `multi-tenant-isolated` does
+not require `MultiTenant`, so gVisor's true capabilities satisfy all nine of
+its predicates; the predicate and the documented promise agree and neither
+needed changing. `remount doctor --profile multi-tenant-isolated --json`
+exited **0** with nine passing checks. The same node under `--profile microvm`
+exited **1**, as it must: gVisor is not a microVM.
+
+`remount conformance --profile multi-tenant-isolated --backend gvisor` against
+that deployment: **`CONFORMANT`, exit 0, 7.613 s. 78 requirements: 64 passed,
+0 failed, 14 unavailable.** By tier: required 63 / 0 / 0; capability-gated
+1 / 0 / 13; extension 0 / 0 / 1. `cleanup: verified`. All ten `CONF-PROF-*`
+rows passed, including `CONF-PROF-SCHEDULING` — a workspace created with
+`requires.profile: multi-tenant-isolated` was actually claimed and served, and
+under a named profile every workspace the run creates carries that requirement.
+The 14 unavailable rows are prerequisites this runner does not arrange
+(`node-fault`, `session-eviction`, `quiesced-snapshot`, `bindings` ×8,
+`transcript-eviction`, `event-eviction`) plus the `CONF-EVT-009` extension;
+none is a required row. This is the first non-`dev` profile pass B33 has, and
+the first on a backend that makes an isolation claim.
+
+A workspace with **no** profile requirement also schedules and runs:
+`remount ws create --name lane-plain --backend gvisor --wait` reached
+`state=claimed`, and `remount exec` inside it reported
+`Linux remount-ws-… 4.19.0-gvisor #1 SMP … aarch64` against the host's
+`6.8.0-117-generic` — a real gVisor kernel, not the host's.
+
+### Live drift and recovery
+
+The prerequisite was broken out of band exactly the way `E26` does it, by
+removing the rootfs symlink the node was pointed at, while the deployment
+served:
+
+| Step | Observed |
+|---|---|
+| baseline | `doctor --profile multi-tenant-isolated` exit 0 |
+| `rm <lane>/links/rootfs` | node logs `runtime profile is no longer satisfied … failed=[profile.runtime.healthy]` |
+| within 1 s | `node.profile.unschedulable` emitted, `origin: node` then `origin: control` |
+| within 7 s | `doctor --profile` exits **1**, naming `profile.runtime.healthy \| host runtime checks are failing: gvisor.rootfs` |
+| new profile workspace | parks with `pending_reason "profile_unschedulable"`; `CONF-PROF-SCHEDULING` fails with that exact reason |
+| node-side re-check | `denied: node n_… does not satisfy runtime profile multi-tenant-isolated: [profile.runtime.healthy]` — the `CodeDenied` + `ReasonProfileUnschedulable` refusal ADR 0089 specifies, observed on a real claim |
+| symlink restored | `node.profile.restored` emitted, `origin: node` then `origin: control` |
+| within 10 s | `doctor --profile` exits **0** again |
+| after recovery | `CONF-PROF-SCHEDULING` passes: 1 passed, 0 failed, 0 unavailable |
+
+The full event sequence on one node, with origins:
+`node.profile.verified` (control) → `unschedulable` (node) → `unschedulable`
+(control) → `restored` (node) → `restored` (control), twice over the two drift
+cycles. Both origins fire at every transition, which is what ADR 0089 says
+should happen and had not been observed against a real host before.
+
+`doctor --profile` lags a transition by one renewal in both directions —
+roughly 7 s to fail and 10 s to recover here with a 2 s probe interval. That is
+the design (a node's evidence reaches control on renewal) and not a defect, but
+a single sample taken immediately after breaking the prerequisite reports the
+old answer, so a script must poll rather than sample.
+
+### Cleanup
+
+Every workspace was destroyed, then the node and the control plane were
+stopped and `/tmp/remount-lane-e2e` removed. Afterwards, inside the VM:
+`/run/remount/netns` empty; `ip netns list` empty; no `rm*` or `tap*` links;
+no `runsc-sandbox`, `runsc-gofer`, `remount` or `firecracker` process; no
+`remount` nftables table; nsfs mounts back to 1.
+
+One residual was observed and is recorded rather than fixed: a `runsc create`
+that fails to start its sandbox leaves an empty cgroup
+`/sys/fs/cgroup/remount-ws-<workspace id>` behind, which `runsc delete --force`
+does not remove. It appeared only on the failure paths of the two defects above
+— three of them across this session, each removed by hand with `rmdir` — and
+no clean run leaked one. The 2026-09-04 `remount-e2e-1`/`-2` cgroups were left
+as found.
+
+### B29 Firecracker: unavailable, with the exact missing items
+
+**Unavailable on this host.** Not a pass, and not a claim that the backend is
+broken: the microVM lane needs a guest image and a pool this VM does not have,
+and reconstructing them was time-boxed. Everything below is what was measured.
+
+Prerequisites present: `/dev/kvm` readable and writable by root, `firecracker`
+and `jailer` v1.16.1 (`sha256 71ca0733…6038a` and `7db39d34…4edd7`), the guest
+kernel `/var/tmp/fc-kernel` (`eb5d95ac…832ec`), the guest manifest
+(`2aee13ee…503a`; protocol 1, vsock port 10789, workspace `/workspace`), the
+btrfs pool at `/srv/fc`, passwordless sudo, and `rg` once installed. The unit
+lane `go test ./internal/workspace/firecracker` passed in 1.207 s, and
+`TestDiskFullRestoreStagingFailsClosedAndCleansUp` passed.
+
+Three things stopped the exact-host lane, each recorded with what is missing:
+
+1. **Path permissions.** `scripts/firecracker-conformance.sh` probes every
+   artifact as the invoking user, but `/srv/fc` is `0700 root` and
+   `/var/tmp/guest-manifest.json` is `0600 root`, so the script reported
+   `UNAVAILABLE: required artifact does not exist: /srv/fc/fc-base.ext4` for a
+   file that exists. Worked around for this run by making `/srv/fc`
+   traversable and copying the manifest; `/srv/fc` was restored to `0700`
+   afterwards. A host preparing this lane must make the artifacts readable by
+   the account that runs the script.
+2. **The retained guest image starts the agent with no `PATH`.** The
+   `/sbin/init` in `/srv/fc/fc-base.ext4` is a real file (not the Alpine
+   busybox symlink, which is the trap the 2026-09-04 notes describe) and does
+   `exec /usr/local/bin/remount guest-agent --workspace /workspace` without
+   exporting `PATH`. The kernel gives init no `PATH`, so the guest agent's
+   lookup of a bare program fails and both B29 tests died immediately with
+   `exec: "sh": executable file not found in $PATH`. The 2026-09-04 session
+   never hit this because it drove the guest by hand with absolute paths
+   (`remount exec $WS -- /bin/sh -c …`). Worked around by reflink-copying the
+   image and adding `export PATH=…` to the copy's init, leaving the original
+   untouched; the copy was deleted afterwards. `integration/firecracker/README.md`
+   states the image contract as the manifest hash, protocol version, vsock port
+   and workspace path, and does not mention `PATH`; whether the guest agent
+   should supply a default `PATH` rather than requiring the image to is left as
+   a question for the Firecracker owner rather than answered here.
+3. **The pool is too small for the checkpoint lane.** With the image fixed,
+   `TestB29FirecrackerCheckpointMoveRestore` failed at
+   `write /srv/fc/lane/m/p/vm-…/.copy-…: no space left on device`. The pool is
+   a 4.0 GiB loop-mounted btrfs image with ~1.3 GiB free before the run, and a
+   full disk+state+memory bundle does not fit.
+
+With 1 and 2 worked around and 3 still blocking, `TestB29FirecrackerHostSmoke`
+ran for 90.08 s and failed on `session output never contained "30 100"` — a
+guest-session assertion that was **not diagnosed**, because by then the lane
+was outside its time box. It is recorded as an open observation, not as a
+verdict about the backend: a run that had to patch its own guest image is not
+evidence about the product either way.
+
+Cleanup: the lane data root `/srv/fc/lane`, the patched image copy
+`/srv/fc/remount-lane-rootfs.ext4`, the manifest copy and the cgroup parent
+`/sys/fs/cgroup/remount-lane` were all removed, no `firecracker` or `jailer`
+process survived, and `/srv/fc` is byte-for-byte the directory it was before
+(2.3 GiB used, 1.3 GiB free, same seven entries). `remount up --backend
+firecracker --profile microvm` was therefore **not attempted**; without a
+passing `scripts/firecracker-conformance.sh` there is nothing it would prove.
+
+### Not reachable from the CLI
+
+`Requires.Profile` has no `remount ws create` flag. The constraint is reachable
+from the raw protocol, from both SDKs (their `Requires` type carries
+`profile`), and from `remount conformance --profile`, which is how it was
+exercised here — but an operator using the CLI cannot ask for it. That is a gap
+for the CLI/SDK builder, not a defect in the profile machinery.

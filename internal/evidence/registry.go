@@ -60,6 +60,9 @@ const (
 	sourceLinux   = "docs/engineering/verification-2026-09.md (Linux host verification 2026-09-04)"
 	sourceProfile = "docs/engineering/verification-2026-09.md (runtime-profile conformance 2026-09-05)"
 	sourceBrowser = "docs/engineering/verification-2026-09.md (browser computer-session conformance 2026-09-05)"
+	// sourceColima is the first run of the gVisor isolation, profile and
+	// drift lanes against a real Linux host with runsc, in a local Colima VM.
+	sourceColima = "docs/engineering/verification-2026-09.md (live gVisor isolation, profile and drift lanes in a Colima VM, 2026-09-05)"
 )
 
 // notLanded is the only honest thing to say about a Plan B row whose ticket
@@ -103,8 +106,9 @@ var scenarios = []Scenario{
 		Owner:    "internal/workspace/gvisor.TestE4DenialConformance, internal/workspace/gvisor.TestE4FailedSetupCleanupConformance",
 		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS", "REMOUNT_CHAOS_IMAGE"},
 		Argv:     []string{"./scripts/gvisor-conformance.sh", "e4"},
-		Recorded: StatusPassed, Source: sourceLinux,
-		Note: "the exact digest-pinned candidate passed all seven denial checks, the host-veth escape assertion, synchronous in-flight revoke, successful revoke cleanup and failed-setup cleanup",
+		Recorded: StatusPassed, Source: sourceColima,
+		Note: "the exact digest-pinned candidate passed all seven denial checks, the host-veth escape assertion, synchronous in-flight revoke, successful revoke cleanup and failed-setup cleanup; " +
+			"re-run 2026-09-05 on Colima Ubuntu aarch64 (kernel 6.8.0-117-generic, runsc release-20260831.0): exit 0 in 38 s, spike policy guest-egress, TestE4DenialConformance 17.66 s",
 	},
 	{
 		ID: "E5", Title: "two mutually untrusting tenants share one gVisor node",
@@ -112,8 +116,9 @@ var scenarios = []Scenario{
 		Owner:    "internal/workspace/gvisor.TestE5SiblingTenantsCannotReachEachOther, internal/node.TestE5TenantIsolationConformance",
 		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS", "REMOUNT_CHAOS_IMAGE"},
 		Argv:     []string{"./scripts/gvisor-conformance.sh", "e5"},
-		Recorded: StatusPassed, Source: sourceLinux,
-		Note: "the backend-level host-veth proof observed zero cross-tenant frames after positive broker controls, and the node-level proof kept files disjoint while attributing each denied broker attempt only to its source tenant",
+		Recorded: StatusPassed, Source: sourceColima,
+		Note: "the backend-level host-veth proof observed zero cross-tenant frames after positive broker controls, and the node-level proof kept files disjoint while attributing each denied broker attempt only to its source tenant; " +
+			"re-run 2026-09-05 on Colima Ubuntu aarch64: TestE5SiblingTenantsCannotReachEachOther 9.73 s over three subtests, TestE5TenantIsolationConformance 0.32 s",
 	},
 	{
 		ID: "E6", Title: "approve-on-first-use parks egress, a decision releases it, timeout denies",
@@ -438,12 +443,14 @@ var scenarios = []Scenario{
 	},
 	{
 		ID: "B28", Title: "the exact gVisor candidate passes isolation and enforced-gateway conformance",
-		Layer: LayerHostCI, Required: true, Source: sourceLinux,
+		Layer: LayerHostCI, Required: true, Source: sourceColima,
 		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS", "REMOUNT_CHAOS_IMAGE"},
 		Owner:    "scripts/gvisor-conformance.sh",
 		Argv:     []string{"./scripts/gvisor-conformance.sh", "all"},
 		Recorded: StatusPassed,
-		Note:     "the aggregate host lane probes Docker/runsc, runs E4 denial/revoke/cleanup, backend-level host-veth sibling isolation and node-level tenant/event isolation against the exact digest-pinned candidate",
+		Note: "the aggregate host lane probes Docker/runsc, runs E4 denial/revoke/cleanup, backend-level host-veth sibling isolation and node-level tenant/event isolation against the exact digest-pinned candidate, " +
+			"and since 2026-09-05 the E26 drift case as well. On Colima Ubuntu aarch64 (kernel 6.8.0-117-generic, runsc release-20260831.0) the aggregate first failed at 345 s and passes in 55 s after the two gVisor " +
+			"defects that run found were fixed: a workspace whose sandbox never started was adoptable by neither Create nor Adopt, and a symlinked REMOUNT_GVISOR_ROOTFS broke every materialization",
 	},
 	{
 		ID: "B29", Title: "Firecracker reports either an exact-host pass or unavailable with a reason",
@@ -457,7 +464,10 @@ var scenarios = []Scenario{
 		Owner:    "scripts/firecracker-conformance.sh",
 		Argv:     []string{"./scripts/firecracker-conformance.sh"},
 		Recorded: StatusPassed,
-		Note:     "the exact Linux/KVM candidate passed real jailer/vsock guest operations, enforced egress, synchronous revoke, full-VM prepare/abort/commit/restore with exact-once continuation, failure-path rejection and cleanup",
+		Note: "the exact Linux/KVM candidate passed real jailer/vsock guest operations, enforced egress, synchronous revoke, full-VM prepare/abort/commit/restore with exact-once continuation, failure-path rejection and cleanup. " +
+			"A 2026-09-05 attempt to re-run the lane in the Colima aarch64 VM alongside the gVisor lanes was UNAVAILABLE and is recorded as such, not as a regression: the retained guest image starts remount guest-agent " +
+			"from an /sbin/init that exports no PATH, so every exec fails at lookup, and the 4.0 GiB btrfs pool has too little free space for the checkpoint bundle (no space left on device). The unit lane and " +
+			"TestDiskFullRestoreStagingFailsClosedAndCleansUp passed there; TestB29FirecrackerHostSmoke's guest-session assertion was left undiagnosed inside its time box. That VM's prerequisites, not the backend, are what is missing",
 	},
 	{
 		ID: "B30", Title: "reconnect and pool bursts stay within declared resource ceilings",
@@ -485,7 +495,7 @@ var scenarios = []Scenario{
 	},
 	{
 		ID: "B33", Title: "a deployment produces a machine-readable per-check verdict for a named runtime profile",
-		Layer: LayerArtifact, Required: true, Source: sourceProfile,
+		Layer: LayerArtifact, Required: true, Source: sourceColima,
 		Owner:    "cmd/remount conformance --profile, scripts/conformance-report.sh",
 		Argv:     []string{"./scripts/conformance-report.sh", "dist", "dev"},
 		Recorded: StatusPassed,
@@ -493,19 +503,23 @@ var scenarios = []Scenario{
 			"at 70 checks, 62 passed, 0 failed, 8 unavailable, cleanup verified, exit 0, and emitted JSON plus the markdown review " +
 			"document. The same binary under --profile multi-tenant-isolated returned exit 1 with 7 profile obligations failing by " +
 			"name and 25 required rows unavailable because the workspaces parked with pending_reason profile_unschedulable. " +
-			"A dev-profile pass is a protocol verdict and makes no isolation claim; the isolation profiles are proved by E26 and B28/B29 on a Linux host.",
+			"A dev-profile pass is a protocol verdict and makes no isolation claim. The isolation claim was then earned on 2026-09-05 " +
+			"against a real gVisor node in a Colima Ubuntu aarch64 VM: `remount conformance --profile multi-tenant-isolated --backend gvisor` " +
+			"judged a live server+node deployment CONFORMANT at 78 checks, 64 passed, 0 failed, 14 unavailable, all 63 required rows passed, " +
+			"cleanup verified, exit 0, with all ten CONF-PROF-* rows passing including CONF-PROF-SCHEDULING.",
 	},
 	{
 		ID: "E26", Title: "profile drift makes a node unschedulable and recovery makes it schedulable again",
-		Layer: LayerHostCI, Required: true, Source: sourceProfile,
+		Layer: LayerHostCI, Required: true, Source: sourceColima,
 		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS"},
 		Owner:    "internal/sim.TestE26ProfileDriftMakesNodeUnschedulable, scripts/gvisor-conformance.sh drift",
 		Argv:     []string{"./scripts/gvisor-conformance.sh", "drift"},
-		Recorded: StatusUnavailable,
-		Note: "unavailable on the darwin/arm64 host this landed on: the lane needs a privileged Linux host with runsc on PATH and " +
-			"REMOUNT_GVISOR_ROOTFS pointing at an unpacked rootfs, because it constructs a real gvisor backend, removes a host " +
-			"prerequisite out of band and waits for node.profile.unschedulable. The scripted-backend half of the same loop " +
-			"(internal/sim.TestProfileDriftMakesNodeUnschedulable) does run here and passes; it proves the control loop, not the host mechanism.",
+		Recorded: StatusPassed,
+		Note: "passed 2026-09-05 on a Colima Ubuntu aarch64 VM (kernel 6.8.0-117-generic, runsc release-20260831.0) in 5.22 s over both levers, the sandbox runtime removed and the immutable rootfs removed: each was " +
+			"observed as node.profile.unschedulable naming the failing check, a workspace requiring the profile parked with pending_reason profile_unschedulable, then node.profile.restored and the parked workspace " +
+			"placed. The first run failed at the 300 s timeout and found the two gVisor defects the ledger entry records; neither is visible to the scripted-backend half of the loop " +
+			"(internal/sim.TestProfileDriftMakesNodeUnschedulable), which proves the control loop and not the host mechanism. The same transitions were then driven by hand against a live control plane and gVisor node: " +
+			"remount doctor --profile exit 0 -> 1 -> 0, with both node and control event origins at every transition.",
 	},
 	{
 		ID: "B34", Title: "a real browser answers every computer operation on a real backend",
