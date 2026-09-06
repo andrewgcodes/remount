@@ -1,6 +1,6 @@
 # Remount
 
-> Run [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [OpenCode](https://github.com/sst/opencode), [Pi](https://github.com/earendil-works/pi), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Aider](https://github.com/Aider-AI/aider), [Goose](https://github.com/block/goose), [Cline](https://github.com/cline/cline), [OpenHands](https://github.com/All-Hands-AI/OpenHands) or your own agent loop as long-running background agents on machines you control.
+> 
 
 Remount is an open protocol and a single static Go binary that gives an AI
 agent a workspace it can run on from anywhere: snapshotted, moved between
@@ -11,23 +11,16 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/an
 
 ## README
 
-- [What you can do with it](https://github.com/andrewgcodes/remount/blob/main/README.md#what-you-can-do-with-it): harness's saved conversation into a workspace and starts the harness there against a brokered key.
-- [How it differs from a sandbox API](https://github.com/andrewgcodes/remount/blob/main/README.md#how-it-differs-from-a-sandbox-api): clients replay from where they were.
+- [Quick start](https://github.com/andrewgcodes/remount/blob/main/README.md#quick-start): Everything below runs on your laptop with no account, token or API key.
+- [Harnesses](https://github.com/andrewgcodes/remount/blob/main/README.md#harnesses): A recipe is a small YAML file embedded in the binary; adding a harness is a YAML pull request, not Go.
+- [Why Remount](https://github.com/andrewgcodes/remount/blob/main/README.md#why-remount): Sandbox APIs give you a container in someone else's cloud for the length of a request.
 - [How it fits together](https://github.com/andrewgcodes/remount/blob/main/README.md#how-it-fits-together): Every machine that runs workspaces is a node.
-- [Quick start](https://github.com/andrewgcodes/remount/blob/main/README.md#quick-start): You need the Go version in `go.mod` (1.27.1 at the time of writing).
-- [Move a workspace](https://github.com/andrewgcodes/remount/blob/main/README.md#move-a-workspace): The filesystem is snapshotted, the workspace is re-queued, a node in that zone picks it up, and your files are there.
-- [Sleep and wake](https://github.com/andrewgcodes/remount/blob/main/README.md#sleep-and-wake): A sleeping workspace has no node.
-- [Keep a workspace awake for background work](https://github.com/andrewgcodes/remount/blob/main/README.md#keep-a-workspace-awake-for-background-work): `ws sleep` means sleep now.
-- [Credentials](https://github.com/andrewgcodes/remount/blob/main/README.md#credentials): Define a binding once, on the server:
-- [Isolation](https://github.com/andrewgcodes/remount/blob/main/README.md#isolation): A runtime profile is a promise a node makes at startup, and the node refuses to start if it cannot keep it.
-- [Browser](https://github.com/andrewgcodes/remount/blob/main/README.md#browser): A computer is a browser the node drives inside a workspace.
-- [Events](https://github.com/andrewgcodes/remount/blob/main/README.md#events): Every state change writes an event in the same transaction as the state.
-- [Commands](https://github.com/andrewgcodes/remount/blob/main/README.md#commands): Ctrl-C in `exec`, `sh` or `attach` detaches and prints the `attach` command that picks the process back up.
-- [Go SDK](https://github.com/andrewgcodes/remount/blob/main/README.md#go-sdk): Import the public packages, not `internal/`:
-- [Observability](https://github.com/andrewgcodes/remount/blob/main/README.md#observability): All three take `--json`.
-- [Repository layout](https://github.com/andrewgcodes/remount/blob/main/README.md#repository-layout): `internal/` is not a supported import path.
+- [SDKs](https://github.com/andrewgcodes/remount/blob/main/README.md#sdks): Go:
+- [Deploying it](https://github.com/andrewgcodes/remount/blob/main/README.md#deploying-it): `remount standalone` is for one machine.
 - [Documentation](https://github.com/andrewgcodes/remount/blob/main/README.md#documentation)
-- [Status and limits](https://github.com/andrewgcodes/remount/blob/main/README.md#status-and-limits): Everything above is implemented and tested, including under the race detector and in the one-process simulator with fault injection.
+- [Repository layout](https://github.com/andrewgcodes/remount/blob/main/README.md#repository-layout)
+- [Status and limits](https://github.com/andrewgcodes/remount/blob/main/README.md#status-and-limits): Everything in this README is implemented and tested, including under the race detector and in a one-process simulator with fault injection.
+- [Contributing and security](https://github.com/andrewgcodes/remount/blob/main/README.md#contributing-and-security): Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) before a change; `make verify` runs every CI gate locally.
 - [License](https://github.com/andrewgcodes/remount/blob/main/README.md#license): Apache-2.0.
 
 ## Using Remount
