@@ -176,8 +176,12 @@ what state each harness carries, is in
 ## Why Remount
 
 Sandbox APIs give you a container in someone else's cloud for the length of a
-request. Remount is built for agents whose work lasts longer than a request
-and longer than the process that started it.
+request, and they compete on how many milliseconds it takes to start one.
+Remount is built for what happens after the first hour: agents whose work
+lasts longer than a request, longer than a connection, and longer than the
+process that started it. Self-hosting is the only mode, not the enterprise
+tier, and it sits underneath the harness you already use instead of replacing
+it.
 
 | | Remount | Hosted sandbox APIs (E2B, Daytona, Modal) | Coder | OpenSandbox |
 |---|---|---|---|---|
