@@ -541,9 +541,11 @@ func TestRunRecipeFileMustMatchAndParse(t *testing.T) {
 	}
 }
 
-func TestBindingPresetLsIsTheOnlySubcommand(t *testing.T) {
+func TestBindingPresetLsRejectsMalformedShapes(t *testing.T) {
 	ctx := context.Background()
-	for _, args := range [][]string{nil, {"preset"}, {"ls"}, {"preset", "rm"}} {
+	// `binding ls` is a real subcommand now (it lists the durable store), so
+	// only the shapes that are still invalid are asserted here.
+	for _, args := range [][]string{nil, {"preset"}, {"preset", "rm"}} {
 		if err := cmdBinding(ctx, args); err == nil {
 			t.Fatalf("binding %q accepted", args)
 		}
