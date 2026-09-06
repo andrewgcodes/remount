@@ -13,6 +13,12 @@
 //	conformance --endpoint URL --external       judge another implementation
 //
 // It writes JUnit XML and the Plan B §6 evidence record.
+//
+// `--profile dev|trusted-single-tenant|multi-tenant-isolated|microvm` adds a
+// verdict about the target's runtime posture (§5): one required row per
+// obligation the profile carries, read from `node.profile.get`, plus a row
+// that creates a workspace with `requires.profile` and proves scheduling
+// honours it. `--markdown FILE` writes the same report as a review document.
 package main
 
 import (
@@ -54,6 +60,8 @@ type options struct {
 	candidate string
 	layer     string
 	manifest  bool
+	profile   string
+	markdown  string
 	perCheck  time.Duration
 	connect   time.Duration
 }
@@ -74,6 +82,8 @@ func run(args []string, stdout, stderr *os.File) error {
 	fs.StringVar(&o.junit, "junit", "", "write JUnit XML here")
 	fs.StringVar(&o.evidence, "evidence", "", "write the Plan B §6 evidence record here")
 	fs.StringVar(&o.reportOut, "report", "", "write the full JSON report here")
+	fs.StringVar(&o.markdown, "markdown", "", "write the review document (one table per tier) here")
+	fs.StringVar(&o.profile, "profile", "", "also judge the target against a runtime profile: "+strings.Join(conformance.ProfileNames, ", "))
 	fs.StringVar(&o.scenario, "scenario", "B20", "scenario id for the evidence record")
 	fs.StringVar(&o.candidate, "candidate", "", "the git commit under test (default: git rev-parse HEAD)")
 	fs.StringVar(&o.layer, "layer", "artifact", "evidence layer for the record")
@@ -101,10 +111,16 @@ func run(args []string, stdout, stderr *os.File) error {
 	}
 	defer func() { _ = target.Close() }()
 
+	candidate := o.candidate
+	if candidate == "" {
+		candidate = gitHead(ctx, o.build)
+	}
 	report, err := conformance.Run(ctx, target, conformance.RunOptions{
-		Manifest: &m,
-		Only:     split(o.only),
-		PerCheck: o.perCheck,
+		Manifest:  &m,
+		Only:      split(o.only),
+		PerCheck:  o.perCheck,
+		Profile:   o.profile,
+		Candidate: candidate,
 		Log: func(res conformance.Result) {
 			fmt.Fprintf(stderr, "%-12s %-14s %s\n", res.Status, res.Requirement.ID, first(res.Reason, res.Requirement.Title))
 		},
@@ -126,11 +142,12 @@ func run(args []string, stdout, stderr *os.File) error {
 			return err
 		}
 	}
-	if o.evidence != "" {
-		candidate := o.candidate
-		if candidate == "" {
-			candidate = gitHead(ctx, o.build)
+	if o.markdown != "" {
+		if err := writeFile(o.markdown, report.WriteMarkdown); err != nil {
+			return err
 		}
+	}
+	if o.evidence != "" {
 		opts := conformance.EvidenceOptions{
 			Scenario:  o.scenario,
 			Candidate: candidate,
@@ -141,6 +158,9 @@ func run(args []string, stdout, stderr *os.File) error {
 		}
 		if o.junit != "" {
 			opts.Artifacts = append(opts.Artifacts, o.junit)
+		}
+		if o.markdown != "" {
+			opts.Artifacts = append(opts.Artifacts, o.markdown)
 		}
 		if err := writeFile(o.evidence, func(w io.Writer) error { return report.WriteEvidence(w, opts) }); err != nil {
 			return err

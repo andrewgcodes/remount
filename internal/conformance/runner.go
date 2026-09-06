@@ -47,11 +47,18 @@ type Report struct {
 	Endpoint        string      `json:"endpoint"`
 	Negotiated      []string    `json:"negotiated_capabilities"`
 	Environment     Environment `json:"environment"`
-	StartedAt       time.Time   `json:"started_at"`
-	DurationMS      int64       `json:"duration_ms"`
-	Results         []Result    `json:"results"`
-	Cleanup         Cleanup     `json:"cleanup"`
-	CleanupReason   string      `json:"cleanup_reason,omitempty"`
+	// Profile is the runtime profile this run judged the target against, or
+	// empty when the run made no profile claim.
+	Profile string `json:"profile,omitempty"`
+	// Candidate is the commit or build identifier the caller says was under
+	// test. The runner never invents one: a report that names a candidate it
+	// did not verify is worse than a report that names none.
+	Candidate     string    `json:"candidate,omitempty"`
+	StartedAt     time.Time `json:"started_at"`
+	DurationMS    int64     `json:"duration_ms"`
+	Results       []Result  `json:"results"`
+	Cleanup       Cleanup   `json:"cleanup"`
+	CleanupReason string    `json:"cleanup_reason,omitempty"`
 	// Aborted is set when the run could not start at all, for instance
 	// because the target declares a protocol version this manifest does not
 	// describe.
@@ -67,6 +74,15 @@ type RunOptions struct {
 	Only []string
 	// PerCheck bounds one requirement. Zero uses two minutes.
 	PerCheck time.Duration
+	// Profile names a runtime profile (§5) to judge the target against, one
+	// of ProfileNames. Empty judges only the protocol manifest. A named
+	// profile adds one required row per obligation the profile carries plus
+	// the scheduling row, and makes every workspace the run creates ask for
+	// that profile.
+	Profile string
+	// Candidate is the commit or build identifier under test, recorded on
+	// the report and rendered in the markdown header.
+	Candidate string
 	// Log receives a line per requirement as it completes.
 	Log func(Result)
 }
@@ -80,6 +96,9 @@ func Run(ctx context.Context, t *Target, opts RunOptions) (*Report, error) {
 	if err := m.Validate(); err != nil {
 		return nil, err
 	}
+	if opts.Profile != "" && !ValidProfile(opts.Profile) {
+		return nil, fmt.Errorf("conformance: unknown runtime profile %q; §5 defines %s", opts.Profile, strings.Join(ProfileNames, ", "))
+	}
 	start := time.Now()
 	report := &Report{
 		ManifestVersion: m.Version,
@@ -88,8 +107,13 @@ func Run(ctx context.Context, t *Target, opts RunOptions) (*Report, error) {
 		TargetKind:      t.Kind,
 		Endpoint:        t.Endpoint,
 		Environment:     t.Environment,
+		Profile:         opts.Profile,
+		Candidate:       opts.Candidate,
 		StartedAt:       start.UTC(),
 		Cleanup:         CleanupNotRequired,
+	}
+	if report.Environment.Backend == "" {
+		report.Environment.Backend = t.Backend
 	}
 	// A target that declares another frame version is not described by this
 	// manifest. Judging it anyway would produce a verdict about a contract it
@@ -107,6 +131,7 @@ func Run(ctx context.Context, t *Target, opts RunOptions) (*Report, error) {
 		return report, nil
 	}
 	defer s.Close()
+	s.Profile = opts.Profile
 	report.Negotiated = s.Control.Negotiated
 
 	only := map[string]bool{}
@@ -116,6 +141,31 @@ func Run(ctx context.Context, t *Target, opts RunOptions) (*Report, error) {
 	perCheck := opts.PerCheck
 	if perCheck == 0 {
 		perCheck = 2 * time.Minute
+	}
+
+	// The profile rows run first. They are the cheapest evidence in the run
+	// and they explain everything after them: a deployment that cannot
+	// satisfy the named profile will park the workspaces the protocol
+	// requirements need, and a reader who has already seen why does not have
+	// to infer it from forty unavailable rows.
+	if opts.Profile != "" {
+		rows, evidence := runProfile(ctx, s, opts.Profile, perCheck)
+		for _, res := range rows {
+			if len(only) > 0 && !only[res.Requirement.ID] {
+				continue
+			}
+			report.Results = append(report.Results, res)
+			if opts.Log != nil {
+				opts.Log(res)
+			}
+		}
+		if len(only) == 0 || only[ProfileSchedulingID] {
+			res := runProfileScheduling(ctx, s, opts.Profile, perCheck, evidence)
+			report.Results = append(report.Results, res)
+			if opts.Log != nil {
+				opts.Log(res)
+			}
+		}
 	}
 
 	for _, r := range m.Requirements {
