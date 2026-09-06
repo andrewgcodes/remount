@@ -110,6 +110,12 @@ type Options struct {
 	MaxMutationRecords      int
 	MaxTimers               int
 	MaxTimersPerWorkspace   int
+	// MaxLeaseSec bounds one durable workspace hold and every idle-policy
+	// duration (ADR 0090); MaxHeldWorkspacesPerTenant bounds how many
+	// workspaces one tenant may pin awake at once. Zero selects 24 hours and
+	// 256.
+	MaxLeaseSec                int64
+	MaxHeldWorkspacesPerTenant int
 	// PublicURL is the externally reachable base (https://host) that agent
 	// URLs are minted under; empty leaves Agent.URL empty.
 	PublicURL string
@@ -236,7 +242,7 @@ func New(opts Options) (*Server, error) {
 		return nil, errors.New("server: artifact and event limits must not be negative")
 	}
 	if opts.MaxConcurrentRequests < 0 || opts.MaxWorkspacesPerTenant < 0 || opts.MaxWorkspacesPerSubject < 0 || opts.MaxMutationRecords < 0 ||
-		opts.MaxTimers < 0 || opts.MaxTimersPerWorkspace < 0 {
+		opts.MaxTimers < 0 || opts.MaxTimersPerWorkspace < 0 || opts.MaxLeaseSec < 0 || opts.MaxHeldWorkspacesPerTenant < 0 {
 		return nil, errors.New("server: control-plane quotas must not be negative")
 	}
 	if opts.WebhookProviders.SlackReplayWindow < 0 {
@@ -497,6 +503,7 @@ func New(opts Options) (*Server, error) {
 		SecurityProfileFloor: floor, MaxWorkspacesPerTenant: opts.MaxWorkspacesPerTenant,
 		MaxWorkspacesPerSubject: opts.MaxWorkspacesPerSubject, MaxMutationRecords: opts.MaxMutationRecords,
 		MaxTimers: opts.MaxTimers, MaxTimersPerWorkspace: opts.MaxTimersPerWorkspace,
+		MaxLeaseSec: opts.MaxLeaseSec, MaxHeldWorkspacesPerTenant: opts.MaxHeldWorkspacesPerTenant,
 		MaxConcurrentRequests: opts.MaxConcurrentRequests, MaxEvents: opts.MaxEvents, PublicURL: opts.PublicURL,
 		PoolReconciler: poolReconciler, PoolBootstrap: opts.PoolBootstrap,
 		ControllerAuthority: authority, ControllerRole: controllerRole, Recovery: recoveryState})
