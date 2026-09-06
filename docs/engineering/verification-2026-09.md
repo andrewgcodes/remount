@@ -2494,3 +2494,187 @@ exact prerequisite is a privileged Linux host with `runsc` on `PATH` and
 loop (`internal/sim.TestProfileDriftMakesNodeUnschedulable`) does run here and
 passes; it proves the control loop, not the host mechanism. `runsc`,
 `multi-tenant-isolated` and `microvm` remain unprovable on darwin.
+
+---
+
+## 2026-09-05 - durable workspace holds and idle policy, live standalone
+
+**Status: verified.** Every claim below was observed against a real
+`remount standalone` process on loopback, not in simulation. One defect was
+found and fixed during the run; it is recorded at the end.
+
+Host: macOS 26.3 (build 25D2125), arm64. Go 1.27.1 darwin/arm64. Tree:
+branch `worktree-agent-a40d1a9490b4e2dd8` at `d3ddc7a` (base
+`claude/gap-brief-2026-09-06` at `fe59175` plus the integrator's helper rename),
+plus the working-tree changes this entry describes. No credential of any kind
+was used or needed; the standalone server has no token and the run reached no
+network but loopback.
+
+Setup, run twice — once with the binary built from `d3ddc7a`, and again after
+the node fix below:
+
+```sh
+go build -o "$SCRATCH/remount" ./cmd/remount
+"$SCRATCH/remount" standalone --listen 127.0.0.1:7455 --data "$SCRATCH/live/data"
+export REMOUNT_SERVER=http://127.0.0.1:7455
+```
+
+`/healthz` reported `{"ok":true,"peers":1,"security_mode":"standalone",
+"security_ready":true,"serving":true}`. Node `n_06g78r36j6rr8szdf61szaqdxw`,
+process backend, local and unisolated by design.
+
+### 1. A hold outlives the process that took it
+
+```sh
+remount ws create --name live-lease-1 --wait          # ws_06g78xsntjh37chere1wk0g0h8
+remount exec ws_06g78x… -- sh -c 'echo background job started; sleep 300' &
+remount ws lease ws_06g78x… --max 30s --reason background_job
+kill -9 <the exec client pid>
+```
+
+`ws lease` returned `wl_06g78xtyevmnxkxrv27vg6hhkr` with
+`max_alive_until=2026-09-06T02:06:45Z` and exited. The streaming client was
+SIGKILLed; no Remount client process from this run remained. A **fresh**
+`remount ws lease get` then reported the hold and
+`lifecycle deadline: sleep at 2026-09-06T02:06:45Z (in 25s, source=lease)`,
+proving the deadline is readable from a process that never armed it.
+
+At 02:06:45.552Z, with no client alive, the control plane acted:
+
+| seq | event | payload |
+|---|---|---|
+| 78 | `ws.lifecycle.expired` | `action=sleep source=lease at=1788660405158 timer=t_lc_ws_06g78x…` |
+| 79 | `ws.lease.expired` | `lease=wl_06g78xt… reason=deadline` |
+| 82 | `s.exited` | `code=143 signal=terminated reason=lifecycle_deadline_expired` |
+| 83 | `ws.snapshot` | `authoritative=true consistency=quiesced` |
+| 86 | `ws.paused` | `reason=lifecycle_deadline_expired` |
+
+`remount ws get` reported `"state": "paused"`. Exit code 143 is SIGTERM, so the
+graceful stop ran before the kill rather than after it.
+
+### 2. The deadline survives a control-plane restart
+
+```sh
+remount ws create --name live-lease-2 --wait          # ws_06g78y0stj4zkthb0m1g0y4bf0
+remount ws lease ws_06g78y0… --max 90s --reason survives_control_plane_restart
+kill -TERM <standalone pid>                            # 02:07:14Z, mid-deadline
+"$SCRATCH/remount" standalone --listen 127.0.0.1:7455 --data "$SCRATCH/live/data"
+```
+
+The hold was granted at 02:07:06.750Z with a deadline of 02:08:36.750Z. The
+server process was stopped 8 seconds later and a new one started at 02:07:17Z,
+which re-claimed the workspace (`ws.state_changed node.disconnect` at
+02:07:10, `ws.claimed` at 02:07:17.283). `remount ws lease get` against the new
+process reported the same lease and
+`lifecycle deadline: sleep at 2026-09-06T02:08:36Z (in 1m11s, source=lease)`.
+
+At 02:08:37.271Z — 0.5s after the deadline, and across a process boundary the
+original grant never saw — `ws.lifecycle.expired`, `ws.lease.expired
+{reason: deadline}` and `ws.paused {reason: lifecycle_deadline_expired}`
+committed. That is the durability claim: nothing in memory carried the
+schedule.
+
+### 3. Idle policy plus mark-idle sleeps the workspace
+
+```sh
+remount ws create --name live-idle-3 --wait           # ws_06g78yfffke0ggkv5bv6ctadpc
+remount ws idle-policy ws_06g78yf… --sleep-after 15s
+remount ws mark-idle ws_06g78yf… --reason turn_settled
+```
+
+`mark-idle` printed
+`lifecycle deadline: sleep at 2026-09-06T02:09:24Z (in 15s, source=idle)`.
+Events: `ws.idle.policy_set {sleep_after_sec: 15}` at 02:09:06.857,
+`ws.idle.marked {idle: true, idle_since: 1788660549876}` at 02:09:09.876, and
+`ws.lifecycle.expired {action: sleep, source: idle}` at 02:09:25.270 followed
+by `ws.paused`. Note the source is `idle`, not `lease`: the workspace had no
+hold.
+
+### 4. mark-active before the deadline prevents it
+
+```sh
+remount ws create --name live-active-4 --wait         # ws_06g78ym078h3pyvpa2fx43kjs8
+remount ws idle-policy ws_06g78ym0… --sleep-after 20s
+remount ws mark-idle ws_06g78ym0… --reason turn_settled     # deadline 02:10:04Z
+remount ws mark-active ws_06g78ym0… --reason new_turn       # 02:09:56Z
+```
+
+`mark-active` printed no deadline line, because there was no longer one to
+print. At 02:10:39Z — 35 seconds past the original deadline — `ws get` still
+reported `"state": "claimed"` with `last_activity_at` set and no
+`lifecycle_deadline`, and the workspace's event stream ended at
+`ws.idle.marked {idle: false, idle_since: 0, reason: new_turn}`. No
+`ws.lifecycle.expired` was ever emitted for it.
+
+### Defect found and fixed: the exit chunk never reached a live subscriber
+
+Running `examples/long-running-autosleep` against this server exposed a real
+bug that none of the simulation tests covered. The workspace reached `paused`
+and the node emitted `s.exited {reason: lifecycle_deadline_expired}`, but the
+example hung indefinitely in `client.Copy` and had to be killed after seven
+minutes. Its own output stopped at "deadline fired".
+
+`Node.releasePrepare` cancelled every output subscription for the workspace in
+the same critical section that removed the workspace from the serving map, and
+only then terminated the sessions. The exit chunk the graceful stop produced
+therefore had no subscriber left to receive it. The reason still reached the
+durable log — which is why the existing sim test, which reattaches and replays,
+passed — but a client that never went away saw its stream go silent and never
+close. That is worse than an exit and worse than an explicit gap: it is
+indistinguishable from work still in progress.
+
+The fix separates the fence from the cut. Removing the workspace from the
+serving map still happens first, so a queued session starter fails its
+post-lock serviceability check. The subscriptions are now drained after
+`stopWorkspaceSessionsGraceful` has joined every session and closed every log,
+bounded by `subscriberDrainTimeout` (5s), and cancelled after that. A failed
+quiesce still cancels immediately.
+
+`internal/sim/lifecycle_exit_delivery_test.go`
+(`TestLiveSessionReceivesLifecycleExitChunk`) was written first and observed
+failing on the unfixed tree — "the attached session stream never ended after
+the lifecycle deadline fired", after the full 60-second bound — and passes in
+3.7 seconds after the fix.
+
+With the fix in place the example completed in about 35 seconds against the
+same live server:
+
+```
+held ws_06g792n… until 2026-09-06T02:27:39Z (lease wl_06g792n…, on_expiry sleep)
+background job started
+renewed wl_06g792n… until 2026-09-06T02:27:34Z (renewals 1)
+pending deadline: sleep at 2026-09-06T02:27:34Z (source lease)
+deadline fired: workspace ws_06g792n… is paused, checkpoint art_sha256:2737d5e1…
+session s_06g792n… exit code 143 reason "lifecycle_deadline_expired"
+event ws.lifecycle.expired action=sleep source=lease
+event ws.lease.expired lease=wl_06g792n… reason=deadline
+woken: node n_06g78r3… gen 2
+filesystem survived: written before the hold expired
+processes after wake: processes-gone
+workspace ws_06g792n… destroyed
+```
+
+The last two lines are the non-guarantee stated out loud: a hold checkpoints
+the filesystem, not memory.
+
+### Bounds
+
+This is a single-host, single-node, process-backend standalone deployment on
+loopback. It proves the control-plane deadline is durable across client death
+and a control-plane restart, and that the CLI, the events and the exit reason
+say what the documentation says they say. It does **not** exercise a
+multi-node failover during an expiry, an isolated or enforced-egress backend, a
+cloud deployment, Windows (where the graceful stop degrades to immediate
+termination), or a control plane behind a real load balancer. Those remain
+covered only by `internal/sim` or not at all.
+
+### Cleanup
+
+Six workspaces were created. The successful example run destroyed its own; the
+other five were destroyed by hand with `remount ws destroy`, including the one
+left behind by the aborted first example run — which is itself worth recording,
+because a client killed mid-run leaves the workspace for its owner to reclaim
+rather than tidying up on the way out. `remount ws ls` afterwards was empty.
+The standalone process was stopped and the scratch data directory removed.
+Nothing was created outside the session scratchpad and no cloud or provider
+resource was involved.
