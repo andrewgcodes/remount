@@ -106,6 +106,11 @@ func mapTenantError(err error) error {
 	case tenant.CodeUnavailable:
 		code = proto.CodeUnreachable
 	}
+	if code == proto.CodeResourceExhausted {
+		// A tenant quota is the one resource_exhausted an SDK must be able to
+		// tell apart from control-plane capacity, so it carries a reason.
+		return proto.ErrReason(code, proto.ReasonQuotaExceeded, "%s", typed.Error())
+	}
 	return proto.Err(code, "%s", typed.Error())
 }
 

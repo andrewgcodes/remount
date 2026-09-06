@@ -131,7 +131,7 @@ func (c *Control) budgetCreate(ctx context.Context, subject Subject, req *proto.
 			return nil, proto.Err(proto.CodeConflict, "budget %s already exists with another definition", value.ID)
 		}
 		if errors.Is(err, budget.ErrCapacity) {
-			return nil, proto.Err(proto.CodeResourceExhausted, "budget capacity exhausted")
+			return nil, proto.ErrReason(proto.CodeResourceExhausted, proto.ReasonQuotaExceeded, "budget capacity exhausted")
 		}
 		return nil, proto.Err(proto.CodeBadRequest, "%v", err)
 	}
@@ -365,7 +365,7 @@ func (c *Control) budgetReserve(ctx context.Context, node string, req *proto.Bud
 			return &proto.BudgetReservation{Denied: true, BudgetIDs: append([]string(nil), denied.BudgetIDs...), Limit: string(denied.Limit), UnmeteredReason: denied.UnmeteredReason}, nil
 		}
 		if errors.Is(err, budget.ErrCapacity) {
-			return nil, proto.Err(proto.CodeResourceExhausted, "budget authority capacity exhausted")
+			return nil, proto.ErrReason(proto.CodeResourceExhausted, proto.ReasonQuotaExceeded, "budget authority capacity exhausted")
 		}
 		return nil, proto.Err(proto.CodeBadRequest, "%v", err)
 	}
