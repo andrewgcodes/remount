@@ -127,11 +127,11 @@ affected tests after resolving an upstream change.
 **Staging by name is not the same as staging what you wrote.** `git add <path>`
 stages the file's *current* contents, including edits a concurrently running
 agent made to it since you last looked. Avoiding `git commit -a` does not
-protect you. This has already produced a broken `main`: `b26492d` staged
+protect you. This has already produced a broken `main`: `8c0f484` staged
 `internal/evidence/registry.go` by name and swept in another agent's B32 wiring,
 so the pushed registry named `integration/installs.TestB32*` while that package
 existed only as an uncommitted directory — a fresh clone had a wired scenario
-pointing at nothing. `ed46694` repaired it.
+pointing at nothing. `0b9b30d` repaired it.
 
 Before every commit made while another agent is working in the tree, run
 `git diff --cached` and read it in full. If it contains work you did not write,

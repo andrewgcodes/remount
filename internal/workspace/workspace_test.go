@@ -321,8 +321,8 @@ func TestDefaultImageTracksRelease(t *testing.T) {
 		"dev",
 		"",
 		"v1.4.0-dirty",
-		"v0.0.0-20260904095559-f3fb13569f00",
-		"v0.0.0-20260904095559-f3fb13569f00+dirty",
+		"v0.0.0-20260904095559-e29e8470724f",
+		"v0.0.0-20260904095559-e29e8470724f+dirty",
 		"abc123",
 	} {
 		if got := DefaultImage(v); got != DefaultImageRepository+":latest" {

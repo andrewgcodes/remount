@@ -22,7 +22,7 @@ full-suite Docker OpenCode lanes remain known failing and are visible CI
 debt.**
 
 Host: Windows Server 2022 amd64. Go: 1.27.1. Race C toolchain: MinGW-w64
-16.1.0. Final post-merge verification used `origin/main` at `51185dd`.
+16.1.0. Final post-merge verification used `origin/main` at `6ac65d5`.
 
 ### Final command results
 
@@ -35,7 +35,7 @@ Host: Windows Server 2022 amd64. Go: 1.27.1. Race C toolchain: MinGW-w64
 | `go test -p 1 -count=1 -timeout 40m -skip '^(TestExecRoundTripCostOfTheDurableSessionTier\|TestPlanbPerfMoveIncompressible\|TestPlanBOpenCodeAgentTranscriptApprovalAndResume\|TestPlanBOpenCodeDeterministicModelLane)$' ./...` | passed after the final upstream merge; package serialization isolated the sim timing lanes from cross-compilation and artifact-install load |
 | `go test -race -p 1 -count=1 -timeout 60m -skip '^(TestPlanbPerfMoveIncompressible\|TestPlanBOpenCodeAgentTranscriptApprovalAndResume\|TestPlanBOpenCodeDeterministicModelLane)$' ./...` | passed after the final upstream merge; package serialization avoided the Windows asynchronous file-I/O exhaustion observed when race packages ran concurrently |
 | `go run ./cmd/conformance --build .` | 60 passed, 0 failed, 8 unavailable; all 53 required rows passed; cleanup verified |
-| `remount-windows-amd64.exe version` | `remount v0.0.0-20260904095415-3e577228074c` |
+| `remount-windows-amd64.exe version` | `remount v0.0.0-20260904095415-ad9540442d27` |
 | `go run ./cmd/conformance --binary .\remount-windows-amd64.exe` | 60 passed, 0 failed, 8 unavailable; all 53 required rows passed; cleanup verified |
 | `./scripts/lint-locks.sh .` | passed |
 
@@ -55,7 +55,7 @@ Classification: **confirmed Windows-host performance defect**, not a passed
 benchmark and not a POSIX-only boundary. Windows CI runs every other test and
 names this exact exclusion in the workflow and job summary.
 
-After integrating `d938d7b`, three focused reruns still failed at 7.6, 8.0,
+After integrating `4b99400`, three focused reruns still failed at 7.6, 8.0,
 and 8.3 MB/s against the 20 MB/s gate.
 
 The final ordinary suite also found a second Windows performance-lane boundary:
@@ -303,7 +303,7 @@ on this Windows VM.
 **The development binary selected an invalid Docker image reference:**
 
 ```text
-image "ghcr.io/andrewgcodes/remount-workspace:v0.0.0-20260904095559-f3fb13569f00+dirty"
+image "ghcr.io/andrewgcodes/remount-workspace:v0.0.0-20260904095559-e29e8470724f+dirty"
 docker: invalid reference format
 ```
 
@@ -358,7 +358,7 @@ test.
 | Development Docker image selection | `internal/workspace.TestDefaultImageTracksRelease` | Go pseudo-versions and `+dirty` versions were treated as published image tags; Docker rejected the resulting reference |
 | All-package resource pressure | `integration/installs.TestB32AGoModuleConsumerBuildsFromTheArtifactAndDrivesTheInstalledServer`, `integration/reproducible.TestB31BinariesAreAFunctionOfTheSourceAlone`, `internal/sim.TestHandoffScaleAndControlFailover`, `TestAgentEndToEndTurnsAndTranscript`, and `TestAgentSurvivesNodeLoss` | parallel packages produced Windows `The supplied user buffer is not valid for the requested operation` writes, scale reattach deadlines, and lease-fencing failures; focused reruns passed or reached their named prerequisite boundary, so Windows CI serializes packages with `-p 1` while retaining concurrency coverage within each package |
 
-The concurrent `c47b4bb` integration also exposed
+The concurrent `7cb569f` integration also exposed
 `integration/policy.TestInfrastructureDoesNotOwnRuntimeFacts` on every host:
 a Terraform validation error named the forbidden command as operator guidance.
 The message now describes the supported move command without looking like an
@@ -401,7 +401,7 @@ closed before temporary-directory removal.
 
 **Status: verified.**
 
-Host: Darwin 25.3.0 arm64. Binary: `b213017`, built with `make build`.
+Host: Darwin 25.3.0 arm64. Binary: `58a9d15`, built with `make build`.
 Backend: `process`. Server: `remount standalone`, disposable data directory
 under the session scratchpad, destroyed at the end of the run.
 
@@ -987,7 +987,7 @@ changed, is in `docs/engineering/performance-regressions-2026-09.md` under
 Host: Darwin 25.3.0 arm64; Docker Desktop 29.4.1 serving `linux/aarch64`;
 Python 3.14.5 (`pip` is not on PATH, `python3 -m pip` and `python3 -m venv`
 are); npm 11.12.1 with node 25.9.0; Go 1.27.1; no `syft`. Candidate
-`c89e413` with this suite as the working-tree change. Every artifact comes
+`2cc59e5` with this suite as the working-tree change. Every artifact comes
 from `make dist`; nothing was published, tagged, pushed or signed.
 
 | Command | Result | Status |
@@ -1837,11 +1837,11 @@ PR #24 combined the independently reproduced RMR-001 through RMR-012
 remediations on `origin/main` `7542a236e9cefef180237efd0df58381f104fdfd`.
 The first exact provider candidate was
 `5ac47ed07a70be53c1222f50c55477bf1af1c232`; a Fly API compatibility fix
-produced `b092578`, secret-version and lifecycle fixes produced `10c6198`, and
-explicit Fly process-secret selection produced final candidate `b30699a`.
+produced `04eac19`, secret-version and lifecycle fixes produced `feb63d9`, and
+explicit Fly process-secret selection produced final candidate `9799c24`.
 
-**Modal — verified but bounded on `5ac47ed`.** The named deployment
-`remount-pr24-5ac47ed` reported an online node running `5ac47ed`. A disposable
+**Modal — verified but bounded on `99a0758`.** The named deployment
+`remount-pr24-99a0758` reported an online node running `99a0758`. A disposable
 Git repository was uploaded to a workspace, OpenCode used brokered OpenAI
 access, and a relative-path retry created `RESULT.txt` with the expected
 content. Pulling the workspace recovered the file locally. The event stream
@@ -1849,23 +1849,23 @@ contained `cred.used` and `egress.allowed`; `doctor --deep --json` reported
 `ok: true` with tenant-residency explicitly unavailable because that reference
 deployment has no tenant authority. The agent was destroyed.
 
-**E2B — verified but bounded on `5ac47ed`.** A custom 2 GiB sandbox ran the
+**E2B — verified but bounded on `99a0758`.** A custom 2 GiB sandbox ran the
 exact binary, accepted a process-backed workspace, executed a command, and
 returned inspect and deep-diagnostic output. Workspace and sandbox destruction
 completed; the provider sandbox was no longer connectable and the node became
 offline after lease expiry. The default 512 MiB E2B sandbox remains
 insufficient for installing and running OpenCode.
 
-**ix.dev — unavailable before Remount readiness on `5ac47ed`.** Two VM boots
+**ix.dev — unavailable before Remount readiness on `99a0758`.** Two VM boots
 failed in provider infrastructure before a usable VM existed. The observed
 errors included VMM worker startup, virtio-blk root-device, CAS-fold, and page
 writeback failures. Cleanup verification showed zero remaining ix VMs. This is
 not a Remount pass.
 
-**Fly — authenticated exact-candidate readiness verified on `b30699a`.**
+**Fly — authenticated exact-candidate readiness verified on `9799c24`.**
 The first live run exposed that the driver sent `timeout=120` to Fly's Machine
 wait endpoint, whose documented and observed maximum is 60 seconds; Fly
-returned HTTP 400. `b092578` sets and enforces a one-minute maximum, and the
+returned HTTP 400. `04eac19` sets and enforces a one-minute maximum, and the
 exact integration lifecycle then created, listed, destroyed, and verified
 absence of a Machine in 17 seconds.
 
@@ -1873,13 +1873,13 @@ The first authenticated-readiness runs then exposed three distinct boundaries:
 launch was not fenced to the version returned by Fly's app-secrets API; the
 driver removed the enrollment secret after provider `started`, before the
 guest process consumed it; and a unique process-secret reference was accepted
-but not injected without explicit app-secret selection. `723b4e1` added
-`min_secrets_version`, `10c6198` retained the unique secret until Machine
-destruction, and `b30699a` set `ignore_app_secrets: true` while mapping only
+but not injected without explicit app-secret selection. `9492307` added
+`min_secrets_version`, `feb63d9` retained the unique secret until Machine
+destruction, and `9799c24` set `ignore_app_secrets: true` while mapping only
 that unique secret to `REMOUNT_ENROLL_TOKEN`.
 
-The repository integration test ran the exact `b30699a` binary from the named
-Modal binary endpoint against Fly app `remount-pr24-9f4daf1`:
+The repository integration test ran the exact `9799c24` binary from the named
+Modal binary endpoint against Fly app `remount-pr24-2e70fb1`:
 
 ```sh
 go test -tags integration -count=1 -v \
@@ -1888,7 +1888,7 @@ go test -tags integration -count=1 -v \
 ```
 
 It passed in 26.24 seconds after observing a new authenticated, online Fly node
-with version `b30699a` and a successful node diagnostic. The control-plane
+with version `9799c24` and a successful node diagnostic. The control-plane
 event stream recorded `node.enrolled`, `node.online`, then `node.offline`;
 provider logs recorded the node starting and establishing its uplink.
 `doctor --deep --json` reported `ok: true`. Deferred teardown removed the
@@ -1899,7 +1899,7 @@ The generic provider `started` result still is not the readiness authority:
 the pool/controller layer must continue to require authenticated Remount
 enrollment before treating a provisioned node as usable.
 
-**Final local candidate gates — verified on `b30699a`.** `make lint`,
+**Final local candidate gates — verified on `9799c24`.** `make lint`,
 `make test`, `make race`, `make conformance`, `make public-api`,
 `make fuzz FUZZTIME=5s`, `go mod verify`, `go mod tidy -diff`, `make dist`,
 and `git diff --check` passed. The ordinary simulation package completed in
@@ -1919,7 +1919,7 @@ provider logs by the test harnesses.
 ## 2026-09-04 — local Claude/Codex conversations handed off to a Modal VM
 
 **Verified, with an explicit runtime qualification.** Candidate
-`99d3b0f-handoff-r2` is the uncommitted handoff correction on base `99d3b0f`.
+`7fce748-handoff-r2` is the uncommitted handoff correction on base `7fce748`.
 The exact frozen binaries were uploaded and their version and SHA-256 verified:
 
 | Binary | SHA-256 |
@@ -2004,7 +2004,7 @@ silently omitted from the record.
 
 ## 2026-09-05 — Claude Code local and Modal ACP permission validation
 
-**Verified on an uncommitted candidate based on `68df7f1`.** A disposable local
+**Verified on an uncommitted candidate based on `8eacd77`.** A disposable local
 repository was exercised through both Claude Code transports. PTY mode created
 `CLAUDE_LOCAL.txt`; ACP initially reached Anthropic through `b_anthropic` but
 could not write because the adapter remained in its default permission mode.
@@ -2017,7 +2017,7 @@ substitution and allowed egress to `api.anthropic.com`.
 The exact Linux candidate was then deployed as the uniquely named Modal app
 `remount-claude-0c59ef2b` in the `dev` environment with a unique volume,
 control secret, and Anthropic secret. Authenticated `nodes --json` showed one
-online Modal process node running `68df7f1-dirty`. Claude ACP created
+online Modal process node running `8eacd77-dirty`. Claude ACP created
 `CLAUDE_ACP_MODAL.txt` containing `claude-acp-modal-ok`; `remount fs read`
 confirmed the bytes. The Agent reported a structured ACP session and one
 completed turn. Durable events recorded four successful `cred.used` decisions
@@ -2084,7 +2084,7 @@ their cross-platform vet gates passed locally.
 ## 2026-09-05 — PR #30 live functional regression verification
 
 **Verified within the boundaries below.** The candidate is PR #30 commit
-`47b379fb36e9d1dac6ece6e0d9a4121cd1328f8f`; merge commit `0cab8a1` has the
+`47b379fb36e9d1dac6ece6e0d9a4121cd1328f8f`; merge commit `b76d21d` has the
 same tree. Tests used the repository `.env` through allowlisted parsing,
 without sourcing shell commands, displaying credential values, or copying the
 repository or personal conversations into a workspace.
@@ -2098,7 +2098,7 @@ repository or personal conversations into a workspace.
 
 The checked-in `scripts/live-handoff.py` driver ran `seed`, `prepare`, and
 `test --recipes claude`, with `--execute`, explicit frozen binary paths, and
-`--candidate 47b379f`. Run directory:
+`--candidate 6b301c2`. Run directory:
 `remount-data/pr30-live-20260905-claude/`. This was a new ephemeral Modal VM,
 not a redeployment or test of the named reference service. It used stock Docker
 security options; the nested-sandbox test relaxation was not enabled.
@@ -2195,8 +2195,8 @@ by the account billing/spending-limit condition reported on PR #30.
 
 Reviewed current user guides, examples, architecture/status claims, build and
 release guidance, repository skills and generated documentation against source.
-The checkout began at `47b379f`; a final fetch found documentation-only PR #31,
-and the checkout was fast-forwarded to `4e3066b` before reapplying the audit
+The checkout began at `6b301c2`; a final fetch found documentation-only PR #31,
+and the checkout was fast-forwarded to `fd4f507` before reapplying the audit
 changes. The new desktop/VNC guidance was retained. There is no Go runtime or
 dependency change: the only Go edit is the ix.dev constructor's explanatory
 comment. The documentation generator now uses the actual repository URL and
@@ -2212,7 +2212,7 @@ Verification on macOS arm64 with Go 1.27.1:
 
 - `make test` passed all ordinary packages and the separate public-SDK module;
   `internal/sim` completed in 325.053 seconds. The suite began before the
-  documentation-only fast-forward; `git diff 47b379f origin/main -- '*.go'
+  documentation-only fast-forward; `git diff 6b301c2 origin/main -- '*.go'
   go.mod go.sum` confirmed no Go or module changes in that update.
 - `make docs` regenerated both bundles. Four
   `python3 scripts/test_gen_llms.py` tests passed: default repository/section
@@ -2436,7 +2436,7 @@ generation, lint, generated-document tests, and diff checks were rechecked.
 ## Runtime-profile conformance, 2026-09-05 (darwin/arm64)
 
 Host: darwin 25.3.0, arm64, 12 CPUs. Tree: the `claude/gap-brief-2026-09-06`
-worktree at `682ccaa` plus the uncommitted Gap 1B change; the candidate id the
+worktree at `8fd7bdf` plus the uncommitted Gap 1B change; the candidate id the
 runs recorded is therefore `682ccaa189c984c9cde9b00d2ac8853a330b78ef`, which is
 the parent of the commit this entry lands in. Both runs built a fresh
 `CGO_ENABLED=0` binary from that tree, booted it as `remount standalone` on a
@@ -2504,13 +2504,13 @@ passes; it proves the control loop, not the host mechanism. `runsc`,
 found and fixed during the run; it is recorded at the end.
 
 Host: macOS 26.3 (build 25D2125), arm64. Go 1.27.1 darwin/arm64. Tree:
-branch `worktree-agent-a40d1a9490b4e2dd8` at `d3ddc7a` (base
-`claude/gap-brief-2026-09-06` at `fe59175` plus the integrator's helper rename),
+branch `worktree-agent-a40d1a9490b4e2dd8` at `9e8d5b1` (base
+`claude/gap-brief-2026-09-06` at `63b48d4` plus the integrator's helper rename),
 plus the working-tree changes this entry describes. No credential of any kind
 was used or needed; the standalone server has no token and the run reached no
 network but loopback.
 
-Setup, run twice — once with the binary built from `d3ddc7a`, and again after
+Setup, run twice — once with the binary built from `9e8d5b1`, and again after
 the node fix below:
 
 ```sh
@@ -2685,7 +2685,7 @@ resource was involved.
 unavailable on the macOS Docker Desktop host itself, and the lane says so
 rather than failing.**
 
-Candidate: `claude/gap-brief-2026-09-06` at `a8da2ee` plus the change this
+Candidate: `claude/gap-brief-2026-09-06` at `da391d1` plus the change this
 entry lands with. Go 1.27.1. macOS 26.3 arm64; Docker Desktop 29.4.1;
 Colima 6.8.0-117 Ubuntu aarch64 with its own docker daemon.
 
@@ -2837,7 +2837,7 @@ neither of which is reachable on darwin.**
 
 Commit under test: `ced0f0064e2ad183f16da807c5a3558391bc4d95`
 (`claude/gap-brief-2026-09-06`), plus the two fixes this entry describes. The
-binary reported `remount v0.0.0-20260906021425-ced0f0064e2a+dirty`.
+binary reported `remount v0.0.0-20260906021425-f593b311f2c0+dirty`.
 
 Host: a Colima Ubuntu aarch64 VM on macOS/arm64 (Apple silicon), started
 earlier with `colima start --nested-virtualization --arch aarch64 --cpu 4
@@ -2853,7 +2853,7 @@ against this worktree rather than a copy.
 
 | Lane | Command | Verdict |
 |---|---|---|
-| linux/arm64 build | `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o dist/remount-linux-arm64 ./cmd/remount`; `colima ssh -- <repo>/dist/remount-linux-arm64 version` | **verified** — `remount v0.0.0-20260906021425-ced0f0064e2a+dirty` |
+| linux/arm64 build | `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o dist/remount-linux-arm64 ./cmd/remount`; `colima ssh -- <repo>/dist/remount-linux-arm64 version` | **verified** — `remount v0.0.0-20260906021425-f593b311f2c0+dirty` |
 | E4 denial + failed-setup cleanup | `./scripts/gvisor-conformance.sh e4` | **verified** — exit 0, 38 s |
 | E5 sibling and tenant isolation | `./scripts/gvisor-conformance.sh all` (E5 half) | **verified** — exit 0 |
 | B28 aggregate | `./scripts/gvisor-conformance.sh all` | **verified after fixes** — exit 0, 55 s (**failed** before: exit 1, 345 s) |
@@ -3168,7 +3168,7 @@ both mint a session principal and hold a claimed workspace (below).
 Host: macOS arm64 (Darwin 25.3.0). Worktree
 `.claude/worktrees/agent-aa7d4eb2fd0d4efcc`, branch
 `worktree-agent-aa7d4eb2fd0d4efcc`, cut from `claude/gap-brief-2026-09-06` at
-`3a96156`; the binary under test was built from the working tree of this gap
+`fea49e2`; the binary under test was built from the working tree of this gap
 2C change with `go build -trimpath -o remount ./cmd/remount`.
 
 **Credential handling.** The provider keys were never a command-line argument
@@ -3312,7 +3312,7 @@ above is closed: a browser now reaches the hosts the broker allows, and an
 unbound host is refused by host policy rather than for want of proxy
 authentication.**
 
-Candidate: `claude/gap-brief-2026-09-06` at `4e78a52` plus the change this
+Candidate: `claude/gap-brief-2026-09-06` at `6ef0d4b` plus the change this
 entry lands with ([ADR 0095](../adr/0095-browser-proxy-auth-through-cdp.md)).
 Go 1.27.1. macOS 26.3 arm64; Colima VM kernel
 `Linux colima 6.8.0-117-generic #117-Ubuntu SMP PREEMPT_DYNAMIC Thu May 7

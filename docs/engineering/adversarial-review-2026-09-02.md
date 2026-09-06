@@ -2484,5 +2484,5 @@ quoted in the verification notes.
 ## Status
 
 No fix has been applied. Every finding here is open. This document is a bug
-register, and the line numbers are accurate as of commit `3a109d4`; re-locate
+register, and the line numbers are accurate as of commit `8c37a22`; re-locate
 each symbol before acting on it.

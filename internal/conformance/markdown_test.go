@@ -23,7 +23,7 @@ func markdownReport() *Report {
 		Target: "remount standalone", TargetKind: KindBuilt,
 		Endpoint: "http://127.0.0.1:7443", Negotiated: []string{"v1", "session-cap"},
 		Environment: Environment{OS: "darwin", Arch: "arm64", Backend: "process"},
-		Profile:     ProfileMultiTenantIsolated, Candidate: "682ccaa",
+		Profile:     ProfileMultiTenantIsolated, Candidate: "8fd7bdf",
 		StartedAt: started, DurationMS: 1500,
 		Cleanup: CleanupVerified,
 		Results: []Result{
@@ -44,7 +44,7 @@ func TestWriteMarkdownCarriesTheHeaderFieldsAReviewNeeds(t *testing.T) {
 	out := b.String()
 	for _, want := range []string{
 		"# Remount conformance — NOT CONFORMANT",
-		"| Candidate | `682ccaa` |",
+		"| Candidate | `8fd7bdf` |",
 		"| Endpoint | `http://127.0.0.1:7443` |",
 		"| Runtime profile | `multi-tenant-isolated` |",
 		"| Backend | `process` |",

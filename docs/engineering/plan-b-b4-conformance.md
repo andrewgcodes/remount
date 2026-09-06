@@ -146,7 +146,7 @@ reaches a record.
 
 ### B20 — the reference binary passes the complete required manifest
 
-**Proven**, `artifact` layer, at `efdfcea` on darwin/arm64, backend `process`.
+**Proven**, `artifact` layer, at `7461799` on darwin/arm64, backend `process`.
 
 ```
 $ conformance --build . --junit b20-junit.xml --evidence b20-evidence.json --scenario B20 --layer artifact

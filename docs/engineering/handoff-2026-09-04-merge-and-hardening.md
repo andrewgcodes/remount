@@ -1,7 +1,7 @@
 # Session wrap — 2026-09-04: the Windows and Linux merges, and what they exposed
 
-Both host-verification branches are on `main`: PR #10 (Windows) as `51185dd`,
-PR #11 (Linux, 72 files, +4427/−566) as `b0a3b4a`. Six commits followed them.
+Both host-verification branches are on `main`: PR #10 (Windows) as `6ac65d5`,
+PR #11 (Linux, 72 files, +4427/−566) as `e7b15c3`. Six commits followed them.
 
 The theme of this session is that **merging two branches that had each been
 verified alone exposed defects neither could see**, and that **running the

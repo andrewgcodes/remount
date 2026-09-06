@@ -361,7 +361,7 @@ TAP, coherent CoW volume, jailed API, and guest-executor adapters are
 integrated". That instruction is stale, and the history says so precisely: the
 four adapters are constructed in `cmd/remount/build_node.go` —
 `NewJailerFactory`, `NewSystemNetworkProvider`, `NewReflinkStore` plus
-`NewCoWVolumeProvider`, and `NewGuestBridge` — and they were wired by `a3b5235`,
+`NewCoWVolumeProvider`, and `NewGuestBridge` — and they were wired by `7ce54c9`,
 while the workflow's deliberate failure was last touched by the earlier
 `5254695`. Nobody went back to it after the integration landed.
 

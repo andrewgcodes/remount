@@ -40,7 +40,7 @@ func sampleReport() *Report {
 // compiler.
 func TestEvidenceRecordMatchesThePlanBSchema(t *testing.T) {
 	body, err := json.Marshal(sampleReport().Evidence(EvidenceOptions{
-		Scenario: "B20", Candidate: "efdfcea", Layer: "artifact",
+		Scenario: "B20", Candidate: "7461799", Layer: "artifact",
 		Command: "cmd/conformance --build .", Required: true, Owner: "cmd/conformance",
 	}))
 	if err != nil {
@@ -78,7 +78,7 @@ func TestEvidenceRecordMatchesThePlanBSchema(t *testing.T) {
 
 func TestEvidenceRecordCarriesNoSecretValue(t *testing.T) {
 	r := sampleReport()
-	body, err := json.Marshal(r.Evidence(EvidenceOptions{Scenario: "B20", Candidate: "efdfcea", Layer: "artifact"}))
+	body, err := json.Marshal(r.Evidence(EvidenceOptions{Scenario: "B20", Candidate: "7461799", Layer: "artifact"}))
 	if err != nil {
 		t.Fatal(err)
 	}

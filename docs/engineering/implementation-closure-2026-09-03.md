@@ -6,7 +6,7 @@ request, and OpenAI/Hugging Face incident-hardening SDMR. It is the current
 status ledger for those point-in-time documents; it does not rewrite their
 historical observations.
 
-The reviewed candidate is `main` after `51ffa15` plus the changes delivered
+The reviewed candidate is `main` after `2b35975` plus the changes delivered
 with this report. The upstream base was fetched again immediately before the
 final pass. The test evidence below is point-in-time evidence, not a substitute
 for continuously enforced CI or an independent production assessment.
@@ -791,7 +791,7 @@ is never recorded as a pass.
 ### Host and candidate
 
 - Host: Darwin 25.3.0 arm64, Go 1.27, `CGO_ENABLED=0`.
-- Base commit: `b213017` (merge of `codex/handoff-2026-09-03`).
+- Base commit: `58a9d15` (merge of `codex/handoff-2026-09-03`).
 - Docker: **available**, server 29.4.1 — the Docker backend lane runs here.
 - gVisor (`runsc`): **unavailable**, not registered with Docker. Docker Desktop
   on macOS runs its daemon inside a VM, so `runsc` cannot be registered.
@@ -882,7 +882,7 @@ would otherwise have been false.
 | E3 two-task queue with sleep between | implemented and verified, **live** | `TestRunOpenCodeQueueDockerIntegration`, 71.7 s; key in 0 log lines |
 | E4 gVisor enforced egress | implemented, externally gated | `runsc` is not registered on this host, so the seven-check denial suite cannot run. The backend advertises `enforced_gateway` only after that suite passes, so it is correctly unavailable rather than falsely green. |
 | E5 two untrusting tenants on one gVisor node | implemented, externally gated | same gate as E4 |
-| E6 approve-on-first-use | implemented and verified | committed `egress.pending` reaches the notifier while the upstream request stays parked, and a decision releases it (`8d5304e`) |
+| E6 approve-on-first-use | implemented and verified | committed `egress.pending` reaches the notifier while the upstream request stays parked, and a decision releases it (`0780b79`) |
 | E7 budgets | implemented and verified | `internal/budget` suite |
 | E8 principal revocation | implemented and verified | `TestE8PrincipalRevocationComposes`, `TestE8OperatorRevocationClosesAmbientSession`, and `TestE8PrincipalRevocationCoreSurvivesRestart` in `integration/identity` |
 | E9 chunked snapshot dedupe | implemented and verified | `TestE9ChunkedSnapshotMoveDeduplicates500MBLogicalFixture`. Literal gap: the fixture is a 500 MiB *logical* tree and the under-3s move is measured on a local process backend, not across a network. |

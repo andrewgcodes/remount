@@ -15,7 +15,7 @@ latency into the tracing system they already run.
 Three specific gaps, each with the same shape — the information exists inside
 the tree but is not published in a form a caller can act on.
 
-**Errors were a code and a sentence.** ADR-era commit 471124e added a stable
+**Errors were a code and a sentence.** ADR-era commit 0ffc725 added a stable
 `Reason` beside `Error.Code`, and the control plane and node started setting it
 at new failure sites. Nothing consumed it. `internal/client` still decided
 whether an `unauthorized` answer was worth retrying by comparing

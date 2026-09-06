@@ -72,7 +72,7 @@ actually arrive.
 
 1. **`.github/workflows/kvm.yml` fails its final step on purpose**, waiting for
    adapters that are wired in `cmd/remount/build_node.go` and have been since
-   `a3b5235`. The premise is stale. It needs someone who can run the workflow;
+   `7ce54c9`. The premise is stale. It needs someone who can run the workflow;
    this session could not.
 2. **Six optional Plan B rows** without owning proof — `evidence list --unowned`.
 3. **`internal/conformance`'s manifest has no required row asserting stderr

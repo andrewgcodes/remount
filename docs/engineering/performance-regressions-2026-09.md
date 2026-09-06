@@ -1,7 +1,7 @@
-# Performance regressions introduced by `a3b5235`, 2026-09
+# Performance regressions introduced by `7ce54c9`, 2026-09
 
 Two regressions were already known: workspace move (0.85 s → 75.79 s for 200 MB)
-and session reattach (0.855 s → 6.754 s), both bisected to `a3b5235`
+and session reattach (0.855 s → 6.754 s), both bisected to `7ce54c9`
 ("feat(platform): converge hosted runtime handoff", 12,504 insertions, 66
 files). This document records a wider sweep for the same commit and reports
 three further regressions, the mechanism behind each, and the lanes that were
@@ -13,14 +13,14 @@ Everything below is a measurement. Where a number is within noise it says so.
 
 - Host: Darwin arm64, 18 cores, shared with other agents running heavy suites.
   Load average at the start of the sweep was 2.90 / 5.41 / 7.28.
-- Builds: `git worktree add --detach <dir> <commit>` for `21ef995` (last good),
-  `a3b5235` (first bad) and `acb3e42` (HEAD at the time of writing), then
+- Builds: `git worktree add --detach <dir> <commit>` for `d99caeb` (last good),
+  `7ce54c9` (first bad) and `f602f41` (HEAD at the time of writing), then
   `go test -c -o <bin> ./internal/sim` in each worktree. The compiled binaries
   are run directly from each worktree's `internal/sim` directory so that the
   test source, fixtures and working directory match the library under test.
 - Comparisons are only made between tests whose **source is identical at both
   commits**. `internal/sim/scale_handoff_test.go` and `bench/` are byte
-  identical across `21ef995..a3b5235` (`git diff 21ef995 a3b5235 -- bench/
+  identical across `d99caeb..7ce54c9` (`git diff d99caeb 7ce54c9 -- bench/
   internal/sim/scale_handoff_test.go` is empty), so those lanes measure the
   library and nothing else.
 - Runs were interleaved (good, bad, head, repeat) rather than batched, so that
@@ -28,7 +28,7 @@ Everything below is a measurement. Where a number is within noise it says so.
 
 ## Ranked results
 
-| # | Operation | `21ef995` | `a3b5235` | Ratio | HEAD | Above noise? |
+| # | Operation | `d99caeb` | `7ce54c9` | Ratio | HEAD | Above noise? |
 |---|---|---:|---:|---:|---:|---|
 | 1 | Session reattach after mid-stream cut (`TestReconnectMidStreamIsLossless`) | 0.52 s | 6.49 s | 12.5× | 7.05 s | yes, already known |
 | 2 | Workspace claim, p99 at 2,000 workspaces | 0.79 s | 7.82 s | 9.9× | 6.63–9.43 s | yes, ranges disjoint |
@@ -49,7 +49,7 @@ cd <worktree>/internal/sim
 The test itself prints the per-operation percentiles (`scale_handoff_test.go`
 lines 94/119/141/178/225). Samples, in milliseconds unless stated:
 
-| Measurement | `21ef995` samples | `a3b5235` samples |
+| Measurement | `d99caeb` samples | `7ce54c9` samples |
 |---|---|---|
 | claim p50 | 390, 428, 449, 477 | 370, 378, 444, 491 |
 | claim p99 | 726, 786, 793, 824 | 7064, 7747, 7887, 8330 |
@@ -102,7 +102,7 @@ This is on the **claim** path for every workspace including workspaces with no
 volumes, and the fleet-scale scenario uses no volumes at all. It is also on the
 **move** path twice (detach on release-prepare, attach on the destination).
 
-`internal/volume` is entirely new in `a3b5235`, and every node opens a
+`internal/volume` is entirely new in `7ce54c9`, and every node opens a
 `LocalBackend` unconditionally (`internal/node/node.go:423`), even when the bind
 mount probe fails and the node reports `read-only volumes unavailable`. On such
 a host the catalog is fsynced on every claim to support a feature that host
@@ -124,7 +124,7 @@ go test -run '^$' -bench 'BenchmarkVolumeFenceCatalog' -benchtime=200x -count=3 
 | 10,000 | 17,269,711 / 24,641,624 | 17.3 ms |
 
 The floor of ~8 ms per claim is the two fsyncs; the growth from 8 ms to 17 ms is
-the catalog re-serialization. Neither cost existed at `21ef995`.
+the catalog re-serialization. Neither cost existed at `d99caeb`.
 
 CPU profile corroboration, same scenario, same command plus
 `-test.cpuprofile`:
@@ -133,7 +133,7 @@ CPU profile corroboration, same scenario, same command plus
 go tool pprof -top -cum <simbin> <profile>
 ```
 
-`a3b5235`, 24.71 s of samples over 39.18 s wall:
+`7ce54c9`, 24.71 s of samples over 39.18 s wall:
 
 ```
 2.53s 10.24%  remount.dev/remount/internal/node.(*Node).attachWorkspaceVolumesScoped
@@ -144,7 +144,7 @@ go tool pprof -top -cum <simbin> <profile>
 1.25s  5.06%  remount.dev/remount/internal/node.(*Node).persistReleasesLocked
 ```
 
-`21ef995`, 18.45 s of samples over 17.29 s wall: no `internal/volume` frames at
+`d99caeb`, 18.45 s of samples over 17.29 s wall: no `internal/volume` frames at
 all, and `os.(*File).Sync` is 0.31 s (1.68%).
 
 `persistReleasesLocked` (`internal/node/release_journal.go`, also new) is the
@@ -154,7 +154,7 @@ release state transitions in a single move.
 
 ## Regression 3: every exec now uploads its session log and takes two extra network round trips before `Wait` returns
 
-`a3b5235` wires tiered session logs (`internal/node/session_logs.go`, new file).
+`7ce54c9` wires tiered session logs (`internal/node/session_logs.go`, new file).
 `tieredSessionLogsEnabled()` is true whenever `n.opts.ArtifactURL != ""` and the
 capability is negotiated, which is the normal production configuration. The
 session `Log` therefore gets a `BlobStore`, and `closeWithPublish`
@@ -180,14 +180,14 @@ synchronously under the lock:
    `node.commitSessionLogRecord` → `peer.Call(proto.PeerControl,
    proto.OpSessionLogCommit, ...)`, a full control-plane round trip.
 
-At `21ef995` `BlobStore` was nil on the node side, so `closeWithPublish` did
+At `d99caeb` `BlobStore` was nil on the node side, so `closeWithPublish` did
 none of this. The measured effect is 0.645 s → 3.125 s p50 for a
 `printf`-sized exec at 200-way concurrency, and roughly 1.3–1.5× on the small
 single-node sim tests, where there is no contention to amplify it.
 
 Mutex profile, same scenario, `-test.mutexprofile -test.mutexprofilefraction=10`:
 
-`a3b5235`, 2,214 s of total mutex delay:
+`7ce54c9`, 2,214 s of total mutex delay:
 
 ```
 1041.72s 47.04%  remount.dev/remount/internal/session.(*Session).finish
@@ -196,7 +196,7 @@ Mutex profile, same scenario, `-test.mutexprofile -test.mutexprofilefraction=10`
  223.84s 10.11%  remount.dev/remount/internal/artifact.(*Store).PutExpected
 ```
 
-`21ef995`, 1,294 s of total mutex delay: `closeWithPublish`, `Session.finish`,
+`d99caeb`, 1,294 s of total mutex delay: `closeWithPublish`, `Session.finish`,
 `handleArtifact` and `PutExpected` do not appear anywhere in the profile
 (`go tool pprof -top -cum -nodecount=200 | grep` returns nothing for any of
 them). The top entries there are `control.wsCreate`, `control.wsClaim` and the
@@ -205,7 +205,7 @@ runtime fork lock, i.e. ordinary work.
 ## Regression 1 note: the reattach cost is a retry, not new work
 
 The reattach regression is already owned elsewhere, but the sweep produced one
-diagnostic worth recording. `TestReconnectMidStreamIsLossless` at `a3b5235` is
+diagnostic worth recording. `TestReconnectMidStreamIsLossless` at `7ce54c9` is
 bimodal — 3.08 s, 6.41 s, 6.49 s, 6.49 s, 6.83 s, 7.09 s, 7.67 s, 10.59 s,
 11.15 s across nine runs — with the modes separated by roughly the 2 s cap of
 the pre-existing `Session.reattach` backoff. A read of the diff found **no new
@@ -238,7 +238,7 @@ go test -run '^$' -bench 'Benchmark(Chunked|Direct|Broker)' -benchtime=3x -count
 
 Medians of five processes:
 
-| Benchmark | `21ef995` | `a3b5235` | HEAD |
+| Benchmark | `d99caeb` | `7ce54c9` | HEAD |
 |---|---:|---:|---:|
 | ChunkedSnapshotFull8MiB | 841.7 ms | 917.9 ms | 845.7 ms |
 | ChunkedSnapshotDelta4KiBOf8MiB | 28.4 ms | 27.5 ms | 28.4 ms |
@@ -259,7 +259,7 @@ in `eventlog` (6.2×), `connector` (5.2×), `artifact/chunked` (4.4×), `fsops`
 Re-running those packages as standalone compiled binaries, one at a time,
 twice per commit, and comparing only the tests present at both commits:
 
-| Package | common-test total, `21ef995` | `a3b5235` | Ratio | Tests only at `a3b5235` |
+| Package | common-test total, `d99caeb` | `7ce54c9` | Ratio | Tests only at `7ce54c9` |
 |---|---:|---:|---:|---:|
 | eventlog | 0.11 s | 0.11 s | 0.95 | 0 |
 | connector | 0.32 s | 0.32 s | 1.00 | 0 |
@@ -281,8 +281,8 @@ it. **Do not use repo-wide `go test` wall time as a performance instrument.**
 **Repo materialize (`TestRepoRefShapes`,
 `TestRepoClonedAtMaterializeWithoutTokenInWorkspace`).** A first pass showed
 these 2–3× slower at HEAD. Repeating showed the good commit spiking too
-(`TestRepoRefShapes` samples 1.31, 1.36, 4.42 s at `21ef995`; 1.32, 1.34,
-1.27 s at `a3b5235`). These tests fork `git` subprocesses and are simply noisy
+(`TestRepoRefShapes` samples 1.31, 1.36, 4.42 s at `d99caeb`; 1.32, 1.34,
+1.27 s at `7ce54c9`). These tests fork `git` subprocesses and are simply noisy
 on a loaded machine. Not a regression.
 
 **Control-plane restart.** 314 / 400 / 526 ms old versus 237 / 242 / 476 ms
@@ -305,8 +305,8 @@ across every exec-shaped test and the console test's ranges do not overlap.
 
 ## Correctness note, not performance
 
-`TestLocalDirectoryRoundTrip` fails at `a3b5235` with `localfs_test.go:148:
-gzip: invalid header`. That is the defect fixed later by `da21b9f`
+`TestLocalDirectoryRoundTrip` fails at `7ce54c9` with `localfs_test.go:148:
+gzip: invalid header`. That is the defect fixed later by `b07f0c6`
 ("fix(snapshot): export chunked snapshots as tar streams"), not a timing
 result. Its 0.40 s → 2.86 s is a failure path and was excluded from the ranking.
 
@@ -361,7 +361,7 @@ ratio between two named files is a fact about those two files.
 | 5 | Reattach after control restart | **improved** — 4.90 s → 4.17 s |
 | 6 | Volume fence write per claim/move | **fixed** for volume-incapable nodes |
 | 7 | Whole fleet-scale scenario | **improved** — 35.1 s → 22.4 s |
-| 3 | Exec round trip p50 at 200-way concurrency | **fixed to 2.2x of baseline** — 3.125 s at `a3b5235`, 1.41 s now against 0.645 s. See "Regression 3, re-diagnosed" and "Both remedies taken". The first diagnosis in this document was wrong. |
+| 3 | Exec round trip p50 at 200-way concurrency | **fixed to 2.2x of baseline** — 3.125 s at `7ce54c9`, 1.41 s now against 0.645 s. See "Regression 3, re-diagnosed" and "Both remedies taken". The first diagnosis in this document was wrong. |
 
 Also fixed separately: the 200 MiB two-node move, 33–76 s → 0.88 s (228 MB/s
 against a 235 MB/s baseline), by bounding chunk-transfer concurrency and
@@ -398,9 +398,9 @@ catalog sizes 1 / 100 / 1000 / 10000.
 `sealSpillLocked`, and that seal performs an fsync, a `BlobStore.Put`, a
 `BlobStore.Head` and a `CommitRecord` — two HTTP requests and a control-plane
 round trip — before the lock is released. Every reader of that session blocks
-behind all of it, on every session close. The mutex profile at `a3b5235`
+behind all of it, on every session close. The mutex profile at `7ce54c9`
 attributes 1041 s of 2214 s total delay to `Session.finish → closeWithPublish`;
-none of those frames appear at `21ef995`.
+none of those frames appear at `d99caeb`.
 
 This is the same shape as the `Node.Diag` race fixed earlier in this pass —
 work that must not hold a lock, holding one — but the remedy is not a
@@ -419,7 +419,7 @@ what makes a completed session survive node loss, which is the whole promise of
 
 ## Regression 3, re-diagnosed (2026-09-03, later the same night)
 
-An earlier revision of this document, and the commit message for `c89e413`,
+An earlier revision of this document, and the commit message for `2cc59e5`,
 said regression 3 was `Log.closeWithPublish` holding `l.mu` across an fsync,
 a `BlobStore.Put`, a `BlobStore.Head` and a `CommitRecord`, "47% of all mutex
 delay". **That attribution was wrong**, and MISTAKES.md #47 records how it was
@@ -696,7 +696,7 @@ quota-bearing store refuse writes it has room for.
 
 Same command, same host, `TestHandoffScaleAndControlFailover`:
 
-| Operation | `21ef995` baseline | `a3b5235` | before these two changes | now |
+| Operation | `d99caeb` baseline | `7ce54c9` | before these two changes | now |
 |---|---:|---:|---:|---:|
 | exec round trip p50 | 0.645 s | 3.125 s | 2.78 s | **1.41 s** |
 | reattach after control restart p50 | 2.24 s | 4.90 s | 4.74 s | **2.75 s** |

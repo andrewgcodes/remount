@@ -26,11 +26,11 @@ branch unless that exact worktree still exists and is clean.
 
 - Integration branch: `codex/handoff-2026-09-03`.
 - Last pre-wrap local commit before the final integration commit:
-  `21ef995 test(sim): record fleet-scale failover evidence`.
-- Main was independently repaired through `202042a` while feature agents were
+  `d99caeb test(sim): record fleet-scale failover evidence`.
+- Main was independently repaired through `e830116` while feature agents were
   editing the integration worktree. The two main-only fixes are:
-  - `197b3ef fix(ci): satisfy static analysis`;
-  - `202042a fix(session): treat closed PTY as EOF`.
+  - `a571d7b fix(ci): satisfy static analysis`;
+  - `e830116 fix(session): treat closed PTY as EOF`.
 - The final integration commit and PR URL are recorded in the delivery message
   for this handoff. Verify them with `git log --oneline --decorate -20` rather
   than assuming a hash from this point-in-time document.
@@ -64,17 +64,17 @@ The commits before the final convergence commit cover these major slices:
 - production tenant onboarding, RBAC and OIDC; and
 - 200-node/2,000-workspace control-failover scale evidence.
 
-Use `git log --reverse --oneline 7e61cde..HEAD` for the exact commit ledger.
+Use `git log --reverse --oneline ac83dfa..HEAD` for the exact commit ledger.
 Important focused acceptance commits already present include:
 
-- `8d5304e test(sim): compose approval notification flow`, which proves a
+- `0780b79 test(sim): compose approval notification flow`, which proves a
   committed `egress.pending` reaches the notifier while the upstream request
   remains parked and that a decision releases it;
-- `21ef995 test(sim): record fleet-scale failover evidence`, which records the
+- `d99caeb test(sim): record fleet-scale failover evidence`, which records the
   real-protocol 200-node/2,000-workspace scenario and checked-in p50/p99 data;
-- `9155d21 fix(ci): include generated SDK packages`, which repaired the SDK
+- `182cd0b fix(ci): include generated SDK packages`, which repaired the SDK
   distribution workflow by checking in both installable packages; and
-- `4d0d7c5 fix(console): preserve terminal replay cursor`, which prevents the
+- `3fe2efd fix(console): preserve terminal replay cursor`, which prevents the
   console from restarting replay at the wrong cursor.
 
 ### 2.1 Onboarding, RBAC and SSO
@@ -260,14 +260,14 @@ validation live in `bench/run.py` and `bench/test_tools.py`.
 The first main push exposed three issues that local focused tests did not:
 
 1. The Examples workflow installed generated SDK directories that were not yet
-   tracked. Commit `9155d21` checked in both packages and their exact install,
+   tracked. Commit `182cd0b` checked in both packages and their exact install,
    build, typecheck and smoke tests passed.
 2. Staticcheck found five style/correctness findings, including a real nested
-   webhook-array append defect. Commit `197b3ef` fixed them and added a
+   webhook-array append defect. Commit `a571d7b` fixed them and added a
    regression.
 3. Linux PTYs return `EIO` after slave closure. The code treated that as a log
    error, and the test raced resize against initial-size output. Commit
-   `202042a` normalizes Unix `EIO` to EOF and makes the resize assertion
+   `e830116` normalizes Unix `EIO` to EOF and makes the resize assertion
    deterministic.
 
 The replacement main CI run `33809584139` passed static analysis, ordinary

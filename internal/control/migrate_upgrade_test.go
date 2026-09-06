@@ -25,7 +25,7 @@ import (
 // same migration twice changes nothing.
 const (
 	// migrationFixtureDB is a database file created by the schema at commit
-	// 407cd50^ — the revision before pool_retirements existed — and then
+	// 3611485^ — the revision before pool_retirements existed — and then
 	// seeded with one row in each durable table the control plane reads at
 	// start-up. It is checked in rather than built at test time so the test
 	// judges a real older file, not this release's idea of an older file.
@@ -122,7 +122,7 @@ func seedMigrationFixture(db *sql.DB) error {
 //	REMOUNT_REGENERATE_MIGRATION_FIXTURE=1 \
 //	  go test ./internal/control -run TestGenerateMigrationFixture -count=1
 //
-// The DDL it reads was extracted verbatim from 407cd50^; see the header of
+// The DDL it reads was extracted verbatim from 3611485^; see the header of
 // testdata/schema-pre-pool-retirements.sql.
 func TestGenerateMigrationFixture(t *testing.T) {
 	if os.Getenv("REMOUNT_REGENERATE_MIGRATION_FIXTURE") != "1" {

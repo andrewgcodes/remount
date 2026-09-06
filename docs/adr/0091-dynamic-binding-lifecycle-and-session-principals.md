@@ -159,7 +159,7 @@ failing path — so it is a tidiness cost rather than an authority leak, and
 
 ### Reasons at existing failure sites
 
-`proto.Error.Reason` (base commit 471124e) sub-classifies a code without
+`proto.Error.Reason` (base commit 0ffc725) sub-classifies a code without
 changing it. No code changed and no message text changed, because
 `Client.staleGrantAuthority` still matches on message text and
 `Client.nodeCall` retries on specific codes. The reasons added:

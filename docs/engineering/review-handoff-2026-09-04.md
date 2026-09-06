@@ -71,7 +71,7 @@ workspace and recovery contract**, not simply â€œother sandboxes hold the keys.â
 
 The three audit test sources already open in the editor at review start were used
 as supplied evidence inputs, not presented as newly authored discoveries. Their
-original basenames were `remount-audit-fd34775-{broker,connector,control}_test.go`.
+original basenames were `remount-audit-2242eea-{broker,connector,control}_test.go`.
 They were read, executed through a Go overlay, checked against current production
 paths, and reproduced under `-race`. Appendix A embeds them so the handoff does
 not depend on this workstation's `/tmp` directory.
@@ -874,7 +874,7 @@ ideas into its strongest product advantage.
 
 ## 10. Verification record
 
-### Fresh checks on `afea7428`
+### Fresh checks on `5d7dade0`
 
 | Check | Observed result |
 |---|---|
@@ -902,7 +902,7 @@ fixtures; passing the package does not prove every optional lane ran.
 ### Integrated documentation candidate
 
 The branch includes `1dca7730a25bb3c5e4ba9a78b8bf6b8f4122b747`. The eleven
-finding paths are unchanged from `afea7428`.
+finding paths are unchanged from `5d7dade0`.
 
 - The focused overlay was rerun with `-race -count=1` after integration. All
   eleven diagnostic tests again failed with the same forbidden outcomes; no

@@ -876,10 +876,10 @@ honest measurements; they were taken at different commits, and nothing ever
 compared them. `git bisect` over 23 commits put the whole regression inside
 one:
 
-    21ef995  test(sim): record fleet-scale failover evidence     0.85s  (235 MB/s)
-    a3b5235  feat(platform): converge hosted runtime handoff     75.79s (2.6 MB/s)
+    d99caeb  test(sim): record fleet-scale failover evidence     0.85s  (235 MB/s)
+    7ce54c9  feat(platform): converge hosted runtime handoff     75.79s (2.6 MB/s)
 
-`a3b5235` is 12,504 insertions across 66 files, and its own handoff document
+`7ce54c9` is 12,504 insertions across 66 files, and its own handoff document
 had already written the warning: "Three subagents shared the integration
 worktree, so the final commit groups a large convergence diff. Review by
 subsystem and behavior, not merely by commit size." It was reviewed by
@@ -990,7 +990,7 @@ that ships because the test fixture had one of everything.
 ## 45. One fsync per unit, in two streaming paths
 
 **Symptom.** The two regressions in #42 had one shared shape, and it was not
-what I guessed. `a3b5235` put **per-unit durable-sync work inside streaming
+what I guessed. `7ce54c9` put **per-unit durable-sync work inside streaming
 paths**, turning one publish into thousands.
 
 Move: the commit routed every filesystem-backed move through chunked-v1, so
@@ -1127,7 +1127,7 @@ audit record; it was only *written* there, and that was enough.
 
 ## 47. I read a mutex profile from the top and named the wrong culprit
 
-After fixing five regressions from `a3b5235`, one stayed open: exec round trip,
+After fixing five regressions from `7ce54c9`, one stayed open: exec round trip,
 0.645 s baseline against 2.54 s. I wrote in the commit message, in
 `docs/engineering/performance-regressions-2026-09.md`, and in my report to the
 user that the cause was `Log.closeWithPublish` holding `l.mu` across an fsync,
@@ -1360,7 +1360,7 @@ secret, builds `b_anthropic` alongside any OpenAI binding, and allows the
 Claude adapter's required hosts. The OpenAI secret name remains backward
 compatible.
 
-**Proof.** The exact dirty candidate on base `68df7f1` was deployed under a
+**Proof.** The exact dirty candidate on base `8eacd77` was deployed under a
 unique Modal development app. Its authenticated node ran Claude ACP against a
 real workspace, created the expected file, and emitted `cred.used` with
 `binding=b_anthropic`, `host=api.anthropic.com:443`, `path=/v1/messages`, and

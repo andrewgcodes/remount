@@ -2,7 +2,7 @@
 
 This dispositions every item of [the gap brief](./gap-brief-2026-09-06.md)
 against code, tests and dated evidence on branch
-`claude/gap-brief-2026-09-06` (cut from `origin/main` `b6c8b18`). It is a
+`claude/gap-brief-2026-09-06` (cut from `origin/main` `9b5dff6`). It is a
 ledger, not a certificate: a row says what exists and how it was proven, and
 an `unavailable` result is never a pass. Update it when the boundary moves.
 
@@ -122,7 +122,7 @@ lifecycle, restart persistence, idempotent replay and secret-never-returned;
 `TestSessionPrincipalIsWorkspaceAndGenerationBound`,
 `TestFleetRevokeEgressKillsGatewayAccess`.
 
-Live: a real-provider smoke at `d64e175` (before the dynamic store) proved
+Live: a real-provider smoke at `f4dacb4` (before the dynamic store) proved
 substitution at `api.openai.com` and `api.anthropic.com`, the OpenAI
 placeholder blocked at the Anthropic host with a `leak_blocked` audit, unbound
 hosts denied, and zero key-shaped strings in the workspace or logs. Note for
@@ -276,12 +276,12 @@ Delivered so far:
 
 | Builder | Scope | Status |
 |---|---|---|
-| Browser lane | `images/browser`, `remount computer` CLI, Python/TS `Computer`, real-Chromium conformance (B34) run live in the Colima VM, docs | merged (5a425b6); brokered browsing fixed and verified live (9ba6f46) |
-| Conformance product | `cmd/conformance --profile`, markdown report, `remount conformance`, evidence E26/B33, gVisor drift lane script, operator docs | merged (ced0f00) |
-| Linux lanes | gVisor E4/E5/B28, E26 drift, a real `multi-tenant-isolated` gVisor node with `doctor` and `conformance --profile`, Firecracker B29 if its environment survived, all inside the Colima VM | merged (e55593d); gVisor verified, Firecracker unavailable |
-| Credentials | `remount binding`/`principal session` CLI, Python/TS helpers, keyless examples against a fake provider (B35), docs, live `.env` run with rotate and revoke | merged (29bae6b); `principal session` live test unavailable until a node can enroll in production mode from the CLI (follow-up running) |
-| Lifecycle | `remount ws lease`/idle CLI, Python/TS methods, auto-sleep example, docs, live timer run across a server restart | merged (39f951d) |
-| Typed errors and observability | typed error classes in three languages, support matrix, dependency-free OTLP tracing, log redaction, ADR 0093 | merged (b94530d); spans verified live against a local collector |
+| Browser lane | `images/browser`, `remount computer` CLI, Python/TS `Computer`, real-Chromium conformance (B34) run live in the Colima VM, docs | merged (90a9b7f); brokered browsing fixed and verified live (7b60355) |
+| Conformance product | `cmd/conformance --profile`, markdown report, `remount conformance`, evidence E26/B33, gVisor drift lane script, operator docs | merged (f593b31) |
+| Linux lanes | gVisor E4/E5/B28, E26 drift, a real `multi-tenant-isolated` gVisor node with `doctor` and `conformance --profile`, Firecracker B29 if its environment survived, all inside the Colima VM | merged (8fd7ecd); gVisor verified, Firecracker unavailable |
+| Credentials | `remount binding`/`principal session` CLI, Python/TS helpers, keyless examples against a fake provider (B35), docs, live `.env` run with rotate and revoke | merged (dfc8423); `principal session` live test unavailable until a node can enroll in production mode from the CLI (follow-up running) |
+| Lifecycle | `remount ws lease`/idle CLI, Python/TS methods, auto-sleep example, docs, live timer run across a server restart | merged (64de2da) |
+| Typed errors and observability | typed error classes in three languages, support matrix, dependency-free OTLP tracing, log redaction, ADR 0093 | merged (d623e8f); spans verified live against a local collector |
 
 ## Deferred by owner decision
 

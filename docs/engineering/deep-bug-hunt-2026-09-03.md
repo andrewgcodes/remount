@@ -9,7 +9,7 @@
 
 ### Integration disposition — 2026-09-05
 
-This report is historical evidence about `7e61cde`, not a list of eight
+This report is historical evidence about `ac83dfa`, not a list of eight
 confirmed defects in current main. The integration review checked main
 `3620140`; the original observations and severities below are preserved.
 This documentation PR does not implement the remaining fixes.

@@ -2,7 +2,7 @@ package sim
 
 // The 2026-09 regression sweep (docs/engineering/performance-regressions-2026-09.md)
 // left one row open — exec round trip, 0.645 s baseline against 3.1 s at
-// a3b5235 — and named the lane that would have caught it: "a single-session
+// 7ce54c9 — and named the lane that would have caught it: "a single-session
 // exec round trip with an artifact URL configured, which is what makes the
 // session-log upload path live". This is that lane.
 //
@@ -76,7 +76,7 @@ func medianExecLatency(lat []time.Duration) time.Duration {
 
 // TestExecRoundTripCostOfTheDurableSessionTier reports what the durable
 // session-log tier costs a single exec, and fails if that cost returns to the
-// level that made the 200-way lane 4.8x slower at a3b5235.
+// level that made the 200-way lane 4.8x slower at 7ce54c9.
 //
 // The bound is a ratio, because the absolute number is a property of the host.
 // It is deliberately loose. Sealing a ~195-byte segment is legitimately not
