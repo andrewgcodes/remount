@@ -40,6 +40,7 @@ import (
 
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/control"
+	"remount.dev/remount/internal/launch"
 	"remount.dev/remount/internal/localfs"
 	"remount.dev/remount/internal/profile"
 	"remount.dev/remount/internal/proto"
@@ -80,7 +81,7 @@ func run(ctx context.Context, argv []string) error {
 	}
 	cmd, args := argv[0], argv[1:]
 	switch cmd {
-	case "ws", "fs", "fleet", "pool", "volume", "budget", "run", "agent", "mcp", "tenant", "principal", "token", "audit", "computer", "node":
+	case "ws", "fs", "fleet", "pool", "volume", "budget", "run", "auth", "agent", "mcp", "tenant", "principal", "token", "audit", "computer", "node":
 		if len(args) > 0 && !isFlag(args[0]) {
 			args = append(append([]string{args[0]}, globals...), args[1:]...)
 		} else {
@@ -136,6 +137,8 @@ func run(ctx context.Context, argv []string) error {
 		return cmdUsage(ctx, args)
 	case "run":
 		return cmdRun(ctx, args)
+	case "auth":
+		return cmdAuth(ctx, args)
 	case "handoff":
 		return cmdHandoff(ctx, args)
 	case "resume":
@@ -215,6 +218,15 @@ func splitGlobalFlags(argv []string) (globals, rest []string) {
 
 func isFlag(a string) bool { return len(a) > 1 && a[0] == '-' }
 
+func normalizeAuthFlag(value string) string {
+	switch value {
+	case "api-key":
+		return launch.AuthAPIKey
+	default:
+		return value
+	}
+}
+
 // requiresProfile validates the `ws create --requires-profile` value before
 // the client dials, so an unknown profile is a named local error rather than a
 // workspace that parks as unschedulable. An empty value means the workspace
@@ -275,8 +287,10 @@ func usage() {
   remount pool create NAME --vendor V --backend B [--min 0 --max 5] | ls | get NAME | rm NAME
   remount budget create ID --attach KIND:ID [--window 1d] [--max-requests N] [--max-tokens N] | ls | rm ID
   remount usage [--tenant T] [--ws WS] [--principal P] [--binding B] [--window 1h|1d|30d]
-  remount run RECIPE [--dir . | --base NAME | --repo URL[@REF] | --ws WS] [--binding b_openai]... [--detach] -- TASK
+  remount run RECIPE [--auth subscription|api-key] [--dir . | --base NAME | --repo URL[@REF] | --ws WS] [--binding b_openai]... [--detach] -- TASK
                                       seed a workspace, install a harness (claude, codex, opencode, openhands, goose, gemini, aider, cline, custom), run it
+  remount auth login|status|logout RECIPE --ws WS
+                                      provider-native subscription auth over a confidential, non-replayable session
   remount run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM]   run the file's tasks in order in one workspace, checkpointing or sleeping between them
   remount handoff [--recipe R] [--task T] [--dir .]                      move this checkout and the harness's conversation into a workspace and keep it going
   remount resume WS [--task T]        rejoin a running harness, or wake the workspace and continue the conversation

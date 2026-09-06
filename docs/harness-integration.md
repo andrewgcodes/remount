@@ -6,11 +6,12 @@ through one interface and adds what no single machine gives you: sessions that
 survive a dropped connection, workspaces that move between machines, and egress
 that never exposes a real credential to the agent.
 
-This document covers four things. It shows `remount run`, which launches a
+This document covers five things. It shows `remount run`, which launches a
 harness from a recipe with one command. It shows the recipe we verified by
 hand against OpenAI's Codex CLI. It gives the general pattern for pointing any
-harness at the broker. And it walks through writing your own loop against the
-Go SDK.
+harness at the broker. It defines explicit subscription versus API-key billing
+for Claude and Codex. And it walks through writing your own loop against the Go
+SDK.
 
 ## `remount run`: one command from a checkout to a working agent
 
@@ -43,8 +44,8 @@ a YAML pull request, not Go.
 
 | Recipe | Harness | Auth | Providers | `--sandbox` mapping | State that travels |
 |---|---|---|---|---|---|
-| `claude` | Claude Code | key or login | anthropic | PTY: `--permission-mode plan` / `acceptEdits` / `--dangerously-skip-permissions`; ACP: `plan` / `acceptEdits` / `bypassPermissions` session mode | `.claude/`, `.claude.json` |
-| `codex` | Codex CLI | key or login | openai, azure-openai, openrouter | `--sandbox read-only` / `workspace-write` / `danger-full-access` | `.codex/` |
+| `claude` | Claude Code | explicit `subscription` or `api-key` | anthropic | PTY: `--permission-mode plan` / `acceptEdits` / `--dangerously-skip-permissions`; ACP: `plan` / `acceptEdits` / `bypassPermissions` session mode | `.claude/`, `.claude.json` |
+| `codex` | Codex CLI | explicit `subscription` or `api-key` | openai, azure-openai, openrouter | `--sandbox read-only` / `workspace-write` / `danger-full-access` | `.codex/` |
 | `opencode` | OpenCode | key or login | anthropic, openai, google, openrouter, groq, deepseek, xai, mistral | `permission.edit/bash/webfetch` in a generated config | `.local/share/opencode/` |
 | `openhands` | OpenHands CLI | key | anthropic, openai, google, openrouter, groq, together, fireworks, deepseek, xai, mistral | harness default | `.openhands/` |
 | `goose` | Goose | key | openai, anthropic, google, openrouter, groq | harness default | `.local/share/goose/`, `.config/goose/` |
@@ -137,9 +138,10 @@ cloud machine. Save the conversation and stop local work before copying it.
 
 ```sh
 cd ~/proj                       # a checkout with a Claude Code conversation open
-remount handoff --recipe claude --binding b_anthropic \
+remount handoff --recipe claude --auth api-key --binding b_anthropic \
   --task "finish the refactor and open a PR"
-remount handoff --recipe codex --binding b_openai --task "continue the refactor"
+remount handoff --recipe codex --auth api-key --binding b_openai \
+  --task "continue the refactor"
 ```
 
 These are alternative examples for the harness you used locally, not two steps
@@ -147,12 +149,12 @@ of one transfer. GitHub tools, authorization and network access must be
 configured separately if the task needs to push or open a PR.
 
 `handoff` detects a recipe from state under your home (`--recipe` when several
-match, `--home` for an isolated state directory). Claude Code and Codex handoffs
-require a brokered provider binding: they do not transfer Keychain credentials,
-subscription logins, provider configuration or unrelated conversations. A local
-autostarted server can select a matching binding from exported provider keys;
-remote bindings must be named explicitly. The CLI does not automatically read
-`.env` files.
+match, `--home` for an isolated state directory). Claude Code and Codex
+handoffs require `--auth api-key` and a brokered provider binding: they do not
+transfer Keychain credentials, subscription logins, provider configuration or
+unrelated conversations. Subscription handoff is refused; create the remote
+workspace and run `remount auth login` there. The CLI does not automatically
+read `.env` files.
 
 For Claude/Codex, the newest valid saved transcript whose metadata matches the
 canonical checkout is selected. Its UUID and transcript path are recorded in
@@ -189,9 +191,12 @@ to hide that incompatibility.
 `remount resume WS` attaches to a live harness session; otherwise it wakes the
 workspace and invokes the resume command with `--task` (default "Continue where
 you left off."). The recipe, bindings, model and selected conversation come from
-the workspace labels. For a scoped handoff, the recorded transcript is checked
-before opening a new session. Legacy workspaces without a selected UUID keep
-their recipe's latest-conversation behavior.
+the workspace labels. The recorded auth mode is preserved; an explicit
+conflicting `--auth` override is refused rather than changing billing. A
+subscription resume reconstructs no provider bindings. For a scoped handoff,
+the recorded transcript is checked before opening a new session. Legacy
+workspaces without a selected UUID keep their recipe's latest-conversation
+behavior.
 
 `remount run RECIPE --queue tasks.txt` runs one task per line in one
 workspace, in order, and records progress as a control-plane `Queue`
@@ -217,18 +222,50 @@ b_bedrock:bedrock?host=us-east-1` fills a region. The workspace receives
 `OPENAI_BASE_URL=${REMOUNT_BROKER}/d/api.openai.com/v1`; the broker
 substitutes the real key on the way out and records `cred.used`.
 
-### Two kinds of auth, stated plainly
+### Explicit billing mode and confidential provider login
 
-Remount brokers **API keys**. Claude Max, ChatGPT/Codex sign-in, Gemini's
-Google sign-in and Copilot are **harness-native logins**: the harness runs its
-own OAuth flow inside the workspace and keeps the token in its state directory.
-That token travels with the workspace, is visible to anything running in it,
-and is not secret-blind. When a recipe that supports a login is launched
-without a provider binding, `run` marks the session `auth: workspace_resident`
-and the node records `auth.workspace_resident{recipe}`. `--security isolated`
-and `multi_tenant` refuse such a launch. Remount never proxies or rewrites a
-subscription token; their terms restrict third-party use and the broker is not
-the place to argue with that.
+Claude and Codex require `--auth subscription` or `--auth api-key` on new
+`run` and `agent create` commands. This is a billing fence, not a convenience
+default: no provider binding means neither that a subscription should be used
+nor that an ambient API key should be trusted.
+
+Subscription onboarding uses the provider-native commands:
+
+```sh
+remount auth login claude --ws WS   # claude auth login --claudeai
+remount auth status claude --ws WS
+remount auth logout claude --ws WS
+
+remount auth login codex --ws WS    # codex login --device-auth
+remount auth status codex --ws WS
+remount auth logout codex --ws WS
+```
+
+These commands run through a sensitive `s.open`: output reaches only the
+opening client, memory and retention are bounded, later `s.attach` is denied,
+and neither spill files, durable session-log artifacts, raw argv nor output are
+written to the event log. The node admits only its exact built-in Claude or
+Codex command with empty client environment and working directory. Start and
+finish events carry only session, recipe, action and exit metadata.
+
+Before each subscription harness launch, the recipe checks that Claude reports
+first-party OAuth or Codex reports ChatGPT login. Raw status output is
+discarded. The launcher unsets the provider's API-key, token and base-URL
+variables before verification and execution, so subscription mode cannot
+silently become API billing. API-key mode requires a compatible brokered
+binding and never falls back to subscription state.
+
+The trust boundary is intentionally narrow in v1. Provider credentials remain
+in the `local` workspace filesystem, under the provider CLI's own storage and
+refresh rules. Same-UID or root code in the VM can read them; isolated and
+multi-tenant profiles refuse subscription auth. Filesystem persistence lets
+the login survive reconnect, snapshot, sleep and wake, but moving to an
+untrusted machine does not improve its confidentiality. Handoff does not import
+a laptop login. Provider logout and provider-side account revocation remain the
+authoritative destructive operations.
+
+Other recipes retain legacy `workspace_resident` behavior when their own auth
+mode allows it. Remount does not proxy or rewrite subscription tokens.
 
 ## Browser and virtual desktop workloads
 
@@ -618,7 +655,8 @@ The **typed connector** (`connector: "git"`, ADR 0054) authorizes a
 
 ```sh
 remount ws create --repo github.com/acme/app@main --repo-depth 1 --binding b_gh
-remount run codex --repo github.com/acme/app -- "fix the flaky test"
+remount run codex --repo github.com/acme/app --auth api-key \
+  --binding b_openai -- "fix the flaky test"
 ```
 
 The node clones through its own broker **before** the workspace is `claimed`,

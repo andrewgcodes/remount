@@ -347,7 +347,7 @@ func TestBuiltinHandoffSelectsOnlyLatestCheckoutConversation(t *testing.T) {
 				kept[sub] = latestContent
 				handoffFixtureFile(t, home, strings.TrimSuffix(latest, ".jsonl")+"/.env", "home-private-sentinel", time.Time{})
 			}
-			res, err := launch.Handoff(ctx, c, launch.HandoffOptions{Dir: dir, Home: home, Recipe: r, Run: launch.Options{Bindings: []launch.Binding{binding}}})
+			res, err := launch.Handoff(ctx, c, launch.HandoffOptions{Dir: dir, Home: home, Recipe: r, Run: launch.Options{Auth: launch.AuthAPIKey, Bindings: []launch.Binding{binding}}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -427,7 +427,7 @@ func TestBuiltinHandoffPinsConversationAcrossResume(t *testing.T) {
 				handoffFixtureFile(t, home, transcript, contents, time.Time{})
 			}
 			r.ResumeCommand = []string{"sh", "-c", `if [ "$1" = "11111111-1111-4111-8111-111111111111" ]; then echo recalled-selected; else echo fresh-provider-filtered; fi`, "mock", "{{.Conversation}}"}
-			res, err := launch.Handoff(ctx, c, launch.HandoffOptions{Dir: dir, Home: home, Recipe: r, Run: launch.Options{Bindings: []launch.Binding{binding}}})
+			res, err := launch.Handoff(ctx, c, launch.HandoffOptions{Dir: dir, Home: home, Recipe: r, Run: launch.Options{Auth: launch.AuthAPIKey, Bindings: []launch.Binding{binding}}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -488,7 +488,7 @@ func TestBuiltinHandoffUnavailableBackendDoesNotUpload(t *testing.T) {
 			}
 			home := t.TempDir()
 			handoffFixtureSession(t, home, recipe, dir, "11111111-1111-4111-8111-111111111111", time.Now())
-			_, err = launch.Handoff(ctxT(t, 30*time.Second), c, launch.HandoffOptions{Dir: dir, Home: home, Recipe: r, Run: launch.Options{Bindings: []launch.Binding{binding}}})
+			_, err = launch.Handoff(ctxT(t, 30*time.Second), c, launch.HandoffOptions{Dir: dir, Home: home, Recipe: r, Run: launch.Options{Auth: launch.AuthAPIKey, Bindings: []launch.Binding{binding}}})
 			if err == nil || !strings.Contains(err.Error(), "namespaced backend") || uploads.Load() != 0 {
 				t.Fatalf("backend preflight: %v; uploads %d", err, uploads.Load())
 			}
@@ -549,7 +549,7 @@ func TestBuiltinHandoffRejectsBeforeUpload(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				run := launch.Options{Bindings: []launch.Binding{binding}}
+				run := launch.Options{Auth: launch.AuthAPIKey, Bindings: []launch.Binding{binding}}
 				want := "saved"
 				switch scenario {
 				case "exclude-state":

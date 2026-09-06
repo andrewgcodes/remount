@@ -43,6 +43,7 @@ import (
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/profile"
 	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/providerauth"
 	"remount.dev/remount/internal/session"
 	"remount.dev/remount/internal/trace"
 	"remount.dev/remount/internal/transport"
@@ -614,6 +615,9 @@ func New(opts Options) (*Node, error) {
 			n.emitSession(proto.EvSExited, s.WS, s.Principal, s.ID, map[string]any{"s": s.ID, "code": info.Code, "signal": info.Signal, "reason": info.Reason})
 			if run := s.Info.Run; run != nil {
 				n.emitSession(proto.EvRunFinished, s.WS, s.Principal, s.ID, map[string]any{"s": s.ID, "recipe": run.Recipe, "exit": info.Code, "signal": info.Signal})
+			}
+			if auth := s.Info.AuthOperation; auth != nil {
+				n.emitSession(proto.EvAuthOperationFinished, s.WS, s.Principal, s.ID, map[string]any{"s": s.ID, "recipe": auth.Recipe, "action": auth.Action, "exit": info.Code, "signal": info.Signal})
 			}
 		},
 	})
@@ -3058,6 +3062,9 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 		if err != nil {
 			return nil, err
 		}
+		if s.Info.Sensitive {
+			return nil, proto.Err(proto.CodeDenied, "sensitive session output is not replayable")
+		}
 		n.subscribe(p, f.From, s, req.From, req.Subscription)
 		return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq(), Kind: s.Kind}, nil
 	case proto.OpSInput:
@@ -3703,7 +3710,28 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 	if err := req.Run.Validate(); err != nil {
 		return nil, err
 	}
-	if req.Run != nil && req.Run.Auth == proto.RunAuthWorkspaceResident && w.Spec.Security.Profile != "" && w.Spec.Security.Profile != proto.SecurityLocal {
+	if err := req.AuthOperation.Validate(); err != nil {
+		return nil, err
+	}
+	if req.Sensitive != (req.AuthOperation != nil) {
+		return nil, proto.Err(proto.CodeBadRequest, "sensitive sessions require auth operation metadata")
+	}
+	if req.Sensitive {
+		if req.NoSubscribe {
+			return nil, proto.Err(proto.CodeBadRequest, "sensitive sessions must stream to their opening client")
+		}
+		if req.Run != nil {
+			return nil, proto.Err(proto.CodeBadRequest, "sensitive auth operations cannot also be harness runs")
+		}
+		if w.Spec.Security.Profile != "" && w.Spec.Security.Profile != proto.SecurityLocal {
+			return nil, proto.Err(proto.CodeDenied, "provider subscription auth is refused under security profile %s", w.Spec.Security.Profile)
+		}
+		expected, err := providerauth.Program(req.AuthOperation.Recipe, req.AuthOperation.Action)
+		if err != nil || !slices.Equal(req.Program, expected) || req.Cwd != "" || len(req.Env) != 0 {
+			return nil, proto.Err(proto.CodeDenied, "sensitive provider authentication command is not node-approved")
+		}
+	}
+	if req.Run != nil && (req.Run.Auth == proto.RunAuthWorkspaceResident || req.Run.Auth == proto.RunAuthSubscription) && w.Spec.Security.Profile != "" && w.Spec.Security.Profile != proto.SecurityLocal {
 		// The node is the authority on the workspace's security profile; a
 		// client cannot talk it into a login it would never see.
 		return nil, proto.Err(proto.CodeDenied, "workspace-resident harness auth is refused under security profile %s", w.Spec.Security.Profile)
@@ -3747,7 +3775,7 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 	spec := session.Spec{
 		WS: w.ID, Generation: w.Generation, Kind: req.Kind, Program: req.Program, Cwd: req.Cwd, Env: envList,
 		Rows: req.Rows, Cols: req.Cols, Stdin: req.Stdin, IdempotencyKey: req.IdempotencyKey,
-		Principal: claims.Principal, Tenant: claims.Tenant, Run: req.Run,
+		Principal: claims.Principal, Tenant: claims.Tenant, Run: req.Run, Sensitive: req.Sensitive, AuthOperation: req.AuthOperation,
 	}
 	spec.IdempotencyKey = sessionIdempotencyKey
 	if req.TimeoutSec > 0 {
@@ -3766,6 +3794,12 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 		}
 		return nil, err
 	}
+	if req.Sensitive && !created {
+		if installedCapability {
+			n.dropSessionCapability(handle)
+		}
+		return nil, proto.Err(proto.CodeDenied, "sensitive sessions cannot be reopened")
+	}
 	if err := n.confirmOpenAuthz(w, claims, s); err != nil {
 		if installedCapability {
 			n.dropSessionCapability(handle)
@@ -3777,10 +3811,19 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 	} else if installedCapability {
 		n.dropSessionCapability(handle)
 	}
-	n.emitSession(proto.EvSOpened, w.ID, claims.Principal, s.ID, map[string]any{"s": s.ID, "kind": req.Kind, "program": req.Program, "client": client})
+	opened := map[string]any{"s": s.ID, "kind": req.Kind, "client": client}
+	if req.Sensitive {
+		opened["sensitive"] = true
+	} else {
+		opened["program"] = req.Program
+	}
+	n.emitSession(proto.EvSOpened, w.ID, claims.Principal, s.ID, opened)
+	if auth := req.AuthOperation; auth != nil && created {
+		n.emitSession(proto.EvAuthOperationStarted, w.ID, claims.Principal, s.ID, map[string]any{"s": s.ID, "recipe": auth.Recipe, "action": auth.Action})
+	}
 	if run := req.Run; run != nil && created {
 		n.emitSession(proto.EvRunStarted, w.ID, claims.Principal, s.ID, map[string]any{"s": s.ID, "recipe": run.Recipe, "task_hash": run.TaskHash, "sandbox": run.Sandbox, "auth": run.Auth})
-		if run.Auth == proto.RunAuthWorkspaceResident {
+		if run.Auth == proto.RunAuthWorkspaceResident || run.Auth == proto.RunAuthSubscription {
 			n.emitSession(proto.EvAuthWSResident, w.ID, claims.Principal, s.ID, map[string]any{"s": s.ID, "recipe": run.Recipe})
 		}
 	}

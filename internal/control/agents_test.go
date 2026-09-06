@@ -318,6 +318,11 @@ func TestAgentCreateIsIdempotentAndValidates(t *testing.T) {
 		t.Fatalf("bad sandbox = %v", err)
 	}
 	if _, err := af.c.agentCreate(context.Background(), localSubject(), &proto.AgentCreateReq{
+		Spec: proto.AgentSpec{Recipe: "claude", Auth: proto.RunAuthSubscription, ACPCommand: []string{"custom-acp"}},
+	}); codeOf(err) != proto.CodeBadRequest {
+		t.Fatalf("subscription with custom acp command = %v", err)
+	}
+	if _, err := af.c.agentCreate(context.Background(), localSubject(), &proto.AgentCreateReq{
 		Spec: agentSpec(""), Policy: proto.AgentPolicy{Approve: proto.ApproveAuto},
 	}); codeOf(err) != proto.CodeDenied {
 		t.Fatalf("auto approve on a local process workspace = %v, want denied", err)

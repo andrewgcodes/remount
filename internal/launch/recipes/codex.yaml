@@ -3,6 +3,14 @@ name: codex
 description: OpenAI Codex CLI
 auth: either
 providers: [openai, azure-openai, openrouter]
+subscription:
+  login: ["codex", "login", "--device-auth"]
+  status: ["codex", "login", "status"]
+  logout: ["codex", "logout"]
+  unset_env: ["CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "AZURE_OPENAI_API_KEY"]
+  verify: |
+    status="$(codex login status 2>/dev/null)" || exit 1
+    case "$status" in "Logged in using ChatGPT"*) ;; *) exit 1;; esac
 hosts:
   - registry.npmjs.org
 install: |

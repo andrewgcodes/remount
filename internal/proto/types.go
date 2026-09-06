@@ -1615,13 +1615,43 @@ type ExitInfo struct {
 const ExitReasonRevoked = "revoked"
 
 type SessionInfo struct {
-	ID       string   `cbor:"id" json:"id"`
-	WS       string   `cbor:"ws" json:"ws"`
-	Kind     string   `cbor:"kind" json:"kind"`
-	Program  []string `cbor:"program,omitempty" json:"program,omitempty"`
-	PID      int      `cbor:"pid,omitempty" json:"pid,omitempty"`
-	OpenedAt int64    `cbor:"opened_at" json:"opened_at"`
-	Run      *RunInfo `cbor:"run,omitempty" json:"run,omitempty"`
+	ID            string         `cbor:"id" json:"id"`
+	WS            string         `cbor:"ws" json:"ws"`
+	Kind          string         `cbor:"kind" json:"kind"`
+	Program       []string       `cbor:"program,omitempty" json:"program,omitempty"`
+	PID           int            `cbor:"pid,omitempty" json:"pid,omitempty"`
+	OpenedAt      int64          `cbor:"opened_at" json:"opened_at"`
+	Run           *RunInfo       `cbor:"run,omitempty" json:"run,omitempty"`
+	Sensitive     bool           `cbor:"sensitive,omitempty" json:"sensitive,omitempty"`
+	AuthOperation *AuthOperation `cbor:"auth_operation,omitempty" json:"auth_operation,omitempty"`
+}
+
+// AuthOperation marks a provider-native authentication command. Its output is
+// delivered only to the opening client and is never retained for replay.
+type AuthOperation struct {
+	Recipe string `cbor:"recipe" json:"recipe"`
+	Action string `cbor:"action" json:"action"`
+}
+
+const (
+	AuthActionLogin  = "login"
+	AuthActionStatus = "status"
+	AuthActionLogout = "logout"
+)
+
+func (a *AuthOperation) Validate() error {
+	if a == nil {
+		return nil
+	}
+	if a.Recipe == "" || len(a.Recipe) > 64 {
+		return Err(CodeBadRequest, "auth operation recipe is required and at most 64 bytes")
+	}
+	switch a.Action {
+	case AuthActionLogin, AuthActionStatus, AuthActionLogout:
+		return nil
+	default:
+		return Err(CodeBadRequest, "auth operation action must be %s, %s or %s", AuthActionLogin, AuthActionStatus, AuthActionLogout)
+	}
 }
 
 // RunInfo marks a session as a harness launch (`remount run`). The node
@@ -1633,7 +1663,8 @@ type RunInfo struct {
 	// put in the event log.
 	TaskHash string `cbor:"task_hash,omitempty" json:"task_hash,omitempty"`
 	Sandbox  string `cbor:"sandbox,omitempty" json:"sandbox,omitempty"`
-	// Auth is RunAuthAPIKey or RunAuthWorkspaceResident.
+	// Auth is RunAuthAPIKey, RunAuthSubscription or the legacy
+	// RunAuthWorkspaceResident.
 	Auth string `cbor:"auth,omitempty" json:"auth,omitempty"`
 }
 
@@ -1642,8 +1673,12 @@ const (
 	// RunAuthAPIKey: the harness reads a brokered provider key placeholder
 	// from the environment.
 	RunAuthAPIKey = "api_key"
+	// RunAuthSubscription: the harness uses a provider-native subscription
+	// login kept inside the trusted local workspace.
+	RunAuthSubscription = "subscription"
 	// RunAuthWorkspaceResident: the harness keeps its own login token in the
-	// workspace, outside the broker's view.
+	// workspace, outside the broker's view. It is retained for older recipes
+	// and recorded workspaces.
 	RunAuthWorkspaceResident = "workspace_resident"
 )
 
@@ -1659,10 +1694,10 @@ func (r *RunInfo) Validate() error {
 		return Err(CodeBadRequest, "run.task_hash or run.sandbox too long")
 	}
 	switch r.Auth {
-	case "", RunAuthAPIKey, RunAuthWorkspaceResident:
+	case "", RunAuthAPIKey, RunAuthSubscription, RunAuthWorkspaceResident:
 		return nil
 	}
-	return Err(CodeBadRequest, "run.auth must be %s or %s", RunAuthAPIKey, RunAuthWorkspaceResident)
+	return Err(CodeBadRequest, "run.auth must be %s, %s or %s", RunAuthAPIKey, RunAuthSubscription, RunAuthWorkspaceResident)
 }
 
 type Gap struct {
@@ -1689,6 +1724,11 @@ type SOpenReq struct {
 	NoSubscribe bool `cbor:"no_sub,omitempty" json:"no_sub,omitempty"`
 	// Run marks a harness launch; see RunInfo.
 	Run *RunInfo `cbor:"run,omitempty" json:"run,omitempty"`
+	// Sensitive makes this a memory-only provider auth session. It must carry
+	// AuthOperation, cannot be attached later, and is never spilled,
+	// published, or committed as a durable session log.
+	Sensitive     bool           `cbor:"sensitive,omitempty" json:"sensitive,omitempty"`
+	AuthOperation *AuthOperation `cbor:"auth_operation,omitempty" json:"auth_operation,omitempty"`
 }
 
 type SOpenRes struct {
@@ -2198,56 +2238,58 @@ const (
 	// EvQuotaExceeded records an admission refusal. It is emitted by both the
 	// tenant-authority admission transaction and the legacy in-process limits,
 	// so a rejection is never only a counter.
-	EvQuotaExceeded     = "quota.exceeded"
-	EvControlRecovered  = "control.recovered"
-	EvWSACL             = "ws.acl"        // ACL replaced; payload names revoked principals and the new revision
-	EvAuthzRevoked      = "authz.revoked" // node closed a revoked principal's sessions
-	EvSOpened           = "s.opened"
-	EvSExited           = "s.exited"
-	EvSInput            = "s.input"
-	EvFSWrite           = "fs.write"
-	EvFSApplyTar        = "fs.apply_tar" // one overlay applied; payload carries artifact and counts, fs.write follows per path
-	EvFSMkdir           = "fs.mkdir"
-	EvFSEdit            = "fs.edit"
-	EvFSRemove          = "fs.remove"
-	EvFSRename          = "fs.rename"
-	EvCredUsed          = "cred.used"
-	EvEgressPending     = "egress.pending"
-	EvEgressAllowed     = "egress.allowed"
-	EvEgressDenied      = "egress.denied"
-	EvEgressRedacted    = "egress.redacted"
-	EvPolicyUpdated     = "policy.updated"
-	EvTimerSet          = "timer.set"
-	EvTimerFired        = "timer.fired"
-	EvPeerGone          = "peer.gone"
-	EvEventGap          = "event.producer_gap"
-	EvFleetRequested    = "fleet.quarantine.requested"
-	EvFleetTarget       = "fleet.quarantine.target"
-	EvFleetCompleted    = "fleet.quarantine.completed"
-	EvBaseCreated       = "base.created"
-	EvBaseRemoved       = "base.removed"
-	EvVolumeCreated     = "volume.created"
-	EvVolumePublished   = "volume.published"
-	EvVolumeAttached    = "volume.attached"
-	EvVolumeDetached    = "volume.detached"
-	EvVolumeRemoved     = "volume.removed"
-	EvQueueCreated      = "queue.created"                // payload {queue, ws, items}
-	EvQueueAdvanced     = "queue.advanced"               // one queued task finished; payload {queue, index, exit, status}
-	EvPoolCreated       = "pool.created"                 // a durable pool specification was admitted
-	EvPoolRemoved       = "pool.removed"                 // an empty pool specification was removed
-	EvPoolScaled        = "pool.scaled"                  // payload {pool, from, to, reason}
-	EvPoolFailed        = "pool.provision_failed"        // payload {pool, reason, retry_at}; no credentials
-	EvPoolRetiring      = "pool.retiring"                // payload {pool, machine, node}; the node is fenced from new claims before its provider destroy
-	EvPoolRetireAborted = "pool.retire_aborted"          // payload {pool, machine, node}; a definite provider failure lifted the fence
-	EvPoolRetired       = "pool.retired"                 // payload {pool, machine, node}; inventory no longer lists the machine and the fence is lifted
-	EvExportAdvanced    = "export.cursor.advanced"       // a durable destination cursor advanced after accepting a batch
-	EvNotifyUnavailable = "notifier.unavailable"         // delivery or its durable fallback is unavailable; payload is sanitized
-	EvNotifyDeadLetter  = "notifier.dead_lettered"       // failed delivery metadata was durably retained
-	EvNotifyDLQPruned   = "notifier.dead_letters_pruned" // bounded retention removed old dead-letter metadata
-	EvRunStarted        = "run.started"                  // a harness launch opened its session; payload {s, recipe, task_hash, sandbox, auth}
-	EvRunFinished       = "run.finished"                 // that session exited; payload {s, recipe, exit, signal}
-	EvAuthWSResident    = "auth.workspace_resident"      // a launch relies on a login the harness keeps inside the workspace; payload {s, recipe}
-	EvWSOffer           = "ws.offer"                     // control -> node (not logged; a hint to claim)
+	EvQuotaExceeded         = "quota.exceeded"
+	EvControlRecovered      = "control.recovered"
+	EvWSACL                 = "ws.acl"        // ACL replaced; payload names revoked principals and the new revision
+	EvAuthzRevoked          = "authz.revoked" // node closed a revoked principal's sessions
+	EvSOpened               = "s.opened"
+	EvSExited               = "s.exited"
+	EvSInput                = "s.input"
+	EvFSWrite               = "fs.write"
+	EvFSApplyTar            = "fs.apply_tar" // one overlay applied; payload carries artifact and counts, fs.write follows per path
+	EvFSMkdir               = "fs.mkdir"
+	EvFSEdit                = "fs.edit"
+	EvFSRemove              = "fs.remove"
+	EvFSRename              = "fs.rename"
+	EvCredUsed              = "cred.used"
+	EvEgressPending         = "egress.pending"
+	EvEgressAllowed         = "egress.allowed"
+	EvEgressDenied          = "egress.denied"
+	EvEgressRedacted        = "egress.redacted"
+	EvPolicyUpdated         = "policy.updated"
+	EvTimerSet              = "timer.set"
+	EvTimerFired            = "timer.fired"
+	EvPeerGone              = "peer.gone"
+	EvEventGap              = "event.producer_gap"
+	EvFleetRequested        = "fleet.quarantine.requested"
+	EvFleetTarget           = "fleet.quarantine.target"
+	EvFleetCompleted        = "fleet.quarantine.completed"
+	EvBaseCreated           = "base.created"
+	EvBaseRemoved           = "base.removed"
+	EvVolumeCreated         = "volume.created"
+	EvVolumePublished       = "volume.published"
+	EvVolumeAttached        = "volume.attached"
+	EvVolumeDetached        = "volume.detached"
+	EvVolumeRemoved         = "volume.removed"
+	EvQueueCreated          = "queue.created"                // payload {queue, ws, items}
+	EvQueueAdvanced         = "queue.advanced"               // one queued task finished; payload {queue, index, exit, status}
+	EvPoolCreated           = "pool.created"                 // a durable pool specification was admitted
+	EvPoolRemoved           = "pool.removed"                 // an empty pool specification was removed
+	EvPoolScaled            = "pool.scaled"                  // payload {pool, from, to, reason}
+	EvPoolFailed            = "pool.provision_failed"        // payload {pool, reason, retry_at}; no credentials
+	EvPoolRetiring          = "pool.retiring"                // payload {pool, machine, node}; the node is fenced from new claims before its provider destroy
+	EvPoolRetireAborted     = "pool.retire_aborted"          // payload {pool, machine, node}; a definite provider failure lifted the fence
+	EvPoolRetired           = "pool.retired"                 // payload {pool, machine, node}; inventory no longer lists the machine and the fence is lifted
+	EvExportAdvanced        = "export.cursor.advanced"       // a durable destination cursor advanced after accepting a batch
+	EvNotifyUnavailable     = "notifier.unavailable"         // delivery or its durable fallback is unavailable; payload is sanitized
+	EvNotifyDeadLetter      = "notifier.dead_lettered"       // failed delivery metadata was durably retained
+	EvNotifyDLQPruned       = "notifier.dead_letters_pruned" // bounded retention removed old dead-letter metadata
+	EvRunStarted            = "run.started"                  // a harness launch opened its session; payload {s, recipe, task_hash, sandbox, auth}
+	EvRunFinished           = "run.finished"                 // that session exited; payload {s, recipe, exit, signal}
+	EvAuthWSResident        = "auth.workspace_resident"      // a launch relies on a login the harness keeps inside the workspace; payload {s, recipe}
+	EvAuthOperationStarted  = "auth.operation.started"       // confidential provider auth began; payload {s, recipe, action}
+	EvAuthOperationFinished = "auth.operation.finished"      // confidential provider auth exited; payload {s, recipe, action, exit, signal}
+	EvWSOffer               = "ws.offer"                     // control -> node (not logged; a hint to claim)
 
 	// Durable workspace leases and idle policy (ADR 0090). EvWSLeaseExpired
 	// above is the *claim* lease returning a workspace to pending; these are

@@ -34,6 +34,7 @@ import (
 	"remount.dev/remount/internal/node"
 	"remount.dev/remount/internal/notifier"
 	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/providerauth"
 	"remount.dev/remount/internal/server"
 	"remount.dev/remount/internal/transport"
 	"remount.dev/remount/internal/workspace"
@@ -677,6 +678,106 @@ func TestNodeUplinkFlapKeepsSessionRunning(t *testing.T) {
 	got, _ := c.GetWorkspace(ctx, ws.ID)
 	if got.Generation != ws.Generation || got.State != proto.WSClaimed {
 		t.Fatalf("%+v", got)
+	}
+}
+
+func TestSensitiveAuthSessionIsActiveClientOnlyAndSanitized(t *testing.T) {
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("sensitive-auth")
+	ws := mustWS(t, c, proto.WorkspaceSpec{})
+	ctx := ctxT(t, 60*time.Second)
+	if err := c.WriteFile(ctx, ws.ID, ".remount/tools/bin/claude", []byte("#!/bin/sh\nprintf confidential-auth-canary\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	auth := &proto.AuthOperation{Recipe: "claude", Action: proto.AuthActionStatus}
+	if _, err := c.Exec(ctx, proto.SOpenReq{
+		WS: ws.ID, Program: []string{"sh", "-c", "printf hidden-command"},
+		Sensitive: true, AuthOperation: auth,
+	}); err == nil || !strings.Contains(err.Error(), "node-approved") {
+		t.Fatalf("arbitrary sensitive command = %v", err)
+	}
+	program, err := providerauth.Program(auth.Recipe, auth.Action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*proto.SOpenReq)
+		wantErr string
+	}{
+		{"missing metadata", func(req *proto.SOpenReq) { req.AuthOperation = nil }, "require auth operation metadata"},
+		{"custom cwd", func(req *proto.SOpenReq) { req.Cwd = "/tmp" }, "node-approved"},
+		{"custom environment", func(req *proto.SOpenReq) { req.Env = map[string]string{"OPENAI_API_KEY": "canary"} }, "node-approved"},
+		{"detached", func(req *proto.SOpenReq) { req.NoSubscribe = true }, "must stream"},
+		{"harness run", func(req *proto.SOpenReq) { req.Run = &proto.RunInfo{Recipe: "claude"} }, "cannot also be harness runs"},
+	} {
+		req := proto.SOpenReq{WS: ws.ID, Program: program, Sensitive: true, AuthOperation: auth}
+		tc.mutate(&req)
+		if _, err := c.Exec(ctx, req); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Errorf("%s request = %v, want error containing %q", tc.name, err, tc.wantErr)
+		}
+	}
+	open := proto.SOpenReq{
+		WS: ws.ID, Kind: proto.SessionExec,
+		Program: program, Sensitive: true, AuthOperation: auth,
+		IdempotencyKey: "sensitive-auth-open",
+	}
+	s, err := c.Exec(ctx, open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := <-s.Chunks()
+	if first.Stream != proto.StreamInfo {
+		t.Fatalf("first stream = %d", first.Stream)
+	}
+	var info proto.SessionInfo
+	if err := proto.Unmarshal(first.Data, &info); err != nil {
+		t.Fatal(err)
+	}
+	if !info.Sensitive || info.AuthOperation == nil || len(info.Program) != 0 {
+		t.Fatalf("sensitive info = %+v", info)
+	}
+	var out bytes.Buffer
+	if exit := client.Copy(s, &out, nil); exit == nil || exit.Code != 0 {
+		t.Fatalf("exit = %+v", exit)
+	}
+	if out.String() != "confidential-auth-canary" {
+		t.Fatalf("active client output = %q", out.String())
+	}
+	if _, err := c.Attach(ctx, ws.ID, s.ID, 0); err == nil || !strings.Contains(err.Error(), "sensitive") {
+		t.Fatalf("later attach = %v", err)
+	}
+	if _, err := c.Exec(ctx, open); err == nil || !strings.Contains(err.Error(), "cannot be reopened") {
+		t.Fatalf("idempotent reopen = %v", err)
+	}
+	var events []proto.Event
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		events, err = c.ReadEvents(ctx, 1, ws.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var started, finished bool
+		for _, event := range events {
+			started = started || event.Type == proto.EvAuthOperationStarted
+			finished = finished || event.Type == proto.EvAuthOperationFinished
+		}
+		if started && finished {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	var started, finished bool
+	for _, event := range events {
+		started = started || event.Type == proto.EvAuthOperationStarted
+		finished = finished || event.Type == proto.EvAuthOperationFinished
+		if strings.Contains(string(event.Payload), "confidential-auth-canary") || strings.Contains(string(event.Payload), `"sh"`) {
+			t.Fatalf("event %s leaked sensitive program/output: %q", event.Type, event.Payload)
+		}
+	}
+	if !started || !finished {
+		t.Fatalf("auth lifecycle events missing: started=%t finished=%t events=%v", started, finished, events)
 	}
 }
 

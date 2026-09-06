@@ -435,9 +435,12 @@ func validateAgentSpec(spec *proto.AgentSpec) error {
 		}
 	}
 	switch spec.Auth {
-	case "", proto.RunAuthAPIKey, proto.RunAuthWorkspaceResident:
+	case "", proto.RunAuthAPIKey, proto.RunAuthSubscription, proto.RunAuthWorkspaceResident:
 	default:
-		return proto.Err(proto.CodeBadRequest, "spec.auth %q is not api-key or workspace-resident", spec.Auth)
+		return proto.Err(proto.CodeBadRequest, "spec.auth %q is not api-key, subscription or workspace-resident", spec.Auth)
+	}
+	if spec.Auth == proto.RunAuthSubscription && len(spec.ACPCommand) != 0 {
+		return proto.Err(proto.CodeBadRequest, "spec.auth subscription cannot be combined with spec.acp_command")
 	}
 	switch spec.Sandbox {
 	case "", proto.AgentSandboxReadOnly, proto.AgentSandboxWorkspaceWrite, proto.AgentSandboxFull:

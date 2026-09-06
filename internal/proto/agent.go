@@ -120,7 +120,8 @@ type AgentSpec struct {
 	// ACPCommand overrides the recipe's acp.command (remount agent create
 	// custom --acp-cmd). It runs in the workspace like everything else.
 	ACPCommand []string `cbor:"acp_command,omitempty" json:"acp_command,omitempty"`
-	// Auth is RunAuthAPIKey or RunAuthWorkspaceResident (ADR 0039).
+	// Auth is RunAuthAPIKey, RunAuthSubscription or the legacy
+	// RunAuthWorkspaceResident (ADR 0039).
 	Auth string `cbor:"auth,omitempty" json:"auth,omitempty"`
 	// Mode is AgentModeACP or AgentModePTY; empty means ACP. The client that
 	// resolved the recipe knows whether it has an ACP server.

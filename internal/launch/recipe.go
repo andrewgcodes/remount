@@ -40,6 +40,10 @@ const (
 	// see, proxy or rewrite it, so this mode is refused under the isolated
 	// and multi-tenant security profiles.
 	AuthWorkspaceResident = "workspace_resident"
+	// AuthSubscription is the explicit launch mode for a provider-native
+	// subscription login. Recipes still declare workspace_resident or either;
+	// this value records what the operator selected for a run.
+	AuthSubscription = "subscription"
 	// AuthEither: api_key when a provider binding is present, otherwise
 	// workspace_resident.
 	AuthEither = "either"
@@ -73,6 +77,10 @@ type Recipe struct {
 	Image string `json:"image,omitempty"`
 	// Auth is api_key (default), workspace_resident or either.
 	Auth string `json:"auth,omitempty"`
+	// Subscription describes the provider CLI's native subscription login.
+	// Remount runs these commands inside the trusted local workspace and never
+	// parses or persists their output.
+	Subscription *SubscriptionSpec `json:"subscription,omitempty"`
 	// Providers lists binding presets the harness can consume, in the order
 	// the recipe prefers them.
 	Providers []string `json:"providers,omitempty"`
@@ -124,6 +132,15 @@ type Recipe struct {
 	// directory so a handoff can continue that conversation with
 	// session/load on the node.
 	SessionIDFrom *SessionIDFrom `json:"session_id_from,omitempty"`
+}
+
+// SubscriptionSpec describes provider-native subscription authentication.
+type SubscriptionSpec struct {
+	Login    []string `json:"login"`
+	Status   []string `json:"status"`
+	Logout   []string `json:"logout"`
+	Verify   string   `json:"verify"`
+	UnsetEnv []string `json:"unset_env,omitempty"`
 }
 
 // ACPSpec is how a recipe starts its harness as an ACP agent.
@@ -200,6 +217,7 @@ type Data struct {
 	Approve      string
 	Model        string
 	Conversation string
+	Auth         string
 	// Providers are the presets bound for this run, in --binding order.
 	Providers []string
 	// Primary is Providers[0] or "".
@@ -272,6 +290,27 @@ func (r *Recipe) Validate() error {
 	case AuthAPIKey, AuthWorkspaceResident, AuthEither:
 	default:
 		return fmt.Errorf("recipe %s: auth must be %s, %s or %s", r.Name, AuthAPIKey, AuthWorkspaceResident, AuthEither)
+	}
+	if r.Subscription != nil {
+		if r.Auth == AuthAPIKey {
+			return fmt.Errorf("recipe %s: subscription auth cannot be declared with api_key-only auth", r.Name)
+		}
+		if len(r.Subscription.Login) == 0 || len(r.Subscription.Status) == 0 || len(r.Subscription.Logout) == 0 {
+			return fmt.Errorf("recipe %s: subscription login, status and logout commands are required", r.Name)
+		}
+		if strings.TrimSpace(r.Subscription.Verify) == "" {
+			return fmt.Errorf("recipe %s: subscription verify script is required", r.Name)
+		}
+		seenEnv := map[string]bool{}
+		for _, name := range r.Subscription.UnsetEnv {
+			if !envNamePattern.MatchString(name) {
+				return fmt.Errorf("recipe %s: subscription unset_env name %q is not a valid identifier", r.Name, name)
+			}
+			if seenEnv[name] {
+				return fmt.Errorf("recipe %s: subscription unset_env name %q listed twice", r.Name, name)
+			}
+			seenEnv[name] = true
+		}
 	}
 	if len(r.Command) == 0 && !r.CommandFromArgs {
 		return fmt.Errorf("recipe %s: command is required", r.Name)
@@ -359,7 +398,7 @@ func (r *Recipe) Validate() error {
 	}
 	// Compile every template once with a representative Data so a syntax
 	// error or unknown field is a load-time error.
-	probe := Data{Task: "t", Recipe: r.Name, Workspace: "ws_probe", Sandbox: SandboxWorkspaceWrite, Approve: ApproveNever, Model: "m", Broker: "$REMOUNT_BROKER", Message: "m", Port: 1}
+	probe := Data{Task: "t", Recipe: r.Name, Workspace: "ws_probe", Sandbox: SandboxWorkspaceWrite, Approve: ApproveNever, Model: "m", Broker: "$REMOUNT_BROKER", Message: "m", Port: 1, Auth: AuthAPIKey}
 	if len(r.Providers) > 0 {
 		probe.Providers = []string{r.Providers[0]}
 		probe.Primary = r.Providers[0]
@@ -642,9 +681,43 @@ func (r *Recipe) Argv(d Data) ([]string, error) {
 	return out.Command, nil
 }
 
-// AuthMode decides how this launch authenticates given the bound providers.
-// It returns an error when the recipe cannot run with what it was given.
-func (r *Recipe) AuthMode(providers []string) (string, error) {
+// AuthMode decides how this launch authenticates given the operator's
+// selection and the bound providers. Recipes with subscription metadata
+// require an explicit selection so billing mode never depends on ambient
+// bindings.
+func (r *Recipe) AuthMode(requested string, providers []string) (string, error) {
+	switch requested {
+	case AuthAPIKey:
+		if r.Auth == AuthWorkspaceResident {
+			return "", fmt.Errorf("recipe %s does not support API-key authentication", r.Name)
+		}
+		if len(providers) == 0 {
+			return "", fmt.Errorf("recipe %s with --auth api-key needs an explicit provider binding (--binding ID[:PRESET]); it accepts %s", r.Name, strings.Join(r.Providers, ", "))
+		}
+		return AuthAPIKey, nil
+	case AuthSubscription:
+		if r.Auth == AuthAPIKey || r.Subscription == nil {
+			return "", fmt.Errorf("recipe %s does not support subscription authentication", r.Name)
+		}
+		if len(providers) != 0 {
+			return "", fmt.Errorf("recipe %s with --auth %s cannot use provider bindings", r.Name, AuthSubscription)
+		}
+		return AuthSubscription, nil
+	case AuthWorkspaceResident:
+		if r.Auth == AuthAPIKey {
+			return "", fmt.Errorf("recipe %s does not support workspace-resident authentication", r.Name)
+		}
+		if len(providers) != 0 {
+			return "", fmt.Errorf("recipe %s workspace-resident authentication cannot use provider bindings", r.Name)
+		}
+		return AuthWorkspaceResident, nil
+	case "":
+	default:
+		return "", fmt.Errorf("--auth must be subscription or api-key")
+	}
+	if r.Subscription != nil && r.Auth == AuthEither {
+		return "", fmt.Errorf("recipe %s requires --auth subscription or --auth api-key", r.Name)
+	}
 	switch r.Auth {
 	case AuthAPIKey:
 		if len(providers) == 0 {
@@ -748,6 +821,17 @@ func (r *Recipe) launcher(d Data, out *rendered, argv []string, extraEnv map[str
 	b.WriteString("cd \"$(dirname \"$0\")/../..\"\n")
 	b.WriteString("[ -f .remount/env ] && . ./.remount/env\n")
 	fmt.Fprintf(&b, "export REMOUNT_RECIPE=%s REMOUNT_SANDBOX=%s\n", ShellQuote(d.Recipe), ShellQuote(d.Sandbox))
+	if d.Auth == AuthSubscription {
+		if r.Subscription == nil {
+			return "", fmt.Errorf("recipe %s has no subscription auth configuration", r.Name)
+		}
+		for _, name := range r.Subscription.UnsetEnv {
+			fmt.Fprintf(&b, "unset %s\n", name)
+		}
+		fmt.Fprintf(&b, "if ! (\n%s\n) >/dev/null 2>&1; then\n", strings.TrimRight(r.Subscription.Verify, "\n"))
+		fmt.Fprintf(&b, "  echo %s >&2\n", ShellQuote(fmt.Sprintf("%s subscription login is unavailable; run `remount auth login %s --ws %s`", r.Name, r.Name, d.Workspace)))
+		b.WriteString("  exit 78\nfi\n")
+	}
 	// The key placeholder and base URL arrive in the session env (see
 	// Binding.SessionEnv); presets only add aliases here.
 	for _, p := range d.Providers {

@@ -141,6 +141,63 @@ func TestStartFailureAlwaysCallsOnExit(t *testing.T) {
 	}
 }
 
+func TestSensitiveSessionNeverSpillsOrCommits(t *testing.T) {
+	store, err := artifact.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	spillDir := t.TempDir()
+	var blobLookups, commits, completions int
+	m := NewManager(ManagerOptions{
+		SpillDir: spillDir, MemBytes: 1 << 20, SpillBytes: 1 << 20, Retention: time.Hour,
+		BlobStoreForTenant: func(string) (artifact.BlobStore, error) {
+			blobLookups++
+			return store, nil
+		},
+		CommitSessionLogRecord: func(string, Spec, LogRecord) error {
+			commits++
+			return nil
+		},
+		CompleteSessionLogRecord: func(string, Spec, proto.SessionInfo, proto.ExitInfo, LogRecord) error {
+			completions++
+			return nil
+		},
+	})
+	t.Cleanup(m.Close)
+	s, err := m.Open(Spec{
+		WS: "ws_sensitive", Tenant: "tenant", Principal: "principal",
+		Kind: proto.SessionExec, Program: []string{"sh", "-c", "printf confidential-canary"},
+		Sensitive: true, AuthOperation: &proto.AuthOperation{Recipe: "claude", Action: proto.AuthActionStatus},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _, exit := collect(t, s)
+	if string(out) != "confidential-canary" || exit.Code != 0 {
+		t.Fatalf("out=%q exit=%+v", out, exit)
+	}
+	if info := s.Info; len(info.Program) != 0 || !info.Sensitive || info.AuthOperation == nil {
+		t.Fatalf("sensitive info leaked program or metadata was lost: %+v", info)
+	}
+	stats := s.Log.Stats()
+	if stats.DiskBytes != 0 || stats.BlobBytes != 0 || blobLookups != 0 || commits != 0 || completions != 0 {
+		t.Fatalf("sensitive persistence: stats=%+v blob_lookups=%d commits=%d completions=%d", stats, blobLookups, commits, completions)
+	}
+	entries, err := os.ReadDir(spillDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("sensitive session created spill files: %v", entries)
+	}
+	if _, err := m.RestoreArchived(proto.SessionLogRecord{
+		Session: s.ID, Workspace: s.WS, Tenant: s.Tenant, Principal: s.Principal,
+		Kind: s.Kind, Info: s.Info, Exit: *s.ExitInfo(), MaxChunk: 1, Complete: true,
+	}, store); err == nil || !strings.Contains(err.Error(), "sensitive") {
+		t.Fatalf("sensitive archive restored: %v", err)
+	}
+}
+
 func TestWaitBlocksUntilDurableCompletionRecordCommits(t *testing.T) {
 	store, err := artifact.NewStore(t.TempDir())
 	if err != nil {

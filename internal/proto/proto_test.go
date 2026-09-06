@@ -13,7 +13,10 @@ import (
 )
 
 func TestFrameRoundTrip(t *testing.T) {
-	req := NewReq(7, "n_abc", OpSOpen, SOpenReq{WS: "ws_1", Kind: SessionExec, Program: []string{"echo", "hi"}})
+	req := NewReq(7, "n_abc", OpSOpen, SOpenReq{
+		WS: "ws_1", Kind: SessionExec, Program: []string{"echo", "hi"},
+		Sensitive: true, AuthOperation: &AuthOperation{Recipe: "claude", Action: AuthActionStatus},
+	})
 	b, err := EncodeFrame(req)
 	if err != nil {
 		t.Fatal(err)
@@ -29,8 +32,28 @@ func TestFrameRoundTrip(t *testing.T) {
 	if err := f.Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if body.WS != "ws_1" || body.Program[1] != "hi" {
+	if body.WS != "ws_1" || body.Program[1] != "hi" || !body.Sensitive ||
+		body.AuthOperation == nil || body.AuthOperation.Recipe != "claude" || body.AuthOperation.Action != AuthActionStatus {
 		t.Fatalf("bad body: %+v", body)
+	}
+}
+
+func TestAuthOperationValidate(t *testing.T) {
+	tests := []struct {
+		auth    *AuthOperation
+		wantErr bool
+	}{
+		{nil, false},
+		{&AuthOperation{Recipe: "claude", Action: AuthActionLogin}, false},
+		{&AuthOperation{Recipe: "codex", Action: AuthActionStatus}, false},
+		{&AuthOperation{Recipe: "claude", Action: AuthActionLogout}, false},
+		{&AuthOperation{Action: AuthActionLogin}, true},
+		{&AuthOperation{Recipe: "claude", Action: "refresh"}, true},
+	}
+	for _, tc := range tests {
+		if err := tc.auth.Validate(); (err != nil) != tc.wantErr {
+			t.Errorf("Validate(%+v) = %v", tc.auth, err)
+		}
 	}
 }
 

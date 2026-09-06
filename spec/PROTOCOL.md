@@ -872,7 +872,7 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 
 | op | Body → Response |
 |---|---|
-| `s.open` | `SOpenReq{ws, kind, program, cwd, env, rows, cols, stdin, timeout_sec, idem, run?}` → `SOpenRes{s, next, kind?}` |
+| `s.open` | `SOpenReq{ws, kind, program, cwd, env, rows, cols, stdin, timeout_sec, idem, run?, sensitive?, auth_operation?}` → `SOpenRes{s, next, kind?}` |
 | `s.attach` | `SAttachReq{s, from, subscription?}` → `SOpenRes{s, next, kind?}` |
 | `s.input` | `SInputReq{s, iseq, d, eof}` → `{}` |
 | `s.resize` | `SResizeReq{s, rows, cols}` → `{}` |
@@ -1102,6 +1102,15 @@ Guarantees:
    either an exit or an explicit `gap`. Fencing a workspace for an authority
    reason — a quarantine, a lost claim — is the exception: there the cut is the
    point, and the reader learns the outcome from the event log instead.
+6. A provider auth open sets `sensitive: true` and carries
+   `auth_operation: AuthOperation{recipe, action}` where action is `login`,
+   `status` or `logout`. The node MUST accept only its exact built-in provider
+   command, with no caller-supplied `cwd` or `env`, under the `local` security
+   profile. It MUST stream to the opening client, refuse later `s.attach`,
+   disable spill and durable session-log publication, omit raw `program` from
+   `SessionInfo` and `s.opened`, and retain the completed in-memory session only
+   for a bounded interval (five minutes in the reference node). A sensitive
+   session cannot also carry `run` or set `no_sub`.
 
 Retention is a bounded in-memory ring plus a spill file. The reference node uses
 2 MiB of memory and 128 MiB of spill per session, and evicts on both a byte cap
@@ -1132,14 +1141,27 @@ transaction with the child process, and it does not survive loss of that process
 the session as a harness launch (`remount run`). `recipe` is the recipe name
 (`^[a-z0-9][a-z0-9_-]{0,63}$`); `task_hash` is a short digest of the task text,
 never the text; `sandbox` is `read-only`, `workspace-write` or `full`; `auth`
-is `api_key` (the harness reads a brokered placeholder from its environment)
-or `workspace_resident` (the harness keeps its own login token in the
-workspace, outside the broker's view). The node validates `run` fail-closed
-(`bad_request`), copies it into `SessionInfo.run`, and emits `run.started`
+is `api_key` (the harness reads a brokered placeholder from its environment),
+`workspace_resident` (the harness keeps its own login token in the workspace,
+outside the broker's view), or `subscription` (a verified provider-native
+subscription login in a trusted-local workspace). The node validates `run`
+fail-closed (`bad_request`), copies it into `SessionInfo.run`, and emits
+`run.started`
 once when the session is created — an idempotent replay of the open emits
 nothing — and `run.finished` from the session's exit path, so a client that
-detached still gets both records. When `auth` is `workspace_resident` the node
-also emits `auth.workspace_resident`.
+detached still gets both records. `subscription` and `workspace_resident` are
+refused outside the local security profile. When `auth` is
+`workspace_resident` or `subscription` the node also emits
+`auth.workspace_resident`, recording that provider authorization state resides
+inside the trusted workspace.
+
+Claude and Codex recipes require the client to select `subscription` or
+`api_key`; omission is not a billing-mode default. Subscription launchers
+remove provider API-key and base-URL variables, run a provider-specific
+fail-closed status check with its output discarded, and then execute the
+harness. API-key mode requires a provider binding. The workspace label
+`remount.auth` records the mode for resume; a conflicting explicit override is
+refused.
 
 ### 8.2 Tiered durable session logs (`tiered-session-logs`)
 
@@ -1605,7 +1627,8 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `node.profile.v
 `fleet.quarantine.completed`, `binding.created`, `binding.rotated`,
 `binding.revoked`, `principal.session.created`, `base.created`, `base.removed`, `volume.created`,
 `volume.published`, `volume.attached`, `volume.detached`, `volume.removed`, `run.started`,
-`run.finished`, `auth.workspace_resident`, `queue.created`,
+`run.finished`, `auth.workspace_resident`, `auth.operation.started`,
+`auth.operation.finished`, `queue.created`,
 `queue.advanced`, `pool.created`, `pool.removed`, `pool.scaled`,
 `pool.provision_failed`, `pool.retiring`, `pool.retire_aborted`, `pool.retired`, `repo.cloned`, `agent.created`, `agent.message`,
 `agent.run.started`, `agent.run.finished`, `agent.session`, `agent.turn`,
@@ -1674,8 +1697,14 @@ content, a permission request's detail or a provider key.
 
 `run.started` carries `s`, `recipe`, `task_hash`, `sandbox` and `auth`;
 `run.finished` carries `s`, `recipe`, `exit` and `signal`;
-`auth.workspace_resident` carries `s` and `recipe`. All three set `session`.
+`auth.workspace_resident` carries `s` and `recipe` for
+`workspace_resident` and `subscription` launches. All three set `session`.
 None carries the task text, the harness argv or a provider key.
+
+`auth.operation.started` carries `s`, `recipe` and `action`;
+`auth.operation.finished` adds `exit` and `signal`. Both set `session`. Neither
+carries provider output, the provider argv, an authorization URL, a device
+code, a callback, a token or a key.
 
 `queue.created` carries `queue`, `ws` and `items` (a count); `queue.advanced`
 carries `queue`, `index`, `exit`, `signal`, `status` and `cursor`. Both are on

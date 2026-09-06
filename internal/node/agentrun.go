@@ -961,7 +961,7 @@ func (r *agentRun) recipe() (*launch.Recipe, launch.Data, error) {
 	data := launch.Data{
 		Task: spec.Task, Recipe: recipe.Name, Workspace: r.w.ID, Sandbox: spec.Sandbox,
 		Approve: r.req.Policy.Approve, Model: spec.Model, Providers: spec.Providers, Primary: spec.Primary,
-		Broker: "${REMOUNT_BROKER}",
+		Broker: "${REMOUNT_BROKER}", Auth: spec.Auth,
 	}
 	return recipe, data, nil
 }

@@ -164,6 +164,9 @@ func Handoff(ctx context.Context, cl *client.Client, o HandoffOptions) (*Handoff
 		}
 		run.MountPath = dir
 	}
+	if scopedHandoff(r) && run.Auth == AuthSubscription {
+		return nil, fmt.Errorf("%s handoff cannot transfer a local subscription login; create or reuse the remote workspace, run `remount auth login %s --ws WS`, then launch with --auth subscription", r.Name, r.Name)
+	}
 	if scopedHandoff(r) && len(run.Bindings) == 0 {
 		return nil, fmt.Errorf("%s handoff requires an explicit provider --binding; local login is not portable and authentication files are never imported", r.Name)
 	}
@@ -277,6 +280,9 @@ type ResumeOptions struct {
 	Task string
 	// Recipe overrides the one recorded on the workspace.
 	Recipe *Recipe
+	// Auth overrides the recorded launch mode. A conflicting override is
+	// refused rather than silently changing the billing source.
+	Auth string
 	// Attach, when true, reattaches to a live harness session instead of
 	// starting a new one when one exists.
 	Attach bool
@@ -340,6 +346,10 @@ func Resume(ctx context.Context, cl *client.Client, o ResumeOptions) (*ResumeRes
 	if len(r.ResumeCommand) == 0 {
 		return nil, fmt.Errorf("recipe %s has no resume_command", r.Name)
 	}
+	auth, err := resumeAuth(ws.ID, ws.Spec.Labels[LabelAuth], o.Auth)
+	if err != nil {
+		return nil, err
+	}
 	res := &ResumeResult{Workspace: ws, Recipe: r}
 
 	if ws.State == proto.WSClaimed && o.Attach {
@@ -386,8 +396,12 @@ func Resume(ctx context.Context, cl *client.Client, o ResumeOptions) (*ResumeRes
 	}
 
 	var bindings []Binding
-	if specs := ws.Spec.Labels[LabelBindings]; specs != "" {
+	if auth != AuthSubscription {
+		specs := ws.Spec.Labels[LabelBindings]
 		for _, spec := range strings.Split(specs, ",") {
+			if spec == "" {
+				continue
+			}
 			b, err := ParseBinding(spec)
 			if err != nil {
 				return nil, fmt.Errorf("workspace %s label %s: %w", ws.ID, LabelBindings, err)
@@ -406,7 +420,7 @@ func Resume(ctx context.Context, cl *client.Client, o ResumeOptions) (*ResumeRes
 	run, err := Start(ctx, cl, Options{
 		Recipe: r, Task: task, WS: ws.ID, Bindings: bindings, Model: ws.Spec.Labels[LabelModel],
 		Conversation: ws.Spec.Labels[LabelConversation], ConversationPath: ws.Spec.Labels[LabelConversationPath],
-		Security: security, Sandbox: o.Sandbox, Approve: o.Approve, Resume: true,
+		Auth: auth, Security: security, Sandbox: o.Sandbox, Approve: o.Approve, Resume: true,
 		PTY: o.PTY, Rows: o.Rows, Cols: o.Cols, Stdin: o.Stdin, Timeout: o.Timeout, Stderr: stderr,
 	})
 	if run != nil {
@@ -414,4 +428,21 @@ func Resume(ctx context.Context, cl *client.Client, o ResumeOptions) (*ResumeRes
 		res.Session = run.Session
 	}
 	return res, err
+}
+
+func resumeAuth(workspace, recorded, requested string) (string, error) {
+	if requested == "" {
+		return recorded, nil
+	}
+	if recorded != "" && requested != recorded {
+		return "", fmt.Errorf("workspace %s was launched with auth %s; refusing resume with %s", workspace, authFlagName(recorded), authFlagName(requested))
+	}
+	return requested, nil
+}
+
+func authFlagName(auth string) string {
+	if auth == AuthAPIKey {
+		return "api-key"
+	}
+	return auth
 }

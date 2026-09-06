@@ -544,7 +544,7 @@ func TestRunValidatesBeforeDialing(t *testing.T) {
 		{"repo and base", []string{"custom", "--repo", "github.com/o/r", "--base", "b", "--", "true"}, "mutually exclusive"},
 		{"depth without repo", []string{"custom", "--repo-depth", "1", "--", "true"}, "--repo-depth needs --repo"},
 		{"negative timeout", []string{"custom", "--timeout", "-1s", "--", "true"}, "negative"},
-		{"resident under isolated", []string{"claude", "--security", "isolated", "--", "x"}, "inside the workspace"},
+		{"resident under isolated", []string{"claude", "--auth", "subscription", "--security", "isolated", "--", "x"}, "inside the workspace"},
 		{"duplicate binding", []string{"opencode", "--binding", "b_openai", "--binding", "b_openai", "--", "x"}, "twice"},
 	}
 	for _, tc := range cases {
@@ -679,26 +679,20 @@ func TestRunQueueFlagsValidateBeforeDialing(t *testing.T) {
 	}
 }
 
-func TestPrepareHandoffDetectsRecipeBeforeDefaultBindings(t *testing.T) {
-	for _, p := range launch.Presets() {
-		if p.KeyEnv != "" {
-			t.Setenv(p.KeyEnv, "")
-		}
-	}
+func TestPrepareHandoffDetectsRecipeWithExplicitAPIKeyAuth(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		recipe   string
 		state    string
-		key      string
 		binding  string
 		useHome  bool
 		explicit bool
 	}{
-		{"claude explicit home", "claude", ".claude", "ANTHROPIC_API_KEY", "b_anthropic", true, false},
-		{"claude default home", "claude", ".claude", "ANTHROPIC_API_KEY", "b_anthropic", false, false},
-		{"codex explicit home", "codex", ".codex", "OPENAI_API_KEY", "b_openai", true, false},
-		{"codex default home", "codex", ".codex", "OPENAI_API_KEY", "b_openai", false, false},
-		{"explicit recipe and binding", "claude", ".claude", "ANTHROPIC_API_KEY", "b_anthropic", true, true},
+		{"claude explicit home", "claude", ".claude", "b_anthropic", true, false},
+		{"claude default home", "claude", ".claude", "b_anthropic", false, false},
+		{"codex explicit home", "codex", ".codex", "b_openai", true, false},
+		{"codex default home", "codex", ".codex", "b_openai", false, false},
+		{"explicit recipe and binding", "claude", ".claude", "b_mine:anthropic", true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -711,8 +705,14 @@ func TestPrepareHandoffDetectsRecipeBeforeDefaultBindings(t *testing.T) {
 			}
 			t.Setenv("HOME", envHome)
 			t.Setenv("USERPROFILE", envHome)
-			t.Setenv(tc.key, "fake-handoff-key-not-a-credential")
-			o := launch.HandoffOptions{Dir: t.TempDir()}
+			b, err := launch.ParseBinding(tc.binding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			o := launch.HandoffOptions{
+				Dir: t.TempDir(),
+				Run: launch.Options{Auth: launch.AuthAPIKey, Bindings: []launch.Binding{b}},
+			}
 			if tc.useHome {
 				o.Home = home
 			}
@@ -722,23 +722,11 @@ func TestPrepareHandoffDetectsRecipeBeforeDefaultBindings(t *testing.T) {
 					t.Fatal(err)
 				}
 				o.Recipe = r
-				b, err := launch.ParseBinding("b_mine:anthropic")
-				if err != nil {
-					t.Fatal(err)
-				}
-				o.Run.Bindings = []launch.Binding{b}
 			}
 			calls := 0
-			err := prepareHandoff(&o, func() []localBinding {
+			err = prepareHandoff(&o, func() []localBinding {
 				calls++
-				if o.Recipe == nil || o.Recipe.Name != tc.recipe {
-					t.Fatalf("recipe was not resolved before binding lookup: %+v", o.Recipe)
-				}
-				local := envBindings()
-				if len(local) != 1 || local[0].ID != tc.binding || local[0].Secret != "$"+tc.key {
-					t.Fatalf("local bindings = %+v", local)
-				}
-				return local
+				return nil
 			})
 			if runtime.GOOS == "windows" {
 				if err == nil || !strings.Contains(err.Error(), "mount_path") {
@@ -747,11 +735,7 @@ func TestPrepareHandoffDetectsRecipeBeforeDefaultBindings(t *testing.T) {
 			} else if err != nil {
 				t.Fatal(err)
 			}
-			want := tc.binding
-			if tc.explicit {
-				want = "b_mine"
-			}
-			if calls != 1 || o.Home != home || o.Recipe == nil || o.Recipe.Name != tc.recipe || len(o.Run.Bindings) != 1 || o.Run.Bindings[0].ID != want {
+			if calls != 0 || o.Home != home || o.Recipe == nil || o.Recipe.Name != tc.recipe || len(o.Run.Bindings) != 1 || o.Run.Bindings[0].ID != b.ID {
 				t.Fatalf("prepared handoff = %+v, binding lookups = %d", o, calls)
 			}
 			if o.Run.Recipe != nil || o.Run.Dir != "" || o.Run.RestoreFrom != "" {
@@ -795,9 +779,18 @@ func TestPrepareHandoffRequiresPortableAuthentication(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		o := launch.HandoffOptions{Dir: t.TempDir(), Home: t.TempDir(), Recipe: r}
-		if err := prepareHandoff(&o, func() []localBinding { return nil }); err == nil || !strings.Contains(err.Error(), "provider --binding") {
-			t.Fatalf("%s preflight auth: %v", name, err)
+		for _, tc := range []struct {
+			auth string
+			want string
+		}{
+			{"", "requires --auth"},
+			{launch.AuthSubscription, "cannot transfer"},
+			{launch.AuthAPIKey, "provider --binding"},
+		} {
+			o := launch.HandoffOptions{Dir: t.TempDir(), Home: t.TempDir(), Recipe: r, Run: launch.Options{Auth: tc.auth}}
+			if err := prepareHandoff(&o, func() []localBinding { return nil }); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("%s auth %q preflight: %v", name, tc.auth, err)
+			}
 		}
 	}
 }
@@ -838,13 +831,15 @@ func TestHandoffAndResumeValidateBeforeDialing(t *testing.T) {
 		{"bad binding", []string{"--binding", "b_x:nopreset", "--home", home}, "nopreset"},
 		{"no state", []string{"--home", home}, "no harness state"},
 		{"no resume", []string{"--recipe", "custom", "--home", home}, "no resume_command"},
-		{"missing provider binding", []string{"--recipe", "claude", "--home", home}, "provider --binding"},
-		{"bad sandbox", []string{"--recipe", "claude", "--binding", "b_anthropic", "--home", home, "--sandbox", "loose"}, "--sandbox"},
-		{"bad approve", []string{"--recipe", "claude", "--binding", "b_anthropic", "--home", home, "--approve", "always"}, "--approve"},
-		{"bad security", []string{"--recipe", "claude", "--binding", "b_anthropic", "--home", home, "--security", "paranoid"}, "--security"},
-		{"foreign provider", []string{"--recipe", "claude", "--binding", "b_openai", "--home", home}, "does not consume"},
-		{"duplicate binding", []string{"--recipe", "claude", "--binding", "b_anthropic", "--binding", "b_anthropic", "--home", home}, "twice"},
-		{"missing directory", []string{"--recipe", "claude", "--binding", "b_anthropic", "--home", home, "--dir", filepath.Join(home, "missing-checkout")}, "missing-checkout"},
+		{"missing auth selection", []string{"--recipe", "claude", "--home", home}, "requires --auth"},
+		{"subscription not portable", []string{"--recipe", "claude", "--auth", "subscription", "--home", home}, "cannot transfer"},
+		{"missing provider binding", []string{"--recipe", "claude", "--auth", "api-key", "--home", home}, "provider --binding"},
+		{"bad sandbox", []string{"--recipe", "claude", "--auth", "api-key", "--binding", "b_anthropic", "--home", home, "--sandbox", "loose"}, "--sandbox"},
+		{"bad approve", []string{"--recipe", "claude", "--auth", "api-key", "--binding", "b_anthropic", "--home", home, "--approve", "always"}, "--approve"},
+		{"bad security", []string{"--recipe", "claude", "--auth", "api-key", "--binding", "b_anthropic", "--home", home, "--security", "paranoid"}, "--security"},
+		{"foreign provider", []string{"--recipe", "claude", "--auth", "api-key", "--binding", "b_openai", "--home", home}, "does not consume"},
+		{"duplicate binding", []string{"--recipe", "claude", "--auth", "api-key", "--binding", "b_anthropic", "--binding", "b_anthropic", "--home", home}, "twice"},
+		{"missing directory", []string{"--recipe", "claude", "--auth", "api-key", "--binding", "b_anthropic", "--home", home, "--dir", filepath.Join(home, "missing-checkout")}, "missing-checkout"},
 	} {
 		t.Run("handoff "+tc.name, func(t *testing.T) {
 			err := cmdHandoff(ctx, tc.args)
@@ -869,6 +864,32 @@ func TestHandoffAndResumeValidateBeforeDialing(t *testing.T) {
 				t.Fatalf("args=%q error=%v want %q", tc.args, err, tc.want)
 			}
 		})
+	}
+}
+
+func TestAuthValidatesBeforeDialing(t *testing.T) {
+	t.Setenv("REMOUNT_AUTOSTART", "0")
+	t.Setenv("REMOUNT_SERVER", "http://127.0.0.1:1")
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"no action", nil, authUsage},
+		{"unknown action", []string{"refresh", "claude", "--ws", "ws_a"}, authUsage},
+		{"missing workspace", []string{"status", "claude"}, authUsage},
+		{"extra recipe", []string{"status", "claude", "codex", "--ws", "ws_a"}, authUsage},
+		{"unsupported recipe", []string{"status", "custom", "--ws", "ws_a"}, "does not support subscription"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := cmdAuth(context.Background(), tc.args)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("args=%q error=%v want %q", tc.args, err, tc.want)
+			}
+		})
+	}
+	if got := normalizeAuthFlag("api-key"); got != launch.AuthAPIKey {
+		t.Fatalf("normalize api-key = %q", got)
 	}
 }
 

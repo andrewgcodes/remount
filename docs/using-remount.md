@@ -77,14 +77,18 @@ The shortest local path is:
 
 ```sh
 export OPENAI_API_KEY=...
-./remount run codex --dir /absolute/path/to/repo -- \
+./remount binding preset apply openai --secret-env OPENAI_API_KEY
+./remount run codex --auth api-key --binding b_openai \
+  --dir /absolute/path/to/repo -- \
   'Fix the failing test, run the focused test, and summarize the change.'
 ```
 
 Replace `codex` with `opencode`, `claude`, or another built-in recipe listed by
-`remount help`. With automatic local standalone, exported provider keys become
-bindings by environment-variable reference; their values are not written into
-the generated bindings file or workspace.
+`remount help`. With automatic local standalone, exported provider keys can
+become bindings by environment-variable reference for recipes that do not
+require an explicit billing mode; their values are not written into the
+generated bindings file or workspace. Claude and Codex require the explicit
+flow below.
 
 For an explicit server-side binding — a named credential the server holds and
 the workspace only ever sees as a placeholder; see
@@ -113,6 +117,57 @@ Important behavior:
 - With `--ws`, an explicit `--security` is a minimum-profile assertion on
   the existing workspace, not an upgrade to its isolation. A weaker workspace
   is rejected; the flag cannot make a cooperative backend enforce isolation.
+
+### Choose Claude or Codex billing explicitly
+
+Claude and Codex never guess between a subscription and an API key. Every new
+run or Agent must select `--auth subscription` or `--auth api-key`; omitting it
+fails before the harness starts.
+
+For a provider subscription, create a trusted-local workspace, authenticate
+with the provider's own CLI, then launch against that workspace:
+
+```sh
+WS=$(./remount ws create --name claude-subscription --security local)
+./remount auth login claude --ws "$WS"
+./remount auth status claude --ws "$WS"
+./remount run claude --ws "$WS" --auth subscription -- \
+  'Continue the implementation and run the focused tests.'
+```
+
+Codex uses the same flow with `codex`. Remount invokes
+`claude auth login --claudeai` or `codex login --device-auth`; the provider
+owns the browser/device authorization, token format, refresh, and logout.
+`remount auth logout RECIPE --ws WS` removes the provider login.
+
+Auth operations use a confidential active-client-only session. Their output is
+kept in memory, cannot be replayed or reattached, is not spilled or published
+as a session-log artifact, and is omitted from durable session events. If the
+connection is interrupted, rerun the operation. The node accepts only the exact
+built-in provider command with no client-supplied environment or working
+directory.
+
+A subscription launch verifies the expected provider-native login and fails
+closed if it is absent, API-key based, console based, or ambiguous. It also
+removes provider API-key and base-URL variables so ambient configuration cannot
+silently change billing. Subscription auth is `local` only: its credentials
+live in the workspace filesystem and can be read by same-UID or root code in
+that VM. They survive ordinary reconnect, snapshot, sleep, and wake with that
+workspace, but Remount does not claim to make them secret-blind.
+
+For API-key billing, name a real brokered binding:
+
+```sh
+./remount run codex --auth api-key --binding b_openai \
+  --dir /absolute/path/to/repo -- 'Fix the failing test.'
+```
+
+API-key mode refuses a missing or incompatible binding and never falls back to
+a subscription login. `remount resume WS` preserves the recorded auth mode; a
+conflicting `--auth` override is refused. `remount handoff` supports
+`--auth api-key` but refuses subscription mode because a laptop's provider
+login is not imported into another workspace; authenticate inside the remote
+workspace instead.
 - Ctrl-C detaches by default; it does not kill the agent. Use
   `--kill-on-interrupt` only when termination is intended.
 - `--detach` prints the Agent/workspace identifiers and returns immediately.
@@ -143,7 +198,7 @@ binding with its provider preset:
 
 ```sh
 WS=$(./remount ws create --binding b_team)
-./remount agent create codex --ws "$WS" --binding b_team:openai -- \
+./remount agent create codex --ws "$WS" --auth api-key --binding b_team:openai -- \
   'Inspect the repository and fix the failing test.'
 ```
 

@@ -50,6 +50,10 @@ type Spec struct {
 	Tenant string
 	// Run marks a harness launch; carried in the info chunk and to OnExit.
 	Run *proto.RunInfo
+	// Sensitive sessions are memory-only, non-replayable provider auth
+	// operations. AuthOperation is sanitized metadata for lifecycle events.
+	Sensitive     bool
+	AuthOperation *proto.AuthOperation
 	// Runner is backend-owned and process-local. It is deliberately excluded
 	// from idempotency serialization.
 	Runner Runner `cbor:"-" json:"-"`
@@ -852,11 +856,11 @@ func (m *Manager) OpenOrReplay(spec Spec) (s *Session, created bool, err error) 
 	}
 	id := ids.New("s")
 	var spillPath string
-	if m.opts.SpillDir != "" {
+	if !spec.Sensitive && m.opts.SpillDir != "" {
 		spillPath = filepath.Join(m.opts.SpillDir, id+".log")
 	}
 	var blobStore artifact.BlobStore
-	if m.opts.BlobStoreForSession != nil {
+	if !spec.Sensitive && m.opts.BlobStoreForSession != nil {
 		blobStore, err = m.opts.BlobStoreForSession(spec.Tenant, spec.WS)
 		if err != nil {
 			if m.opts.OnRecordError != nil {
@@ -864,7 +868,7 @@ func (m *Manager) OpenOrReplay(spec Spec) (s *Session, created bool, err error) 
 			}
 			blobStore, err = nil, nil
 		}
-	} else if m.opts.BlobStoreForTenant != nil {
+	} else if !spec.Sensitive && m.opts.BlobStoreForTenant != nil {
 		blobStore, err = m.opts.BlobStoreForTenant(spec.Tenant)
 	}
 	if blobStore != nil || (m.opts.BlobStoreForTenant != nil && m.opts.BlobStoreForSession == nil) {
@@ -886,8 +890,12 @@ func (m *Manager) OpenOrReplay(spec Spec) (s *Session, created bool, err error) 
 	if blobStore == nil {
 		commitRecord = nil
 	}
+	spillBytes := m.opts.SpillBytes
+	if spec.Sensitive {
+		spillBytes = 0
+	}
 	log, err := NewLog(LogOptions{
-		MemBytes: m.opts.MemBytes, SpillBytes: m.opts.SpillBytes, SpillPath: spillPath,
+		MemBytes: m.opts.MemBytes, SpillBytes: spillBytes, SpillPath: spillPath,
 		MaxChunk: m.opts.MaxChunk, MaxChunks: m.opts.MaxChunks, BlobStore: blobStore,
 		SegmentBytes: m.opts.SegmentBytes, MaxSegments: m.opts.MaxLogSegments, CommitRecord: commitRecord,
 	})
@@ -895,20 +903,26 @@ func (m *Manager) OpenOrReplay(spec Spec) (s *Session, created bool, err error) 
 		m.mu.Unlock()
 		return nil, false, err
 	}
+	program := spec.Program
+	if spec.Sensitive {
+		program = nil
+	}
 	s = &Session{
 		ID: id, WS: spec.WS, Kind: spec.Kind, Log: log, exited: make(chan struct{}), observed: make(chan struct{}), startDone: make(chan struct{}), outputReady: make(chan struct{}), Principal: spec.Principal, Tenant: spec.Tenant,
-		Info: proto.SessionInfo{ID: id, WS: spec.WS, Kind: spec.Kind, Program: spec.Program, OpenedAt: time.Now().UnixMilli(), Run: spec.Run},
+		Info: proto.SessionInfo{ID: id, WS: spec.WS, Kind: spec.Kind, Program: program, OpenedAt: time.Now().UnixMilli(), Run: spec.Run, Sensitive: spec.Sensitive, AuthOperation: spec.AuthOperation},
 	}
-	s.onComplete = func(info proto.ExitInfo, record LogRecord) error {
-		if m.opts.CompleteSessionLogRecord != nil {
-			if err := m.opts.CompleteSessionLogRecord(s.ID, spec, s.Info, info, record); err != nil {
-				if m.opts.OnRecordError != nil {
-					m.opts.OnRecordError(s.ID, err)
+	if !spec.Sensitive {
+		s.onComplete = func(info proto.ExitInfo, record LogRecord) error {
+			if m.opts.CompleteSessionLogRecord != nil {
+				if err := m.opts.CompleteSessionLogRecord(s.ID, spec, s.Info, info, record); err != nil {
+					if m.opts.OnRecordError != nil {
+						m.opts.OnRecordError(s.ID, err)
+					}
+					return err
 				}
-				return err
 			}
+			return nil
 		}
-		return nil
 	}
 	s.onFinish = func() { m.markInactive(id, s) }
 	m.sessions[id] = s
@@ -1003,6 +1017,9 @@ func (m *Manager) RestoreArchived(record proto.SessionLogRecord, store artifact.
 	if !record.Complete || record.Session == "" || record.Workspace == "" || record.Principal == "" || record.Info.ID != record.Session || record.Info.WS != record.Workspace {
 		return nil, errors.New("session: incomplete archived record")
 	}
+	if record.Info.Sensitive || record.Info.AuthOperation != nil {
+		return nil, errors.New("session: sensitive sessions cannot be restored")
+	}
 	segments := make([]SegmentRef, len(record.Segments))
 	for i, segment := range record.Segments {
 		segments[i] = SegmentRef{First: segment.First, Next: segment.Next, Artifact: segment.Artifact, Bytes: segment.Bytes}
@@ -1056,6 +1073,9 @@ func (m *Manager) scheduleReap(s *Session) {
 		if configured := m.opts.RetentionForTenant(s.Tenant); configured > 0 {
 			retention = configured
 		}
+	}
+	if s.Info.Sensitive && retention > 5*time.Minute {
+		retention = 5 * time.Minute
 	}
 	m.scheduleReapAt(s, time.Now().Add(retention))
 

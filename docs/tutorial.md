@@ -675,7 +675,8 @@ Fix the flaky TestReconnect and make the suite green.
 Update CHANGELOG.md for the 0.4 release.
 Open a PR titled "0.4" with a summary of the changes.
 TASKS
-remount run codex --dir proj --binding b_openai --queue tonight.txt --sleep-after 20m
+remount run codex --dir proj --auth api-key --binding b_openai \
+  --queue tonight.txt --sleep-after 20m
 ```
 
 Each task is a `run` session; between tasks the workspace checkpoints (or here

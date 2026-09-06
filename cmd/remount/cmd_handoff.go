@@ -18,7 +18,7 @@ import (
 // handoff: move this checkout and the harness's conversation into a workspace
 // ---------------------------------------------------------------------------
 
-const handoffUsage = "handoff [--recipe R] [--task \"continue\"] [--dir .] [--home ~] [--binding ID[:PRESET]]... [--security P] [--sandbox M] [--approve M] [--name N] [--backend B] [--image IMG] [--attach]"
+const handoffUsage = "handoff [--recipe R] [--auth api-key] [--task \"continue\"] [--dir .] [--home ~] [--binding ID[:PRESET]]... [--security P] [--sandbox M] [--approve M] [--name N] [--backend B] [--image IMG] [--attach]"
 
 func prepareHandoff(o *launch.HandoffOptions, localBindings func() []localBinding) error {
 	if o.Dir == "" {
@@ -56,10 +56,15 @@ func prepareHandoff(o *launch.HandoffOptions, localBindings func() []localBindin
 	if o.Recipe.CommandFromArgs {
 		return fmt.Errorf("recipe %s takes its command from the arguments and has no conversation to hand off", o.Recipe.Name)
 	}
-	if o.Run.Bindings, err = defaultBindings(o.Recipe, o.Run.Bindings, localBindings()); err != nil {
-		return err
+	if o.Run.Auth == "" {
+		if o.Run.Bindings, err = defaultBindings(o.Recipe, o.Run.Bindings, localBindings()); err != nil {
+			return err
+		}
 	}
-	if (o.Recipe.Name == "claude" || o.Recipe.Name == "codex") && len(o.Run.Bindings) == 0 {
+	if (o.Recipe.Name == "claude" || o.Recipe.Name == "codex") && o.Run.Auth == launch.AuthSubscription {
+		return fmt.Errorf("%s handoff cannot transfer a local subscription login; authenticate inside the remote workspace instead", o.Recipe.Name)
+	}
+	if (o.Recipe.Name == "claude" || o.Recipe.Name == "codex") && o.Run.Auth == launch.AuthAPIKey && len(o.Run.Bindings) == 0 {
 		return fmt.Errorf("%s handoff requires a provider --binding; local login credentials are not transferred", o.Recipe.Name)
 	}
 	probe := o.Run
@@ -88,6 +93,7 @@ func cmdHandoff(ctx context.Context, args []string) error {
 	backend := fs.String("backend", "", "require a node backend (docker, process)")
 	name := fs.String("name", "", "workspace name")
 	model := fs.String("model", "", "model id passed to the harness")
+	auth := fs.String("auth", "", "api-key (subscription login state is not imported)")
 	security := fs.String("security", "", "local | isolated | multi_tenant (default local)")
 	sandbox := fs.String("sandbox", launch.SandboxWorkspaceWrite, "read-only | workspace-write | full")
 	approve := fs.String("approve", launch.ApproveNever, "never | on-request")
@@ -111,7 +117,7 @@ func cmdHandoff(ctx context.Context, args []string) error {
 		Dir: *dir, Home: *home, ExcludeGit: !*includeGit,
 		Run: launch.Options{
 			Task: *task, Name: *name, Image: *image, Backend: *backend, Security: *security, Sandbox: *sandbox,
-			Approve: *approve, Model: *model, Exclude: exclude, Timeout: *timeout, Stderr: os.Stderr,
+			Auth: normalizeAuthFlag(*auth), Approve: *approve, Model: *model, Exclude: exclude, Timeout: *timeout, Stderr: os.Stderr,
 		},
 	}
 	if *recipeName != "" {
@@ -182,7 +188,7 @@ func cmdHandoff(ctx context.Context, args []string) error {
 // resume: pick a handed-off or run workspace back up
 // ---------------------------------------------------------------------------
 
-const resumeUsage = "resume WS [--task \"continue\"] [--recipe R] [--detach] [--no-attach]"
+const resumeUsage = "resume WS [--task \"continue\"] [--recipe R] [--auth subscription|api-key] [--detach] [--no-attach]"
 
 func cmdResume(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("resume", flag.ExitOnError)
@@ -190,6 +196,7 @@ func cmdResume(ctx context.Context, args []string) error {
 	c.flags(fs)
 	recipeName := fs.String("recipe", "", "harness recipe (default: the one recorded on the workspace)")
 	task := fs.String("task", "", "prompt for the resumed harness (default: \""+launch.DefaultResumeTask+"\")")
+	auth := fs.String("auth", "", "override the recorded auth mode; conflicting changes are refused")
 	sandbox := fs.String("sandbox", launch.SandboxWorkspaceWrite, "read-only | workspace-write | full")
 	approve := fs.String("approve", launch.ApproveNever, "never | on-request")
 	detach := fs.Bool("detach", false, "print ids and return")
@@ -204,7 +211,7 @@ func cmdResume(ctx context.Context, args []string) error {
 		return errors.New("--timeout must not be negative")
 	}
 	o := launch.ResumeOptions{
-		WS: fs.Arg(0), Task: *task, Attach: !*noAttach, Sandbox: *sandbox, Approve: *approve,
+		WS: fs.Arg(0), Task: *task, Auth: normalizeAuthFlag(*auth), Attach: !*noAttach, Sandbox: *sandbox, Approve: *approve,
 		Timeout: *timeout, Stderr: os.Stderr,
 	}
 	if *recipeName != "" {

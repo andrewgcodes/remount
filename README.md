@@ -121,14 +121,17 @@ nothing is listening:
 
 ```sh
 export ANTHROPIC_API_KEY=...
-remount run claude --dir . -- 'add integration tests for the payments module'
+remount binding preset apply anthropic --secret-env ANTHROPIC_API_KEY
+remount run claude --auth api-key --binding b_anthropic \
+  --dir . -- 'add integration tests for the payments module'
 ```
 
 Hand that conversation to a cloud machine and leave, then resume it tomorrow
 from anywhere:
 
 ```sh
-remount handoff --recipe claude --binding b_anthropic --task 'finish the refactor and open a PR'
+remount handoff --recipe claude --auth api-key --binding b_anthropic \
+  --task 'finish the refactor and open a PR'
 remount resume $WS
 ```
 
@@ -136,7 +139,8 @@ Run a queue of tasks overnight, sleeping between them on a durable timer, and
 wake a workspace when the PR merges:
 
 ```sh
-remount run codex --queue tasks.txt --sleep-after 30m
+remount run codex --auth api-key --binding b_openai \
+  --queue tasks.txt --sleep-after 30m
 remount ws sleep $WS --on github.pr.merged
 ```
 
