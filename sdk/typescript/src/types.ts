@@ -525,6 +525,138 @@ export interface ChunkBody {
   "d"?: Uint8Array;
 }
 
+export interface ComputerAction {
+  "kind": string;
+  "x"?: number;
+  "y"?: number;
+  "dx"?: number;
+  "dy"?: number;
+  "tox"?: number;
+  "toy"?: number;
+  "text"?: string;
+  "key"?: string;
+  "button"?: string;
+  "mod"?: number;
+}
+
+export interface ComputerCloseReq {
+  "ws": string;
+  "computer": string;
+  "grant"?: Grant | null;
+  "idem"?: string;
+}
+
+export interface ComputerCreateReq {
+  "ws": string;
+  "idem"?: string;
+  "grant"?: Grant | null;
+  "launch"?: ComputerLaunch | null;
+  "viewport"?: ComputerViewport;
+  "profile"?: string;
+  "env"?: Record<string, string>;
+}
+
+export interface ComputerCreateRes {
+  "computer": string;
+  "s"?: string;
+  "cdp"?: string;
+  "viewport"?: ComputerViewport;
+}
+
+export interface ComputerDownload {
+  "artifact"?: string;
+  "filename"?: string;
+  "url"?: string;
+  "bytes"?: number;
+  "state": string;
+  "reason"?: string;
+}
+
+export interface ComputerDownloadsReq {
+  "ws": string;
+  "computer": string;
+  "grant"?: Grant | null;
+}
+
+export interface ComputerDownloadsRes {
+  "downloads"?: Array<ComputerDownload>;
+}
+
+export interface ComputerEvalReq {
+  "ws": string;
+  "computer": string;
+  "grant"?: Grant | null;
+  "expr": string;
+}
+
+export interface ComputerEvalRes {
+  "value"?: Uint8Array;
+}
+
+export interface ComputerGetReq {
+  "ws": string;
+  "computer": string;
+  "grant"?: Grant | null;
+}
+
+export interface ComputerGetRes {
+  "computer": string;
+  "state": string;
+  "reason"?: string;
+  "viewport"?: ComputerViewport;
+  "s"?: string;
+}
+
+export interface ComputerInputReq {
+  "ws": string;
+  "computer": string;
+  "grant"?: Grant | null;
+  "iseq": number;
+  "actions"?: Array<ComputerAction>;
+}
+
+export interface ComputerInputRes {
+  "applied": boolean;
+  "last_iseq": number;
+}
+
+export interface ComputerLaunch {
+  "program"?: Array<string>;
+  "port"?: number;
+  "attach"?: boolean;
+}
+
+export interface ComputerNavigateReq {
+  "ws": string;
+  "computer": string;
+  "grant"?: Grant | null;
+  "url": string;
+  "idem"?: string;
+}
+
+export interface ComputerNavigateRes {
+  "url"?: string;
+  "title"?: string;
+  "status"?: string;
+}
+
+export interface ComputerScreenshotReq {
+  "ws": string;
+  "computer": string;
+  "grant"?: Grant | null;
+}
+
+export interface ComputerScreenshotRes {
+  "png": Uint8Array;
+  "w": number;
+  "h": number;
+}
+
+export interface ComputerViewport {
+  "w"?: number;
+  "h"?: number;
+}
+
 export interface ControlDiag {
   "now": number;
   "uptime_sec": number;
@@ -658,6 +790,7 @@ export interface Error {
   "code": string;
   "msg"?: string;
   "oldest"?: number;
+  "reason"?: string;
 }
 
 export interface Event {
@@ -1949,6 +2082,14 @@ export const OPERATIONS = {
   "budget.remove": { constant: "OpBudgetRemove", request: "BudgetRemoveReq", response: "" },
   "budget.reserve": { constant: "OpBudgetReserve", request: "BudgetReserveReq", response: "BudgetReservation" },
   "budget.settle": { constant: "OpBudgetSettle", request: "BudgetSettleReq", response: "BudgetSettlement" },
+  "computer.close": { constant: "OpComputerClose", request: "ComputerCloseReq", response: "" },
+  "computer.create": { constant: "OpComputerCreate", request: "ComputerCreateReq", response: "ComputerCreateRes" },
+  "computer.downloads": { constant: "OpComputerDownloads", request: "ComputerDownloadsReq", response: "ComputerDownloadsRes" },
+  "computer.eval": { constant: "OpComputerEval", request: "ComputerEvalReq", response: "ComputerEvalRes" },
+  "computer.get": { constant: "OpComputerGet", request: "ComputerGetReq", response: "ComputerGetRes" },
+  "computer.input": { constant: "OpComputerInput", request: "ComputerInputReq", response: "ComputerInputRes" },
+  "computer.navigate": { constant: "OpComputerNavigate", request: "ComputerNavigateReq", response: "ComputerNavigateRes" },
+  "computer.screenshot": { constant: "OpComputerScreenshot", request: "ComputerScreenshotReq", response: "ComputerScreenshotRes" },
   "controller.state": { constant: "OpControllerState", request: "", response: "" },
   "diag": { constant: "OpDiag", request: "DiagReq", response: "ControlDiag" },
   "e2ee.kx": { constant: "OpE2EEKeyExchange", request: "", response: "" },

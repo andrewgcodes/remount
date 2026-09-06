@@ -432,3 +432,108 @@ func (c *Client) NodeDiag(ctx context.Context, nodeID, workspace string, verify 
 func (c *Client) NodeStatus(ctx context.Context, nodeID string) (*api.NodeStatus, error) {
 	return c.inner.NodeStatus(ctx, nodeID)
 }
+
+// Computer is a browser the node drives inside a workspace on this client's
+// behalf. Coordinates are CSS pixels from the top-left of the declared
+// viewport; see ADR 0088.
+type Computer struct {
+	inner *internalclient.Computer
+	ID    string
+	WS    string
+}
+
+func wrapComputer(computer *internalclient.Computer) *Computer {
+	if computer == nil {
+		return nil
+	}
+	return &Computer{inner: computer, ID: computer.ID(), WS: computer.WS()}
+}
+
+// CreateComputer starts, or attaches to, a browser inside the workspace.
+func (c *Client) CreateComputer(ctx context.Context, request api.ComputerCreateRequest, options ...OperationOption) (*Computer, error) {
+	body := proto.ComputerCreateReq{
+		WS: request.WS, Viewport: request.Viewport, Profile: request.Profile,
+		Env: cloneStringMap(request.Env),
+	}
+	if request.Launch != nil {
+		launch := *request.Launch
+		launch.Program = append([]string(nil), launch.Program...)
+		body.Launch = &launch
+	}
+	computer, err := c.inner.CreateComputer(ctx, body, options...)
+	return wrapComputer(computer), err
+}
+
+// Computer returns a handle on a computer created earlier, by id.
+func (c *Client) Computer(workspace, id string) *Computer {
+	return wrapComputer(c.inner.Computer(workspace, id))
+}
+
+// Session is the browser's exec session id, or "" when the node attached to a
+// browser the workspace started itself.
+func (m *Computer) Session() string { return m.inner.Session() }
+
+// CDPVersion is the browser's DevTools identification string.
+func (m *Computer) CDPVersion() string { return m.inner.CDPVersion() }
+
+// Viewport is the CSS-pixel rectangle every coordinate refers to.
+func (m *Computer) Viewport() api.ComputerViewport { return m.inner.Viewport() }
+
+// Get reports the computer's current state and why, if it is not ready.
+func (m *Computer) Get(ctx context.Context) (*api.ComputerState, error) {
+	return m.inner.Get(ctx)
+}
+
+// Screenshot captures the viewport as a PNG.
+func (m *Computer) Screenshot(ctx context.Context) (*api.ComputerScreenshot, error) {
+	return m.inner.Screenshot(ctx)
+}
+
+// Input applies a batch of actions exactly once, even if the call is retried.
+func (m *Computer) Input(ctx context.Context, actions ...api.ComputerAction) error {
+	return m.inner.Input(ctx, actions...)
+}
+
+// Click presses and releases the left button at a viewport coordinate.
+func (m *Computer) Click(ctx context.Context, x, y int) error { return m.inner.Click(ctx, x, y) }
+
+// Move moves the pointer without pressing a button.
+func (m *Computer) Move(ctx context.Context, x, y int) error { return m.inner.Move(ctx, x, y) }
+
+// Type inserts text into whatever has focus.
+func (m *Computer) Type(ctx context.Context, text string) error { return m.inner.Type(ctx, text) }
+
+// Key presses one named key, such as Enter or ArrowDown.
+func (m *Computer) Key(ctx context.Context, key string, modifiers int) error {
+	return m.inner.Key(ctx, key, modifiers)
+}
+
+// Scroll dispatches a wheel event at a viewport coordinate.
+func (m *Computer) Scroll(ctx context.Context, x, y, dx, dy int) error {
+	return m.inner.Scroll(ctx, x, y, dx, dy)
+}
+
+// Drag presses at one coordinate, moves, and releases at another.
+func (m *Computer) Drag(ctx context.Context, x, y, toX, toY int) error {
+	return m.inner.Drag(ctx, x, y, toX, toY)
+}
+
+// Navigate loads a URL and waits for the load event or the node's timeout.
+func (m *Computer) Navigate(ctx context.Context, url string, options ...OperationOption) (*api.ComputerNavigation, error) {
+	return m.inner.Navigate(ctx, url, options...)
+}
+
+// Eval runs an expression in the page and returns its JSON value.
+func (m *Computer) Eval(ctx context.Context, expression string) ([]byte, error) {
+	return m.inner.Eval(ctx, expression)
+}
+
+// Downloads lists what the browser fetched and the artifacts holding them.
+func (m *Computer) Downloads(ctx context.Context) ([]api.ComputerDownload, error) {
+	return m.inner.Downloads(ctx)
+}
+
+// Close ends the conversation and kills a browser the node spawned.
+func (m *Computer) Close(ctx context.Context, options ...OperationOption) error {
+	return m.inner.Close(ctx, options...)
+}

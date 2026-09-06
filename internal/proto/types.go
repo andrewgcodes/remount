@@ -1808,3 +1808,233 @@ const (
 	EvAuthWSResident    = "auth.workspace_resident"      // a launch relies on a login the harness keeps inside the workspace; payload {s, recipe}
 	EvWSOffer           = "ws.offer"                     // control -> node (not logged; a hint to claim)
 )
+
+// ---------------------------------------------------------------------------
+// Computer sessions (browser/computer use over the port substrate)
+//
+// A computer is a Chrome DevTools Protocol conversation the node holds with a
+// browser running inside the workspace. The bytes travel the same resolved TCP
+// path a `port.open` session uses, so every backend that can forward a
+// workspace port can host one. See ADR 0088.
+// ---------------------------------------------------------------------------
+
+const (
+	OpComputerCreate     = "computer.create"     // ComputerCreateReq -> ComputerCreateRes
+	OpComputerScreenshot = "computer.screenshot" // ComputerScreenshotReq -> ComputerScreenshotRes
+	OpComputerInput      = "computer.input"      // ComputerInputReq -> ComputerInputRes
+	OpComputerNavigate   = "computer.navigate"   // ComputerNavigateReq -> ComputerNavigateRes
+	OpComputerEval       = "computer.eval"       // ComputerEvalReq -> ComputerEvalRes
+	OpComputerDownloads  = "computer.downloads"  // ComputerDownloadsReq -> ComputerDownloadsRes
+	OpComputerClose      = "computer.close"      // ComputerCloseReq -> {}
+	OpComputerGet        = "computer.get"        // ComputerGetReq -> ComputerGetRes
+)
+
+// Computer lifecycle events. Payloads name the computer, never page content.
+const (
+	// EvComputerCreated payload {computer, s, port, attach, profile, w, h, cdp}
+	EvComputerCreated = "computer.created"
+	// EvComputerClosed payload {computer, reason}; reason is a ComputerClosedReason*.
+	EvComputerClosed = "computer.closed"
+	// EvComputerDownload payload {computer, artifact, filename, bytes,
+	// artifact_bytes, s}; bytes is the file, artifact_bytes the archive.
+	EvComputerDownload = "computer.download"
+	// EvComputerDegraded payload {computer, reason}
+	EvComputerDegraded = "computer.degraded"
+)
+
+// Computer states reported by computer.get.
+const (
+	ComputerStateReady    = "ready"
+	ComputerStateDegraded = "degraded"
+	ComputerStateClosed   = "closed"
+)
+
+// computer.closed reasons. A crash reuses the shared error vocabulary so one
+// name covers the event payload and the Error.Reason a later op returns.
+const (
+	ComputerClosedReasonClosed            = "closed"
+	ComputerClosedReasonCrashed           = ReasonBrowserCrashed
+	ComputerClosedReasonWorkspaceReleased = "workspace_released"
+)
+
+// Action kinds accepted by computer.input.
+const (
+	ComputerActionClick  = "click"
+	ComputerActionType   = "type"
+	ComputerActionKey    = "key"
+	ComputerActionScroll = "scroll"
+	ComputerActionDrag   = "drag"
+	ComputerActionMove   = "move"
+)
+
+// Download states reported by computer.downloads.
+const (
+	ComputerDownloadInProgress = "in_progress"
+	ComputerDownloadCompleted  = "completed"
+	ComputerDownloadCanceled   = "canceled"
+	// ComputerDownloadBlocked: the file finished but publication failed.
+	ComputerDownloadBlocked = "blocked"
+)
+
+// ComputerMaxScreenshotBytes caps one computer.screenshot response. A capture
+// larger than this is refused with CodeResourceExhausted rather than streamed:
+// a screenshot is a single response body, not a session log.
+const ComputerMaxScreenshotBytes = 8 << 20
+
+// ComputerViewport is the CSS-pixel rectangle the browser renders and the
+// coordinate system every action uses. The origin is its top-left corner.
+type ComputerViewport struct {
+	Width  int `cbor:"w,omitempty" json:"w,omitempty"`
+	Height int `cbor:"h,omitempty" json:"h,omitempty"`
+}
+
+// ComputerLaunch describes how the node obtains a CDP endpoint. Attach means
+// the browser is already listening; otherwise the node spawns Program as a
+// managed exec session with the workspace's ordinary brokered environment.
+type ComputerLaunch struct {
+	Program []string `cbor:"program,omitempty" json:"program,omitempty"`
+	Port    int      `cbor:"port,omitempty" json:"port,omitempty"`
+	Attach  bool     `cbor:"attach,omitempty" json:"attach,omitempty"`
+}
+
+type ComputerCreateReq struct {
+	WS             string            `cbor:"ws" json:"ws"`
+	IdempotencyKey string            `cbor:"idem,omitempty" json:"idem,omitempty"`
+	Grant          *Grant            `cbor:"grant,omitempty" json:"grant,omitempty"`
+	Launch         *ComputerLaunch   `cbor:"launch,omitempty" json:"launch,omitempty"`
+	Viewport       ComputerViewport  `cbor:"viewport,omitempty" json:"viewport,omitempty"`
+	Profile        string            `cbor:"profile,omitempty" json:"profile,omitempty"`
+	Env            map[string]string `cbor:"env,omitempty" json:"env,omitempty"`
+}
+
+type ComputerCreateRes struct {
+	Computer   string           `cbor:"computer" json:"computer"`
+	Session    string           `cbor:"s,omitempty" json:"s,omitempty"`
+	CDPVersion string           `cbor:"cdp,omitempty" json:"cdp,omitempty"`
+	Viewport   ComputerViewport `cbor:"viewport,omitempty" json:"viewport,omitempty"`
+}
+
+type ComputerScreenshotReq struct {
+	WS       string `cbor:"ws" json:"ws"`
+	Computer string `cbor:"computer" json:"computer"`
+	Grant    *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+}
+
+type ComputerScreenshotRes struct {
+	PNG    []byte `cbor:"png" json:"png"`
+	Width  int    `cbor:"w" json:"w"`
+	Height int    `cbor:"h" json:"h"`
+}
+
+// ComputerAction is one input event in CSS pixels. Unused fields stay zero.
+type ComputerAction struct {
+	Kind      string `cbor:"kind" json:"kind"`
+	X         int    `cbor:"x,omitempty" json:"x,omitempty"`
+	Y         int    `cbor:"y,omitempty" json:"y,omitempty"`
+	DX        int    `cbor:"dx,omitempty" json:"dx,omitempty"`
+	DY        int    `cbor:"dy,omitempty" json:"dy,omitempty"`
+	ToX       int    `cbor:"tox,omitempty" json:"tox,omitempty"`
+	ToY       int    `cbor:"toy,omitempty" json:"toy,omitempty"`
+	Text      string `cbor:"text,omitempty" json:"text,omitempty"`
+	Key       string `cbor:"key,omitempty" json:"key,omitempty"`
+	Button    string `cbor:"button,omitempty" json:"button,omitempty"`
+	Modifiers int    `cbor:"mod,omitempty" json:"mod,omitempty"`
+}
+
+// Modifier bits for ComputerAction.Modifiers; the values are CDP's own.
+const (
+	ComputerModifierAlt   = 1
+	ComputerModifierCtrl  = 2
+	ComputerModifierMeta  = 4
+	ComputerModifierShift = 8
+)
+
+type ComputerInputReq struct {
+	WS       string           `cbor:"ws" json:"ws"`
+	Computer string           `cbor:"computer" json:"computer"`
+	Grant    *Grant           `cbor:"grant,omitempty" json:"grant,omitempty"`
+	ISeq     uint64           `cbor:"iseq" json:"iseq"`
+	Actions  []ComputerAction `cbor:"actions,omitempty" json:"actions,omitempty"`
+}
+
+// ComputerInputRes reports whether this request was applied or recognised as a
+// duplicate, and the highest input sequence the computer has applied.
+type ComputerInputRes struct {
+	Applied      bool   `cbor:"applied" json:"applied"`
+	LastInputSeq uint64 `cbor:"last_iseq" json:"last_iseq"`
+}
+
+type ComputerNavigateReq struct {
+	WS             string `cbor:"ws" json:"ws"`
+	Computer       string `cbor:"computer" json:"computer"`
+	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+	URL            string `cbor:"url" json:"url"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+type ComputerNavigateRes struct {
+	URL    string `cbor:"url,omitempty" json:"url,omitempty"`
+	Title  string `cbor:"title,omitempty" json:"title,omitempty"`
+	Status string `cbor:"status,omitempty" json:"status,omitempty"`
+}
+
+// Navigation outcomes reported by ComputerNavigateRes.Status.
+const (
+	ComputerNavigateLoaded  = "loaded"
+	ComputerNavigateTimeout = "timeout"
+)
+
+type ComputerEvalReq struct {
+	WS         string `cbor:"ws" json:"ws"`
+	Computer   string `cbor:"computer" json:"computer"`
+	Grant      *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+	Expression string `cbor:"expr" json:"expr"`
+}
+
+// ComputerEvalRes carries the JSON encoding of Runtime.evaluate's returned
+// value. It is page-controlled data: decode it, never execute it.
+type ComputerEvalRes struct {
+	Value []byte `cbor:"value,omitempty" json:"value,omitempty"`
+}
+
+type ComputerDownloadsReq struct {
+	WS       string `cbor:"ws" json:"ws"`
+	Computer string `cbor:"computer" json:"computer"`
+	Grant    *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+}
+
+// ComputerDownload is one file the browser downloaded. Artifact is set once
+// the node has published the file into the tenant's artifact store.
+type ComputerDownload struct {
+	Artifact string `cbor:"artifact,omitempty" json:"artifact,omitempty"`
+	Filename string `cbor:"filename,omitempty" json:"filename,omitempty"`
+	URL      string `cbor:"url,omitempty" json:"url,omitempty"`
+	Bytes    int64  `cbor:"bytes,omitempty" json:"bytes,omitempty"`
+	State    string `cbor:"state" json:"state"`
+	Reason   string `cbor:"reason,omitempty" json:"reason,omitempty"`
+}
+
+type ComputerDownloadsRes struct {
+	Downloads []ComputerDownload `cbor:"downloads,omitempty" json:"downloads,omitempty"`
+}
+
+type ComputerCloseReq struct {
+	WS             string `cbor:"ws" json:"ws"`
+	Computer       string `cbor:"computer" json:"computer"`
+	Grant          *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+type ComputerGetReq struct {
+	WS       string `cbor:"ws" json:"ws"`
+	Computer string `cbor:"computer" json:"computer"`
+	Grant    *Grant `cbor:"grant,omitempty" json:"grant,omitempty"`
+}
+
+type ComputerGetRes struct {
+	Computer string           `cbor:"computer" json:"computer"`
+	State    string           `cbor:"state" json:"state"`
+	Reason   string           `cbor:"reason,omitempty" json:"reason,omitempty"`
+	Viewport ComputerViewport `cbor:"viewport,omitempty" json:"viewport,omitempty"`
+	Session  string           `cbor:"s,omitempty" json:"s,omitempty"`
+}

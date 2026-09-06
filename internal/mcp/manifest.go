@@ -79,7 +79,9 @@ var composites = []Operation{
 var protocolOperations = []string{
 	"agent.approval.decided", "agent.cancel", "agent.create", "agent.deliver", "agent.destroy", "agent.fork", "agent.get", "agent.list", "agent.message", "agent.report", "agent.run", "agent.run.cancel", "agent.sleep", "agent.transcript", "agent.wake",
 	"approval.decide", "approval.get", "approval.list", "artifact.proof", "audit.export", "audit.key", "base.create", "base.list", "base.remove", "binding.lease",
-	"budget.create", "budget.list", "budget.remove", "budget.reserve", "budget.settle", "controller.state", "diag", "egress.approval",
+	"budget.create", "budget.list", "budget.remove", "budget.reserve", "budget.settle",
+	"computer.close", "computer.create", "computer.downloads", "computer.eval", "computer.get", "computer.input", "computer.navigate", "computer.screenshot",
+	"controller.state", "diag", "egress.approval",
 	"events.post", "events.stop", "events.tail", "fleet.get", "fleet.list", "fleet.quarantine",
 	"fs.apply_tar", "fs.edit", "fs.list", "fs.mkdir", "fs.read", "fs.remove", "fs.rename", "fs.search", "fs.stat", "fs.write", "grant",
 	"node.diag", "node.list", "node.status", "pool.create", "pool.get", "pool.list", "pool.remove", "port.open", "principal.create", "principal.invite", "principal.list", "principal.revoke", "principal.token.issue",

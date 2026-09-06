@@ -778,6 +778,14 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `s.wait` | `SWaitReq{s, timeout_sec}` → `SWaitRes{exited, exit}` |
 | `s.list` | `SListReq{ws}` → `SListRes{sessions}` |
 | `port.open` | `PortOpenReq{ws, port, host}` → `SOpenRes` |
+| `computer.create` | `ComputerCreateReq{ws, launch{program, port, attach}, viewport{w, h}, profile, env, idem}` → `ComputerCreateRes{computer, s, cdp, viewport}`; `attach:true` connects to a browser already listening on `port` (default 9222), otherwise the node spawns `program` as a managed exec session with the workspace's ordinary brokered environment and polls `GET /json/version` until it answers |
+| `computer.screenshot` | `ComputerScreenshotReq{ws, computer}` → `ComputerScreenshotRes{png, w, h}`; PNG clipped to the declared viewport, capped at 8 MiB and refused with `resource_exhausted` above it |
+| `computer.input` | `ComputerInputReq{ws, computer, iseq, actions}` → `ComputerInputRes{applied, last_iseq}`; deduplicated by `iseq` exactly as `s.input` is. Coordinates are CSS pixels from the viewport's top-left corner |
+| `computer.navigate` | `ComputerNavigateReq{ws, computer, url, idem}` → `ComputerNavigateRes{url, title, status}`; `status` is `loaded` or `timeout` |
+| `computer.eval` | `ComputerEvalReq{ws, computer, expr}` → `ComputerEvalRes{value}`; `value` is the JSON encoding of `Runtime.evaluate` with `returnByValue`, and is page-controlled data |
+| `computer.downloads` | `ComputerDownloadsReq{ws, computer}` → `ComputerDownloadsRes{downloads[{artifact, filename, url, bytes, state, reason}]}` |
+| `computer.close` | `ComputerCloseReq{ws, computer, idem}` → `{}`; closes the conversation and kills a browser the node spawned. Closing one that is already gone succeeds |
+| `computer.get` | `ComputerGetReq{ws, computer}` → `ComputerGetRes{computer, state, reason, viewport, s}`; `state` is `ready`, `degraded` or `closed` |
 | `fs.read` | `FSReadReq{ws, path, offset, limit}` → `FSReadRes{d, size, eof}` |
 | `fs.write` | `FSWriteReq{ws, path, d, mode, append, mkdirp, idem}` → `{}` |
 | `fs.list` | `FSListReq{ws, path}` → `FSListRes{entries}` |
@@ -802,6 +810,30 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `ws.quarantine.commit` | control only: `WSQuarantineCommitReq{operation, ws, gen, backend, snapshot}` → `{}` and authorizes deletion only after an exact durable phase-one proof |
 
 Session kinds are `exec`, `pty` and `port`.
+
+A **computer** is not a fourth session kind. It is a Chrome DevTools Protocol
+conversation the node holds with a browser inside the workspace, carried over
+exactly the byte path `port.open` resolves, so every backend that can forward a
+workspace port can host one and none needs a workspace-resident daemon. The
+browser is an ordinary managed exec session when the node spawns it, so a
+client can attach to its output, and sleep, release and quarantine stop it the
+way they stop any session. Its profile lives under `.remount/browser/<profile>`
+and its downloads under `.remount/downloads`; both are inside the directory
+every snapshot excludes, so a profile is node-local and a downloaded file
+reaches the client as a published artifact rather than as snapshot payload.
+Failures reuse the stable codes with a `Reason` (§2): a dead browser is
+`closed`/`browser_crashed`, a DevTools port that never answers is
+`timeout`/`display_unavailable` and one that answers without a usable page is
+`unsupported`/`display_unavailable`, a malformed action is
+`bad_request`/`input_rejected`, a navigation the egress policy refused is
+`denied`/`navigation_denied`, an unusable profile is `conflict`/`profile_corrupt`,
+and a backend with no workspace port path is
+`unsupported`/`backend_unsupported`. A file that finished downloading but could
+not be published is not an error on any request; it appears in
+`computer.downloads` with `state:"blocked"` and a `reason`, because a failure
+must be visible in the listing rather than absent from it. The broker
+terminates no TLS and its CONNECT rules name hosts, so navigation policy is
+per host and never per URL (§9).
 
 Control persists the incremented workspace `release_epoch` before sending
 `ws.release`. A node accepts an exact retry only when generation, epoch,
@@ -1334,7 +1366,19 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `identity.roles_changed`, `identity.principal_revoked`,
 `session.log.committed`, `session.log.deleted`, `session.log.unavailable`,
 `audit.exported`, `audit.export_denied`, `retention.enforced`,
-`retention.violation`, `residency.denied` and `export.cursor.advanced`.
+`retention.violation`, `residency.denied`, `export.cursor.advanced`,
+`computer.created`, `computer.closed`, `computer.download` and
+`computer.degraded`.
+
+Computer events are on the workspace stream, carry `computer`, and set
+`session` to the browser's exec session when the node spawned one.
+`computer.created` carries `s`, `port`, `attach`, `profile`, `w`, `h` and
+`cdp` (the browser's DevTools identification string); `computer.degraded` and
+`computer.closed` carry `reason`, one of `closed`, `browser_crashed` or
+`workspace_released`; `computer.download` carries `artifact`, `filename`,
+`bytes` (the file's own size), `artifact_bytes` (the published archive's) and
+`s`. None carries a page's content, a URL's query string, a
+screenshot, a downloaded file's bytes or a credential.
 
 Principal role events are tenant-scoped and carry the actor, principal,
 revision and complete non-secret role set. Access, refresh, provider, device,

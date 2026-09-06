@@ -169,3 +169,69 @@ const (
 	SnapshotConsistencyLive     = proto.SnapshotConsistencyLive
 	SnapshotConsistencyQuiesced = proto.SnapshotConsistencyQuiesced
 )
+
+// Computer resources. A computer is a browser a node drives inside a
+// workspace; coordinates are CSS pixels from the top-left of the viewport.
+type (
+	ComputerViewport   = proto.ComputerViewport
+	ComputerLaunch     = proto.ComputerLaunch
+	ComputerAction     = proto.ComputerAction
+	ComputerScreenshot = proto.ComputerScreenshotRes
+	ComputerNavigation = proto.ComputerNavigateRes
+	ComputerDownload   = proto.ComputerDownload
+	ComputerState      = proto.ComputerGetRes
+)
+
+// ComputerCreateRequest starts, or attaches to, a browser in a workspace. Like
+// SessionOpenRequest it is a public resource request rather than an alias of
+// the wire request, whose signed grant field is an implementation detail.
+type ComputerCreateRequest struct {
+	WS       string
+	Launch   *ComputerLaunch
+	Viewport ComputerViewport
+	Profile  string
+	Env      map[string]string
+}
+
+const (
+	ComputerStateReady    = proto.ComputerStateReady
+	ComputerStateDegraded = proto.ComputerStateDegraded
+	ComputerStateClosed   = proto.ComputerStateClosed
+
+	ComputerActionClick  = proto.ComputerActionClick
+	ComputerActionType   = proto.ComputerActionType
+	ComputerActionKey    = proto.ComputerActionKey
+	ComputerActionScroll = proto.ComputerActionScroll
+	ComputerActionDrag   = proto.ComputerActionDrag
+	ComputerActionMove   = proto.ComputerActionMove
+
+	ComputerModifierAlt   = proto.ComputerModifierAlt
+	ComputerModifierCtrl  = proto.ComputerModifierCtrl
+	ComputerModifierMeta  = proto.ComputerModifierMeta
+	ComputerModifierShift = proto.ComputerModifierShift
+
+	ComputerNavigateLoaded  = proto.ComputerNavigateLoaded
+	ComputerNavigateTimeout = proto.ComputerNavigateTimeout
+
+	ComputerDownloadInProgress = proto.ComputerDownloadInProgress
+	ComputerDownloadCompleted  = proto.ComputerDownloadCompleted
+	ComputerDownloadCanceled   = proto.ComputerDownloadCanceled
+	ComputerDownloadBlocked    = proto.ComputerDownloadBlocked
+)
+
+// Stable error reasons a computer operation can carry alongside its code.
+const (
+	ReasonBrowserCrashed     = proto.ReasonBrowserCrashed
+	ReasonDisplayUnavailable = proto.ReasonDisplayUnavailable
+	ReasonInputRejected      = proto.ReasonInputRejected
+	ReasonNavigationDenied   = proto.ReasonNavigationDenied
+	ReasonProfileCorrupt     = proto.ReasonProfileCorrupt
+	ReasonBackendUnsupported = proto.ReasonBackendUnsupported
+	ReasonDownloadBlocked    = proto.ReasonDownloadBlocked
+)
+
+// ErrorReason returns the stable reason refining an error's code, or "" when
+// the error is not a protocol error or carries no reason. Match on the code
+// first; a reason narrows it, and an unrecognised reason must degrade to the
+// code rather than to an unhandled case.
+func ErrorReason(err error) string { return proto.ErrorReason(err) }
