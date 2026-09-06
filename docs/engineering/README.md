@@ -14,6 +14,18 @@ host/provider prerequisites and dated verification. Use it with current code
 and the verification ledger; the historical closure below is not a release-wide
 feature inventory.
 
+
+### [Gap brief for engineering — 2026-09-06](./gap-brief-2026-09-06.md)
+
+The product gap brief that turns Remount from a trusted-pilot runtime into a
+default self-hosted cloud-agent runtime SDK: named isolation profiles with a
+fail-closed node gate and drift detection, dynamic brokered credentials with
+session principals, a first-class computer/browser session API, durable
+workspace leases and idle policy, and typed errors, conformance and release
+mechanics. Its owner constraint is that nothing becomes a hosted product. The
+[implementation record](./gap-brief-2026-09-06-implementation.md) dispositions
+every item against code, tests and dated evidence.
+
 ### [Codebase review and remediation handoff — 2026-09-04](./review-handoff-2026-09-04.md)
 
 Report-only review with eleven reproduced failing invariants, a local-verification
