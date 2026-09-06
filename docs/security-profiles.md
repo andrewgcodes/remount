@@ -107,10 +107,6 @@ backend inside a machine, and vendor pools remain one tenant per VM.
 
 ## Operational proof
 
-Getting a node to advertise anything at all against a production-mode control
-plane starts with a one-time enrollment credential; see "Enroll a node" in
-`docs/operations.md` for the exact commands.
-
 Use `remount nodes --json` and `remount doctor --deep --json` to inspect
 what a live node actually advertised and what it could verify. The release
 claim for `gvisor` also requires the seven E4 denial checks in the isolation
