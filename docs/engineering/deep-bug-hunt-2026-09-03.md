@@ -7,6 +7,30 @@
 
 ## Executive summary
 
+### Integration disposition — 2026-09-05
+
+This report is historical evidence about `7e61cde`, not a list of eight
+confirmed defects in current main. The integration review checked main
+`3620140`; the original observations and severities below are preserved.
+This documentation PR does not implement the remaining fixes.
+
+| Finding | Disposition at integration | Current evidence / next proof |
+|---|---|---|
+| RBH-001 | Original failure fixed separately in PR #24 | `internal/control/agent_report_publish_test.go` proves failed commits leave the report watermark and state unpublished and retryable. |
+| RBH-002 | Original reset/lost-outbox mechanism addressed separately | `internal/node/event_loop_test.go:TestProducerSequenceContinuesAcrossRestart` and `internal/sim/node_event_restart_test.go:TestNodeEventsSurviveANodeRestart`; this is not a claim of lossless node delivery under every capacity or crash condition. |
+| RBH-003 | Original cross-subject binding flaw fixed separately | `internal/control/auth_test.go:TestAClaimedClientPeerIDCannotBeReboundToAnotherSubject`. |
+| RBH-004 | Remains a current code-path concern | `relay.route` still calls destination `Send` synchronously; reproduce blocked-destination isolation on the next fix candidate. |
+| RBH-005 | Requires a complete current reproduction | `transport.Peer.nextID` remains per-instance, but reused numbers alone do not prove that an old response can complete a new request. Exercise delayed routing across replacement peers. |
+| RBH-006 | Post-open validation gap remains | `FS.Read` requires a regular file before opening, but checks only `IsDir` on the opened handle. A deterministic object-replacement regression is still required. |
+| RBH-007 | Original overflow mechanism superseded; terminal-status concern remains | Overflow now drops events and sets internal `Lagged` state instead of closing immediately. Public `TailEvents` still returns only a channel; failed reattachment can close it and CLI follow returns success. Update the reproduction accordingly. |
+| RBH-008 | Historical Docker evidence retained; not requalified here | Docker preparation still wraps `docker exec`, while Unix session signals target the host process group. Repeat the child/grandchild experiment through the public API before claiming current container-tree termination. |
+
+See also the [later review's inherited-finding disposition](review-handoff-2026-09-04.md)
+and [current implementation status](current-status.md). Neither a historical
+pass nor a historical failure automatically qualifies today's candidate.
+
+### Original audit summary
+
 The review retained eight current defects after comparing candidates against the
 current tree, the historical 2026-09-02 reviews, the 2026-09-03 implementation
 closure, existing tests, and Remount's documented invariants.

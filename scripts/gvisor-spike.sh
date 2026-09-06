@@ -59,6 +59,8 @@ ip link add "$host_if" type veth peer name "$guest_if"
 ip link set "$guest_if" netns "$namespace"
 ip addr add 169.254.251.1/30 dev "$host_if"
 ip netns exec "$namespace" ip addr add 169.254.251.2/30 dev "$guest_if"
+# Linux needs the guest link up to accept its gateway. The host peer remains
+# down until runsc starts after one of the deny-first packet policies commits.
 ip netns exec "$namespace" ip link set lo up
 ip netns exec "$namespace" ip link set "$guest_if" up
 ip netns exec "$namespace" ip route add default via 169.254.251.1
@@ -95,6 +97,8 @@ table netdev $host_table {
 }
 NFT
 fi
+
+echo "gVisor spike packet policy: $policy"
 
 setsid socat TCP4-LISTEN:17443,bind=169.254.251.1,reuseaddr,fork EXEC:/bin/cat >/dev/null 2>&1 &
 broker_pid=$!
