@@ -139,6 +139,25 @@ Known limits: the browser profile lives under the snapshot-excluded
 policy is per host because the broker does not terminate TLS; Firecracker
 can drive a browser but reports downloads as `backend_unsupported`.
 
+Follow-up delivered: `images/browser` (Chromium plus `socat`, health probe),
+`remount computer create|get|screenshot|click|type|key|scroll|navigate|eval|downloads|close`,
+Python and TypeScript `Computer` classes, `integration/browser` conformance
+(evidence B34) and `scripts/browser-conformance.sh`. The live lane ran real
+Chromium 152 inside the Colima VM on the docker backend and verified create,
+`file://` navigation, click, screenshot change, typing into an input, a
+contenteditable and an iframe, download to artifact with its event,
+unbound-host navigation denied with an `egress.denied` audit, crash reported
+as `browser_crashed`, and sleep/wake dropping the computer and profile while
+the filesystem survived. It found and fixed three defects: Chromium ignores
+`--remote-debugging-address` (a forwarder now bridges the port), Chromium's
+`$HOME/.config` broke `ws.sleep` (the browser's home is now its profile
+directory), and a fresh handle restarted `iseq` at 1 so every CLI action
+after the first was dropped (`computer.get` now returns `last_iseq` and
+handles resume from it; ADR 0094). Open: Chromium never sends
+`Proxy-Authorization`, so brokered navigation to an allowed host is refused
+as unauthenticated; the fix is the CDP `Fetch.authRequired` handler, in
+progress.
+
 ## Gap 4 — durable lifecycle for running work
 
 Delivered (ADR [0090](../adr/0090-durable-workspace-leases-and-idle-policy.md)):
@@ -202,12 +221,12 @@ Delivered so far:
 
 | Builder | Scope | Status |
 |---|---|---|
-| Browser lane | `images/browser`, `remount computer` CLI, Python/TS `Computer`, real-Chromium conformance (B34) run live in Docker, docs | in progress |
+| Browser lane | `images/browser`, `remount computer` CLI, Python/TS `Computer`, real-Chromium conformance (B34) run live in the Colima VM, docs | merged (5a425b6); brokered browsing to an allowed host still needs CDP proxy auth (follow-up running) |
 | Conformance product | `cmd/conformance --profile`, markdown report, `remount conformance`, evidence E26/B33, gVisor drift lane script, operator docs | merged (ced0f00) |
 | Linux lanes | gVisor E4/E5/B28, E26 drift, a real `multi-tenant-isolated` gVisor node with `doctor` and `conformance --profile`, Firecracker B29 if its environment survived, all inside the Colima VM | in progress |
 | Credentials | `remount binding`/`principal session` CLI, Python/TS helpers, keyless examples against a fake provider (B35), docs, live `.env` run with rotate and revoke | in progress |
 | Lifecycle | `remount ws lease`/idle CLI, Python/TS methods, auto-sleep example, docs, live timer run across a server restart | merged (39f951d) |
-| Typed errors and observability | typed error classes in three languages, support matrix, dependency-free OTLP tracing, log redaction, ADR 0093 | in progress |
+| Typed errors and observability | typed error classes in three languages, support matrix, dependency-free OTLP tracing, log redaction, ADR 0093 | merged (b94530d); spans verified live against a local collector |
 
 ## Deferred by owner decision
 
