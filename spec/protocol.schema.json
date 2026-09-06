@@ -3828,10 +3828,16 @@
         "seq": {
           "type": "integer"
         },
+        "span": {
+          "type": "string"
+        },
         "t": {
           "type": "string"
         },
         "to": {
+          "type": "string"
+        },
+        "trace": {
           "type": "string"
         },
         "v": {

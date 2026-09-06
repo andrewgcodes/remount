@@ -1,4 +1,5 @@
 import { Decoder, Encoder } from "cbor-x";
+import { fromWire, ProtocolError } from "./errors.js";
 
 const encoder = new Encoder({ useRecords: false, variableMapSize: true });
 const decoder = new Decoder({ mapsAsObjects: true });
@@ -69,13 +70,6 @@ interface WebSocketLike {
 }
 
 export type WebSocketFactory = (url: string) => Promise<WebSocketLike>;
-
-export class ProtocolError extends Error {
-  constructor(public readonly code: string, message = "", public readonly oldest = 0) {
-    super(message ? `${code}: ${message}` : code);
-    this.name = "ProtocolError";
-  }
-}
 
 export class ConnectionClosed extends Error {}
 
@@ -485,7 +479,7 @@ export class Client {
     }).then((response: Frame) => {
       if (response.err) {
         const message = String(response.err.msg ?? "").split(this.token).join("[redacted]");
-        throw new ProtocolError(response.err.code ?? "internal", message, Number(response.err.oldest ?? 0));
+        throw fromWire(String(response.err.code ?? "internal"), String(response.err.reason ?? ""), message, Number(response.err.oldest ?? 0));
       }
       return response;
     });
@@ -618,5 +612,5 @@ export async function raiseHTTP(response: Response, secret = ""): Promise<void> 
   } catch { /* bounded status only */ }
   const detail = body.error && typeof body.error === "object" ? body.error : body;
   const message = String(detail.message ?? `HTTP ${response.status}`).split(secret).join(secret ? "[redacted]" : "");
-  throw new ProtocolError(String(detail.code ?? "internal"), message);
+  throw fromWire(String(detail.code ?? "internal"), String(detail.reason ?? ""), message);
 }

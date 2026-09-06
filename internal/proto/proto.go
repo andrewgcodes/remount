@@ -70,6 +70,14 @@ type Frame struct {
 	Op              string `cbor:"op,omitempty" json:"op,omitempty"`     // req: operation name; ev: event type
 	Body            []byte `cbor:"body,omitempty" json:"body,omitempty"` // CBOR-encoded payload, kind/op specific
 	Err             *Error `cbor:"err,omitempty" json:"err,omitempty"`   // res: non-nil on failure
+	// Trace and Span carry an operator-configured trace context so a node's
+	// span for a request is a child of the control-plane span that caused it.
+	// Both are lowercase hex (16 and 8 bytes) and are absent unless the
+	// sender has tracing enabled. They are additive, carry no authority, and
+	// are never trusted for anything: a peer that ignores them behaves
+	// exactly as before.
+	Trace string `cbor:"trace,omitempty" json:"trace,omitempty"`
+	Span  string `cbor:"span,omitempty" json:"span,omitempty"`
 }
 
 // Error is a machine-readable failure. Code is stable; Msg is for humans.
@@ -145,6 +153,41 @@ const (
 	ReasonDownloadBlocked          = "download_blocked"           // denied: policy refused a browser download
 	ReasonProfileUnschedulable     = "profile_unschedulable"      // denied or unsupported: no node currently satisfies the runtime profile
 )
+
+// WorkspaceOf returns the workspace id a frame names, for observability only.
+// The header carries it on chunks and events; a request carries it in the
+// body, as `ws` on node operations and as `id` on `ws.*` control operations,
+// where the id is a workspace by definition.
+//
+// It is best effort and authorizes nothing. A handler that needs the
+// workspace for a decision decodes the request it actually handles, under the
+// grant check; this exists so a span can say which workspace an operation
+// touched without every dispatch arm learning about tracing.
+func WorkspaceOf(f *Frame) string {
+	if f == nil {
+		return ""
+	}
+	if f.WS != "" {
+		return f.WS
+	}
+	if len(f.Body) == 0 {
+		return ""
+	}
+	var probe struct {
+		WS string `cbor:"ws,omitempty"`
+		ID string `cbor:"id,omitempty"`
+	}
+	if err := Unmarshal(f.Body, &probe); err != nil {
+		return ""
+	}
+	if probe.WS != "" {
+		return probe.WS
+	}
+	if strings.HasPrefix(f.Op, "ws.") {
+		return probe.ID
+	}
+	return ""
+}
 
 // Err builds an *Error.
 func Err(code, format string, a ...any) *Error {

@@ -328,6 +328,9 @@ var (
 	AuditExports              = Count("remount_audit_exports_total", "signed compliance bundles produced by audit export")
 	AuditExportDenied         = Count("remount_audit_exports_denied_total", "audit exports refused by tenant isolation, authorization or range validation")
 	AuditExportGaps           = Count("remount_audit_export_gaps_total", "audit exports refused because the requested range is no longer complete")
+
+	TraceSpansExported  = Count("remount_trace_spans_exported_total", "request spans an operator-configured OTLP collector accepted")
+	TraceExportFailures = Count("remount_trace_export_failures_total", "request spans that never reached the collector, whether dropped at a full export queue or lost to a failed batch")
 )
 
 func init() {

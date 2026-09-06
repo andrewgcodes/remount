@@ -46,6 +46,11 @@ const (
 type apiError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// Reason refines Code with a stable proto.Reason* value when the server
+	// set one. It is omitted when empty so an older consumer sees the same
+	// document it saw before, and it is what the Python and TypeScript SDKs
+	// map to a typed exception.
+	Reason string `json:"reason,omitempty"`
 }
 
 type apiErrorBody struct {
@@ -85,7 +90,7 @@ func httpStatus(err error) (int, apiError) {
 	case proto.CodeResourceExhausted:
 		status = http.StatusTooManyRequests
 	}
-	return status, apiError{Code: pe.Code, Message: pe.Msg}
+	return status, apiError{Code: pe.Code, Message: pe.Msg, Reason: pe.Reason}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

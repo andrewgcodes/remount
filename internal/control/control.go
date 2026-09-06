@@ -37,6 +37,7 @@ import (
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/relay"
 	"remount.dev/remount/internal/tenant"
+	"remount.dev/remount/internal/trace"
 	"remount.dev/remount/internal/transport"
 )
 
@@ -1959,7 +1960,9 @@ func (c *Control) HandleFrame(ctx context.Context, f *proto.Frame) {
 				<-c.requestSlots
 				c.requestWG.Done()
 			}()
-			body, err := c.dispatch(c.requestCtx, f)
+			reqCtx, span := trace.StartRemote(c.requestCtx, f.Op, f.Trace, f.Span)
+			body, err := c.dispatch(reqCtx, f)
+			c.finishSpan(span, f, err)
 			if err != nil {
 				var pe *proto.Error
 				if !errors.As(err, &pe) {
@@ -1995,6 +1998,25 @@ func (c *Control) HandleFrame(ctx context.Context, f *proto.Frame) {
 		c.requestMu.Unlock()
 	}
 	_ = ctx // inbound transport contexts do not carry a remote deadline
+}
+
+// finishSpan records the routing facts of one dispatched request and ends its
+// span. It records the op (the span name), the workspace and the calling
+// principal, and the stable code and reason of a failure — never a token,
+// never a body, never message text that could carry one.
+func (c *Control) finishSpan(span *trace.Span, f *proto.Frame, err error) {
+	if span == nil {
+		return
+	}
+	span.Set("remount.peer", f.From)
+	span.Set("remount.principal", c.principalOf(f.From))
+	span.Set("remount.ws", proto.WorkspaceOf(f))
+	var pe *proto.Error
+	if errors.As(err, &pe) {
+		span.Set("remount.code", pe.Code)
+		span.Set("remount.reason", pe.Reason)
+	}
+	span.End(err)
 }
 
 func (c *Control) principalOf(from string) string {

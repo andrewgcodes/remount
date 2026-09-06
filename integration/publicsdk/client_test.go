@@ -29,6 +29,19 @@ func TestPublicSurfaceCompilesForExternalModule(t *testing.T) {
 	_ = client.WithIdempotencyKey("logical-operation-1")
 	_ = api.IsErrorCode(&api.Error{Code: api.CodeConflict}, api.CodeConflict)
 
+	// Typed errors: a consumer narrows a code with a stable reason without
+	// reaching into internal/proto and without matching on message text.
+	denied := &api.Error{Code: api.CodeDenied, Reason: api.ReasonEgressDenied, Msg: "host is not bound"}
+	if !api.Is(denied, api.CodeDenied, api.ReasonEgressDenied) {
+		t.Fatal("api.Is did not match a code and reason from outside the module")
+	}
+	if api.Is(denied, api.CodeDenied, api.ReasonPermissionDenied) {
+		t.Fatal("api.Is matched a different reason under the same code")
+	}
+	if api.ErrorReason(denied) != api.ReasonEgressDenied {
+		t.Fatalf("api.ErrorReason = %q", api.ErrorReason(denied))
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := c.CreateWorkspace(ctx, spec); err == nil || !errors.Is(err, context.Canceled) {
