@@ -73,6 +73,7 @@ section() {
 	echo
 	echo "- [design.md]($BASE/docs/design.md): why each piece is shaped the way it is, and the failure model."
 	echo "- [operations.md]($BASE/docs/operations.md): tokens, TLS, backends, leases, backups."
+	echo "- [credentials.md]($BASE/docs/credentials.md): bindings, substitution locations, rotation, revocation, session principals, refusals and audit."
 	echo "- [current-status.md]($BASE/docs/engineering/current-status.md): implementation boundaries and dated verification evidence."
 	echo "- [console.md]($BASE/docs/console.md): the embedded operator console and its real-server tests."
 	echo "- [ADRs]($BASE/docs/adr): one decision per file, never edited after the fact."

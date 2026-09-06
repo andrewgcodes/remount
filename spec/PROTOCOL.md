@@ -1334,8 +1334,11 @@ browser login state is scoped, rotated and revoked differently from an API
 key and MUST NOT share a binding with one.
 
 `methods` and `path_prefixes` narrow a binding beyond its destination hosts.
-They are recorded policy carried on the lease; the broker rule order in §9
-above is where a conforming implementation enforces them.
+They travel on the lease and are enforced in the same credential pass that
+checks destination, expiry and TLS: a request whose method or path the binding
+does not cover is refused before substitution and before any upstream byte, and
+a surface that cannot say what it is about to send fails closed for a scoped
+binding. Empty means every method or every path.
 
 `retention` records a provider data-retention requirement as metadata.
 Remount cannot enforce a provider's policy; it records what the operator
@@ -1354,6 +1357,13 @@ A node whose leases were minted from a different fingerprint MUST re-lease.
 `binding.lease` then refuses (`revoked` or `binding_missing`), and the node
 MUST drop the leases it holds rather than keeping them until `expires_at`. A
 transport failure is not a refusal: leases survive it and expire normally.
+
+A node that has dropped a workspace's leases MUST keep the placeholders it was
+holding, together with the default `ref:<id>` form of every binding the
+workspace declares. A request still carrying one is refused with
+`unauthorized` + `revoked` before any upstream byte, rather than travelling to
+the provider as an ordinary string that earns the provider's own 401 and hands
+an internal identifier to a third party.
 
 **Broker TTL expiry is not provider-side revocation.** Revoking a binding
 stops Remount substituting the credential. The credential itself remains valid

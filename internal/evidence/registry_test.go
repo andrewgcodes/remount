@@ -30,13 +30,22 @@ func TestRegistryCoversEveryHandoffAndPlanBScenario(t *testing.T) {
 			t.Errorf("%s from the Plan B phase tables is missing", id)
 		}
 	}
-	for _, id := range []string{"E26", "B33", "B34"} {
+	for _, id := range []string{"E26", "B33", "B34", "B35"} {
 		if _, ok := have[id]; !ok {
 			t.Errorf("%s from the 2026-09-06 gap brief is missing", id)
 		}
 	}
-	if len(have) != 60 {
-		t.Fatalf("registry holds %d rows, want E1-E26 plus B1-B34", len(have))
+	// The rows above are mandated by the handoff and the Plan B tables and must
+	// never disappear. Rows a later gap brief adds are additive, so the count is
+	// a floor rather than an equality; what keeps a new row honest is that it
+	// still has to name the source its recorded outcome comes from.
+	if len(have) < 57 {
+		t.Fatalf("registry holds %d rows, want at least E1-E25 plus B1-B32", len(have))
+	}
+	for _, s := range Scenarios() {
+		if s.Recorded != "" && s.Source == "" {
+			t.Errorf("%s records an outcome without naming its source", s.ID)
+		}
 	}
 }
 
@@ -89,6 +98,7 @@ var wiredScenarios = map[string]string{
 	"B10": "provider stall proves control authority is not held across a provider call",
 	"B33": "a freshly booted standalone judged black-box against the manifest and a named runtime profile",
 	"E26": "a real gVisor node loses a host prerequisite out of band and stops receiving profile-constrained work",
+	"B35": "the three brokered-credential examples against a loopback fake provider, with no network and no key",
 }
 
 func TestOnlyDeliberatelyWiredScenariosAreWired(t *testing.T) {

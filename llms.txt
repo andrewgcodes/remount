@@ -32,7 +32,7 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/an
 - [Retrieve modified files](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#retrieve-modified-files): Agent changes live in the workspace, not automatically in the original host checkout.
 - [Use workspace primitives directly](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#use-workspace-primitives-directly): Start a manual local deployment:
 - [Run browser and virtual desktop workloads](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#run-browser-and-virtual-desktop-workloads)
-- [Broker provider credentials](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#broker-provider-credentials): Provider keys belong in the server or node environment, never in a workspace or committed bindings file.
+- [Broker provider credentials](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#broker-provider-credentials): Provider keys belong in the control plane, never in a workspace.
 - [Deploy the Modal reference](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#deploy-the-modal-reference): `deploy/modal_app.py` is a reference deployment of one control plane and one process-backend node in one Modal container.
 - [Choose a runtime profile](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#choose-a-runtime-profile): A runtime profile is what a **machine** claims, as distinct from `security.profile`, which is what one **workspace** requires.
 - [Provider-backed nodes are not credential checks](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#provider-backed-nodes-are-not-credential-checks): Fly, E2B, Modal, ix.dev, and SSH pool drivers create whole Remount nodes.
@@ -84,6 +84,7 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/an
 
 - [design.md](https://github.com/andrewgcodes/remount/blob/main/docs/design.md): why each piece is shaped the way it is, and the failure model.
 - [operations.md](https://github.com/andrewgcodes/remount/blob/main/docs/operations.md): tokens, TLS, backends, leases, backups.
+- [credentials.md](https://github.com/andrewgcodes/remount/blob/main/docs/credentials.md): bindings, substitution locations, rotation, revocation, session principals, refusals and audit.
 - [current-status.md](https://github.com/andrewgcodes/remount/blob/main/docs/engineering/current-status.md): implementation boundaries and dated verification evidence.
 - [console.md](https://github.com/andrewgcodes/remount/blob/main/docs/console.md): the embedded operator console and its real-server tests.
 - [ADRs](https://github.com/andrewgcodes/remount/blob/main/docs/adr): one decision per file, never edited after the fact.

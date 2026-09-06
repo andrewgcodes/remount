@@ -15,6 +15,7 @@ import httpx
 from websockets.asyncio.client import connect as websocket_connect
 
 from .errors import ProtocolError, raise_for
+from .credentials import CredentialOperations
 from .types import (
     FSApplyTarRes,
     FSEntry,
@@ -243,7 +244,7 @@ class Session:
             self.last_input_seq = sequence
 
 
-class Client:
+class Client(CredentialOperations):
     """A reconnecting Remount protocol client."""
 
     def __init__(
@@ -1067,4 +1068,4 @@ class Client:
         message = str(detail.get("message", f"HTTP {response.status_code}"))
         if self.token:
             message = message.replace(self.token, "[redacted]")
-        raise ProtocolError(str(detail.get("code", "internal")), message)
+        raise ProtocolError(str(detail.get("code", "internal")), message, 0, str(detail.get("reason", "")))
