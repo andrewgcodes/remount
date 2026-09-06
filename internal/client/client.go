@@ -478,6 +478,95 @@ func (c *Client) WakeWorkspace(ctx context.Context, id string, options ...Operat
 	return &ws, err
 }
 
+// LeaseWorkspace takes a durable hold that keeps a claimed workspace awake
+// until a control-plane deadline. Unlike a timer in the caller's process, the
+// deadline survives this client dying, being redeployed, or losing the
+// network: when it passes with nobody renewing it, the control plane performs
+// req.OnExpiry ("sleep" by default, or "destroy") on its own.
+//
+// A workspace has at most one hold; a second call with a fresh idempotency key
+// replaces it.
+func (c *Client) LeaseWorkspace(ctx context.Context, req proto.WSLeaseReq, options ...OperationOption) (*proto.WorkspaceLease, error) {
+	idem, err := requestKey(req.IdempotencyKey, options)
+	if err != nil {
+		return nil, err
+	}
+	req.IdempotencyKey = idem
+	var lease proto.WorkspaceLease
+	return &lease, c.call(ctx, proto.PeerControl, proto.OpWSLease, req, &lease)
+}
+
+// RenewLease extends a hold by extendSec from now. It fails with
+// CodeConflict and Reason "lifecycle_deadline_expired" once the deadline has
+// fired, and "generation_mismatch" once the workspace has moved; both mean the
+// caller must take a fresh lease rather than assume it still holds one.
+func (c *Client) RenewLease(ctx context.Context, id, leaseID string, extendSec int64, options ...OperationOption) (*proto.WorkspaceLease, error) {
+	idem, _ := operationKey(options)
+	req := proto.WSLeaseRenewReq{ID: id, LeaseID: leaseID, ExtendSec: extendSec, IdempotencyKey: idem}
+	var lease proto.WorkspaceLease
+	return &lease, c.call(ctx, proto.PeerControl, proto.OpWSLeaseRenew, req, &lease)
+}
+
+// CancelLease removes a hold. The workspace stays claimed and falls back to
+// its idle policy, if it has one.
+func (c *Client) CancelLease(ctx context.Context, id, leaseID string, options ...OperationOption) (*proto.Workspace, error) {
+	idem, _ := operationKey(options)
+	req := proto.WSLeaseCancelReq{ID: id, LeaseID: leaseID, IdempotencyKey: idem}
+	var ws proto.Workspace
+	return &ws, c.call(ctx, proto.PeerControl, proto.OpWSLeaseCancel, req, &ws)
+}
+
+// GetLease returns a workspace's hold and the deadline the control plane will
+// act on next, which may come from the idle policy rather than a hold. It
+// reports CodeNotFound when the workspace has neither.
+func (c *Client) GetLease(ctx context.Context, id string) (*proto.WSLeaseRes, error) {
+	var res proto.WSLeaseRes
+	return &res, c.call(ctx, proto.PeerControl, proto.OpWSLeaseGet, proto.WSLeaseGetReq{ID: id}, &res)
+}
+
+// SetIdlePolicy installs the durable no-work cleanup rule for a workspace.
+// Both durations zero removes it. The clock only runs while the workspace is
+// marked idle.
+func (c *Client) SetIdlePolicy(ctx context.Context, id string, sleepAfterSec, destroyAfterSec int64, options ...OperationOption) (*proto.Workspace, error) {
+	idem, _ := operationKey(options)
+	req := proto.WSIdlePolicyReq{
+		ID: id, SleepAfterSec: sleepAfterSec, DestroyAfterSec: destroyAfterSec, IdempotencyKey: idem,
+	}
+	var ws proto.Workspace
+	return &ws, c.call(ctx, proto.PeerControl, proto.OpWSIdlePolicy, req, &ws)
+}
+
+// MarkIdle starts the idle clock. Session traffic does not do this on its own:
+// only the caller knows that a turn settled rather than merely paused.
+func (c *Client) MarkIdle(ctx context.Context, id, reason string, options ...OperationOption) (*proto.Workspace, error) {
+	return c.markIdle(ctx, id, true, reason, options...)
+}
+
+// MarkActive stops the idle clock and clears any pending idle deadline.
+func (c *Client) MarkActive(ctx context.Context, id, reason string, options ...OperationOption) (*proto.Workspace, error) {
+	return c.markIdle(ctx, id, false, reason, options...)
+}
+
+func (c *Client) markIdle(ctx context.Context, id string, idle bool, reason string, options ...OperationOption) (*proto.Workspace, error) {
+	idem, _ := operationKey(options)
+	req := proto.WSIdleMarkReq{ID: id, Idle: idle, Reason: reason, IdempotencyKey: idem}
+	var ws proto.Workspace
+	return &ws, c.call(ctx, proto.PeerControl, proto.OpWSIdleMark, req, &ws)
+}
+
+// requestKey reconciles an idempotency key carried on a request body with one
+// supplied as an option, the way SleepWorkspace does.
+func requestKey(onRequest string, options []OperationOption) (string, error) {
+	idem, configured := operationKey(options)
+	if configured && onRequest != "" && onRequest != idem {
+		return "", proto.Err(proto.CodeBadRequest, "conflicting idempotency keys")
+	}
+	if onRequest == "" || configured {
+		return idem, nil
+	}
+	return onRequest, nil
+}
+
 // ListNodes lists nodes.
 func (c *Client) ListNodes(ctx context.Context) ([]proto.NodeStatus, error) {
 	var res proto.NodeListRes

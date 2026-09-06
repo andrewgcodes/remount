@@ -239,6 +239,14 @@ type Options struct {
 	// MaxBasesPerTenant bounds pinned base images, each of which holds an
 	// artifact out of garbage collection. Zero selects 256.
 	MaxBasesPerTenant int
+	// MaxLeaseSec bounds one durable workspace hold (ADR 0090), renewals
+	// included, and every idle-policy duration. It is not LeaseSec above:
+	// that is the node's claim renewal, this is the longest a client may pin
+	// a workspace awake. Zero selects 24 hours.
+	MaxLeaseSec int64
+	// MaxHeldWorkspacesPerTenant bounds how many workspaces one tenant may
+	// hold awake with a live lease at once. Zero selects 256.
+	MaxHeldWorkspacesPerTenant int
 	// MaxSessionLogsPerTenant bounds retained durable replay records. The
 	// segment count inside each record is separately format-bounded.
 	MaxSessionLogsPerTenant int
@@ -362,6 +370,11 @@ type Control struct {
 	fleetWake             chan struct{}
 	timerReservations     int
 	timerReservationsByWS map[string]int
+	// lifecycleWork tracks in-flight and backed-off executions of a fired
+	// lifecycle deadline (ADR 0090). It is a scheduling hint only: the
+	// durable authority is Workspace.LifecycleDeadline, so a restart
+	// re-derives the work rather than trusting anything here.
+	lifecycleWork map[string]*lifecycleState
 
 	requestMu           sync.Mutex
 	requestSlots        chan struct{}
@@ -512,6 +525,15 @@ func New(opts Options) (*Control, error) {
 	if opts.MaxBasesPerTenant <= 0 {
 		opts.MaxBasesPerTenant = 256
 	}
+	if opts.MaxLeaseSec < 0 || opts.MaxHeldWorkspacesPerTenant < 0 {
+		return nil, errors.New("control: lifecycle lease limits must not be negative")
+	}
+	if opts.MaxLeaseSec == 0 {
+		opts.MaxLeaseSec = defaultMaxLeaseSec
+	}
+	if opts.MaxHeldWorkspacesPerTenant == 0 {
+		opts.MaxHeldWorkspacesPerTenant = defaultMaxHeldWorkspacesPerTenant
+	}
 	if opts.MaxSessionLogsPerTenant <= 0 {
 		opts.MaxSessionLogsPerTenant = defaultMaxSessionLogsPerTenant
 	}
@@ -576,6 +598,7 @@ func New(opts Options) (*Control, error) {
 		dirtyApprovals:        map[string]*proto.Approval{},
 		transcriptWaiters:     map[string]chan struct{}{},
 		agentRetry:            map[string]time.Time{},
+		lifecycleWork:         map[string]*lifecycleState{},
 		agentDelivered:        map[string]time.Time{},
 		agentBusy:             map[string]struct{}{},
 		agentKick:             make(chan struct{}, 1),
@@ -2245,6 +2268,60 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return c.wsWake(ctx, c.principalOf(f.From), req.ID, "", req.IdempotencyKey)
+	case proto.OpWSLease:
+		req, err := decode[proto.WSLeaseReq](f)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := c.authorizeWorkspace(ctx, f.From, req.ID, ActionWrite); err != nil {
+			return nil, err
+		}
+		return c.wsLease(ctx, c.principalOf(f.From), req)
+	case proto.OpWSLeaseRenew:
+		req, err := decode[proto.WSLeaseRenewReq](f)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := c.authorizeWorkspace(ctx, f.From, req.ID, ActionWrite); err != nil {
+			return nil, err
+		}
+		return c.wsLeaseRenew(ctx, c.principalOf(f.From), req)
+	case proto.OpWSLeaseCancel:
+		req, err := decode[proto.WSLeaseCancelReq](f)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := c.authorizeWorkspace(ctx, f.From, req.ID, ActionWrite); err != nil {
+			return nil, err
+		}
+		return c.wsLeaseCancel(ctx, c.principalOf(f.From), req)
+	case proto.OpWSLeaseGet:
+		req, err := decode[proto.WSLeaseGetReq](f)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := c.authorizeWorkspace(ctx, f.From, req.ID, ActionRead); err != nil {
+			return nil, err
+		}
+		return c.wsLeaseGet(req.ID)
+	case proto.OpWSIdlePolicy:
+		req, err := decode[proto.WSIdlePolicyReq](f)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := c.authorizeWorkspace(ctx, f.From, req.ID, ActionWrite); err != nil {
+			return nil, err
+		}
+		return c.wsIdlePolicy(ctx, c.principalOf(f.From), req)
+	case proto.OpWSIdleMark:
+		req, err := decode[proto.WSIdleMarkReq](f)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := c.authorizeWorkspace(ctx, f.From, req.ID, ActionWrite); err != nil {
+			return nil, err
+		}
+		return c.wsIdleMark(ctx, c.principalOf(f.From), req)
 	case proto.OpWSACL:
 		req, err := decode[proto.WSACLReq](f)
 		if err != nil {
@@ -3107,6 +3184,7 @@ func (c *Control) snapshotWS(id string) *proto.Workspace {
 	cp.Spec.Volumes = append([]proto.VolumeMount(nil), ws.Spec.Volumes...)
 	cp.Spec.RestoreObjects = append([]string(nil), ws.Spec.RestoreObjects...)
 	cp.LastSnapshotObjects = append([]string(nil), ws.LastSnapshotObjects...)
+	cp.Lease, cp.IdlePolicy, cp.LifecycleDeadline = ws.CloneLifecycle()
 	return &cp
 }
 
@@ -3127,7 +3205,9 @@ func (c *Control) wsListAuthorized(ctx context.Context, from string) (*proto.WSL
 	var candidates []proto.Workspace
 	for _, ws := range c.workspaces {
 		if ws.State != proto.WSDestroyed {
-			candidates = append(candidates, *ws)
+			candidate := *ws
+			candidate.Lease, candidate.IdlePolicy, candidate.LifecycleDeadline = ws.CloneLifecycle()
+			candidates = append(candidates, candidate)
 		}
 	}
 	c.mu.Unlock()
@@ -3770,10 +3850,27 @@ func (c *Control) wsDestroy(ctx context.Context, principal, id, idem string) err
 			copyTimer := *timer
 			copyTimer.Fired = true
 			copyTimer.FiredAt = c.now().UnixMilli()
+			copyTimer.Superseded = true
+			copyTimer.Reason = proto.LeaseEndDestroyed
 			timerUpdates = append(timerUpdates, &copyTimer)
 		}
 	}
+	// A destroyed workspace holds nothing awake. Ending the hold and clearing
+	// the pending deadline here, in the destroy's own transaction, is what
+	// stops the lifecycle timer above from ever acting (ADR 0090).
+	var endedLease *proto.WorkspaceLease
+	if destroyed.Lease.Live() {
+		ended := *destroyed.Lease
+		ended.EndedAt, ended.EndedReason = c.now().UnixMilli(), proto.LeaseEndDestroyed
+		destroyed.Lease, endedLease = &ended, &ended
+	}
+	destroyed.LifecycleDeadline = nil
 	events := []*proto.Event{c.wsEvent(&destroyed, proto.EvWSDestroyed, principal, node, nil)}
+	if endedLease != nil {
+		events = append(events, c.wsEvent(&destroyed, proto.EvWSLeaseHoldExpired, principal, node, map[string]any{
+			"lease": endedLease.ID, "reason": proto.LeaseEndDestroyed,
+		}))
+	}
 	if !wasHeld {
 		events = append(events, c.destroyedVolumeDetachEvents(&destroyed, ws.Spec.Volumes, principal, node, idem)...)
 	}
@@ -4067,12 +4164,27 @@ func (c *Control) wsMove(ctx context.Context, principal string, req *proto.WSMov
 	if next.Spec.RestoreFormat == proto.ArtifactFormatFirecrackerFullV1 {
 		processes = "restore_pending"
 	}
-	if err := c.persistWSAndMutation(&next, scope, req.IdempotencyKey, proto.OpWSMove, req, &next,
-		c.wsEvent(&next, proto.EvWSMoved, principal, "", map[string]any{"restore_from": snap, "processes": processes})); err != nil {
+	// A move re-places the workspace, so a hold taken against the old
+	// placement no longer describes anything. Retiring it here, in the move's
+	// own transaction, is what makes the old timer unable to fire against the
+	// new generation; the idle clock restarts wherever the workspace lands.
+	retired, endedLease := c.retireLifecycleLocked(&next, proto.LeaseEndMoved)
+	next.IdleSince = 0
+	moveEvents := []*proto.Event{
+		c.wsEvent(&next, proto.EvWSMoved, principal, "", map[string]any{"restore_from": snap, "processes": processes}),
+	}
+	if endedLease != nil {
+		moveEvents = append(moveEvents, c.wsEvent(&next, proto.EvWSLeaseHoldExpired, principal, "", map[string]any{
+			"lease": endedLease.ID, "reason": proto.LeaseEndMoved,
+		}))
+	}
+	if err := c.persistWorkspaceTimerAndMutation(&next, retired, scope, req.IdempotencyKey, proto.OpWSMove, req, &next,
+		moveEvents...); err != nil {
 		c.mu.Unlock()
 		return nil, err
 	}
 	*ws = next
+	c.publishLifecycleLocked(retired)
 	c.mu.Unlock()
 	metrics.WSMoved.Inc()
 	c.offerPending(ctx)
@@ -6196,7 +6308,10 @@ func (c *Control) Tick(ctx context.Context) {
 		}
 	}
 	for _, t := range c.timers {
-		if !t.Fired && t.At > 0 && t.At <= now {
+		// A lifecycle deadline is not a wake: firing it here would resume a
+		// workspace the deadline exists to put to sleep. expireLifecycle owns
+		// those rows (ADR 0090).
+		if !t.Fired && !t.Lifecycle() && t.At > 0 && t.At <= now {
 			fire = append(fire, t)
 		}
 	}
@@ -6206,6 +6321,8 @@ func (c *Control) Tick(ctx context.Context) {
 	for _, t := range fire {
 		c.fireTimer(ctx, t)
 	}
+	c.expireLifecycle(ctx, now)
+	c.publishLifecycleGauges()
 	c.offerPending(ctx)
 	c.reconcilePoolsAsync()
 	c.agentReconcileAsync(c.requestCtx)

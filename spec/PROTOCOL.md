@@ -372,6 +372,7 @@ operator-actionable `failed` or terminal `destroyed` state.
 | `ws.released` | node | `claiming/claimed→pending` | exact generation and node; it cannot override a control-owned transition |
 | move | control | `released/paused/pending→pending` | expected generation |
 | sleep/wake | control | `released/pending/paused→paused`; `paused→pending` | expected generation |
+| lifecycle deadline | control | the `sleep` or `destroy` rows above | the workspace row must still name the pending deadline |
 | destroy | control | `claimed/claiming→destroying→destroyed`; `pending/released/paused→destroyed` | expected generation; held states also require the node |
 | lease expiry | control | `claiming/claimed→pending` | exact generation and node, then generation increments |
 | fleet quarantine | control | `claiming/claimed/failed→quiescing`, then any non-destroyed state `→failed/destroyed` | target list freezes node and generation |
@@ -379,6 +380,11 @@ operator-actionable `failed` or terminal `destroyed` state.
 `destroyed` is absorbing. `failed` is durable and operator-actionable; ordinary
 claim, ready, move, sleep, wake, and destroy calls cannot silently revive it.
 Duplicate mutating operations are answered from the durable idempotency record.
+
+A lifecycle deadline adds no state to this table. It executes through the same
+`sleep` or `destroy` operations above, with the same generation and node rules,
+so nothing about an automatic expiry can reach a transition an explicit call
+could not.
 
 ### 5.2 Stable paths and task queues
 
@@ -445,6 +451,43 @@ volume row and event commit atomically. At the 128-version bound an unpinned
 old version may be pruned; if every old version is pinned the call fails with
 `resource_exhausted`.
 
+### 5.5 Durable holds and idle policy
+
+A client that starts a long-running job cannot own the deadline for it: its
+process may be redeployed, scaled down, or partitioned, and an in-process timer
+dies with it. `ws.lease` moves the deadline into the control plane as a durable
+row.
+
+`min_alive_until` is the earliest the idle policy may act; `max_alive_until` is
+the hard deadline. When it passes with nobody renewing, the control plane
+performs `on_expiry` — `sleep` releases with a filesystem checkpoint and
+publishes `paused`, `destroy` destroys the workspace — and records
+`ws.lifecycle.expired`. A hold is not a memory checkpoint: processes are ended,
+and only the filesystem survives.
+
+`ws.idle.policy` is the no-work rule and `ws.idle.mark` drives its clock.
+Activity is explicit: `ws.idle.mark{idle:false}`, `ws.lease` and
+`ws.lease.renew` reset it. Session traffic does not, because inferring activity
+from every session open would make it a durable control-plane write, and
+because only the caller can tell a settled turn from a pause.
+
+`Workspace.lifecycle_deadline` is the derived view of what happens next and
+when — the earlier of the hold's hard deadline and the idle policy's next
+action — so a client reads its position from `ws.get` without knowing timers
+exist. `idle_since` and `last_activity_at` are the clock behind it.
+
+The workspace row is the fence, not the generation. `ws.move`, `ws.destroy`
+and `ws.lease.cancel` each clear the pending deadline in their own
+transaction, so a timer the row no longer names is retired with
+`ws.lease.expired{reason}` instead of acting. A re-placement the client did not
+ask for — a lost node, an expired claim lease — keeps the deadline, because
+dropping it there would leak the workspace the hold exists to reclaim.
+
+Sessions ended by an expiry carry `exit.reason = "lifecycle_deadline_expired"`,
+so a replayed log says the control plane ended the work rather than leaving a
+reader to infer it. A node that predates this behavior still releases
+correctly but reports the ordinary release reason.
+
 ## 6. Control-plane operations
 
 Sent to `control`. Client operations are marked C, node operations N.
@@ -458,6 +501,12 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `ws.move` | C | `WSMoveReq{id, requires?, placement?, idem}` → `Workspace` |
 | `ws.sleep` | C | `WSSleepReq{id, after_sec\|at\|on, match?, idem}` → `Timer`; `match` is a bounded exact payload-field predicate used only with `on` |
 | `ws.wake` | C | `WSGetReq{id, idem}` → `Workspace` |
+| `ws.lease` | C | `WSLeaseReq{id, min_alive_sec?, max_alive_sec, on_expiry?, reason?, idem}` → `WorkspaceLease`; a durable hold on a `claimed` workspace. `on_expiry` is `sleep` (default) or `destroy`; `max_alive_sec` may not exceed the deployment's maximum hold. One hold per workspace: a new key replaces the previous one. Refused `conflict`/`workspace_not_ready` unless the workspace is `claimed`, and `resource_exhausted`/`quota_exceeded` at the tenant held-workspace limit |
+| `ws.lease.renew` | C | `WSLeaseRenewReq{id, lease, extend_sec, min_alive_sec?, idem}` → `WorkspaceLease`; extends both bounds from now. Refused `conflict`/`lifecycle_deadline_expired` once the deadline fired or the hold was cancelled, and `conflict`/`generation_mismatch` once the workspace was moved or re-placed |
+| `ws.lease.cancel` | C | `WSLeaseCancelReq{id, lease, idem}` → `Workspace`; removes the hold. The workspace stays `claimed` under its idle policy, if any |
+| `ws.lease.get` | C | `WSLeaseGetReq{id}` → `WSLeaseRes{lease?, deadline?}`; `not_found` when the workspace has neither a hold nor a deadline |
+| `ws.idle.policy` | C | `WSIdlePolicyReq{id, sleep_after_sec?, destroy_after_sec?, idem}` → `Workspace`; both zero removes the policy. Durations may not exceed the deployment's maximum hold |
+| `ws.idle.mark` | C | `WSIdleMarkReq{id, idle, reason?, idem}` → `Workspace`; `idle=true` starts the idle clock, `idle=false` is the activity signal and clears any pending idle deadline |
 | `ws.acl` | C | `WSACLReq{id, acl{readers, writers}, idem}` → `Workspace`; owner or admin only; replaces the ACL and advances `authz_revision` (§4.1) |
 | `base.create` | C | `BaseCreateReq{name, artifact, workspace?, idem}` → `Base`; pins an uploaded artifact under a tenant-unique name (§10.1) |
 | `base.list` | C | → `BaseListRes{bases}`; the caller's tenant only, unless admin |
@@ -1334,7 +1383,26 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
 `identity.roles_changed`, `identity.principal_revoked`,
 `session.log.committed`, `session.log.deleted`, `session.log.unavailable`,
 `audit.exported`, `audit.export_denied`, `retention.enforced`,
-`retention.violation`, `residency.denied` and `export.cursor.advanced`.
+`retention.violation`, `residency.denied`, `export.cursor.advanced`,
+`ws.lease.granted`, `ws.lease.renewed`, `ws.lease.cancelled`,
+`ws.lease.expired`, `ws.idle.policy_set`, `ws.idle.marked`,
+`ws.lifecycle.expired`, `ws.lifecycle.expiry_failed` and `ws.hold.max_reached`.
+
+Durable-hold events are on the workspace stream. `ws.lease.granted` carries
+`lease`, `min_alive_until`, `max_alive_until`, `on_expiry`, `reason` and `gen`;
+`ws.lease.renewed` carries `lease`, the new bounds and `renewals`;
+`ws.lease.cancelled` carries `lease`; `ws.lease.expired` carries `lease` and a
+`reason` of `deadline`, `moved`, `destroyed` or `superseded`.
+`ws.idle.policy_set` carries the two durations and `ws.idle.marked` carries
+`idle`, `reason` and `idle_since`. `ws.lifecycle.expired` carries `action`,
+`source` (`lease` or `idle`), `at` and `timer`, and commits with the durable
+mark that makes the expiry exactly once across a restart;
+`ws.lifecycle.expiry_failed` carries `action`, `source`, `attempts` and
+`error`, and means the workspace is degraded and operator-actionable rather
+than quietly still running. `ws.hold.max_reached` accompanies a
+`resource_exhausted`/`quota_exceeded` refusal with `scope`, `used` and `limit`.
+Note that `ws.lease_expired` is a different event: it is the node's *claim*
+lease expiring and returning a workspace to `pending`.
 
 Principal role events are tenant-scoped and carry the actor, principal,
 revision and complete non-secret role set. Access, refresh, provider, device,
