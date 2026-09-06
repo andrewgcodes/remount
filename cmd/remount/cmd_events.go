@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"strings"
 	"time"
 
+	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/proto"
 )
 
@@ -19,6 +21,19 @@ type eventFilter struct {
 
 func (f eventFilter) match(e proto.Event) bool {
 	return f.Session == "" || e.Session == f.Session
+}
+
+// splitEventTypes turns a comma-separated --type value into prefixes,
+// dropping empty entries so a trailing comma is not a filter that matches
+// everything.
+func splitEventTypes(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 // eventJSON is the --json shape of one event: authoritative metadata plus the
@@ -61,12 +76,27 @@ func cmdEvents(ctx context.Context, args []string) error {
 	follow := fs.Bool("follow", false, "stream new events")
 	ws := fs.String("ws", "", "filter by workspace")
 	session := fs.String("session", "", "filter by session id (s.opened, s.exited, …)")
+	binding := fs.String("binding", "", "filter by credential binding id (server-side)")
+	host := fs.String("host", "", "filter by egress destination host (server-side)")
+	types := fs.String("type", "", "filter by comma-separated event-type prefixes, e.g. egress,cred (server-side)")
 	from := fs.Uint64("from", 1, "first seq")
 	parse(fs, args)
-	if err := arity(fs, 0, 0, "events [--follow] [--ws WS] [--session SID] [--from N]"); err != nil {
+	if err := arity(fs, 0, 0, "events [--follow] [--ws WS] [--session SID] [--binding B] [--host H] [--type PREFIX,…] [--from N]"); err != nil {
 		return err
 	}
 	filter := eventFilter{Session: *session}
+	// Binding, host and type narrow the stream in the control plane; session
+	// stays here because it is a per-event field the server does not index.
+	var serverFilters []client.EventFilterOption
+	if *binding != "" {
+		serverFilters = append(serverFilters, client.WithEventBinding(*binding))
+	}
+	if *host != "" {
+		serverFilters = append(serverFilters, client.WithEventHost(*host))
+	}
+	if prefixes := splitEventTypes(*types); len(prefixes) > 0 {
+		serverFilters = append(serverFilters, client.WithEventTypes(prefixes...))
+	}
 	cl := c.client()
 	defer cl.Close()
 	print := func(e proto.Event) {
@@ -83,7 +113,7 @@ func cmdEvents(ctx context.Context, args []string) error {
 		fmt.Printf("%6d %s %-18s %-30s %-14s %s\n", e.Seq, time.UnixMilli(e.At).Format("15:04:05.000"), e.Type, e.Stream, e.Principal, string(pj))
 	}
 	if !*follow {
-		evs, err := cl.ReadEvents(ctx, *from, *ws)
+		evs, err := cl.ReadEvents(ctx, *from, *ws, serverFilters...)
 		if err != nil {
 			return err
 		}
@@ -92,7 +122,7 @@ func cmdEvents(ctx context.Context, args []string) error {
 		}
 		return nil
 	}
-	ch, err := cl.TailEvents(ctx, *from, *ws)
+	ch, err := cl.TailEvents(ctx, *from, *ws, serverFilters...)
 	if err != nil {
 		return err
 	}

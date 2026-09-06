@@ -2,6 +2,8 @@ package control
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -139,5 +141,123 @@ func TestBudgetReservationExpiryIsDurableAndObservable(t *testing.T) {
 	restored, err := again.usageGet(context.Background(), localSubject(), &proto.UsageReq{})
 	if err != nil || len(restored.Usage) != 1 || restored.Usage[0].IncompleteRequests != 1 {
 		t.Fatalf("restored expiry = %+v, %v", restored, err)
+	}
+}
+
+// TestConcurrentBudgetReservationsCannotOverrun is the concurrency proof the
+// hard-budget invariant needs. A budget exercised only sequentially cannot
+// show that admission and accounting are one decision: the failure mode is
+// two callers reading the same remaining allowance and both being admitted,
+// and it appears only when they race.
+func TestConcurrentBudgetReservationsCannotOverrun(t *testing.T) {
+	const limit = 8
+	const callers = 48
+	f := newControlFixture(t, "", nil)
+	ws := claimedApprovalWorkspace(t, f)
+	created, err := f.c.budgetCreate(context.Background(), localSubject(), &proto.BudgetCreateReq{
+		Budget: proto.Budget{
+			ID: "hard-requests", AttachTo: string(budget.AttachTenant), AttachID: "tenant-a",
+			Window: string(budget.WindowDay), MaxRequests: limit,
+		},
+		IdempotencyKey: "create-hard-budget",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type outcome struct {
+		reservation string
+		denied      bool
+		err         error
+	}
+	results := make([]outcome, callers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			reserved, reserveErr := f.c.budgetReserve(context.Background(), "n_approve", &proto.BudgetReserveReq{
+				Key: fmt.Sprintf("concurrent-%02d", i), WS: ws.ID, Gen: ws.Generation,
+				Principal: "alice", Provider: "unknown",
+			})
+			switch {
+			case reserveErr != nil:
+				results[i] = outcome{err: reserveErr}
+			case reserved.Denied:
+				results[i] = outcome{denied: true}
+			case !reserved.Tracked || reserved.ID == "":
+				results[i] = outcome{err: fmt.Errorf("admitted reservation is untracked: %+v", reserved)}
+			default:
+				results[i] = outcome{reservation: reserved.ID}
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var admitted []string
+	denied := 0
+	for i, result := range results {
+		switch {
+		case result.err != nil:
+			t.Fatalf("caller %d: %v", i, result.err)
+		case result.denied:
+			denied++
+		default:
+			admitted = append(admitted, result.reservation)
+		}
+	}
+	if len(admitted) > limit {
+		t.Fatalf("%d reservations were admitted against a limit of %d", len(admitted), limit)
+	}
+	if len(admitted) != limit {
+		t.Fatalf("%d reservations were admitted; the limit of %d was unreachable under contention", len(admitted), limit)
+	}
+	if denied != callers-limit {
+		t.Fatalf("denied=%d admitted=%d, want the remaining %d denied", denied, len(admitted), callers-limit)
+	}
+	unique := map[string]bool{}
+	for _, id := range admitted {
+		if unique[id] {
+			t.Fatalf("reservation id %s was handed out twice", id)
+		}
+		unique[id] = true
+	}
+	if got := len(eventsOfType(t, f.log, proto.EvBudgetReserved)); got != limit {
+		t.Fatalf("budget.reserved events = %d, want %d", got, limit)
+	}
+	if got := len(eventsOfType(t, f.log, proto.EvEgressDenied)); got != denied {
+		t.Fatalf("egress.denied events = %d, want %d", got, denied)
+	}
+
+	// Settlement leaves the ledger consistent: every admitted reservation is
+	// charged exactly once and nothing is left active.
+	for _, id := range admitted {
+		if _, settleErr := f.c.budgetSettle(context.Background(), "n_approve", &proto.BudgetSettleReq{
+			Reservation: id, Mode: string(budget.SettlementRequestOnly),
+		}); settleErr != nil {
+			t.Fatalf("settle %s: %v", id, settleErr)
+		}
+	}
+	usage, err := f.c.usageGet(context.Background(), localSubject(), &proto.UsageReq{Window: string(budget.WindowDay)})
+	if err != nil || len(usage.Usage) != 1 {
+		t.Fatalf("usage = %+v, %v", usage, err)
+	}
+	if usage.Usage[0].Requests != limit || usage.Usage[0].ActiveReservations != 0 || usage.Usage[0].IncompleteRequests != 0 {
+		t.Fatalf("settled usage = %+v, want %d requests and no active or incomplete reservations", usage.Usage[0], limit)
+	}
+	if usage.Usage[0].BudgetID != created.ID {
+		t.Fatalf("usage names budget %q, want %q", usage.Usage[0].BudgetID, created.ID)
+	}
+
+	// The budget is spent, so a fresh request is refused rather than admitted
+	// against an allowance that settlement only appeared to release.
+	after, err := f.c.budgetReserve(context.Background(), "n_approve", &proto.BudgetReserveReq{
+		Key: "after-settlement", WS: ws.ID, Gen: ws.Generation, Principal: "alice", Provider: "unknown",
+	})
+	if err != nil || !after.Denied {
+		t.Fatalf("post-settlement reserve = %+v, %v", after, err)
 	}
 }

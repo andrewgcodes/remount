@@ -758,12 +758,44 @@ func (c *Client) PostEvent(ctx context.Context, e proto.Event) error {
 	return c.call(ctx, proto.PeerControl, proto.OpEventsPost, proto.EventPost{Events: []proto.Event{e}}, nil)
 }
 
+// EventFilterOption narrows a read or tail of the canonical log. Filters are
+// applied by the control plane, so a caller asking "what did this binding do
+// against this host?" receives that answer rather than a history to sift.
+type EventFilterOption func(*proto.EventsTailReq)
+
+// WithEventBinding returns only events the named binding produced.
+func WithEventBinding(binding string) EventFilterOption {
+	return func(req *proto.EventsTailReq) { req.Binding = binding }
+}
+
+// WithEventHost returns only events recorded against the named destination.
+// A bare host also matches the canonical host:port an audit records.
+func WithEventHost(host string) EventFilterOption {
+	return func(req *proto.EventsTailReq) { req.Host = host }
+}
+
+// WithEventTypes returns only events whose type begins with one of these
+// prefixes, so "egress" selects every egress.* type.
+func WithEventTypes(prefixes ...string) EventFilterOption {
+	return func(req *proto.EventsTailReq) {
+		req.Types = append(req.Types, prefixes...)
+	}
+}
+
+func applyEventFilters(req *proto.EventsTailReq, filters []EventFilterOption) {
+	for _, filter := range filters {
+		if filter != nil {
+			filter(req)
+		}
+	}
+}
+
 // ReadEvents returns historical events.
-func (c *Client) ReadEvents(ctx context.Context, from uint64, ws string) ([]proto.Event, error) {
+func (c *Client) ReadEvents(ctx context.Context, from uint64, ws string, filters ...EventFilterOption) ([]proto.Event, error) {
 	cursor := from
 	var all []proto.Event
 	for {
-		events, err := c.ReadEventPage(ctx, cursor, ws)
+		events, err := c.ReadEventPage(ctx, cursor, ws, filters...)
 		if err != nil {
 			return nil, err
 		}
@@ -784,21 +816,26 @@ func (c *Client) ReadEvents(ctx context.Context, from uint64, ws string) ([]prot
 
 // ReadEventPage returns at most one control-plane page of historical events.
 // Exporters use it to avoid retaining the complete audit history in memory.
-func (c *Client) ReadEventPage(ctx context.Context, from uint64, ws string) ([]proto.Event, error) {
+func (c *Client) ReadEventPage(ctx context.Context, from uint64, ws string, filters ...EventFilterOption) ([]proto.Event, error) {
 	var response proto.EventPost
-	err := c.call(ctx, proto.PeerControl, proto.OpEventsTail, proto.EventsTailReq{From: from, WS: ws}, &response)
+	req := proto.EventsTailReq{From: from, WS: ws}
+	applyEventFilters(&req, filters)
+	err := c.call(ctx, proto.PeerControl, proto.OpEventsTail, req, &response)
 	return response.Events, err
 }
 
 // TailEvents streams events on the returned channel until ctx ends.
-func (c *Client) TailEvents(ctx context.Context, from uint64, ws string) (<-chan proto.Event, error) {
+func (c *Client) TailEvents(ctx context.Context, from uint64, ws string, filters ...EventFilterOption) (<-chan proto.Event, error) {
 	sub := newEventSubscription(c, ids.New("sub"), from, ws)
+	// The subscription keeps its filter so a reattach after a reconnect asks
+	// the same question rather than reverting to the whole log.
+	applyEventFilters(&sub.filter, filters)
 	c.mu.Lock()
 	c.eventSubs[sub.id] = sub
 	c.mu.Unlock()
-	if err := c.call(ctx, proto.PeerControl, proto.OpEventsTail, proto.EventsTailReq{
-		From: from, WS: ws, Follow: true, Subscription: sub.id,
-	}, nil); err != nil {
+	req := proto.EventsTailReq{From: from, WS: ws, Follow: true, Subscription: sub.id}
+	applyEventFilters(&req, filters)
+	if err := c.call(ctx, proto.PeerControl, proto.OpEventsTail, req, nil); err != nil {
 		c.removeEventSubscription(sub)
 		sub.close()
 		return nil, err
@@ -811,9 +848,13 @@ func (c *Client) TailEvents(ctx context.Context, from uint64, ws string) (<-chan
 }
 
 type eventSubscription struct {
-	c          *Client
-	id         string
-	ws         string
+	c  *Client
+	id string
+	ws string
+	// filter carries the narrowing this subscription asked for so a reattach
+	// after a reconnect asks the same question. Only its filter fields are
+	// meaningful; cursor and subscription id are supplied at each call.
+	filter     proto.EventsTailReq
 	mu         sync.Mutex
 	next       uint64
 	in         chan proto.Event
@@ -913,9 +954,9 @@ func (s *eventSubscription) reattach(generation uint64) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	err := s.c.call(ctx, proto.PeerControl, proto.OpEventsTail, proto.EventsTailReq{
-		From: s.cursor(), WS: s.ws, Follow: true, Subscription: s.id,
-	}, nil)
+	req := s.filter
+	req.From, req.WS, req.Follow, req.Subscription = s.cursor(), s.ws, true, s.id
+	err := s.c.call(ctx, proto.PeerControl, proto.OpEventsTail, req, nil)
 	if err != nil && s.c.generation() == generation {
 		s.close()
 	}

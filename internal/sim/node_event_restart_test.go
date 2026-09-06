@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/node"
 	"remount.dev/remount/internal/proto"
 )
@@ -17,7 +18,7 @@ import (
 // waitForNodeEvent tails control's canonical log for a node-origin event of
 // one type attributed to one session, and fails if none arrives in time.
 func waitForNodeEvent(t *testing.T, c interface {
-	TailEvents(context.Context, uint64, string) (<-chan proto.Event, error)
+	TailEvents(context.Context, uint64, string, ...client.EventFilterOption) (<-chan proto.Event, error)
 }, ws, typ, session string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -44,7 +45,7 @@ func waitForNodeEvent(t *testing.T, c interface {
 // describeEvents lists what control holds for ws, so a failure says what did
 // arrive rather than only what did not.
 func describeEvents(c interface {
-	TailEvents(context.Context, uint64, string) (<-chan proto.Event, error)
+	TailEvents(context.Context, uint64, string, ...client.EventFilterOption) (<-chan proto.Event, error)
 }, ws string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
