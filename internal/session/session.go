@@ -337,6 +337,21 @@ func (s *Session) Terminate(reason string) {
 	s.Kill()
 }
 
+// Stop records reason and asks the process to exit, without killing it. It is
+// the first half of a graceful termination: the caller is responsible for
+// escalating to Terminate when the grace period passes, because a process that
+// ignores the request must never turn a bounded shutdown into an unbounded
+// wait. On Windows a job object has no distinct polite signal, so this
+// terminates immediately there; the recorded reason is the same either way.
+func (s *Session) Stop(reason string) {
+	s.mu.Lock()
+	if s.exit == nil && s.closeReason == "" {
+		s.closeReason = reason
+	}
+	s.mu.Unlock()
+	_ = s.Signal("TERM")
+}
+
 func (s *Session) finish(info proto.ExitInfo) {
 	s.mu.Lock()
 	if s.exit != nil {
@@ -631,12 +646,52 @@ func (m *Manager) KillWorkspace(ws string) error {
 // TerminateWorkspace joins every producer but retains completed logs for late
 // attach and cross-node replay until the configured retention deadline.
 func (m *Manager) TerminateWorkspace(ws, reason string) error {
-	var failed []string
-	for _, s := range m.List(ws) {
+	return m.TerminateWorkspaceGraceful(ws, reason, 0)
+}
+
+// TerminateWorkspaceGraceful stops every session of a workspace, giving each
+// process up to grace to exit on its own before it is killed, and joins all of
+// them before returning. A zero grace is the immediate kill TerminateWorkspace
+// has always performed.
+//
+// Two properties matter more than the grace itself. The reason reaches the
+// exit chunk, so a replayed log says why the work ended rather than leaving a
+// client to infer it from a missing process. And every session is joined
+// before the caller may report the workspace quiesced: cancellation is not
+// completion, and a snapshot taken while a producer is still writing is not
+// the tree anybody asked for.
+func (m *Manager) TerminateWorkspaceGraceful(ws, reason string, grace time.Duration) error {
+	sessions := m.List(ws)
+	for _, s := range sessions {
 		<-s.startDone
-		if !s.Exited() {
+		if s.Exited() {
+			continue
+		}
+		if grace > 0 {
+			s.Stop(reason)
+		} else {
 			s.Terminate(reason)
 		}
+	}
+	if grace > 0 {
+		deadline := time.Now().Add(grace)
+		for _, s := range sessions {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), remaining)
+			_, _ = s.Wait(ctx)
+			cancel()
+		}
+		for _, s := range sessions {
+			if !s.Exited() {
+				s.Terminate(reason)
+			}
+		}
+	}
+	var failed []string
+	for _, s := range sessions {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_, err := s.Wait(ctx)
 		if err == nil && s.observed != nil {

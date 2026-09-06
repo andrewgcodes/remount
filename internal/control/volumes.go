@@ -626,5 +626,6 @@ func snapshotWorkspace(ws *proto.Workspace) *proto.Workspace {
 	cp.Spec.ACL.Readers = append([]string(nil), ws.Spec.ACL.Readers...)
 	cp.Spec.ACL.Writers = append([]string(nil), ws.Spec.ACL.Writers...)
 	cp.Spec.Labels = cloneMap(ws.Spec.Labels)
+	cp.Lease, cp.IdlePolicy, cp.LifecycleDeadline = ws.CloneLifecycle()
 	return &cp
 }

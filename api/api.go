@@ -88,6 +88,11 @@ type (
 	Event                = proto.Event
 	Timer                = proto.Timer
 	SleepRequest         = proto.WSSleepReq
+	WorkspaceLease       = proto.WorkspaceLease
+	IdlePolicy           = proto.IdlePolicy
+	LifecycleDeadline    = proto.LifecycleDeadline
+	LeaseRequest         = proto.WSLeaseReq
+	LeaseStatus          = proto.WSLeaseRes
 	SessionStatus        = proto.SessionStatus
 	SessionInfo          = proto.SessionInfo
 	ExitInfo             = proto.ExitInfo
@@ -138,6 +143,12 @@ const (
 	WorkspaceDestroying    = proto.WSDestroying
 	WorkspaceDestroyed     = proto.WSDestroyed
 	WorkspaceFailed        = proto.WSFailed
+
+	// Durable workspace lifecycle (ADR 0090).
+	LeaseExpirySleep     = proto.LeaseExpirySleep
+	LeaseExpiryDestroy   = proto.LeaseExpiryDestroy
+	LifecycleSourceLease = proto.LifecycleSourceLease
+	LifecycleSourceIdle  = proto.LifecycleSourceIdle
 
 	SecurityLocal       = proto.SecurityLocal
 	SecurityIsolated    = proto.SecurityIsolated

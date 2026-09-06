@@ -136,6 +136,13 @@ type Options struct {
 	// budget. Zero selects 4 concurrent snapshots and a one-second interval.
 	MaxConcurrentSnapshots int
 	SnapshotMinInterval    time.Duration
+	// LifecycleGrace is how long a session gets to exit on its own when the
+	// control plane releases a workspace because a durable lifecycle deadline
+	// expired (ADR 0090). An ordinary release still kills immediately: the
+	// grace exists because a deadline expiry is a scheduled, predictable end
+	// to work that may have a flush to do. Zero selects five seconds;
+	// negative disables the grace.
+	LifecycleGrace time.Duration
 	// Volumes overrides the durable local read-only mount backend. Nil creates
 	// the Linux bind-mount implementation rooted under DataDir.
 	Volumes volume.Backend
@@ -423,6 +430,9 @@ func New(opts Options) (*Node, error) {
 	if opts.SnapshotMinInterval == 0 {
 		opts.SnapshotMinInterval = time.Second
 	}
+	if opts.LifecycleGrace == 0 {
+		opts.LifecycleGrace = defaultLifecycleGrace
+	}
 	for _, d := range []string{"", "ws", "spill", "artifacts", "volumes", "volumes/sources"} {
 		if err := os.MkdirAll(filepath.Join(opts.DataDir, d), 0o700); err != nil {
 			return nil, err
@@ -597,7 +607,10 @@ func New(opts Options) (*Node, error) {
 		},
 		OnExit: func(s *session.Session, info proto.ExitInfo) {
 			n.dropSessionCapabilities(s.ID)
-			n.emitSession(proto.EvSExited, s.WS, s.Principal, s.ID, map[string]any{"s": s.ID, "code": info.Code, "signal": info.Signal})
+			// Reason is why the node ended the session when the process did
+			// not end on its own. Without it in the canonical log, a policy
+			// decision and a crash are the same record (ADR 0090).
+			n.emitSession(proto.EvSExited, s.WS, s.Principal, s.ID, map[string]any{"s": s.ID, "code": info.Code, "signal": info.Signal, "reason": info.Reason})
 			if run := s.Info.Run; run != nil {
 				n.emitSession(proto.EvRunFinished, s.WS, s.Principal, s.ID, map[string]any{"s": s.ID, "recipe": run.Recipe, "exit": info.Code, "signal": info.Signal})
 			}
@@ -1986,16 +1999,43 @@ func appendWarning(existing, warning string) string {
 // resulting session. Callers must remove the workspace from the serving map
 // first so queued starters fail their post-lock serviceability check.
 func (n *Node) stopWorkspaceSessions(w *ws) error {
+	return n.stopWorkspaceSessionsGraceful(w, "workspace released", 0)
+}
+
+// defaultLifecycleGrace is how long a session gets to exit on its own when a
+// durable lifecycle deadline expires.
+const defaultLifecycleGrace = 5 * time.Second
+
+// stopWorkspaceSessionsGraceful is stopWorkspaceSessions with an explicit exit
+// reason and grace period. The reason reaches the session's exit chunk, so a
+// replay of work the control plane ended says so rather than looking like an
+// ordinary release.
+func (n *Node) stopWorkspaceSessionsGraceful(w *ws, reason string, grace time.Duration) error {
 	// Computers hold a CDP conversation over a live port path, so they are
 	// closed and joined before the sessions they talk to are terminated.
 	n.stopComputers(w.ID, proto.ComputerClosedReasonWorkspaceReleased)
 	w.treeMu.Lock()
-	err := n.sessions.TerminateWorkspace(w.ID, "workspace released")
+	err := n.sessions.TerminateWorkspaceGraceful(w.ID, reason, grace)
 	w.treeMu.Unlock()
 	// Agent runs join after the tree boundary is released: a run still
 	// waiting to spawn needs the boundary to observe the workspace is gone.
 	n.stopAgentRuns(w.ID, "workspace sessions stopped")
 	return err
+}
+
+// releaseSessionStop chooses how a release ends the workspace's sessions. A
+// lifecycle deadline expiry is the only release that is both expected and
+// scheduled, so it is the only one that both names itself in the exit chunk
+// and waits.
+func (n *Node) releaseSessionStop(reason string) (string, time.Duration) {
+	if reason == proto.ReasonLifecycleDeadlineExpired {
+		grace := n.opts.LifecycleGrace
+		if grace < 0 {
+			grace = 0
+		}
+		return proto.ReasonLifecycleDeadlineExpired, grace
+	}
+	return "workspace released", 0
 }
 
 // fenceWorkspace stops all execution and egress but preserves the filesystem.
@@ -5112,7 +5152,8 @@ func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error
 	n.mu.Unlock()
 	// Drain any session startup already inside the tree boundary, then stop all
 	// resulting processes so the snapshot (or destroy) is quiescent.
-	if err := n.stopWorkspaceSessions(w); err != nil {
+	stopReason, stopGrace := n.releaseSessionStop(req.Reason)
+	if err := n.stopWorkspaceSessionsGraceful(w, stopReason, stopGrace); err != nil {
 		return nil, n.rollbackRelease(ctx, w, prepared, fmt.Errorf("quiesce workspace sessions: %w", err))
 	}
 	if err := n.updateRelease(req.WS, releasePreparing, releaseQuiesced, proto.WSReleasedReq{}); err != nil {

@@ -405,6 +405,25 @@ type Workspace struct {
 	// never an input to a decision, so it emits no event of its own. It
 	// carries a Reason* constant, currently only ReasonProfileUnschedulable.
 	PendingReason string `cbor:"pending_reason,omitempty" json:"pending_reason,omitempty"`
+	// Lease is the durable hold that keeps this workspace awake (ADR 0090).
+	// IdlePolicy, IdleSince and LastActivityAt are the no-work cleanup rule
+	// and its clock. LifecycleDeadline is the derived view of what the
+	// control plane will do next, so a client never has to read timers.
+	//
+	// All four are replaced wholesale, never mutated through the pointer, so
+	// a copy taken from under the control-plane mutex stays valid.
+	Lease             *WorkspaceLease    `cbor:"lease,omitempty" json:"lease,omitempty"`
+	IdlePolicy        *IdlePolicy        `cbor:"idle_policy,omitempty" json:"idle_policy,omitempty"`
+	IdleSince         int64              `cbor:"idle_since,omitempty" json:"idle_since,omitempty"`
+	LastActivityAt    int64              `cbor:"last_activity_at,omitempty" json:"last_activity_at,omitempty"`
+	LifecycleDeadline *LifecycleDeadline `cbor:"lifecycle_deadline,omitempty" json:"lifecycle_deadline,omitempty"`
+}
+
+// CloneLifecycle returns a copy of the lifecycle pointers, so a caller holding
+// a shallow Workspace copy can hand it out without sharing rows the control
+// plane still owns.
+func (w *Workspace) CloneLifecycle() (*WorkspaceLease, *IdlePolicy, *LifecycleDeadline) {
+	return w.Lease.Clone(), w.IdlePolicy.Clone(), w.LifecycleDeadline.Clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -462,6 +481,15 @@ const (
 	OpPoolGet              = "pool.get"                // PoolGetReq -> Pool
 	OpPoolList             = "pool.list"               // -> PoolListRes
 	OpPoolRemove           = "pool.remove"             // PoolRemoveReq -> {}
+
+	// Durable workspace lifecycle (ADR 0090). The deadline lives in the
+	// control plane, so it survives the caller's process dying.
+	OpWSLease       = "ws.lease"        // WSLeaseReq -> WorkspaceLease
+	OpWSLeaseRenew  = "ws.lease.renew"  // WSLeaseRenewReq -> WorkspaceLease
+	OpWSLeaseCancel = "ws.lease.cancel" // WSLeaseCancelReq -> Workspace
+	OpWSLeaseGet    = "ws.lease.get"    // WSLeaseGetReq -> WSLeaseRes
+	OpWSIdlePolicy  = "ws.idle.policy"  // WSIdlePolicyReq -> Workspace
+	OpWSIdleMark    = "ws.idle.mark"    // WSIdleMarkReq -> Workspace
 )
 
 type WSCreateReq struct {
@@ -493,6 +521,198 @@ type WSSleepReq struct {
 	OnEvent        string            `cbor:"on,omitempty" json:"on,omitempty"`               // or when an event of this type is posted
 	Match          map[string]string `cbor:"match,omitempty" json:"match,omitempty"`         // payload fields that must all match
 	IdempotencyKey string            `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Durable workspace leases and idle policy (ADR 0090)
+// ---------------------------------------------------------------------------
+
+// Lease expiry actions. OnExpiry names what the control plane does when a
+// hold's hard deadline passes with nobody renewing it.
+const (
+	LeaseExpirySleep   = "sleep"   // release with a filesystem checkpoint, then paused
+	LeaseExpiryDestroy = "destroy" // release and destroy the workspace
+)
+
+// Lifecycle deadline sources.
+const (
+	LifecycleSourceLease = "lease" // the hard deadline of an explicit hold
+	LifecycleSourceIdle  = "idle"  // the workspace's idle policy
+)
+
+// Lease end reasons recorded in WorkspaceLease.EndedReason and in the
+// ws.lease.expired event.
+const (
+	LeaseEndDeadline   = "deadline"   // the hard deadline fired
+	LeaseEndCancelled  = "cancelled"  // ws.lease.cancel removed the hold
+	LeaseEndMoved      = "moved"      // ws.move re-queued the workspace
+	LeaseEndDestroyed  = "destroyed"  // ws.destroy ended the workspace
+	LeaseEndSuperseded = "superseded" // a later ws.lease replaced the hold
+)
+
+// WorkspaceLease is a durable hold that keeps a claimed workspace awake until
+// a control-plane deadline, whether or not the caller that asked for it is
+// still alive. It is not the claim lease: Workspace.LeaseUntil is the node's
+// ownership renewal, and this is the client's statement that work is running.
+//
+// A published lease value is immutable. Every mutation replaces the whole
+// pointer on Workspace, so a shallow copy handed out from under the
+// control-plane mutex shares nothing that can change underneath it.
+type WorkspaceLease struct {
+	ID string `cbor:"id" json:"id"`
+	WS string `cbor:"ws" json:"ws"`
+	// Generation is the workspace generation the hold was granted against.
+	// A move invalidates the hold; renewing it then reports
+	// ReasonGenerationMismatch rather than silently holding a new placement.
+	Generation uint64 `cbor:"gen" json:"gen"`
+	// MinAliveUntil is the earliest the idle policy may put this workspace to
+	// sleep. MaxAliveUntil is the hard deadline. Both are unix millis.
+	MinAliveUntil int64 `cbor:"min_alive_until,omitempty" json:"min_alive_until,omitempty"`
+	MaxAliveUntil int64 `cbor:"max_alive_until" json:"max_alive_until"`
+	// OnExpiry is LeaseExpirySleep or LeaseExpiryDestroy.
+	OnExpiry  string `cbor:"on_expiry" json:"on_expiry"`
+	Reason    string `cbor:"reason,omitempty" json:"reason,omitempty"`
+	CreatedAt int64  `cbor:"created_at" json:"created_at"`
+	RenewedAt int64  `cbor:"renewed_at,omitempty" json:"renewed_at,omitempty"`
+	Renewals  uint64 `cbor:"renewals,omitempty" json:"renewals,omitempty"`
+	// EndedAt and EndedReason record that the hold no longer keeps the
+	// workspace awake. An ended lease is retained so a late renew learns why
+	// it was refused instead of getting a bare not_found.
+	EndedAt     int64  `cbor:"ended_at,omitempty" json:"ended_at,omitempty"`
+	EndedReason string `cbor:"ended_reason,omitempty" json:"ended_reason,omitempty"`
+}
+
+// Live reports whether the hold still keeps its workspace awake.
+func (l *WorkspaceLease) Live() bool { return l != nil && l.EndedAt == 0 }
+
+// Clone copies a lease so a value returned from under a lock shares nothing.
+func (l *WorkspaceLease) Clone() *WorkspaceLease {
+	if l == nil {
+		return nil
+	}
+	cp := *l
+	return &cp
+}
+
+// IdlePolicy is the durable no-work cleanup rule for one workspace. It is the
+// generic form of the built-in Agent resource's AgentPolicy.SleepAfterSec, and
+// unlike WorkspaceSpec.Idle it is enforced by the control plane.
+type IdlePolicy struct {
+	// SleepAfterSec puts a claimed, idle workspace to sleep. DestroyAfterSec
+	// destroys one that has stayed idle that long, whether claimed or already
+	// asleep. Zero disables that half of the policy.
+	SleepAfterSec   int64 `cbor:"sleep_after_sec,omitempty" json:"sleep_after_sec,omitempty"`
+	DestroyAfterSec int64 `cbor:"destroy_after_sec,omitempty" json:"destroy_after_sec,omitempty"`
+}
+
+// Set reports whether the policy asks for anything.
+func (p *IdlePolicy) Set() bool {
+	return p != nil && (p.SleepAfterSec > 0 || p.DestroyAfterSec > 0)
+}
+
+// Clone copies a policy so a value returned from under a lock shares nothing.
+func (p *IdlePolicy) Clone() *IdlePolicy {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	return &cp
+}
+
+// LifecycleDeadline is the derived view of what the control plane will do to
+// this workspace next and when. A client reads it from ws.get without knowing
+// anything about timers. Exactly one is pending per workspace: the earliest of
+// the lease's hard deadline and the idle policy's next action.
+type LifecycleDeadline struct {
+	At      int64  `cbor:"at" json:"at"`         // unix millis
+	Action  string `cbor:"action" json:"action"` // LeaseExpirySleep | LeaseExpiryDestroy
+	Source  string `cbor:"source" json:"source"` // LifecycleSourceLease | LifecycleSourceIdle
+	TimerID string `cbor:"timer,omitempty" json:"timer,omitempty"`
+	// Fired records that the deadline passed and the control plane has taken
+	// ownership of executing it. Failed records that execution exhausted its
+	// retries; the workspace is then degraded and operator-actionable.
+	Fired    bool   `cbor:"fired,omitempty" json:"fired,omitempty"`
+	FiredAt  int64  `cbor:"fired_at,omitempty" json:"fired_at,omitempty"`
+	Failed   bool   `cbor:"failed,omitempty" json:"failed,omitempty"`
+	Attempts int    `cbor:"attempts,omitempty" json:"attempts,omitempty"`
+	Error    string `cbor:"error,omitempty" json:"error,omitempty"`
+}
+
+// Pending reports whether the deadline is still waiting to fire.
+func (d *LifecycleDeadline) Pending() bool { return d != nil && !d.Fired }
+
+// Clone copies a deadline so a value returned from under a lock shares nothing.
+func (d *LifecycleDeadline) Clone() *LifecycleDeadline {
+	if d == nil {
+		return nil
+	}
+	cp := *d
+	return &cp
+}
+
+// WSLeaseReq takes a durable hold on a claimed workspace. MaxAliveSec is the
+// hard deadline; MinAliveSec, when set, is how long the idle policy is
+// forbidden from acting. A workspace has at most one hold: a request with a
+// new idempotency key replaces the previous one.
+type WSLeaseReq struct {
+	ID             string `cbor:"id" json:"id"`
+	MinAliveSec    int64  `cbor:"min_alive_sec,omitempty" json:"min_alive_sec,omitempty"`
+	MaxAliveSec    int64  `cbor:"max_alive_sec" json:"max_alive_sec"`
+	OnExpiry       string `cbor:"on_expiry,omitempty" json:"on_expiry,omitempty"` // default sleep
+	Reason         string `cbor:"reason,omitempty" json:"reason,omitempty"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// WSLeaseRenewReq extends an existing hold by ExtendSec from now, bounded by
+// the control plane's maximum hold. It is refused with
+// ReasonLifecycleDeadlineExpired once the deadline already fired, and with
+// ReasonGenerationMismatch once the workspace moved.
+type WSLeaseRenewReq struct {
+	ID             string `cbor:"id" json:"id"`
+	LeaseID        string `cbor:"lease" json:"lease"`
+	ExtendSec      int64  `cbor:"extend_sec" json:"extend_sec"`
+	MinAliveSec    int64  `cbor:"min_alive_sec,omitempty" json:"min_alive_sec,omitempty"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// WSLeaseCancelReq removes a hold. The workspace stays claimed and falls back
+// to its idle policy, which is what it would have done had the hold never
+// existed.
+type WSLeaseCancelReq struct {
+	ID             string `cbor:"id" json:"id"`
+	LeaseID        string `cbor:"lease" json:"lease"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// WSLeaseGetReq reads a workspace's hold and derived deadline.
+type WSLeaseGetReq struct {
+	ID string `cbor:"id" json:"id"`
+}
+
+// WSLeaseRes is the hold plus the derived deadline the control plane will act
+// on next. Deadline may name the idle policy even when Lease is nil.
+type WSLeaseRes struct {
+	Lease    *WorkspaceLease    `cbor:"lease,omitempty" json:"lease,omitempty"`
+	Deadline *LifecycleDeadline `cbor:"deadline,omitempty" json:"deadline,omitempty"`
+}
+
+// WSIdlePolicyReq installs or replaces a workspace's idle policy. Both zero
+// removes it.
+type WSIdlePolicyReq struct {
+	ID              string `cbor:"id" json:"id"`
+	SleepAfterSec   int64  `cbor:"sleep_after_sec,omitempty" json:"sleep_after_sec,omitempty"`
+	DestroyAfterSec int64  `cbor:"destroy_after_sec,omitempty" json:"destroy_after_sec,omitempty"`
+	IdempotencyKey  string `cbor:"idem,omitempty" json:"idem,omitempty"`
+}
+
+// WSIdleMarkReq starts or stops the idle clock. Idle=false is the activity
+// signal: session traffic does not extend a deadline, because that would make
+// every session open a durable control-plane write.
+type WSIdleMarkReq struct {
+	ID             string `cbor:"id" json:"id"`
+	Idle           bool   `cbor:"idle,omitempty" json:"idle,omitempty"`
+	Reason         string `cbor:"reason,omitempty" json:"reason,omitempty"`
+	IdempotencyKey string `cbor:"idem,omitempty" json:"idem,omitempty"`
 }
 
 // WSACLReq replaces a workspace's ACL. Principals present before and absent
@@ -1270,10 +1490,42 @@ type Timer struct {
 	At        int64             `cbor:"at,omitempty" json:"at,omitempty"` // unix millis
 	OnEvent   string            `cbor:"on,omitempty" json:"on,omitempty"` // event type
 	Match     map[string]string `cbor:"match,omitempty" json:"match,omitempty"`
-	Action    string            `cbor:"action" json:"action"` // resume
+	Action    string            `cbor:"action" json:"action"` // resume | sleep | destroy
 	Fired     bool              `cbor:"fired" json:"fired"`
 	FiredAt   int64             `cbor:"fired_at,omitempty" json:"fired_at,omitempty"`
 	CreatedAt int64             `cbor:"created_at" json:"created_at"`
+	// Kind distinguishes the wake timers ws.sleep has always created from the
+	// lifecycle deadlines of ADR 0090. Empty is TimerKindResume, so rows
+	// written before this field decode unchanged.
+	Kind string `cbor:"kind,omitempty" json:"kind,omitempty"`
+	// Generation is the workspace generation a lifecycle timer was armed
+	// against. A move invalidates the timer rather than acting on a placement
+	// nobody asked to hold.
+	Generation uint64 `cbor:"gen,omitempty" json:"gen,omitempty"`
+	// Superseded marks a timer that was retired without acting. It is set
+	// alongside Fired so retention collects it like any other spent row.
+	Superseded bool   `cbor:"superseded,omitempty" json:"superseded,omitempty"`
+	Reason     string `cbor:"reason,omitempty" json:"reason,omitempty"`
+}
+
+// Timer kinds. TimerKindResume is the historical ws.sleep wake and is the
+// zero value, so timers written by earlier releases keep their meaning.
+const (
+	TimerKindResume      = ""
+	TimerKindLeaseExpiry = "lease_expiry"
+	TimerKindIdleSleep   = "idle_sleep"
+	TimerKindIdleDestroy = "idle_destroy"
+)
+
+// Lifecycle reports whether the timer is a control-plane lifecycle deadline
+// rather than a wake.
+func (t *Timer) Lifecycle() bool {
+	switch t.Kind {
+	case TimerKindLeaseExpiry, TimerKindIdleSleep, TimerKindIdleDestroy:
+		return true
+	default:
+		return false
+	}
 }
 
 type TimerListRes struct {
@@ -1995,6 +2247,19 @@ const (
 	EvRunFinished       = "run.finished"                 // that session exited; payload {s, recipe, exit, signal}
 	EvAuthWSResident    = "auth.workspace_resident"      // a launch relies on a login the harness keeps inside the workspace; payload {s, recipe}
 	EvWSOffer           = "ws.offer"                     // control -> node (not logged; a hint to claim)
+
+	// Durable workspace leases and idle policy (ADR 0090). EvWSLeaseExpired
+	// above is the *claim* lease returning a workspace to pending; these are
+	// the client-visible hold and its deadline.
+	EvWSLeaseGranted          = "ws.lease.granted"           // payload {lease, max_alive_until, min_alive_until, on_expiry, reason}
+	EvWSLeaseRenewed          = "ws.lease.renewed"           // payload {lease, max_alive_until, renewals}
+	EvWSLeaseCancelled        = "ws.lease.cancelled"         // payload {lease}
+	EvWSLeaseHoldExpired      = "ws.lease.expired"           // payload {lease, reason: deadline|moved|destroyed|superseded}
+	EvWSIdlePolicySet         = "ws.idle.policy_set"         // payload {sleep_after_sec, destroy_after_sec}
+	EvWSIdleMarked            = "ws.idle.marked"             // payload {idle, reason, idle_since}
+	EvWSLifecycleExpired      = "ws.lifecycle.expired"       // payload {action, source, at, timer}
+	EvWSLifecycleExpiryFailed = "ws.lifecycle.expiry_failed" // payload {action, source, attempts, error}
+	EvWSHoldMaxReached        = "ws.hold.max_reached"        // payload {scope, used, limit}
 )
 
 // ---------------------------------------------------------------------------

@@ -1172,6 +1172,23 @@ export interface Idle {
   "destroy_after_sec"?: number;
 }
 
+export interface IdlePolicy {
+  "sleep_after_sec"?: number;
+  "destroy_after_sec"?: number;
+}
+
+export interface LifecycleDeadline {
+  "at": number;
+  "action": string;
+  "source": string;
+  "timer"?: string;
+  "fired"?: boolean;
+  "fired_at"?: number;
+  "failed"?: boolean;
+  "attempts"?: number;
+  "error"?: string;
+}
+
 export interface NetworkPolicy {
   "default"?: string;
   "rules"?: Array<EgressRule>;
@@ -1787,6 +1804,10 @@ export interface Timer {
   "fired": boolean;
   "fired_at"?: number;
   "created_at": number;
+  "kind"?: string;
+  "gen"?: number;
+  "superseded"?: boolean;
+  "reason"?: string;
 }
 
 export interface TimerListRes {
@@ -1965,12 +1986,58 @@ export interface WSGetReq {
   "grant"?: Grant | null;
 }
 
+export interface WSIdleMarkReq {
+  "id": string;
+  "idle"?: boolean;
+  "reason"?: string;
+  "idem"?: string;
+}
+
+export interface WSIdlePolicyReq {
+  "id": string;
+  "sleep_after_sec"?: number;
+  "destroy_after_sec"?: number;
+  "idem"?: string;
+}
+
 export interface WSInfoRes {
   "ws": string;
   "backend": string;
   "root"?: string;
   "sessions"?: Array<string>;
   "broker"?: string;
+}
+
+export interface WSLeaseCancelReq {
+  "id": string;
+  "lease": string;
+  "idem"?: string;
+}
+
+export interface WSLeaseGetReq {
+  "id": string;
+}
+
+export interface WSLeaseRenewReq {
+  "id": string;
+  "lease": string;
+  "extend_sec": number;
+  "min_alive_sec"?: number;
+  "idem"?: string;
+}
+
+export interface WSLeaseReq {
+  "id": string;
+  "min_alive_sec"?: number;
+  "max_alive_sec": number;
+  "on_expiry"?: string;
+  "reason"?: string;
+  "idem"?: string;
+}
+
+export interface WSLeaseRes {
+  "lease"?: WorkspaceLease | null;
+  "deadline"?: LifecycleDeadline | null;
 }
 
 export interface WSListRes {
@@ -2139,11 +2206,31 @@ export interface Workspace {
   "quarantine_operation"?: string;
   "quarantined_at"?: number;
   "pending_reason"?: string;
+  "lease"?: WorkspaceLease | null;
+  "idle_policy"?: IdlePolicy | null;
+  "idle_since"?: number;
+  "last_activity_at"?: number;
+  "lifecycle_deadline"?: LifecycleDeadline | null;
 }
 
 export interface WorkspaceACL {
   "readers"?: Array<string>;
   "writers"?: Array<string>;
+}
+
+export interface WorkspaceLease {
+  "id": string;
+  "ws": string;
+  "gen": number;
+  "min_alive_until"?: number;
+  "max_alive_until": number;
+  "on_expiry": string;
+  "reason"?: string;
+  "created_at": number;
+  "renewed_at"?: number;
+  "renewals"?: number;
+  "ended_at"?: number;
+  "ended_reason"?: string;
 }
 
 export interface WorkspaceSelector {
@@ -2306,7 +2393,13 @@ export const OPERATIONS = {
   "ws.create": { constant: "OpWSCreate", request: "WSCreateReq", response: "Workspace" },
   "ws.destroy": { constant: "OpWSDestroy", request: "WSGetReq", response: "" },
   "ws.get": { constant: "OpWSGet", request: "WSGetReq", response: "Workspace" },
+  "ws.idle.mark": { constant: "OpWSIdleMark", request: "WSIdleMarkReq", response: "Workspace" },
+  "ws.idle.policy": { constant: "OpWSIdlePolicy", request: "WSIdlePolicyReq", response: "Workspace" },
   "ws.info": { constant: "OpWSInfo", request: "WSGetReq", response: "WSInfoRes" },
+  "ws.lease": { constant: "OpWSLease", request: "WSLeaseReq", response: "WorkspaceLease" },
+  "ws.lease.cancel": { constant: "OpWSLeaseCancel", request: "WSLeaseCancelReq", response: "Workspace" },
+  "ws.lease.get": { constant: "OpWSLeaseGet", request: "WSLeaseGetReq", response: "WSLeaseRes" },
+  "ws.lease.renew": { constant: "OpWSLeaseRenew", request: "WSLeaseRenewReq", response: "WorkspaceLease" },
   "ws.list": { constant: "OpWSList", request: "", response: "WSListRes" },
   "ws.move": { constant: "OpWSMove", request: "WSMoveReq", response: "Workspace" },
   "ws.quarantine": { constant: "OpWSQuarantine", request: "WSQuarantineReq", response: "WSQuarantineRes" },

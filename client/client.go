@@ -160,6 +160,45 @@ func (c *Client) ListNodes(ctx context.Context) ([]api.NodeStatus, error) {
 	return c.inner.ListNodes(ctx)
 }
 
+// LeaseWorkspace takes a durable hold that keeps a claimed workspace awake
+// until a control-plane deadline. The deadline survives this process dying.
+func (c *Client) LeaseWorkspace(ctx context.Context, request api.LeaseRequest, options ...OperationOption) (*api.WorkspaceLease, error) {
+	return c.inner.LeaseWorkspace(ctx, request, options...)
+}
+
+// RenewLease extends a hold by extendSec seconds from now.
+func (c *Client) RenewLease(ctx context.Context, id, leaseID string, extendSec int64, options ...OperationOption) (*api.WorkspaceLease, error) {
+	return c.inner.RenewLease(ctx, id, leaseID, extendSec, options...)
+}
+
+// CancelLease removes a hold, leaving the workspace claimed under its idle
+// policy.
+func (c *Client) CancelLease(ctx context.Context, id, leaseID string, options ...OperationOption) (*api.Workspace, error) {
+	return c.inner.CancelLease(ctx, id, leaseID, options...)
+}
+
+// GetLease returns a workspace's hold and the deadline the control plane will
+// act on next.
+func (c *Client) GetLease(ctx context.Context, id string) (*api.LeaseStatus, error) {
+	return c.inner.GetLease(ctx, id)
+}
+
+// SetIdlePolicy installs the durable no-work cleanup rule for a workspace.
+func (c *Client) SetIdlePolicy(ctx context.Context, id string, sleepAfterSec, destroyAfterSec int64, options ...OperationOption) (*api.Workspace, error) {
+	return c.inner.SetIdlePolicy(ctx, id, sleepAfterSec, destroyAfterSec, options...)
+}
+
+// MarkIdle starts a workspace's idle clock.
+func (c *Client) MarkIdle(ctx context.Context, id, reason string, options ...OperationOption) (*api.Workspace, error) {
+	return c.inner.MarkIdle(ctx, id, reason, options...)
+}
+
+// MarkActive stops a workspace's idle clock and clears any pending idle
+// deadline.
+func (c *Client) MarkActive(ctx context.Context, id, reason string, options ...OperationOption) (*api.Workspace, error) {
+	return c.inner.MarkActive(ctx, id, reason, options...)
+}
+
 // CreateVolume creates a tenant-scoped immutable shared-data volume from an
 // uploaded artifact.
 func (c *Client) CreateVolume(ctx context.Context, request api.VolumeCreateRequest, options ...OperationOption) (*api.Volume, error) {

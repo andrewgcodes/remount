@@ -4061,6 +4061,56 @@
       },
       "additionalProperties": true
     },
+    "IdlePolicy": {
+      "type": "object",
+      "properties": {
+        "destroy_after_sec": {
+          "type": "integer"
+        },
+        "sleep_after_sec": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": true
+    },
+    "LifecycleDeadline": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "at": {
+          "type": "integer"
+        },
+        "attempts": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "failed": {
+          "type": "boolean"
+        },
+        "fired": {
+          "type": "boolean"
+        },
+        "fired_at": {
+          "type": "integer"
+        },
+        "source": {
+          "type": "string"
+        },
+        "timer": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "at",
+        "source"
+      ],
+      "additionalProperties": true
+    },
     "NetworkPolicy": {
       "type": "object",
       "properties": {
@@ -6217,7 +6267,13 @@
         "fired_at": {
           "type": "integer"
         },
+        "gen": {
+          "type": "integer"
+        },
         "id": {
+          "type": "string"
+        },
+        "kind": {
           "type": "string"
         },
         "match": {
@@ -6228,6 +6284,12 @@
         },
         "on": {
           "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "superseded": {
+          "type": "boolean"
         },
         "ws": {
           "type": "string"
@@ -6867,6 +6929,48 @@
       ],
       "additionalProperties": true
     },
+    "WSIdleMarkReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "idle": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "WSIdlePolicyReq": {
+      "type": "object",
+      "properties": {
+        "destroy_after_sec": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "sleep_after_sec": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
     "WSInfoRes": {
       "type": "object",
       "properties": {
@@ -6893,6 +6997,117 @@
         "backend",
         "ws"
       ],
+      "additionalProperties": true
+    },
+    "WSLeaseCancelReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "lease": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "lease"
+      ],
+      "additionalProperties": true
+    },
+    "WSLeaseGetReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "WSLeaseRenewReq": {
+      "type": "object",
+      "properties": {
+        "extend_sec": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "lease": {
+          "type": "string"
+        },
+        "min_alive_sec": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "extend_sec",
+        "id",
+        "lease"
+      ],
+      "additionalProperties": true
+    },
+    "WSLeaseReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "max_alive_sec": {
+          "type": "integer"
+        },
+        "min_alive_sec": {
+          "type": "integer"
+        },
+        "on_expiry": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "max_alive_sec"
+      ],
+      "additionalProperties": true
+    },
+    "WSLeaseRes": {
+      "type": "object",
+      "properties": {
+        "deadline": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LifecycleDeadline"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lease": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceLease"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
       "additionalProperties": true
     },
     "WSListRes": {
@@ -7416,6 +7631,22 @@
         "id": {
           "type": "string"
         },
+        "idle_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IdlePolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idle_since": {
+          "type": "integer"
+        },
+        "last_activity_at": {
+          "type": "integer"
+        },
         "last_snapshot": {
           "type": "string"
         },
@@ -7428,8 +7659,28 @@
           },
           "type": "array"
         },
+        "lease": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceLease"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "lease_until": {
           "type": "integer"
+        },
+        "lifecycle_deadline": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LifecycleDeadline"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "node": {
           "type": "string"
@@ -7500,6 +7751,56 @@
           "type": "array"
         }
       },
+      "additionalProperties": true
+    },
+    "WorkspaceLease": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer"
+        },
+        "ended_at": {
+          "type": "integer"
+        },
+        "ended_reason": {
+          "type": "string"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "max_alive_until": {
+          "type": "integer"
+        },
+        "min_alive_until": {
+          "type": "integer"
+        },
+        "on_expiry": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "renewals": {
+          "type": "integer"
+        },
+        "renewed_at": {
+          "type": "integer"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "gen",
+        "id",
+        "max_alive_until",
+        "on_expiry",
+        "ws"
+      ],
       "additionalProperties": true
     },
     "WorkspaceSelector": {
@@ -8312,10 +8613,46 @@
       "response": "Workspace"
     },
     {
+      "constant": "OpWSIdleMark",
+      "name": "ws.idle.mark",
+      "request": "WSIdleMarkReq",
+      "response": "Workspace"
+    },
+    {
+      "constant": "OpWSIdlePolicy",
+      "name": "ws.idle.policy",
+      "request": "WSIdlePolicyReq",
+      "response": "Workspace"
+    },
+    {
       "constant": "OpWSInfo",
       "name": "ws.info",
       "request": "WSGetReq",
       "response": "WSInfoRes"
+    },
+    {
+      "constant": "OpWSLease",
+      "name": "ws.lease",
+      "request": "WSLeaseReq",
+      "response": "WorkspaceLease"
+    },
+    {
+      "constant": "OpWSLeaseCancel",
+      "name": "ws.lease.cancel",
+      "request": "WSLeaseCancelReq",
+      "response": "Workspace"
+    },
+    {
+      "constant": "OpWSLeaseGet",
+      "name": "ws.lease.get",
+      "request": "WSLeaseGetReq",
+      "response": "WSLeaseRes"
+    },
+    {
+      "constant": "OpWSLeaseRenew",
+      "name": "ws.lease.renew",
+      "request": "WSLeaseRenewReq",
+      "response": "WorkspaceLease"
     },
     {
       "constant": "OpWSList",

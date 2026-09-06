@@ -1175,6 +1175,23 @@ Idle = TypedDict("Idle", {
     "destroy_after_sec": NotRequired[int],
 }, total=False)
 
+IdlePolicy = TypedDict("IdlePolicy", {
+    "sleep_after_sec": NotRequired[int],
+    "destroy_after_sec": NotRequired[int],
+}, total=False)
+
+LifecycleDeadline = TypedDict("LifecycleDeadline", {
+    "at": Required[int],
+    "action": Required[str],
+    "source": Required[str],
+    "timer": NotRequired[str],
+    "fired": NotRequired[bool],
+    "fired_at": NotRequired[int],
+    "failed": NotRequired[bool],
+    "attempts": NotRequired[int],
+    "error": NotRequired[str],
+}, total=False)
+
 NetworkPolicy = TypedDict("NetworkPolicy", {
     "default": NotRequired[str],
     "rules": NotRequired[list["EgressRule"]],
@@ -1790,6 +1807,10 @@ Timer = TypedDict("Timer", {
     "fired": Required[bool],
     "fired_at": NotRequired[int],
     "created_at": Required[int],
+    "kind": NotRequired[str],
+    "gen": NotRequired[int],
+    "superseded": NotRequired[bool],
+    "reason": NotRequired[str],
 }, total=False)
 
 TimerListRes = TypedDict("TimerListRes", {
@@ -1968,12 +1989,58 @@ WSGetReq = TypedDict("WSGetReq", {
     "grant": NotRequired[Optional["Grant"]],
 }, total=False)
 
+WSIdleMarkReq = TypedDict("WSIdleMarkReq", {
+    "id": Required[str],
+    "idle": NotRequired[bool],
+    "reason": NotRequired[str],
+    "idem": NotRequired[str],
+}, total=False)
+
+WSIdlePolicyReq = TypedDict("WSIdlePolicyReq", {
+    "id": Required[str],
+    "sleep_after_sec": NotRequired[int],
+    "destroy_after_sec": NotRequired[int],
+    "idem": NotRequired[str],
+}, total=False)
+
 WSInfoRes = TypedDict("WSInfoRes", {
     "ws": Required[str],
     "backend": Required[str],
     "root": NotRequired[str],
     "sessions": NotRequired[list[str]],
     "broker": NotRequired[str],
+}, total=False)
+
+WSLeaseCancelReq = TypedDict("WSLeaseCancelReq", {
+    "id": Required[str],
+    "lease": Required[str],
+    "idem": NotRequired[str],
+}, total=False)
+
+WSLeaseGetReq = TypedDict("WSLeaseGetReq", {
+    "id": Required[str],
+}, total=False)
+
+WSLeaseRenewReq = TypedDict("WSLeaseRenewReq", {
+    "id": Required[str],
+    "lease": Required[str],
+    "extend_sec": Required[int],
+    "min_alive_sec": NotRequired[int],
+    "idem": NotRequired[str],
+}, total=False)
+
+WSLeaseReq = TypedDict("WSLeaseReq", {
+    "id": Required[str],
+    "min_alive_sec": NotRequired[int],
+    "max_alive_sec": Required[int],
+    "on_expiry": NotRequired[str],
+    "reason": NotRequired[str],
+    "idem": NotRequired[str],
+}, total=False)
+
+WSLeaseRes = TypedDict("WSLeaseRes", {
+    "lease": NotRequired[Optional["WorkspaceLease"]],
+    "deadline": NotRequired[Optional["LifecycleDeadline"]],
 }, total=False)
 
 WSListRes = TypedDict("WSListRes", {
@@ -2142,11 +2209,31 @@ Workspace = TypedDict("Workspace", {
     "quarantine_operation": NotRequired[str],
     "quarantined_at": NotRequired[int],
     "pending_reason": NotRequired[str],
+    "lease": NotRequired[Optional["WorkspaceLease"]],
+    "idle_policy": NotRequired[Optional["IdlePolicy"]],
+    "idle_since": NotRequired[int],
+    "last_activity_at": NotRequired[int],
+    "lifecycle_deadline": NotRequired[Optional["LifecycleDeadline"]],
 }, total=False)
 
 WorkspaceACL = TypedDict("WorkspaceACL", {
     "readers": NotRequired[list[str]],
     "writers": NotRequired[list[str]],
+}, total=False)
+
+WorkspaceLease = TypedDict("WorkspaceLease", {
+    "id": Required[str],
+    "ws": Required[str],
+    "gen": Required[int],
+    "min_alive_until": NotRequired[int],
+    "max_alive_until": Required[int],
+    "on_expiry": Required[str],
+    "reason": NotRequired[str],
+    "created_at": Required[int],
+    "renewed_at": NotRequired[int],
+    "renewals": NotRequired[int],
+    "ended_at": NotRequired[int],
+    "ended_reason": NotRequired[str],
 }, total=False)
 
 WorkspaceSelector = TypedDict("WorkspaceSelector", {
@@ -2309,7 +2396,13 @@ OPERATIONS: dict[str, dict[str, object]] = {
     "ws.create": {"constant": "OpWSCreate", "request": "WSCreateReq", "response": "Workspace"},
     "ws.destroy": {"constant": "OpWSDestroy", "request": "WSGetReq", "response": ""},
     "ws.get": {"constant": "OpWSGet", "request": "WSGetReq", "response": "Workspace"},
+    "ws.idle.mark": {"constant": "OpWSIdleMark", "request": "WSIdleMarkReq", "response": "Workspace"},
+    "ws.idle.policy": {"constant": "OpWSIdlePolicy", "request": "WSIdlePolicyReq", "response": "Workspace"},
     "ws.info": {"constant": "OpWSInfo", "request": "WSGetReq", "response": "WSInfoRes"},
+    "ws.lease": {"constant": "OpWSLease", "request": "WSLeaseReq", "response": "WorkspaceLease"},
+    "ws.lease.cancel": {"constant": "OpWSLeaseCancel", "request": "WSLeaseCancelReq", "response": "Workspace"},
+    "ws.lease.get": {"constant": "OpWSLeaseGet", "request": "WSLeaseGetReq", "response": "WSLeaseRes"},
+    "ws.lease.renew": {"constant": "OpWSLeaseRenew", "request": "WSLeaseRenewReq", "response": "WorkspaceLease"},
     "ws.list": {"constant": "OpWSList", "request": "", "response": "WSListRes"},
     "ws.move": {"constant": "OpWSMove", "request": "WSMoveReq", "response": "Workspace"},
     "ws.quarantine": {"constant": "OpWSQuarantine", "request": "WSQuarantineReq", "response": "WSQuarantineRes"},
