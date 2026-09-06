@@ -3352,6 +3352,9 @@
         "severity": {
           "type": "string"
         },
+        "status": {
+          "type": "string"
+        },
         "subject": {
           "type": "string"
         }
@@ -4026,6 +4029,15 @@
         "os": {
           "type": "string"
         },
+        "profile": {
+          "type": "string"
+        },
+        "runtime_checks": {
+          "items": {
+            "$ref": "#/$defs/Finding"
+          },
+          "type": "array"
+        },
         "snapshots": {
           "type": "string"
         },
@@ -4054,6 +4066,95 @@
       },
       "required": [
         "nodes"
+      ],
+      "additionalProperties": true
+    },
+    "NodeProfileEvent": {
+      "type": "object",
+      "properties": {
+        "failed": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "node": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "node",
+        "profile",
+        "status"
+      ],
+      "additionalProperties": true
+    },
+    "NodeProfileGetReq": {
+      "type": "object",
+      "properties": {
+        "node": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "NodeProfileGetRes": {
+      "type": "object",
+      "properties": {
+        "nodes": {
+          "items": {
+            "$ref": "#/$defs/NodeProfileReport"
+          },
+          "type": "array"
+        },
+        "profile": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "NodeProfileReport": {
+      "type": "object",
+      "properties": {
+        "checks": {
+          "items": {
+            "$ref": "#/$defs/Finding"
+          },
+          "type": "array"
+        },
+        "configured": {
+          "type": "string"
+        },
+        "evaluated_at": {
+          "type": "integer"
+        },
+        "node": {
+          "type": "string"
+        },
+        "online": {
+          "type": "boolean"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "evaluated_at",
+        "node",
+        "profile",
+        "status"
       ],
       "additionalProperties": true
     },
@@ -4717,6 +4818,9 @@
           "type": "integer"
         },
         "os": {
+          "type": "string"
+        },
+        "profile": {
           "type": "string"
         }
       },
@@ -6756,6 +6860,18 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "report_checks": {
+          "type": "boolean"
+        },
+        "runtime_checks": {
+          "items": {
+            "$ref": "#/$defs/Finding"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -6984,6 +7100,9 @@
           "type": "string"
         },
         "owner": {
+          "type": "string"
+        },
+        "pending_reason": {
           "type": "string"
         },
         "quarantine_operation": {
@@ -7530,6 +7649,12 @@
       "constant": "OpNodeList",
       "name": "node.list",
       "response": "NodeListRes"
+    },
+    {
+      "constant": "OpNodeProfileGet",
+      "name": "node.profile.get",
+      "request": "NodeProfileGetReq",
+      "response": "NodeProfileGetRes"
     },
     {
       "constant": "OpNodeStatus",

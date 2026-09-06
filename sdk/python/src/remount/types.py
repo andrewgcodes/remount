@@ -972,6 +972,7 @@ Finding = TypedDict("Finding", {
     "subject": NotRequired[str],
     "detail": Required[str],
     "hint": NotRequired[str],
+    "status": NotRequired[str],
 }, total=False)
 
 FleetGetReq = TypedDict("FleetGetReq", {
@@ -1165,10 +1166,39 @@ NodeInfo = TypedDict("NodeInfo", {
     "caps": NotRequired[list[str]],
     "snapshots": NotRequired[str],
     "version": NotRequired[str],
+    "profile": NotRequired[str],
+    "runtime_checks": NotRequired[list["Finding"]],
 }, total=False)
 
 NodeListRes = TypedDict("NodeListRes", {
     "nodes": Required[list["NodeStatus"]],
+}, total=False)
+
+NodeProfileEvent = TypedDict("NodeProfileEvent", {
+    "node": Required[str],
+    "profile": Required[str],
+    "status": Required[str],
+    "failed": NotRequired[list[str]],
+}, total=False)
+
+NodeProfileGetReq = TypedDict("NodeProfileGetReq", {
+    "node": NotRequired[str],
+    "profile": NotRequired[str],
+}, total=False)
+
+NodeProfileGetRes = TypedDict("NodeProfileGetRes", {
+    "profile": NotRequired[str],
+    "nodes": NotRequired[list["NodeProfileReport"]],
+}, total=False)
+
+NodeProfileReport = TypedDict("NodeProfileReport", {
+    "node": Required[str],
+    "profile": Required[str],
+    "status": Required[str],
+    "checks": NotRequired[list["Finding"]],
+    "evaluated_at": Required[int],
+    "configured": NotRequired[str],
+    "online": NotRequired[bool],
 }, total=False)
 
 NodeStatus = TypedDict("NodeStatus", {
@@ -1365,6 +1395,7 @@ Requires = TypedDict("Requires", {
     "caps": NotRequired[list[str]],
     "os": NotRequired[str],
     "arch": NotRequired[str],
+    "profile": NotRequired[str],
 }, total=False)
 
 RunInfo = TypedDict("RunInfo", {
@@ -1932,6 +1963,9 @@ WSRenewReq = TypedDict("WSRenewReq", {
     "gen": NotRequired[dict[str, int]],
     "controller_epoch": NotRequired[int],
     "authz": NotRequired[dict[str, int]],
+    "profile": NotRequired[str],
+    "runtime_checks": NotRequired[list["Finding"]],
+    "report_checks": NotRequired[bool],
 }, total=False)
 
 WSRenewRes = TypedDict("WSRenewRes", {
@@ -2009,6 +2043,7 @@ Workspace = TypedDict("Workspace", {
     "release_operation": NotRequired[str],
     "quarantine_operation": NotRequired[str],
     "quarantined_at": NotRequired[int],
+    "pending_reason": NotRequired[str],
 }, total=False)
 
 WorkspaceACL = TypedDict("WorkspaceACL", {
@@ -2117,6 +2152,7 @@ OPERATIONS: dict[str, dict[str, object]] = {
     "grant": {"constant": "OpGrant", "request": "GrantReq", "response": "Grant"},
     "node.diag": {"constant": "OpNodeDiag", "request": "NodeDiagReq", "response": "NodeDiag"},
     "node.list": {"constant": "OpNodeList", "request": "", "response": "NodeListRes"},
+    "node.profile.get": {"constant": "OpNodeProfileGet", "request": "NodeProfileGetReq", "response": "NodeProfileGetRes"},
     "node.status": {"constant": "OpNodeStatus", "request": "", "response": "NodeStatus"},
     "pool.create": {"constant": "OpPoolCreate", "request": "PoolCreateReq", "response": "Pool"},
     "pool.get": {"constant": "OpPoolGet", "request": "PoolGetReq", "response": "Pool"},
