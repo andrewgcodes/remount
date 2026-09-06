@@ -156,6 +156,17 @@ func ErrReason(code, reason, format string, a ...any) *Error {
 	return &Error{Code: code, Reason: reason, Msg: fmt.Sprintf(format, a...)}
 }
 
+// ErrorReason returns the stable Reason on a protocol error, or "" when err is
+// not one or carries no reason. It is the read side of ErrReason: a caller
+// switches on Code and then, only if it needs to, narrows on this.
+func ErrorReason(err error) string {
+	var pe *Error
+	if errors.As(err, &pe) {
+		return pe.Reason
+	}
+	return ""
+}
+
 var encMode cbor.EncMode
 var decMode cbor.DecMode
 
