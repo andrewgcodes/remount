@@ -2,7 +2,9 @@
 
 <img src="docs/assets/remount-banner.svg" alt="Remount" width="820">
 
-<h1>Long-running agents on your own machines</h1>
+<h1>vMotion for AI agents.</h1>
+
+<p><b>The failure-tested runtime for cloud agents: pause, move, resume, reattach, never hold a key. Self-hosted, one binary.</b></p>
 
 [Quick start](#quick-start) · [Harnesses](#harnesses) · [Why Remount](#why-remount) · [Docs](docs/using-remount.md) · [Protocol](spec/PROTOCOL.md) · [Website](https://remount.dev)
 
