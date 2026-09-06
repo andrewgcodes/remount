@@ -1,6 +1,7 @@
 import { Decoder, Encoder } from "cbor-x";
 import type { Workspace, WorkspaceLease, WSLeaseRes } from "./types.js";
 import { fromWire, ProtocolError } from "./errors.js";
+import { Computer, type ComputerCreateOptions } from "./computer.js";
 
 const encoder = new Encoder({ useRecords: false, variableMapSize: true });
 const decoder = new Decoder({ mapsAsObjects: true });
@@ -637,6 +638,16 @@ export class Client {
     session.nextSeq = from; this.sessions.set(sessionID, session);
     await session.reattach(this.generation);
     return session;
+  }
+
+  /** Start, or attach to, a browser inside the workspace. */
+  createComputer(workspace: string, options: ComputerCreateOptions = {}): Promise<Computer> {
+    return Computer.create(this, workspace, options);
+  }
+
+  /** Return a handle on a computer created earlier, by id. */
+  computer(workspace: string, id: string): Computer {
+    return new Computer(this, workspace, id);
   }
 
   async uploadArtifact(data: Uint8Array): Promise<{ id: string; size: number }> {

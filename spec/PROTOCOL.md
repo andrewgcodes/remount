@@ -880,7 +880,7 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `computer.eval` | `ComputerEvalReq{ws, computer, expr}` → `ComputerEvalRes{value}`; `value` is the JSON encoding of `Runtime.evaluate` with `returnByValue`, and is page-controlled data |
 | `computer.downloads` | `ComputerDownloadsReq{ws, computer}` → `ComputerDownloadsRes{downloads[{artifact, filename, url, bytes, state, reason}]}` |
 | `computer.close` | `ComputerCloseReq{ws, computer, idem}` → `{}`; closes the conversation and kills a browser the node spawned. Closing one that is already gone succeeds |
-| `computer.get` | `ComputerGetReq{ws, computer}` → `ComputerGetRes{computer, state, reason, viewport, s}`; `state` is `ready`, `degraded` or `closed` |
+| `computer.get` | `ComputerGetReq{ws, computer}` → `ComputerGetRes{computer, state, reason, viewport, s, last_iseq}`; `state` is `ready`, `degraded` or `closed`. `last_iseq` is the highest input sequence applied, which a caller that did not create the computer must read before its first `computer.input`: a sequence restarted at one is one the node has already applied |
 | `fs.read` | `FSReadReq{ws, path, offset, limit}` → `FSReadRes{d, size, eof}` |
 | `fs.write` | `FSWriteReq{ws, path, d, mode, append, mkdirp, idem}` → `{}` |
 | `fs.list` | `FSListReq{ws, path}` → `FSListRes{entries}` |

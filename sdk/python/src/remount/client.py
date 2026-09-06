@@ -966,6 +966,39 @@ class Client:
         await session._reattach(self.generation)
         return session
 
+    async def create_computer(
+        self,
+        workspace: str,
+        *,
+        launch: dict[str, Any] | None = None,
+        viewport: dict[str, Any] | None = None,
+        profile: str = "",
+        env: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> Any:
+        """Start, or attach to, a browser inside the workspace.
+
+        Returns a :class:`remount.computer.Computer`. The import is deferred
+        because that module names this one for typing.
+        """
+        from .computer import Computer
+
+        return await Computer.create(
+            self,
+            workspace,
+            launch=launch,
+            viewport=viewport,
+            profile=profile,
+            env=env,
+            idempotency_key=idempotency_key,
+        )
+
+    def computer(self, workspace: str, computer_id: str) -> Any:
+        """Return a handle on a computer created earlier, by id."""
+        from .computer import Computer
+
+        return Computer(self, workspace, computer_id)
+
     async def upload_artifact(self, data: bytes) -> tuple[str, int]:
         digest = hashlib.sha256(data).hexdigest()
         artifact_id = "art_sha256:" + digest

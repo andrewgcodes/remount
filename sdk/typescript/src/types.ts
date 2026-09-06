@@ -679,6 +679,7 @@ export interface ComputerGetRes {
   "reason"?: string;
   "viewport"?: ComputerViewport;
   "s"?: string;
+  "last_iseq"?: number;
 }
 
 export interface ComputerInputReq {

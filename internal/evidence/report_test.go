@@ -131,7 +131,7 @@ func TestADirtyCandidateIsMarkedInTheSummary(t *testing.T) {
 
 func TestListNamesTheOpenRowsAndTheirTickets(t *testing.T) {
 	text := RenderList(View(fakeEnv(nil)))
-	if !strings.Contains(text, "59 of 59 registered acceptance scenarios shown") {
+	if !strings.Contains(text, "60 of 60 registered acceptance scenarios shown") {
 		t.Fatalf("the list must lead with the counts:\n%s", strings.SplitN(text, "\n", 2)[0])
 	}
 	for _, want := range []string{"OPEN: Plan B phase B1", "E1", "B32", "missing env: REMOUNT_INTEGRATION_OPENAI_KEY"} {
