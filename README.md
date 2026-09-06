@@ -2,7 +2,9 @@
 
 <img src="docs/assets/remount-banner.svg" alt="Remount" width="820">
 
-<h1>Long-running agents on your own machines</h1>
+<h1>Close the laptop. Your agent keeps working.</h1>
+
+<p><b>A durable, movable computer for AI agents, on machines you control.</b></p>
 
 [Quick start](#quick-start) · [Harnesses](#harnesses) · [Why Remount](#why-remount) · [Docs](docs/using-remount.md) · [Protocol](spec/PROTOCOL.md) · [Website](https://remount.dev)
 

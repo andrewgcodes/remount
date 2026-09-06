@@ -18,6 +18,6 @@
     <text x="88" y="188" xml:space="preserve"> / _, _/ /___/ /  / / /_/ / /_/ / /|  / / /    </text>
     <text x="88" y="220" xml:space="preserve">/_/ |_/_____/_/  /_/\____/\____/_/ |_/ /_/     </text>
   </g>
-  <text x="88" y="270" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="22" font-weight="700" fill="#ffc078">long-running agents on your own machines_</text>
+  <text x="88" y="270" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="22" font-weight="700" fill="#ffc078">close the laptop. your agent keeps working_</text>
   <text x="1112" y="270" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" fill="#948b7e">one binary · one protocol · apache-2.0</text>
 </svg>
