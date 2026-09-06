@@ -115,6 +115,29 @@ func (k *systemKernel) Probe(ctx context.Context) error {
 			return closeErr
 		}
 	}
+	return k.probeNetdevTables(ctx)
+}
+
+// probeNetdevTables proves the kernel can host the netdev-family nftables
+// table every workspace's deny-all ingress policy lives in. A netlink socket
+// opening is not that proof: a kernel built without CONFIG_NF_TABLES_NETDEV
+// accepts the socket and refuses the table with EOPNOTSUPP, which previously
+// surfaced only when the first workspace failed to materialize, after the
+// node had already enrolled and been handed work. The probe creates and
+// deletes a table of its own so the node fails closed at startup instead.
+func (k *systemKernel) probeNetdevTables(ctx context.Context) error {
+	const table = "remount_probe"
+	attrs := concat(nlaString(unix.NFTA_TABLE_NAME, table), nlaU32BE(unix.NFTA_TABLE_FLAGS, 0))
+	err := k.nft(ctx, unix.NFT_MSG_NEWTABLE, unix.NLM_F_CREATE, unix.NFPROTO_NETDEV, attrs)
+	if err != nil {
+		if errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EAFNOSUPPORT) || errors.Is(err, unix.EINVAL) {
+			return fmt.Errorf("nf_tables netdev family is unsupported by this kernel (CONFIG_NF_TABLES_NETDEV): %w", err)
+		}
+		return fmt.Errorf("create nf_tables netdev probe table: %w", err)
+	}
+	if err := k.nft(ctx, unix.NFT_MSG_DELTABLE, 0, unix.NFPROTO_NETDEV, nlaString(unix.NFTA_TABLE_NAME, table)); err != nil && !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("delete nf_tables netdev probe table: %w", err)
+	}
 	return nil
 }
 

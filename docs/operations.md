@@ -989,6 +989,95 @@ mutation. A machine is eligible for idle destruction only when its
 `remount.node` label exactly matches an online control node reporting zero
 workspace assignments.
 
+A pool's `--backend` is what the machines run, and the machines are held to
+the same floor as any other node: a production control plane admits `gvisor`
+or `firecracker` and refuses `process` with `enrolled node backend process
+cannot satisfy isolated`. So the machine image has to carry `runsc` and an
+unpacked rootfs, and the pool is created with `--backend gvisor`:
+
+```sh
+remount pool create ix --vendor ix --backend gvisor --min 0 --max 4 --region us-east-1 --label zone=ix
+```
+
+A pool belongs to the tenant of the operator who created it, and its nodes
+serve that tenant's workspaces, so create pools as a tenant operator rather
+than the global bootstrap principal. `pool rm` refuses while the pool holds
+machines; a pool created with `--min 0` drains itself after
+`--idle-scale-down`.
+
+### E2B
+
+E2B sandboxes cannot host pool nodes today. The driver and the template in
+[`images/e2b/`](../images/e2b/) take a sandbox all the way to an enrolled
+`gvisor` node, but E2B's kernel (6.1, checked 2026-09-06) is built without
+`CONFIG_NF_TABLES_NETDEV`, `CONFIG_NET_CLS_FLOWER` and `CONFIG_NET_ACT_GACT`,
+and the enforced egress gateway installs its deny-all policy as a
+netdev-family nftables table. Every workspace materialization on such a node
+failed with `install deny-all policy: create host ingress table: operation
+not supported`. The network probe now creates and deletes a netdev table at
+node startup, so the node refuses to start there with `enforced network
+unavailable: nf_tables netdev family is unsupported by this kernel` rather
+than enrolling and holding workspaces `pending`.
+
+What the driver does, for the day the kernel changes or for a self-hosted
+E2B with a different one: E2B snapshots a template after its start command
+has run and resumes every sandbox from that snapshot, so nothing passed at
+sandbox creation reaches the start command as an environment variable. The
+driver creates the sandbox with `secure: true`, then writes the `REMOUNT_*`
+bootstrap values, enrollment credential included, to
+`/home/user/remount-bootstrap.env` through the sandbox's envd file API,
+authenticating with the one-time access token the create response carries.
+That token is used for that request and never logged or stored. The start
+command waits for the file, imports it, deletes it, and execs `remount up`
+as root, logging to `/var/lib/remount/node.log`. A sandbox whose bootstrap
+cannot be delivered is killed immediately so the retry starts clean.
+Optional entry fields: `sandbox_domain` (default: the API endpoint host
+without its `api.` label), `bootstrap_path`, `bootstrap_user`. Build the
+template with:
+
+```sh
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o remount-linux-amd64 ./cmd/remount
+pip install e2b && export E2B_API_KEY=...
+python3 images/e2b/build.py remount-linux-amd64 remount-node
+```
+
+### ix.dev
+
+The `ix` entry runs [`scripts/provision/remount-ix-helper`](../scripts/provision/remount-ix-helper),
+a Python program over the vendor's `ix` CLI (`curl https://ix.dev/install.sh | sh`),
+authenticated by the variable `token_env` names. Its `tenant` and `pool`
+fields bind the helper to exactly one pool, and `region` is the default
+placement.
+
+```json
+{"vendor": "ix", "helper": "/usr/local/bin/remount-ix-helper",
+ "token_env": "IX_TOKEN", "region": "us-east-1", "tenant": "*", "pool": "ix"}
+```
+
+Each machine is a VM from the vendor's default image, which is NixOS with a
+read-only `/usr`, so everything the node needs lives under the data
+directory. The helper stores the enrollment credential as a per-VM entry in
+the `ix` secret store (`ix secret set` from a mode-0600 file), attaches it
+with `ix new --secret-env`, removes the store entry once the VM holds its
+copy, and then runs a bootstrap over `ix shell` that downloads the node
+binary, a pinned `runsc` and rootfs when the pool backend is `gvisor`, imports
+the `REMOUNT_*` values from the VM's init environment, and starts
+`remount up`. `ix shell` exits 0 whatever the remote command did, so the
+helper treats a missing `REMOUNT_BOOTSTRAP_OK` marker as a failed create. ix
+VMs carry no labels, so tenant and pool inventory is kept in a small local
+state file (`REMOUNT_IX_HELPER_STATE`, default `~/.remount/ix-helper`),
+which is the helper's limitation rather than Remount's.
+
+### Modal
+
+Modal hosts the control plane well: [`deploy/modal_app.py`](../deploy/modal_app.py)
+is the reference deployment (`make modal-deploy`). It cannot host pool nodes.
+A Modal Sandbox already runs under gVisor without `CAP_SYS_ADMIN`, so `runsc`
+cannot start inside it, and the only backend it could run, `process`, is
+refused by every production mode. The `modal` provisioner entry stays for
+deployments that ship their own helper against a different runtime; no helper
+is bundled.
+
 ## Provider webhooks and outbound notifications
 
 `remount server --notifications /etc/remount/notifications.json` enables

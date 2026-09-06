@@ -1,5 +1,5 @@
 {
-  "_comment": "Canonical POST /sandboxes request body. This is the contract the driver must emit. Field names here are the drift surface: if E2B renames one, change it here and both the fake service and the driver's contract test move together.",
+  "_comment": "Canonical POST /sandboxes request body. This is the contract the driver must emit. Field names here are the drift surface: if E2B renames one, change it here and both the fake service and the driver's contract test move together. Bootstrap values are not in this body: E2B resumes sandboxes from a snapshot taken after the template's start command ran, so creation-time envVars never reach it. The driver delivers them afterwards through the envd file API.",
   "templateID": "remount-node",
   "timeout": 3600,
   "secure": true,
@@ -9,13 +9,5 @@
     "remount_tenant": "tenant-a",
     "remount_pool": "iad",
     "remount_label_region": "iad"
-  },
-  "envVars": {
-    "REMOUNT_ENROLL_TOKEN": "",
-    "REMOUNT_SERVER": "https://control.example",
-    "REMOUNT_BINARY_URL": "https://control.example/remount",
-    "REMOUNT_BACKEND": "process",
-    "REMOUNT_DATA_DIR": "/var/lib/remount",
-    "REMOUNT_NODE_ID": ""
   }
 }

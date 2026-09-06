@@ -3634,3 +3634,78 @@ scratchpad directory holding the launcher scripts, the built binary and the
 logs was removed too. The `remount` processes still visible in `pgrep` at
 cleanup belong to an unrelated concurrent session under a different scratchpad
 directory.
+
+## 2026-09-06: E2B and ix.dev node pools, live
+
+Goal: README quick starts for Modal, E2B and ix.dev that were actually run.
+Control plane: `remount server --mode production-single-tenant --provisioners`
+on this laptop, reached by the machines through a Cloudflare quick tunnel; a
+second tunnel served the linux/amd64 node binary. Vendor credentials came
+from `.env` into the server process only. Branch `feat/cloud-pool-quickstarts`
+(PR #42).
+
+### What had to change before anything enrolled
+
+| Finding | Fix |
+|---|---|
+| E2B resumes sandboxes from a snapshot taken after the template's start command ran; creation-time `envVars` never reach it, so the node idled forever | driver delivers `/home/user/remount-bootstrap.env` through envd `POST /files` with the create response's `envdAccessToken`; template start command polls for it (`images/e2b/`) |
+| A retry of that delivery after a 5xx posted an empty body | each attempt rebuilds the request from the captured bytes; test `TestBootstrapDeliveryRetriesWithTheFullBody` |
+| ix: `--secret-env` takes `<store key>=<ENV>` and the key must exist in `ix secret` | helper stores a per-VM entry from a mode-0600 file, attaches it, removes it after `ix new` |
+| ix: the default image is NixOS with a read-only `/usr`; `ix shell` exits 0 whatever the remote command did; `--env` values reach only PID 1 | binary, `runsc` and rootfs live under the data dir; bootstrap imports `REMOUNT_*` from `/proc/1/environ`; the helper requires a `REMOUNT_BOOTSTRAP_OK` marker on stdout |
+| Both vendors' nodes enrolled with `--backend process` were refused: `enrolled node backend process cannot satisfy isolated` | pools created with `--backend gvisor`; images carry runsc 20260817.0 and Alpine minirootfs 3.22.1, pinned by digest |
+| A global operator's workspace is placed but `exec` fails with `identity authority unavailable` | lane uses a tenant operator (`ops`) for the pool and a tenant agent (`builder`) for the workspace; the swallowed cause in `mapIdentityError` is noted as a defect |
+| A failing inventory call (the helper path vanished during a branch switch) was retried and recorded as `pool.provision_failed` every second | control-side exponential backoff for inventory failures, 2s to 2m |
+
+### ix.dev: pass
+
+Pool `ix` (`--backend gvisor --min 0 --max 2 --idle-scale-down 2m`,
+tenant `acme`). As `builder`, `ws create --label zone=ix`:
+
+| Step | Result |
+|---|---|
+| `pool.scaled` 0→1, VM `ix-06g7ahnf…` | 34s after `ws create` |
+| `node.enrolled`, `remount nodes` ONLINE true, BACKENDS gvisor, 100 CPU | runsc on the VM's KVM |
+| workspace claimed | 51s after `ws create` |
+| `exec sh -c 'uname -r; cat /etc/alpine-release; id -u; pwd'` | `4.19.0-gvisor`, `3.22.1`, `0`, `/work` |
+| second `exec cat hello.txt` | file written by the first exec was there |
+| `ws destroy`, then idle scale-down | `pool.retired` after the 2m window; `ix ls` empty |
+| `pool rm ix` | succeeded once the retirement fence cleared |
+
+### E2B: enrolls, cannot run workspaces
+
+Pool `e2b` (`--backend gvisor`). The sandbox received its bootstrap file,
+the node enrolled 4s after `pool.scaled`, and the workspace was placed on it.
+Every materialization then failed with `install deny-all policy: create host
+ingress table: operation not supported`. `/proc/config.gz` in the sandbox:
+`CONFIG_NF_TABLES=y`, `CONFIG_NF_TABLES_INET=y`, but
+`CONFIG_NF_TABLES_NETDEV`, `CONFIG_NET_CLS_FLOWER` and
+`CONFIG_NET_ACT_GACT` are not set. The enforced gateway needs the netdev
+family, so E2B cannot host an isolated node on its current kernel. Two
+consequences landed: the netns kernel probe now creates and deletes a
+netdev-family table so such a node fails closed at startup, and the README
+says E2B cannot host nodes yet rather than presenting a quick start that
+stops at enrollment. The workspace was destroyed, the sandbox killed, and
+the pool removed (`pool.scaled` 1→0 `inventory_reconciled`).
+
+### Modal: control plane only
+
+`make modal-deploy` and `make modal-smoke` passed earlier in the session
+(deployment `remount-quickstart`). A sandbox probe ran `runsc` under Modal:
+`can't run sandbox process in minimal chroot since we don't have
+CAP_SYS_ADMIN` on both the systrap and ptrace platforms, so Modal sandboxes
+cannot host gvisor nodes and the `process` backend is refused by production
+modes. No Modal pool helper ships; the operations guide says why.
+
+### Credentials
+
+The enrollment credential reached E2B only inside the envd file upload and
+ix only through the vendor's secret store; neither appeared in a command
+line, tag, metadata field, event or log. The E2B create-request contract no
+longer carries `envVars`, and the contract test asserts the token is absent
+from the create body and present only in the delivered file.
+
+### Cleanup
+
+Both pools removed; `e2b sandbox list` and `ix ls` empty; the Modal probe
+app `remount-probe` stopped; local server, tunnels and binary server killed
+at the end of the session.

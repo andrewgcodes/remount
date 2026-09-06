@@ -208,6 +208,8 @@ func (c *Control) poolRemove(ctx context.Context, subject Subject, req *proto.Po
 		return err
 	}
 	delete(c.pools, key)
+	delete(c.poolInventoryFailures, key)
+	delete(c.poolInventoryRetryAt, key)
 	c.mu.Unlock()
 	if c.opts.PoolReconciler != nil {
 		c.opts.PoolReconciler.Forget(c.poolSpec(pool))

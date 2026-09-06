@@ -2,6 +2,8 @@ package e2b
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,7 +29,7 @@ func contractDriver(t *testing.T, opts e2bfake.Options) (*Driver, *e2bfake.Servi
 	}
 	service := e2bfake.New(opts)
 	t.Cleanup(service.Close)
-	driver, err := New(Config{Endpoint: service.URL(), APIKey: opts.APIKey, Template: "remount-node"})
+	driver, err := New(Config{Endpoint: service.URL(), EnvdEndpoint: service.URL(), APIKey: opts.APIKey, Template: "remount-node"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,6 +73,21 @@ func TestB8ContractCoversCreatePaginatedListFilterAndIdempotentDestroy(t *testin
 		}
 		if _, ok := bodies[0][field]; !ok {
 			t.Fatalf("create request omits contract field %q; the driver and contract/create_request.json have drifted", field)
+		}
+	}
+	// The bootstrap, enrollment token included, reaches the sandbox through
+	// the envd file route and only that route.
+	for _, id := range ids {
+		files := service.Files(id)
+		content, ok := files[DefaultBootstrapPath]
+		if !ok || !strings.Contains(content, "REMOUNT_ENROLL_TOKEN='") {
+			t.Fatalf("sandbox %s received bootstrap files %v", id, files)
+		}
+	}
+	for _, body := range bodies {
+		encoded, _ := json.Marshal(body)
+		if strings.Contains(string(encoded), "REMOUNT_ENROLL_TOKEN") {
+			t.Fatalf("enrollment token in create body: %s", encoded)
 		}
 	}
 
@@ -242,7 +259,7 @@ func TestMaxLifetimeReplacementIsVisibleAsAbsence(t *testing.T) {
 func TestDriverRefusesAnUnexpectedProviderRoute(t *testing.T) {
 	service := e2bfake.New(e2bfake.Options{})
 	defer service.Close()
-	driver, err := New(Config{Endpoint: service.URL(), APIKey: "fake-key", Template: "remount-node"})
+	driver, err := New(Config{Endpoint: service.URL(), EnvdEndpoint: service.URL(), APIKey: "fake-key", Template: "remount-node"})
 	if err != nil {
 		t.Fatal(err)
 	}

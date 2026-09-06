@@ -313,6 +313,102 @@ Reference deployments for Docker Compose, Helm, Modal and Fly are under
 [deploy/](deploy/). Which backend satisfies which profile on which operating
 system is the generated [support matrix](docs/security-profiles.md).
 
+## Quick starts on Modal, E2B and ix.dev
+
+Two ways to get a Remount control plane and nodes without owning a server,
+and one vendor that cannot host nodes yet. Everything below was run, with the
+vendor's real API key in the environment, before it went into this file.
+
+**Modal hosts the control plane.** The reference app runs `remount server`
+in production mode on a persistent volume, with the master key and the
+operator credential in Modal secrets:
+
+```sh
+pip install modal && modal setup
+make modal-deploy          # deploys deploy/modal_app.py, prints the URL
+make modal-smoke           # creates a workspace, runs a command, destroys it
+```
+
+Modal cannot host nodes: a Modal sandbox already runs under gVisor without
+`CAP_SYS_ADMIN`, so `runsc` cannot start inside it, and production control
+planes refuse the `process` backend.
+
+**ix.dev hosts nodes.** A pool asks the vendor for machines, each machine
+enrolls itself as a node with a one-time credential, and the control plane
+scales the pool between `--min` and `--max`, destroying machines that sit
+idle. Nodes run `--backend gvisor`, which is what a production control plane
+admits. Start from a control plane the machines can reach, with a tenant
+operator for the pool and a tenant agent for the work:
+
+```sh
+export REMOUNT_MASTER_KEY="$(head -c 32 /dev/urandom | base64)"
+remount server --listen 0.0.0.0:7443 --data /var/lib/remount \
+  --mode production-single-tenant \
+  --bootstrap-principal root --bootstrap-token-file /run/remount/root.token \
+  --provisioners /etc/remount/provisioners.json
+export REMOUNT_SERVER=https://control.example REMOUNT_TOKEN="$(cat /run/remount/root.token)"
+remount principal create ops --tenant acme --roles operator
+remount principal create builder --tenant acme --roles agent
+remount token issue ops --tenant acme --role operator --ttl 1h --json     # save access_token
+remount token issue builder --tenant acme --role agent --ttl 1h --json   # save access_token
+```
+
+`/etc/remount/provisioners.json` names the vendor, the pool it serves, and
+where a new machine downloads the node binary from. The API key is an
+environment variable the server reads at startup, never a value in the file:
+
+```json
+{
+  "bootstrap": {
+    "server_url": "https://control.example",
+    "binary_url": "https://control.example/downloads/remount",
+    "data_dir": "/var/lib/remount"
+  },
+  "drivers": [
+    {"vendor": "ix", "helper": "/usr/local/bin/remount-ix-helper",
+     "token_env": "IX_TOKEN", "region": "us-east-1", "tenant": "acme", "pool": "ix"}
+  ]
+}
+```
+
+Install the vendor CLI next to the server, copy the helper into place, and
+create the pool as the tenant operator. Each machine is a fresh VM with KVM,
+so `runsc` runs on its KVM platform there; the helper installs the node
+binary, `runsc` and a rootfs under the data directory on first boot:
+
+```sh
+curl https://ix.dev/install.sh | sh && export IX_TOKEN=...
+install -m 0755 scripts/provision/remount-ix-helper /usr/local/bin/
+REMOUNT_TOKEN=$OPS_TOKEN remount pool create ix --vendor ix --backend gvisor \
+  --min 0 --max 4 --idle-scale-down 15m --region us-east-1 --label zone=ix
+```
+
+Then, as the agent principal, ask for a workspace in that zone. The pool
+provisions a VM on demand, the node enrolls, the workspace is claimed, and
+the machine is destroyed again once it has been idle for the scale-down
+window:
+
+```sh
+REMOUNT_TOKEN=$BUILDER_TOKEN remount ws create --name hello --label zone=ix --json
+REMOUNT_TOKEN=$BUILDER_TOKEN remount exec WS -- sh -c 'uname -r; cat /etc/alpine-release'
+# 4.19.0-gvisor
+# 3.22.1
+REMOUNT_TOKEN=$OPS_TOKEN remount events --type pool,node   # pool.scaled, node.enrolled, pool.retired
+```
+
+Measured on 2026-09-06: the workspace was claimed 51 seconds after
+`ws create` on a pool that held no machines.
+
+**E2B cannot host nodes yet.** The driver and template in
+[`images/e2b/`](images/e2b/) take a sandbox all the way to an enrolled
+`gvisor` node, but E2B's kernel is built without the nftables netdev family
+and tc flower, which the enforced egress gateway needs, so no isolated
+workspace can materialize there. A node started on such a kernel now refuses
+to enroll with `enforced network unavailable: nf_tables netdev family is
+unsupported by this kernel` instead of accepting work it cannot run. The
+details are in the
+[operations guide](docs/operations.md#provider-backed-node-pools).
+
 ## Documentation
 
 - [docs/using-remount.md](docs/using-remount.md): using a deployment, from a first workspace to a moved one.
@@ -1313,7 +1409,9 @@ app, region, network, server URL, enrollment, and binary metadata.
 
 Treat a lane whose prerequisites are absent as **unavailable**, not healthy.
 The provider registry and pool lifecycle are covered in
-[`operations.md`](operations.md#provider-backed-node-pools).
+[`operations.md`](operations.md#provider-backed-node-pools), with per-vendor
+notes for E2B, ix.dev and Modal, including why a production control plane
+only admits `--backend gvisor` pool machines.
 
 ## Verify outcomes and clean up
 

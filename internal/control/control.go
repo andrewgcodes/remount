@@ -398,6 +398,8 @@ type Control struct {
 	volumes               map[string]*proto.Volume
 	pools                 map[string]*proto.Pool // poolKey(tenant, name) -> desired node capacity
 	poolBusy              map[string]bool
+	poolInventoryFailures map[string]int       // consecutive inventory failures, for backoff
+	poolInventoryRetryAt  map[string]time.Time // no inventory call before this instant
 	poolIdle              map[poolMachine]time.Time
 	poolRetiring          map[string]poolRetirement // node -> durable scale-down fence; no new claims
 	poolWG                sync.WaitGroup
@@ -640,6 +642,8 @@ func New(opts Options) (*Control, error) {
 		volumes:               map[string]*proto.Volume{},
 		pools:                 map[string]*proto.Pool{},
 		poolBusy:              map[string]bool{},
+		poolInventoryFailures: map[string]int{},
+		poolInventoryRetryAt:  map[string]time.Time{},
 		poolIdle:              map[poolMachine]time.Time{},
 		poolRetiring:          map[string]poolRetirement{},
 		queues:                map[string]*proto.Queue{},

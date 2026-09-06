@@ -44,6 +44,10 @@ type provisionerEntry struct {
 	RemoteHelper   string `json:"remote_helper,omitempty"`
 	Region         string `json:"region,omitempty"`
 	Size           string `json:"size,omitempty"`
+	// E2B: where sandboxes are reachable and where the bootstrap file lands.
+	SandboxDomain string `json:"sandbox_domain,omitempty"`
+	BootstrapPath string `json:"bootstrap_path,omitempty"`
+	BootstrapUser string `json:"bootstrap_user,omitempty"`
 }
 
 func loadProvisioners(path string) ([]provision.Driver, control.PoolBootstrap, error) {
@@ -100,7 +104,8 @@ func buildProvisioner(vendor string, entry provisionerEntry) (provision.Driver, 
 		if err != nil {
 			return nil, err
 		}
-		return e2b.New(e2b.Config{Endpoint: entry.Endpoint, APIKey: key, Template: entry.Template})
+		return e2b.New(e2b.Config{Endpoint: entry.Endpoint, APIKey: key, Template: entry.Template,
+			SandboxDomain: entry.SandboxDomain, BootstrapPath: entry.BootstrapPath, BootstrapUser: entry.BootstrapUser})
 	case "modal":
 		id, err := requiredProvisionEnv(entry.TokenIDEnv)
 		if err != nil {

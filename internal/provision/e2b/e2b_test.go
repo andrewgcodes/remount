@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -19,12 +20,37 @@ func TestDriverCreateListDestroyContract(t *testing.T) {
 	var mu sync.Mutex
 	var current *sandbox
 	posts := 0
+	bootstraps := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.URL.Path == "/files" {
+			// The envd file route: the bootstrap, including the enrollment
+			// token, arrives here and nowhere else.
+			if r.Header.Get("X-Access-Token") != "envd-token" {
+				t.Errorf("bootstrap delivery presented the wrong envd token")
+			}
+			if r.URL.Query().Get("path") != DefaultBootstrapPath || r.URL.Query().Get("username") != "user" {
+				t.Errorf("bootstrap delivery query=%s", r.URL.RawQuery)
+			}
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				t.Error(err)
+			}
+			file, _, err := r.FormFile("file")
+			if err != nil {
+				t.Fatal(err)
+			}
+			content, _ := io.ReadAll(file)
+			if !strings.Contains(string(content), "REMOUNT_ENROLL_TOKEN='"+enrollment+"'\n") || !strings.Contains(string(content), "REMOUNT_SERVER='https://control.example'\n") {
+				t.Errorf("bootstrap file=%q", content)
+			}
+			bootstraps++
+			_, _ = w.Write([]byte(`[{"path":"/home/user/remount-bootstrap.env","type":"file"}]`))
+			return
+		}
 		if r.Header.Get("X-API-Key") != "api-key" {
 			t.Errorf("missing X-API-Key")
 		}
-		mu.Lock()
-		defer mu.Unlock()
 		switch r.Method {
 		case http.MethodGet:
 			if r.URL.Path != "/v2/sandboxes" {
@@ -37,11 +63,15 @@ func TestDriverCreateListDestroyContract(t *testing.T) {
 			_ = json.NewEncoder(w).Encode([]sandbox{*current})
 		case http.MethodPost:
 			posts++
+			raw, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(raw), enrollment) {
+				t.Error("enrollment token entered the create request; it belongs only in the bootstrap file")
+			}
 			var create newSandbox
-			if err := json.NewDecoder(r.Body).Decode(&create); err != nil {
+			if err := json.Unmarshal(raw, &create); err != nil {
 				t.Error(err)
 			}
-			if create.TemplateID != "template" || !create.Secure || create.EnvVars["REMOUNT_ENROLL_TOKEN"] != enrollment {
+			if create.TemplateID != "template" || !create.Secure {
 				t.Errorf("create=%+v", create)
 			}
 			if create.Network == nil || create.Network.AllowPublicTraffic == nil || *create.Network.AllowPublicTraffic || len(create.Network.AllowOut) != 1 {
@@ -53,7 +83,7 @@ func TestDriverCreateListDestroyContract(t *testing.T) {
 			}
 			current = &sandbox{SandboxID: "sbx-id", StartedAt: time.Now(), State: "running", Metadata: create.Metadata}
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(current)
+			_ = json.NewEncoder(w).Encode(sandbox{SandboxID: "sbx-id", ClientID: "client", EnvdAccessToken: "envd-token"})
 		case http.MethodDelete:
 			if r.URL.Path != "/sandboxes/sbx-id" {
 				t.Errorf("DELETE path=%s", r.URL.Path)
@@ -64,7 +94,7 @@ func TestDriverCreateListDestroyContract(t *testing.T) {
 	}))
 	defer server.Close()
 	allowPublic := false
-	driver, err := New(Config{Endpoint: server.URL, APIKey: "api-key", Template: "template", Network: &NetworkConfig{AllowPublicTraffic: &allowPublic, AllowOut: []string{"control.example"}}})
+	driver, err := New(Config{Endpoint: server.URL, EnvdEndpoint: server.URL, APIKey: "api-key", Template: "template", Network: &NetworkConfig{AllowPublicTraffic: &allowPublic, AllowOut: []string{"control.example"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,6 +105,9 @@ func TestDriverCreateListDestroyContract(t *testing.T) {
 	}
 	if machine.ID != "sbx-id" || machine.Tenant != "tenant-a" || machine.Provider != "e2b" {
 		t.Fatalf("machine=%+v", machine)
+	}
+	if bootstraps != 1 {
+		t.Fatalf("bootstrap delivered %d times, want 1", bootstraps)
 	}
 	if _, err := driver.Create(context.Background(), request); err != nil {
 		t.Fatal(err)
@@ -158,9 +191,15 @@ func TestConcurrentCreateIsIdempotent(t *testing.T) {
 	var mu sync.Mutex
 	var current *sandbox
 	posts := 0
+	bootstraps := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
+		if r.URL.Path == "/files" {
+			bootstraps++
+			_, _ = w.Write([]byte(`[{"path":"/home/user/remount-bootstrap.env","type":"file"}]`))
+			return
+		}
 		if r.Method == http.MethodGet {
 			if current == nil {
 				_, _ = w.Write([]byte("[]"))
@@ -176,10 +215,10 @@ func TestConcurrentCreateIsIdempotent(t *testing.T) {
 		}
 		current = &sandbox{SandboxID: "only-one", Metadata: create.Metadata}
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(current)
+		_ = json.NewEncoder(w).Encode(sandbox{SandboxID: "only-one", EnvdAccessToken: "envd-token"})
 	}))
 	defer server.Close()
-	driver, err := New(Config{Endpoint: server.URL, APIKey: "api-key", Template: "template"})
+	driver, err := New(Config{Endpoint: server.URL, EnvdEndpoint: server.URL, APIKey: "api-key", Template: "template"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,8 +236,96 @@ func TestConcurrentCreateIsIdempotent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if posts != 1 {
-		t.Fatalf("concurrent create posted %d times", posts)
+	if posts != 1 || bootstraps != 1 {
+		t.Fatalf("concurrent create posted %d times and delivered %d bootstraps", posts, bootstraps)
+	}
+}
+
+func TestBootstrapDeliveryRetriesWithTheFullBody(t *testing.T) {
+	var mu sync.Mutex
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.URL.Path == "/files":
+			attempts++
+			if attempts == 1 {
+				http.Error(w, `{"message":"envd not ready"}`, http.StatusServiceUnavailable)
+				return
+			}
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				t.Error(err)
+			}
+			file, _, err := r.FormFile("file")
+			if err != nil {
+				t.Errorf("retry lost the multipart body: %v", err)
+				http.Error(w, "no file", http.StatusBadRequest)
+				return
+			}
+			content, _ := io.ReadAll(file)
+			if !strings.Contains(string(content), "REMOUNT_ENROLL_TOKEN='retry-secret'") {
+				t.Errorf("retry body=%q", content)
+			}
+			_, _ = w.Write([]byte(`[{"path":"/home/user/remount-bootstrap.env","type":"file"}]`))
+		case r.Method == http.MethodGet:
+			_, _ = w.Write([]byte("[]"))
+		case r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(sandbox{SandboxID: "retry", EnvdAccessToken: "envd-token"})
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	driver, err := New(Config{Endpoint: server.URL, EnvdEndpoint: server.URL, APIKey: "api-key", Template: "template"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := driver.Create(context.Background(), testRequest("retry-secret")); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if attempts != 2 {
+		t.Fatalf("attempts=%d, want 2", attempts)
+	}
+}
+
+func TestCreateReleasesSandboxWhenBootstrapDeliveryFails(t *testing.T) {
+	var mu sync.Mutex
+	deleted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.URL.Path == "/files":
+			http.Error(w, `{"code":401,"message":"unauthorized"}`, http.StatusUnauthorized)
+		case r.Method == http.MethodGet:
+			_, _ = w.Write([]byte("[]"))
+		case r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(sandbox{SandboxID: "orphan", EnvdAccessToken: "envd-token"})
+		case r.Method == http.MethodDelete && r.URL.Path == "/sandboxes/orphan":
+			deleted = true
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	driver, err := New(Config{Endpoint: server.URL, EnvdEndpoint: server.URL, APIKey: "api-key", Template: "template"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = driver.Create(context.Background(), testRequest("secret"))
+	if err == nil || !strings.Contains(err.Error(), "deliver bootstrap") || strings.Contains(err.Error(), "envd-token") {
+		t.Fatalf("err=%v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !deleted {
+		t.Fatal("a sandbox that cannot receive its bootstrap was left running")
 	}
 }
 
