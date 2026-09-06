@@ -170,6 +170,20 @@ base defects were found and fixed on the way: the wake scan fired lifecycle
 timers as resumes, and `paused` was published before the spent deadline was
 cleared.
 
+Follow-up delivered: `remount ws lease|idle-policy|mark-idle|mark-active`,
+`ws get` prints the hold and deadline, Python and TypeScript methods,
+`examples/long-running-autosleep` with an in-process test, a user-guide
+section and the tutorial reference. The live lane on a real standalone
+verified all four claims: a 30 s hold outlived a SIGKILLed client and paused
+the workspace with `s.exited{reason: lifecycle_deadline_expired}`; a 90 s hold
+fired after the control plane was stopped and restarted mid-deadline; an idle
+policy slept the workspace after `mark-idle`; `mark-active` cleared a pending
+deadline. The lane found a third defect: an attached client hung forever on
+expiry because output subscriptions were cut before the exit chunk was
+written (also affected `ws sleep` and `ws move`). Fixed by draining
+subscribers after every session is joined; `TestLiveSessionReceivesLifecycleExitChunk`
+failed first and now passes. Ledger entry in the verification file.
+
 ## Gap 5 — SDK, conformance, release, observability
 
 Delivered so far:
@@ -192,7 +206,7 @@ Delivered so far:
 | Conformance product | `cmd/conformance --profile`, markdown report, `remount conformance`, evidence E26/B33, gVisor drift lane script, operator docs | merged (ced0f00) |
 | Linux lanes | gVisor E4/E5/B28, E26 drift, a real `multi-tenant-isolated` gVisor node with `doctor` and `conformance --profile`, Firecracker B29 if its environment survived, all inside the Colima VM | in progress |
 | Credentials | `remount binding`/`principal session` CLI, Python/TS helpers, keyless examples against a fake provider (B35), docs, live `.env` run with rotate and revoke | in progress |
-| Lifecycle | `remount ws lease`/idle CLI, Python/TS methods, auto-sleep example, docs, live timer run across a server restart | in progress |
+| Lifecycle | `remount ws lease`/idle CLI, Python/TS methods, auto-sleep example, docs, live timer run across a server restart | merged (39f951d) |
 | Typed errors and observability | typed error classes in three languages, support matrix, dependency-free OTLP tracing, log redaction, ADR 0093 | in progress |
 
 ## Deferred by owner decision
