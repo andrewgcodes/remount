@@ -39,6 +39,11 @@ type Session struct {
 	Control *Conn
 	// HTTP is the plain HTTP client for the artifact and event surfaces.
 	HTTP *http.Client
+	// Profile is the runtime profile this run is judging, or empty. When set,
+	// every workspace the run creates carries it as requires.profile, so the
+	// protocol requirements are exercised on a node that actually satisfies
+	// the profile rather than on whatever node happened to be free.
+	Profile string
 
 	mu        sync.Mutex
 	created   []string // workspace ids to destroy
@@ -93,6 +98,9 @@ func (s *Session) CreateWorkspace(ctx context.Context, spec WorkspaceSpec) (Work
 	if spec.Requires.Backend == "" {
 		spec.Requires.Backend = s.Target.Backend
 	}
+	if spec.Requires.Profile == "" {
+		spec.Requires.Profile = s.Profile
+	}
 	var ws Workspace
 	if err := s.Call(ctx, "ws.create", WSCreateReq{Spec: spec, Idem: s.Idem("ws")}, &ws); err != nil {
 		return ws, err
@@ -103,9 +111,24 @@ func (s *Session) CreateWorkspace(ctx context.Context, spec WorkspaceSpec) (Work
 	return ws, nil
 }
 
+// profileParkGrace is how long a profile-constrained workspace is given
+// before its pending_reason is believed. The reason is derived from the fleet
+// at the moment of the read, so a node one heartbeat away from being counted
+// can produce one transiently; waiting a beat costs two seconds and not
+// waiting costs a false verdict.
+const profileParkGrace = 2 * time.Second
+
 // WaitClaimed polls until the workspace reports claimed with a node.
+//
+// When the run is judging a runtime profile, a workspace the control plane
+// has parked with a pending_reason ends the wait immediately rather than
+// after the full deadline. That matters twice: the run finishes in seconds
+// instead of ninety per requirement, and the outcome is unavailable with the
+// parked reason named — the requirement was not disproved, it could not be
+// observed on a fleet that satisfies the profile.
 func (s *Session) WaitClaimed(ctx context.Context, id string) (Workspace, error) {
-	deadline := time.Now().Add(90 * time.Second)
+	start := time.Now()
+	deadline := start.Add(90 * time.Second)
 	var last Workspace
 	for time.Now().Before(deadline) {
 		var ws Workspace
@@ -115,6 +138,11 @@ func (s *Session) WaitClaimed(ctx context.Context, id string) (Workspace, error)
 		last = ws
 		if ws.State == WSClaimed && ws.Node != "" {
 			return ws, nil
+		}
+		if s.Profile != "" && ws.PendingReason != "" && time.Since(start) > profileParkGrace {
+			return ws, Unavailablef(
+				"the target parked workspace %s with pending_reason %q: no node satisfies runtime profile %q, so this requirement could not be observed under it",
+				id, ws.PendingReason, s.Profile)
 		}
 		if ws.State == WSFailed {
 			return ws, fmt.Errorf("conformance: workspace %s reached %s", id, ws.State)

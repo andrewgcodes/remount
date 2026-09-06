@@ -9,12 +9,30 @@ backend is absent, not healthy.
 
 ## Profile compatibility
 
-| Backend | local | isolated | multi_tenant |
-|---|---:|---:|---:|
-| `process` | yes | no | no |
-| `docker` | yes | no | no |
-| `gvisor` | yes | yes | no |
-| `firecracker` | yes | no | no |
+The first three columns are the per-workspace placement contract of
+`proto.SecuritySpec.Profile`. The last is the node-level runtime profile
+of `internal/profile` (ADR 0089): the strongest `--profile` a node
+registering only this backend could satisfy on its capabilities alone. They are
+different contracts with similar names, and a backend can satisfy one and not
+the other — gVisor satisfies the `multi-tenant-isolated` runtime profile
+but not a workspace asking for `multi_tenant`, because that additionally
+requires a microVM.
+
+| Backend | local | isolated | multi_tenant | Runtime profiles satisfied |
+|---|---:|---:|---:|---|
+| `process` | yes | no | no | `dev` |
+| `docker` | yes | no | no | `dev`, `trusted-single-tenant` |
+| `gvisor` | yes | yes | no | `dev`, `trusted-single-tenant`, `multi-tenant-isolated` |
+| `firecracker` | yes | no | no | `dev` |
+
+A node registers more than one backend at a time, and every runtime-profile
+predicate holds over *every* registered backend, so a fleet's real answer is
+the weakest row it registers rather than the strongest. The column also assumes
+no failing host check: `profile.runtime.healthy` folds what a live node's
+`Reprobe` reports, and `microvm` additionally needs a live host
+compatibility result, which a generated table cannot supply. Ask a running
+deployment with `remount doctor --profile` or
+`remount conformance --profile`.
 
 `local` defaults to minimum isolation `none`. `isolated` requires
 container isolation, a deny-default network, brokered secrets, required audit,

@@ -20,6 +20,26 @@ tests and engineering notes do not.
 
 ### Added
 
+- `remount conformance [--profile dev|trusted-single-tenant|multi-tenant-isolated|microvm]`
+  judges a deployment black-box against the protocol manifest and, when a
+  profile is named, against that profile: one required row per obligation read
+  from `node.profile.get`, plus a row that creates a workspace with
+  `requires.profile` and proves scheduling honours it. `--markdown FILE`
+  writes a review document with one table per tier and a footer stating how
+  many checks were unavailable; `--report`, `--junit`, `--evidence` and
+  `--out DIR` write the other formats. `--launch self` boots a standalone from
+  the running binary and judges that. Exit codes are `0` conformant, `1` a
+  check failed, `2` nothing failed but something could not be observed — the
+  same three-valued contract as `remount doctor --profile`.
+- `cmd/conformance` gains the same `--profile` and `--markdown` flags, and the
+  JSON report gains `profile` and `candidate` fields.
+- `make conformance-report` builds this commit's binary, boots it as a
+  standalone deployment and writes `conformance.json`, `conformance.md` and a
+  Plan B §6 evidence record into `OUT` (default `dist/`, `PROFILE` default
+  `dev`). It does not change `make conformance`, which still means the
+  hostile-input suites under the race detector.
+- `docs/security-profiles.md` gains a "Runtime profiles satisfied" column per
+  backend, derived from `internal/profile` rather than hand-maintained.
 - Wire errors carry an optional `reason`: a stable sub-classification inside an
   existing `code` that a client may act on, alongside `proto.ErrReason` and the
   `proto.Reason*` constants. Older peers ignore the field and a code without a
