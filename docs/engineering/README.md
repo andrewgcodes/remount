@@ -22,6 +22,13 @@ and remediation requirements. It distinguishes current findings from inherited
 PR #7 issues and historical evidence. No bugs are fixed by this document; read
 its finding register alongside the earlier implementation closure.
 
+### [Deep bug hunt — 2026-09-03](./deep-bug-hunt-2026-09-03.md)
+
+The original PR #7 report, preserved with a September 5 integration disposition.
+Three original mechanisms have later fixes; the remaining concerns have
+different current evidence requirements. Read the disposition before treating
+the historical list as outstanding defects.
+
 ### [Hardening implementation closure — 2026-09-03](./implementation-closure-2026-09-03.md) — historical closure
 
 Its `2026-09 build plan disposition` section records the Phase 2–6 build plan

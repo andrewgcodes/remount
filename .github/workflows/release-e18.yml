@@ -37,7 +37,7 @@ jobs:
             [[ "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || exit 1
           fi
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.candidate.outputs.ref }}
           fetch-depth: 0
@@ -93,7 +93,7 @@ jobs:
         run: |
           ./install.sh
           test "$("$REMOUNT_INSTALL_DIR/remount" version)" = "remount $REMOUNT_VERSION"
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.1"
       - name: Verify public go install path
@@ -129,7 +129,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.release-contract.outputs.tag }}
       - name: Download Linux binaries
@@ -161,7 +161,7 @@ jobs:
           build-args: VERSION=${{ needs.release-contract.outputs.tag }}
           provenance: true
       - name: Attest container provenance
-        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-name: ${{ steps.registry.outputs.image }}
           subject-digest: ${{ steps.image.outputs.digest }}
