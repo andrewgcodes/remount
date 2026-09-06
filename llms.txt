@@ -1,6 +1,6 @@
 # Remount
 
-> Remount gives an AI agent a computer it can keep.
+> Remount is a runtime for AI agents that need a real computer rather than a function call.
 
 Remount is an open protocol and a single static Go binary that gives an AI
 agent a workspace it can run on from anywhere: snapshotted, moved between
@@ -11,8 +11,9 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/an
 
 ## README
 
+- [What you can do with it](https://github.com/andrewgcodes/remount/blob/main/README.md#what-you-can-do-with-it): again, `attach`, and read the output you missed.
+- [How it differs from a sandbox API](https://github.com/andrewgcodes/remount/blob/main/README.md#how-it-differs-from-a-sandbox-api): Most sandbox products give you a container behind an HTTP API in someone else's cloud.
 - [How it fits together](https://github.com/andrewgcodes/remount/blob/main/README.md#how-it-fits-together): Every machine that runs workspaces is a node.
-- [What it does](https://github.com/andrewgcodes/remount/blob/main/README.md#what-it-does): back, `attach`, and the output replays from where you left off.
 - [Quick start](https://github.com/andrewgcodes/remount/blob/main/README.md#quick-start): You need the Go version in `go.mod` (1.27.1 at the time of writing).
 - [Move a workspace](https://github.com/andrewgcodes/remount/blob/main/README.md#move-a-workspace): The filesystem is snapshotted, the workspace is re-queued, a node in that zone picks it up, and your files are there.
 - [Sleep and wake](https://github.com/andrewgcodes/remount/blob/main/README.md#sleep-and-wake): A sleeping workspace has no node.

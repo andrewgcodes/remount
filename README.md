@@ -1,14 +1,64 @@
 # Remount
 
-Remount gives an AI agent a computer it can keep. A workspace is a filesystem
-plus the processes running in it. You can snapshot it, move it to another
-machine, put it to sleep, wake it later, and reconnect to a command that is
-still running and get the output you missed. Credentials never enter the
-workspace; a broker on the node substitutes them on the way out.
+Remount is a runtime for AI agents that need a real computer rather than a
+function call. You give an agent a workspace: a filesystem and the processes
+running in it, on a machine you control. The agent can run a build for an
+hour, open a browser, download files, and call an API with a key it never
+sees, and the work keeps going after your process, your connection or the
+machine goes away.
 
-It is one Go binary and one wire protocol. You run it on your own machines:
-a laptop, a VM, a GPU box, Kubernetes, Modal, Fly. There is no Remount
-service, no account, and nothing phones home. Apache-2.0.
+It is one static Go binary and one wire protocol, Apache-2.0, that you run
+on your own laptop, VMs, GPU boxes, Kubernetes, Modal or Fly. There is no
+Remount service and nothing phones home.
+
+## What you can do with it
+
+- Run a coding agent against a repo for hours. Close the laptop, open it
+  again, `attach`, and read the output you missed. The session lives on the
+  node, not in your terminal.
+- Start a task on your laptop and move the workspace to a GPU box mid-task.
+  Files and policy follow; the agent picks up from its saved state.
+- Give an agent an OpenAI or Anthropic key it never sees. The workspace holds
+  a placeholder; the node's broker substitutes the real key only for the
+  hosts that binding allows, records every use, and revocation reaches a live
+  workspace within one renewal.
+- Let a background job outlive the turn that started it. A lease keeps the
+  workspace awake until a deadline stored in the control plane, so it
+  survives a deploy or a crash of your own service, and then sleeps the
+  workspace instead of billing you forever.
+- Drive a browser inside the workspace: navigate, screenshot, click, type,
+  download files that become artifacts. Browser traffic follows the same
+  egress policy as everything else.
+- Run untrusted customers' agents on gVisor or Firecracker nodes that refuse
+  to start unless they can prove their isolation, and hand a security
+  reviewer a conformance report where every check is pass, fail or
+  unavailable.
+- Do all of it from Go, Python or TypeScript, or from the CLI.
+
+## How it differs from a sandbox API
+
+Most sandbox products give you a container behind an HTTP API in someone
+else's cloud. Remount is built around a few decisions that a hosted
+container cannot make for you:
+
+- **A session is a log, not a socket.** The node keeps every byte of output
+  with a sequence number. A client that disconnects replays from where it
+  was, and a range that retention has dropped shows up as an explicit gap.
+- **A workspace is a value.** Its filesystem is snapshotted and restored on
+  another node, and every grant is bound to a generation, so a stale client
+  cannot act on a workspace that has moved.
+- **The workspace is trusted with nothing.** Secrets, policy and lifecycle
+  live in the node and the control plane. The workspace sees placeholders.
+- **Lifecycle belongs to the control plane.** Sleep, wake, leases and idle
+  policy are durable timers in the control plane, not a `setTimeout` in your
+  worker.
+- **Isolation is a checked promise.** A node declares a runtime profile and
+  refuses to serve if its backends cannot meet it; a check that cannot run is
+  reported unavailable, never healthy.
+- **Everything is an event**, committed in the same transaction as the state
+  it describes.
+- **Nothing is hosted.** The protocol is public and the reference
+  implementation is meant to be replaced if you can do better.
 
 If you want to use it, start with [docs/using-remount.md](docs/using-remount.md).
 If you want to know how it works, read [docs/design.md](docs/design.md) and
@@ -33,30 +83,6 @@ Every machine that runs workspaces is a node. Nodes and clients both dial the
 control plane, so nothing needs a public inbound port. The control plane owns
 the queue of workspaces waiting for a node, the event log, policy and
 credential bindings. Session traffic passes through it as opaque frames.
-
-## What it does
-
-- Sessions belong to the node, not to your terminal. Close the laptop, come
-  back, `attach`, and the output replays from where you left off. If retention
-  has dropped bytes, you get an explicit gap rather than silence.
-- Workspaces move. `ws move` snapshots the filesystem, re-queues the workspace,
-  and a node in the zone you asked for picks it up. Files and policy travel;
-  running processes do not.
-- Workspaces sleep and wake on a timer or on an event, and a lease can hold a
-  workspace awake while background work runs, with the deadline stored in the
-  control plane so it survives your process dying.
-- The workspace holds placeholders, not keys. The broker swaps a placeholder
-  for the real credential only on a request to a host that binding allows, and
-  records every use. Revoking a binding reaches a live workspace within one
-  renewal.
-- A node declares a runtime profile (`dev`, `trusted-single-tenant`,
-  `multi-tenant-isolated`, `microvm`) and refuses to start if its backends
-  cannot meet it. `doctor --profile` and `conformance --profile` check a
-  running deployment and report each check as pass, fail or unavailable.
-- A browser can run inside a workspace and be driven through the API:
-  screenshot, click, type, navigate, downloads. It goes through the same
-  egress policy as everything else.
-- Go, Python and TypeScript SDKs, and a CLI that covers all of it.
 
 ## Quick start
 
