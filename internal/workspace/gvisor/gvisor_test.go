@@ -244,3 +244,216 @@ func TestAdoptRebuildsNetworkAfterStartupReap(t *testing.T) {
 		t.Fatalf("calls = %v, want %v", log.calls, want)
 	}
 }
+
+// TestAdoptRecoversATreeWhoseSandboxNeverStarted is the unit form of the
+// wedge the live Colima gVisor drift lane hit on 2026-09-05.
+//
+// A materialization that fails inside ApplyNetworkPolicy — the sandbox would
+// not start — has already created the bundle and its work tree, and the
+// deferred cleanup revokes the boundary before the metadata file is ever
+// written. The node then quarantines the workspace, deliberately retaining
+// the local filesystem, and every retry arrives with adopt=true. Before this
+// test, Create refused with CodeConflict because the bundle existed and Adopt
+// refused with CodeNotFound because network.json did not, so the workspace
+// could never be materialized again on that node: the retry loop reported
+// "has no retained network metadata" forever, which is the wrong problem and
+// one no operator can act on.
+//
+// A retained tree with no retained boundary is not a missing workspace. It is
+// a workspace that was never started, so the honest recovery is a fresh
+// boundary over the bytes that are already there.
+func TestAdoptRecoversATreeWhoseSandboxNeverStarted(t *testing.T) {
+	log := &callLog{}
+	kernel := &fakeKernel{log: log}
+	runtime := &fakeRuntime{log: log, root: "/state", binary: "/usr/bin/runsc", failCreate: true}
+	b := testBackend(t, kernel, runtime)
+	if err := os.MkdirAll(b.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	raw, err := b.Create(ctx, "ws_one", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := raw.(*handle)
+	if err := os.WriteFile(filepath.Join(h.bundle, "work", "keep.txt"), []byte("bytes only here"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	host := h.BrokerAdvertiseHost()
+	endpoint := workspace.NetworkEndpoint{Workspace: "ws_one", Generation: 3,
+		ReverseProxyURL: "http://" + host + ":7443/reverse", ForwardProxyURL: "http://" + host + ":7443"}
+	if err := h.ApplyNetworkPolicy(ctx, proto.NetworkPolicy{Default: proto.NetworkDefaultDeny}, endpoint); err == nil {
+		t.Fatal("ApplyNetworkPolicy succeeded although the sandbox could not start")
+	}
+
+	// This is exactly the sequence internal/node.materializeWithReadyHook
+	// runs on the retry: Adopt, then Create, then Adopt again on conflict.
+	var pe *proto.Error
+	if _, err := b.Create(ctx, "ws_one", proto.WorkspaceSpec{}, nil); err == nil {
+		t.Fatal("Create accepted a workspace whose tree is still on disk")
+	} else if !errors.As(err, &pe) || pe.Code != proto.CodeConflict {
+		t.Fatalf("Create after a failed start = %v, want conflict", err)
+	}
+
+	runtime.failCreate = false
+	adopted, err := b.Adopt(ctx, "ws_one")
+	if err != nil {
+		t.Fatalf("Adopt refused a retained tree whose sandbox never started: %v", err)
+	}
+	if got := adopted.(*handle).MountPath(); got != proto.DefaultMountPath {
+		t.Fatalf("adopted mount path = %q, want %q", got, proto.DefaultMountPath)
+	}
+	body, err := os.ReadFile(filepath.Join(b.dir, "ws_one", "work", "keep.txt"))
+	if err != nil || string(body) != "bytes only here" {
+		t.Fatalf("adoption did not retain the workspace bytes: %q %v", body, err)
+	}
+	// The recovered handle must be serviceable rather than merely
+	// constructed: the whole point of adopting is that the next
+	// materialization succeeds.
+	ah := adopted.(*handle)
+	next := workspace.NetworkEndpoint{Workspace: "ws_one", Generation: 4,
+		ReverseProxyURL: "http://" + ah.BrokerAdvertiseHost() + ":7443/reverse",
+		ForwardProxyURL: "http://" + ah.BrokerAdvertiseHost() + ":7443"}
+	if err := ah.ApplyNetworkPolicy(ctx, proto.NetworkPolicy{Default: proto.NetworkDefaultDeny}, next); err != nil {
+		t.Fatalf("the adopted workspace could not be started: %v", err)
+	}
+}
+
+// TestAdoptHonoursTheMountPathOfATreeThatNeverStarted proves the recovery
+// above does not silently move the workspace. A non-default mount path chosen
+// at Create time has to survive a failed start, because serving the same
+// bytes at a different path is a wrong answer rather than an error.
+func TestAdoptHonoursTheMountPathOfATreeThatNeverStarted(t *testing.T) {
+	log := &callLog{}
+	kernel := &fakeKernel{log: log}
+	runtime := &fakeRuntime{log: log, root: "/state", binary: "/usr/bin/runsc", failCreate: true}
+	b := testBackend(t, kernel, runtime)
+	if err := os.MkdirAll(b.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	raw, err := b.Create(ctx, "ws_two", proto.WorkspaceSpec{MountPath: "/srv/app"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := raw.(*handle)
+	host := h.BrokerAdvertiseHost()
+	if err := h.ApplyNetworkPolicy(ctx, proto.NetworkPolicy{}, workspace.NetworkEndpoint{
+		Workspace: "ws_two", Generation: 3,
+		ReverseProxyURL: "http://" + host + ":7443", ForwardProxyURL: "http://" + host + ":7443",
+	}); err == nil {
+		t.Fatal("ApplyNetworkPolicy succeeded although the sandbox could not start")
+	}
+	runtime.failCreate = false
+	adopted, err := b.Adopt(ctx, "ws_two")
+	if err != nil {
+		t.Fatalf("Adopt refused a retained tree whose sandbox never started: %v", err)
+	}
+	if got := adopted.(*handle).MountPath(); got != "/srv/app" {
+		t.Fatalf("adopted mount path = %q, want /srv/app", got)
+	}
+}
+
+// TestRootFSGivenAsASymlinkIsResolvedForTheSandbox is the second defect the
+// live Colima lane found on 2026-09-05, and the one with teeth.
+//
+// Measured on runsc release-20260831.0, aarch64: an OCI bundle whose
+// root.path is a symlink to a directory fails to start with
+//
+//	creating container: cannot create sandbox: cannot read client sync file:
+//	waiting for sandbox to start: EOF
+//
+// while the identical bundle naming the resolved directory starts. The same
+// four-way experiment showed the runsc binary may be reached through a
+// symlink; only the rootfs matters.
+//
+// Nothing refused the configuration. os.Stat follows symlinks, so New
+// verified the rootfs, the node registered gvisor, advertised
+// enforced_gateway and satisfied multi-tenant-isolated, and then failed every
+// single materialization with a runsc message that names neither the rootfs
+// nor the symlink. Pointing REMOUNT_GVISOR_ROOTFS at a symlink is the normal
+// way to swap an immutable image atomically, so this is a configuration an
+// operator will reach for.
+//
+// Resolving it is the fix rather than refusing it, and the split matters: the
+// sandbox is started from the resolved directory, while the drift probe keeps
+// watching the path the operator configured, so removing that symlink is
+// still observed as the rootfs going away.
+func TestRootFSGivenAsASymlinkIsResolvedForTheSandbox(t *testing.T) {
+	dir := t.TempDir()
+	image := filepath.Join(dir, "rootfs-2026-09-05")
+	if err := os.Mkdir(image, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "rootfs")
+	if err := os.Symlink(image, link); err != nil {
+		t.Fatal(err)
+	}
+
+	// The comparison target is the image directory with its own symlinks
+	// resolved: on darwin t.TempDir() itself sits under /var -> /private/var,
+	// and the property under test is "no symlink survives into the bundle",
+	// not "exactly one link was followed".
+	image, err := filepath.EvalSymlinks(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured, resolved, err := resolveRootFS(link)
+	if err != nil {
+		t.Fatalf("resolveRootFS(%q): %v", link, err)
+	}
+	if configured != link {
+		t.Fatalf("configured rootfs = %q, want the path as given %q", configured, link)
+	}
+	if resolved != image {
+		t.Fatalf("resolved rootfs = %q, want the real directory %q", resolved, image)
+	}
+
+	log := &callLog{}
+	b := &Backend{dir: filepath.Join(dir, "workspaces"), rootfs: resolved, rootfsPath: configured,
+		network: netns.NewManager(&fakeKernel{log: log}),
+		runtime: &fakeRuntime{log: log, root: "/state", binary: "/usr/bin/runsc"}}
+	if err := os.MkdirAll(b.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := b.Create(context.Background(), "ws_one", proto.WorkspaceSpec{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := raw.(*handle)
+	config, err := h.ociConfig("/run/remount/netns/fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(config), `"path": "`+image+`"`) {
+		t.Fatalf("the OCI bundle does not name the resolved rootfs %q:\n%s", image, config)
+	}
+	if strings.Contains(string(config), `"path": "`+link+`"`) {
+		t.Fatalf("the OCI bundle still names the symlink %q, which runsc cannot serve", link)
+	}
+
+	// Drift is still measured against the operator's path: swapping or
+	// deleting the symlink is the rootfs going away, whatever survives at the
+	// far end of it.
+	checks := b.Reprobe(context.Background())
+	if !findingStatus(checks, CheckRootFS, proto.CheckPass) {
+		t.Fatalf("the rootfs check did not pass while the symlink was intact: %+v", checks)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	checks = b.Reprobe(context.Background())
+	if !findingStatus(checks, CheckRootFS, proto.CheckFail) {
+		t.Fatalf("removing the configured rootfs path was not observed as drift: %+v", checks)
+	}
+}
+
+func findingStatus(checks []proto.Finding, name, status string) bool {
+	for _, c := range checks {
+		if c.Check == name {
+			return c.Status == status
+		}
+	}
+	return false
+}
