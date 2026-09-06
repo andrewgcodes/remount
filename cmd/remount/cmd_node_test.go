@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -20,8 +21,11 @@ func TestWriteSecretFileIsExclusiveAndPrivate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
+	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm != 0o600 {
 		t.Fatalf("enrollment file mode = %#o, want 0600", perm)
+	}
+	if err := validateSecretFilePermissions(path, info); err != nil {
+		t.Fatalf("enrollment file permissions: %v", err)
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -45,12 +49,14 @@ func TestWriteSecretFileIsExclusiveAndPrivate(t *testing.T) {
 
 func TestReadSecretFileRefusesAReadableFile(t *testing.T) {
 	dir := t.TempDir()
-	open := filepath.Join(dir, "open.token")
-	if err := os.WriteFile(open, []byte("enroll_abc\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := readSecretFile(open); err == nil || !strings.Contains(err.Error(), "0644") {
-		t.Fatalf("readSecretFile on a world-readable path = %v", err)
+	if runtime.GOOS != "windows" {
+		open := filepath.Join(dir, "open.token")
+		if err := os.WriteFile(open, []byte("enroll_abc\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readSecretFile(open); err == nil || !strings.Contains(err.Error(), "0644") {
+			t.Fatalf("readSecretFile on a world-readable path = %v", err)
+		}
 	}
 	empty := filepath.Join(dir, "empty.token")
 	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {

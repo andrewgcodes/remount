@@ -46,6 +46,10 @@ func storedAccessToken(server string) string {
 	if path == "" {
 		return ""
 	}
+	info, err := os.Stat(path)
+	if err != nil || validateSecretFilePermissions(path, info) != nil {
+		return ""
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return ""
@@ -102,7 +106,7 @@ func cmdLogin(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
 	serverURL := fs.String("server", envOr("REMOUNT_SERVER", "http://127.0.0.1:7443"), "server URL")
 	tenantID := fs.String("tenant", "", "tenant configured for OIDC")
-	credentialPath := fs.String("credential-file", defaultCredentialPath(), "mode-0600 credential file")
+	credentialPath := fs.String("credential-file", defaultCredentialPath(), "private credential file")
 	jsonOutput := fs.Bool("json", false, "JSON output")
 	parse(fs, args)
 	if err := arity(fs, 0, 0, "login --tenant TENANT"); err != nil {
@@ -257,6 +261,9 @@ func writeCredentialFile(path string, value credentialFile) error {
 			_ = os.Remove(temporary)
 		}
 	}()
+	if err := secureSecretFile(temporary); err != nil {
+		return err
+	}
 	encoder := json.NewEncoder(file)
 	if err := encoder.Encode(value); err != nil {
 		return err

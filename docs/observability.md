@@ -84,9 +84,11 @@ control plane's copy was damaged while the node's cache was still intact, and
 the tool says exactly that. It exits non-zero, so it works as a health check.
 
 **A check that cannot run is never reported as a pass.** If a node refuses the
-deep call, doctor emits `node.diag_unavailable` and says its workspaces were
-not checked. An earlier version skipped quietly and printed "healthy", which
-is the most dangerous output a health tool can produce.
+deep call, doctor emits `node.diag_unavailable`, prints `INCOMPLETE`, and exits
+2 because its workspaces were not checked. JSON reports `ok: false` and
+`incomplete: true`. Exit 1 remains reserved for a verified failure. An earlier
+version skipped quietly and printed "healthy", which is the most dangerous
+output a health tool can produce.
 
 ## Two scripts for machine readers
 

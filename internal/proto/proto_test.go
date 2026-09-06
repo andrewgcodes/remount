@@ -153,6 +153,30 @@ func TestSessionSubscriptionFieldIsWireCompatible(t *testing.T) {
 	}
 }
 
+func TestSessionOpenKindIsWireCompatible(t *testing.T) {
+	type legacyOpenRes struct {
+		S            string `cbor:"s"`
+		Next         uint64 `cbor:"next"`
+		LastInputSeq uint64 `cbor:"last_iseq,omitempty"`
+	}
+
+	var oldResponse legacyOpenRes
+	if err := Unmarshal(MustMarshal(SOpenRes{S: "s_1", Next: 8, LastInputSeq: 3, Kind: SessionPTY}), &oldResponse); err != nil {
+		t.Fatal(err)
+	}
+	if oldResponse.S != "s_1" || oldResponse.Next != 8 || oldResponse.LastInputSeq != 3 {
+		t.Fatalf("legacy response = %+v", oldResponse)
+	}
+
+	var newResponse SOpenRes
+	if err := Unmarshal(MustMarshal(legacyOpenRes{S: "s_1", Next: 8, LastInputSeq: 3}), &newResponse); err != nil {
+		t.Fatal(err)
+	}
+	if newResponse.Kind != "" {
+		t.Fatalf("legacy response kind = %q", newResponse.Kind)
+	}
+}
+
 func TestAgentBindingSpecsAreWireCompatible(t *testing.T) {
 	type legacyAgentSpec struct {
 		Recipe    string   `cbor:"recipe"`

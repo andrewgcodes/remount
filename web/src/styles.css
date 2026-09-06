@@ -7,6 +7,7 @@
   --bg: #0a0e15;
   --surface: #111722;
   --surface-2: #171f2d;
+  --panel: rgb(17 23 34 / 88%);
   --line: #263145;
   --text: #dce4ef;
   --muted: #8996aa;
@@ -63,7 +64,7 @@ main { width: min(100%, 98rem); min-width: 0; padding: 2.5rem clamp(1rem, 4vw, 4
 .metric span { color: var(--muted); font-size: .8rem; }
 .metric strong { font: 500 2.25rem/1 ui-monospace, monospace; }
 .metric.bad strong { color: var(--bad); }
-.panel { min-width: 0; margin-bottom: .8rem; border: 1px solid var(--line); border-radius: .65rem; background: rgb(17 23 34 / 88%); overflow: hidden; }
+.panel { min-width: 0; margin-bottom: .8rem; border: 1px solid var(--line); border-radius: .65rem; background: var(--panel); overflow: hidden; }
 .panel-header { min-height: 3rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .8rem 1rem; border-bottom: 1px solid var(--line); }
 .panel-header h2 { margin: 0; font-size: .88rem; letter-spacing: .01em; }
 .panel-header > span { color: var(--muted); font-size: .75rem; }
@@ -149,7 +150,7 @@ progress { width: 100%; height: .32rem; border: 0; accent-color: var(--accent); 
 .modal .actions { justify-content: flex-end; }
 
 @media (prefers-color-scheme: light) {
-  :root { --bg: #f4f6f8; --surface: #fff; --surface-2: #eef1f5; --line: #d8dee8; --text: #182231; --muted: #637085; --accent: #08785e; --accent-ink: #fff; --warn: #9d5e00; --bad: #bc303a; --good: #08785e; --focus: #135fc7; }
+  :root { --bg: #f4f6f8; --surface: #fff; --surface-2: #eef1f5; --panel: rgb(255 255 255 / 88%); --line: #d8dee8; --text: #182231; --muted: #637085; --accent: #08785e; --accent-ink: #fff; --warn: #9d5e00; --bad: #bc303a; --good: #08785e; --focus: #135fc7; }
   body { background: radial-gradient(circle at 80% -20%, #dceaf7 0, transparent 34rem), var(--bg); }
   .sidebar { background: rgb(250 252 255 / 88%); }
 }

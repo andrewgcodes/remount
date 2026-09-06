@@ -29,7 +29,7 @@ reach process listings, crash dumps and monitoring agents that never see an
 environment variable. Every flag that takes a credential also reads an
 environment variable, and `remount up`, `remount server` and the client all
 accept `REMOUNT_TOKEN`. Production mode avoids the question entirely: it issues
-per-principal tokens through `--bootstrap-token-file`, an exclusive mode-0600
+per-principal tokens through `--bootstrap-token-file`, an exclusive private
 path, and `remount token issue`, rather than a shared secret anyone can reuse.
 
 Additional server flags:
@@ -41,7 +41,7 @@ Additional server flags:
 | `--notifications` | none | provider-webhook and outbound-notification JSON; credentials are named environment references |
 | `--lease` | `30` | claim lease in seconds |
 | `--mode` | `standalone` | `standalone`, `production-single-tenant`, or `production-multi-tenant` |
-| `--bootstrap-principal` / `--bootstrap-token-file` | none | first global operator and exclusive mode-0600 initial access file; production only |
+| `--bootstrap-principal` / `--bootstrap-token-file` | none | first global operator and exclusive private initial access file; production only |
 | `--max-concurrent-requests` | `128` | active control request handlers; excess work fails with `resource_exhausted` |
 | `--max-tenant-workspaces` / `--max-subject-workspaces` | `1000` / `100` | non-destroyed workspace quotas |
 | `--max-mutation-records` | `100000` | retained control idempotency results |
@@ -72,8 +72,9 @@ multi-tenant isolation.
 ### Production onboarding and OIDC
 
 Bootstrap exactly one short-lived global operator on the first production
-start. The path must not exist; Remount creates it mode 0600 and never writes
-the bearer to a log or event.
+start. The path must not exist; Remount creates it privately and never writes
+the bearer to a log or event. That means mode 0600 on Unix and a protected
+NTFS DACL on Windows.
 
 ```sh
 remount server --mode production-multi-tenant --data /var/lib/remount \
@@ -91,9 +92,10 @@ The OIDC JSON contains only public-client configuration: `issuer`,
 `group_roles` mappings. Issuers must be HTTPS. `remount login --tenant acme`
 performs discovery and RFC 8628 device flow, verifies RS256 from the discovered
 JWKS through the server, and stores the access/refresh pair in
-`~/.remount/credentials.json` (or `REMOUNT_CREDENTIAL_FILE`) mode 0600. Refresh
-rotation is single-use. Provider, refresh, device, enrollment and bootstrap
-bearers never appear in canonical events.
+`~/.remount/credentials.json` (or `REMOUNT_CREDENTIAL_FILE`) with the same
+platform-native private-file protection. Refresh rotation is single-use.
+Provider, refresh, device, enrollment and bootstrap bearers never appear in
+canonical events.
 
 ### Enroll a node
 
@@ -119,7 +121,7 @@ remount server --listen 127.0.0.1:7443 --data /var/lib/remount \
 export REMOUNT_SERVER=http://127.0.0.1:7443
 export REMOUNT_TOKEN="$(tr -d '\n' </run/remount/op.token)"
 
-# 3. Mint the machine's credential. --out is exclusive and mode 0600; the
+# 3. Mint the machine's credential. --out is exclusive and private; the
 #    command refuses to overwrite a path that already exists.
 remount node enroll --name web-1 --tenant acme --labels zone=eu-west \
   --ttl 10m --out /run/remount/web-1.enroll
@@ -147,7 +149,7 @@ REMOUNT_TOKEN="$(tr -d '\n' </run/remount/builder.token)" \
 | `--tenant` | caller's tenant | exact tenant. A global operator (tenant `*`) must name one |
 | `--labels k=v` | none | trusted placement labels, repeatable. A node can neither expand nor replace them in its hello, and `tenant` is stamped by the control plane regardless |
 | `--ttl` | `10m` | credential lifetime, 1s to 10m. The window is short on purpose: it only has to cover handing the file to one machine |
-| `--out FILE` | none | exclusive mode-0600 destination. Exactly one of `--out` and `--stdout` |
+| `--out FILE` | none | exclusive private destination: mode 0600 on Unix, protected owner/SYSTEM/Administrators DACL on Windows. Exactly one of `--out` and `--stdout` |
 | `--stdout` | off | print the credential once on stdout, for a pipe into a provisioning system |
 
 **The backend has to satisfy the deployment's security floor, or the hello is
@@ -168,8 +170,8 @@ refused node can be reconfigured and restarted with the same file.
 ambient bearer deliberately: `REMOUNT_TOKEN` is usually exported for the client
 CLI, and a node that quietly enrolled with an operator bearer instead of the
 credential you just named would fail confusingly. The node refuses an
-enrollment file any other local user can read, and logs which source it used —
-never the value.
+enrollment file any other local user can read, using Unix mode bits or the
+Windows DACL as appropriate, and logs which source it used — never the value.
 
 Each credential is for exactly one machine. To add a second node, mint a
 second credential; reusing the first is refused. `remount node enroll` is not
@@ -360,12 +362,14 @@ alternate data streams, reserved device names, ambiguous trailing dots or
 spaces, and reparse-point escapes. Do not bypass Remount's rooted filesystem
 operations with workspace-side host tools.
 
-POSIX modes such as `0600` do not describe Windows ACL confidentiality. File
-master keys are checked against their Windows DACL and are refused when a
-principal other than the owner, current account, Local System, or local
-Administrators has read access. Apply equivalently restrictive ACLs to other
-sensitive files and audit them with `icacls`; using
-`REMOUNT_MASTER_KEY` avoids a master-key file.
+POSIX modes such as `0600` do not describe Windows ACL confidentiality.
+Remount-created enrollment, bootstrap, and OIDC credential files and connector
+scope keys receive a protected DACL granting access only to the current
+account, Local System, and local Administrators. Remount refuses existing
+credential files, connector scope keys, and file master keys when another
+principal has read access. Apply equivalently restrictive ACLs to other
+sensitive files and audit them with `icacls`; using `REMOUNT_MASTER_KEY` avoids
+a master-key file.
 
 ## Snapshot consistency
 

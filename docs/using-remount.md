@@ -68,6 +68,8 @@ Do not place a bearer on a command line on a shared host. Process arguments
 are visible to other local processes. Production identity, TLS, tokens, OIDC,
 backups, and node enrollment are covered in
 [`operations.md`](operations.md).
+Remount-created credential files use mode 0600 on Unix and protected NTFS
+DACLs on Windows; files readable by another local principal are refused.
 
 ## Run a coding agent on a checkout
 
@@ -301,6 +303,10 @@ caller explicitly requests termination:
 ./remount exec "$WS" -- sh -c 'for i in $(seq 1 60); do echo "$i"; sleep 1; done'
 ./remount attach "$WS" SESSION_ID --from 0
 ```
+
+`attach` uses local raw terminal mode only for PTY sessions. Replaying an exec
+session leaves normal terminal output processing enabled, so newline-delimited
+output starts each line in column one while preserving the recorded bytes.
 
 Workspace lifecycle:
 
@@ -954,10 +960,11 @@ For a coding-agent task, verify at least:
 5. disposable Agents, workspaces, provider resources, and temporary secret
    imports were removed.
 
-`doctor` is three-valued: pass, fail, or unavailable. Unavailable checks are
-not evidence of health. Read individual findings even when the command exits
-zero or JSON says `ok: true`: warnings such as `tenant.residency_unavailable`
-mean that named policy was not checked.
+`doctor` is three-valued: exit 0 means every available check passed, exit 1
+means a check failed, and exit 2 means no check failed but at least one was
+unavailable. JSON reports unavailable runs as `ok: false` and
+`incomplete: true`; findings such as `tenant.residency_unavailable` name the
+policy that was not checked.
 
 ## Public API, errors and tracing
 

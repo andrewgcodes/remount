@@ -51,7 +51,7 @@ func runNodeEnroll(ctx context.Context, fs *flag.FlagSet, args []string, commonF
 	tenant := fs.String("tenant", "", "exact tenant (required for a global operator)")
 	ttl := fs.Duration("ttl", nodeEnrollmentTTLMax, "credential lifetime (1s to 10m)")
 	idem := fs.String("idem", "", "stable idempotency key")
-	out := fs.String("out", "", "exclusive mode-0600 path to write the credential to")
+	out := fs.String("out", "", "exclusive private path to write the credential to")
 	toStdout := fs.Bool("stdout", false, "print the credential once on stdout instead of writing a file")
 	labels := kvFlag{}
 	fs.Var(labels, "labels", "trusted placement label k=v bound to the enrollment (repeatable)")
@@ -124,7 +124,7 @@ func runNodeEnroll(ctx context.Context, fs *flag.FlagSet, args []string, commonF
 			})
 			return nil
 		}
-		fmt.Fprintf(os.Stderr, "one-time enrollment for %s in tenant %s written to %s (mode 0600), expires %s\n",
+		fmt.Fprintf(os.Stderr, "one-time enrollment for %s in tenant %s written privately to %s, expires %s\n",
 			res.Name, res.Tenant, target, expires)
 		fmt.Fprintf(os.Stderr, "start the node with: remount up --server %s --enrollment-file %s\n", commonFlags.server, target)
 		return nil
@@ -141,7 +141,7 @@ func runNodeEnroll(ctx context.Context, fs *flag.FlagSet, args []string, commonF
 	return nil
 }
 
-// reserveSecretFile claims an exclusive mode-0600 path, the same contract
+// reserveSecretFile claims an exclusive private path, the same contract
 // `--bootstrap-token-file` uses. O_EXCL rather than a truncating write:
 // silently overwriting a file the operator already handed to a machine would
 // strand that machine with a credential nobody can name any more.
@@ -149,6 +149,11 @@ func reserveSecretFile(path string) (*os.File, error) {
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("create %s: %w", path, err)
+	}
+	if err := secureSecretFile(path); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return nil, fmt.Errorf("secure %s: %w", path, err)
 	}
 	return file, nil
 }
@@ -181,15 +186,15 @@ func writeSecretFile(path, secret string) error {
 }
 
 // readSecretFile is the node side of writeSecretFile. It refuses a file any
-// other local user can read, because a one-time enrollment on a mode-0644 path
-// has already failed at being one-time.
+// other local user can read because that enrollment has already failed at
+// being one-time.
 func readSecretFile(path string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return "", err
 	}
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return "", fmt.Errorf("%s is mode %#o: a credential file must not be group- or world-accessible", path, perm)
+	if err := validateSecretFilePermissions(path, info); err != nil {
+		return "", err
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {

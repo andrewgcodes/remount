@@ -73,6 +73,12 @@ are `{generation,node?,state,at,eventSeq}`. State and event fields come from
 durable control data; the adapter must not infer a successful move from a node
 connection or request response.
 
+The workspace Run field converts shell-style single quotes, double quotes and
+backslash escapes into the `command` array. It does not invoke a shell or
+perform expansion; use an explicit command such as `sh -c '...'` when shell
+syntax is required. Incomplete quoting is rejected rather than sent as a
+different command.
+
 ### Files
 
 | Method and route | Result or body |

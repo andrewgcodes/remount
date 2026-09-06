@@ -81,7 +81,8 @@ func NewEnvMasterKey(envName, keyID string) (*AESMasterKey, error) {
 }
 
 // NewFileMasterKey loads a base64- or hex-encoded 32-byte key from a trusted
-// control-plane file. Symlinks and group/world-readable files are refused.
+// control-plane file. Symlinks and files readable by other principals are
+// refused.
 func NewFileMasterKey(path, keyID string) (*AESMasterKey, error) {
 	st, err := os.Lstat(path)
 	if err != nil {

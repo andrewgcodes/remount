@@ -1597,6 +1597,7 @@ export interface SOpenRes {
   "s": string;
   "next": number;
   "last_iseq"?: number;
+  "kind"?: string;
 }
 
 export interface SResizeReq {

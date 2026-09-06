@@ -283,6 +283,44 @@ func TestDriveKillOnInterruptForwardsSIGINTThenDetaches(t *testing.T) {
 	}
 }
 
+func TestDoctorUnavailableIsIncompleteNotHealthy(t *testing.T) {
+	rep := doctorReport{OK: true}
+	rep.add(proto.Finding{
+		Severity: "warn",
+		Check:    "tenant.residency_unavailable",
+		Detail:   "residency policy could not be checked",
+	})
+	output := captureStdout(t, func() {
+		err := finish(rep, false)
+		var code exitError
+		if !errors.As(err, &code) || code != 2 {
+			t.Fatalf("exit=%v", err)
+		}
+	})
+	if strings.Contains(output, "\nhealthy\n") || !strings.Contains(output, "INCOMPLETE") {
+		t.Fatalf("output=%q", output)
+	}
+
+	jsonOutput := captureStdout(t, func() {
+		_ = finish(rep, true)
+	})
+	if !strings.Contains(jsonOutput, `"ok": false`) || !strings.Contains(jsonOutput, `"incomplete": true`) {
+		t.Fatalf("json=%s", jsonOutput)
+	}
+}
+
+func TestAttachUsesRawTerminalOnlyForPTYOnTerminal(t *testing.T) {
+	if attachUsesRawTerminal(proto.SessionExec, true) {
+		t.Fatal("exec attach enabled raw terminal mode")
+	}
+	if attachUsesRawTerminal(proto.SessionPTY, false) {
+		t.Fatal("non-terminal PTY attach enabled raw terminal mode")
+	}
+	if !attachUsesRawTerminal(proto.SessionPTY, true) {
+		t.Fatal("terminal PTY attach did not enable raw mode")
+	}
+}
+
 func TestExecTimeoutIsNotClamped(t *testing.T) {
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	timeout := fs.Duration("timeout", 0, "")
@@ -302,7 +340,7 @@ func TestWorkspaceCreateRejectsClientSelectedPrincipalBeforeDial(t *testing.T) {
 	}
 }
 
-func TestCredentialFileIsMode0600AndServerScoped(t *testing.T) {
+func TestCredentialFileIsPrivateAndServerScoped(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "credentials.json")
 	value := credentialFile{Server: "https://one.example", Tenant: "tenant-a", AccessToken: "access-secret", RefreshToken: "refresh-secret"}
 	if err := writeCredentialFile(path, value); err != nil {
@@ -312,10 +350,11 @@ func TestCredentialFileIsMode0600AndServerScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runtime.GOOS == "windows" {
-		t.Log("unavailable: Go file modes do not expose Windows ACL confidentiality")
-	} else if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("credential mode=%o", info.Mode().Perm())
+	}
+	if err := validateSecretFilePermissions(path, info); err != nil {
+		t.Fatalf("credential file permissions: %v", err)
 	}
 	t.Setenv("REMOUNT_CREDENTIAL_FILE", path)
 	if got := storedAccessToken("https://one.example"); got != "access-secret" {

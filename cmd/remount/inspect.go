@@ -347,9 +347,23 @@ func humanBytes(n int64) string {
 // ---------------------------------------------------------------------------
 
 type doctorReport struct {
-	OK       bool            `json:"ok"`
-	Checked  []string        `json:"checked"`
-	Findings []proto.Finding `json:"findings"`
+	OK         bool            `json:"ok"`
+	Incomplete bool            `json:"incomplete,omitempty"`
+	Checked    []string        `json:"checked"`
+	Findings   []proto.Finding `json:"findings"`
+}
+
+func (r *doctorReport) add(findings ...proto.Finding) {
+	r.Findings = append(r.Findings, findings...)
+	for _, finding := range findings {
+		if finding.Severity == "error" {
+			r.OK = false
+		}
+		if strings.HasSuffix(finding.Check, "_unavailable") {
+			r.OK = false
+			r.Incomplete = true
+		}
+	}
 }
 
 func cmdDoctor(ctx context.Context, args []string) error {
@@ -367,31 +381,23 @@ func cmdDoctor(ctx context.Context, args []string) error {
 	}
 	rep := doctorReport{OK: true}
 
-	add := func(f ...proto.Finding) {
-		rep.Findings = append(rep.Findings, f...)
-		for _, x := range f {
-			if x.Severity == "error" {
-				rep.OK = false
-			}
-		}
-	}
 	check := func(name string) { rep.Checked = append(rep.Checked, name) }
 
 	// 1. Control plane reachable, and its own findings.
 	check("control.reachable")
 	d, err := cl.Diag(ctx, *deep)
 	if err != nil {
-		add(proto.Finding{Severity: "error", Check: "control.reachable", Detail: err.Error(),
+		rep.add(proto.Finding{Severity: "error", Check: "control.reachable", Detail: err.Error(),
 			Hint: "check --server and --token"})
 		return finish(rep, c.json)
 	}
-	add(d.Findings...)
+	rep.add(d.Findings...)
 
 	// 2. The database's own integrity check. This is the deepest statement
 	// the control plane can make about whether its state is intact.
 	check("control.db_integrity")
 	if d.DBIntegrity != "" && d.DBIntegrity != "ok" {
-		add(proto.Finding{Severity: "error", Check: "control.db_integrity", Detail: d.DBIntegrity,
+		rep.add(proto.Finding{Severity: "error", Check: "control.db_integrity", Detail: d.DBIntegrity,
 			Hint: "sqlite reports corruption; restore control.db from a backup"})
 	}
 
@@ -399,7 +405,7 @@ func cmdDoctor(ctx context.Context, args []string) error {
 	// what it holds.
 	nodes, err := cl.ListNodes(ctx)
 	if err != nil {
-		add(proto.Finding{Severity: "error", Check: "node.list", Detail: err.Error()})
+		rep.add(proto.Finding{Severity: "error", Check: "node.list", Detail: err.Error()})
 		return finish(rep, c.json)
 	}
 	wss, _ := cl.ListWorkspaces(ctx)
@@ -413,7 +419,7 @@ func cmdDoctor(ctx context.Context, args []string) error {
 	for _, n := range nodes {
 		if !n.Online {
 			if len(expected[n.ID]) > 0 {
-				add(proto.Finding{Severity: "warn", Check: "node.offline_holding", Subject: n.ID,
+				rep.add(proto.Finding{Severity: "warn", Check: "node.offline_holding", Subject: n.ID,
 					Detail: fmt.Sprintf("offline while holding %d workspaces", len(expected[n.ID])),
 					Hint:   "their leases will expire and they will be re-queued"})
 			}
@@ -429,19 +435,19 @@ func cmdDoctor(ctx context.Context, args []string) error {
 		if err != nil {
 			// Never skip a check quietly. A consistency check that cannot run
 			// is not a passing consistency check.
-			add(proto.Finding{Severity: "warn", Check: "node.diag_unavailable", Subject: n.ID,
+			rep.add(proto.Finding{Severity: "warn", Check: "node.diag_unavailable", Subject: n.ID,
 				Detail: "could not read this node's deep state: " + err.Error(),
 				Hint:   "its workspaces were not checked for consistency"})
 			continue
 		}
-		add(nd.Findings...)
+		rep.add(nd.Findings...)
 		have := map[string]bool{}
 		for _, w := range nd.Workspaces {
 			have[w.ID] = true
 		}
 		for _, id := range expected[n.ID] {
 			if !have[id] {
-				add(proto.Finding{Severity: "error", Check: "consistency.missing_on_node", Subject: id,
+				rep.add(proto.Finding{Severity: "error", Check: "consistency.missing_on_node", Subject: id,
 					Detail: fmt.Sprintf("control plane says %s holds it; the node does not", n.ID),
 					Hint:   "data may be lost if there is no snapshot; check `remount inspect " + id + "`"})
 			}
@@ -454,7 +460,7 @@ func cmdDoctor(ctx context.Context, args []string) error {
 				}
 			}
 			if !found {
-				add(proto.Finding{Severity: "warn", Check: "consistency.orphan_on_node", Subject: w.ID,
+				rep.add(proto.Finding{Severity: "warn", Check: "consistency.orphan_on_node", Subject: w.ID,
 					Detail: fmt.Sprintf("%s is holding a workspace the control plane does not assign to it", n.ID),
 					Hint:   "it will be dropped on the node's next resync"})
 			}
@@ -474,7 +480,7 @@ func cmdDoctor(ctx context.Context, args []string) error {
 			}
 		}
 		if !placeable {
-			add(proto.Finding{Severity: "error", Check: "workspace.no_nodes", Subject: ws.ID,
+			rep.add(proto.Finding{Severity: "error", Check: "workspace.no_nodes", Subject: ws.ID,
 				Detail: "pending with no node online at all"})
 		}
 	}
@@ -497,16 +503,16 @@ func cmdDoctor(ctx context.Context, args []string) error {
 	}
 	check("data.loss_signals")
 	if v := d.Metrics["remount_artifact_digest_mismatch_total"]; v > 0 {
-		add(proto.Finding{Severity: "error", Check: "artifact.corruption",
+		rep.add(proto.Finding{Severity: "error", Check: "artifact.corruption",
 			Detail: fmt.Sprintf("%g artifacts failed digest verification", v)})
 	}
 	if v := d.Metrics["remount_frames_dropped_total"]; v > 0 {
-		add(proto.Finding{Severity: "info", Check: "relay.frames_dropped",
+		rep.add(proto.Finding{Severity: "info", Check: "relay.frames_dropped",
 			Detail: fmt.Sprintf("%g frames were addressed to a peer that had gone", v),
 			Hint:   "expected during reconnects; a rising rate means peers are flapping"})
 	}
 	if v := d.Metrics["remount_session_gaps_total"]; v > 0 {
-		add(proto.Finding{Severity: "warn", Check: "session.gaps",
+		rep.add(proto.Finding{Severity: "warn", Check: "session.gaps",
 			Detail: fmt.Sprintf("%g replay gaps were reported; that much output no client could retrieve", v)})
 	}
 	return finish(rep, c.json)
@@ -630,16 +636,31 @@ func finish(rep doctorReport, asJSON bool) error {
 			printFindings(rep.Findings)
 		}
 		fmt.Println()
-		if rep.OK {
-			fmt.Println("healthy")
-		} else {
+		switch {
+		case reportFailed(rep):
 			fmt.Println("PROBLEMS FOUND")
+		case rep.Incomplete:
+			fmt.Println("INCOMPLETE: some checks could not run; this is not a healthy result")
+		default:
+			fmt.Println("healthy")
 		}
 	}
-	if !rep.OK {
+	if reportFailed(rep) {
 		return exitError(1)
 	}
+	if rep.Incomplete {
+		return exitError(2)
+	}
 	return nil
+}
+
+func reportFailed(rep doctorReport) bool {
+	for _, finding := range rep.Findings {
+		if finding.Severity == "error" {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
