@@ -2233,3 +2233,150 @@ This was not a new comprehensive security audit, a dependency upgrade, or a
 production qualification. No `.env` credentials were loaded, cloud resources
 deployed, browser/host-isolation lanes rerun, or new race/full-verify result
 claimed. Prior live and race evidence remains dated in its original entries.
+
+## Historical PR #13 evidence integrated on 2026-09-05
+
+The following entries retain the original Linux candidate results. Their
+integration does not claim a new Linux/runsc host pass on current main.
+
+### 2026-09-04 — release-matrix node inventory propagation
+
+The Ubuntu test job failed `TestReleaseMatrixUnderLocalProfile` because the
+test queried control-plane node inventory immediately after both node-local
+`Online` signals. One node had completed its local handshake but had not yet
+become visible to the subsequent client list request. The test now waits,
+within its existing 30-second context, until both exact node identities are
+listed before asserting their negotiated protocols. The protocol and placement
+assertions are unchanged.
+
+Verification:
+
+```sh
+go test -race -count=20 \
+  -run '^TestReleaseMatrixUnderLocalProfile$' \
+  -timeout 300s ./internal/sim
+go test -count=1 -timeout 1200s ./internal/sim
+staticcheck ./internal/sim
+go vet ./internal/sim
+```
+
+All commands passed. The repeated race proof completed in 19.219 seconds and
+the complete simulation package completed in 251.767 seconds.
+
+### 2026-09-04 — Windows-main integration after the Ubuntu CI fix
+
+The Linux branch merged `origin/main` at
+`51185ddeda5c4451c024a1fd7c660e4cc271a52b`, retaining the upstream
+cross-platform split files, serialized heavy test gates, bounded concurrent
+cursor detach, and local workspace cleanup. The merge also retained the Linux
+branch's durable session completion ordering, exact stale-grant handling,
+durable event polling, filesystem-access preparation, and deny-first gVisor
+proof.
+
+Verification:
+
+```sh
+make lint
+make test
+make race
+make conformance
+go test -race -count=20 \
+  -run '^TestReleaseMatrixUnderLocalProfile$' \
+  -timeout 300s ./internal/sim
+staticcheck ./internal/sim
+go vet ./internal/sim
+go test -count=1 -timeout 1200s ./internal/sim
+go run ./cmd/conformance --build .
+sudo -n env \
+  REMOUNT_GVISOR_ROOTFS=/home/ubuntu/firecracker-artifacts/gvisor-rootfs-alpine-3.22 \
+  scripts/gvisor-spike.sh
+```
+
+All commands passed. The repeated release-matrix race proof completed in
+19.063 seconds and the complete simulation package completed in 254.963
+seconds. The complete race suite and serialized conformance suite passed. The
+built-binary conformance run reported 60 passed, 0 failed, and 8 unavailable;
+all 53 required requirements passed and cleanup was verified.
+
+Linux 5.15 rejected the upstream netdev egress hook with `Operation not
+supported`; the spike installed its deny-first host-ingress fallback and
+passed broker reachability, IPv4 TCP, IPv6, UDP, DNS, ICMP, raw-socket, unlisted
+CONNECT, and post-revoke denial checks. Its exit trap deleted the runsc
+sandbox, veth, nftables table, network namespace, bind mount, and temporary
+directory. **Status: verified.**
+
+### 2026-09-04 — B32 aggregate correction and merged-main follow-up
+
+The first aggregate run on committed candidate
+`a48d046132ba01976fb799424607654bb33c32b9` correctly failed:
+
+```text
+evidence: verdict failed: 1 required rows failed, 20 unavailable, 0 leaks
+B32: owning proof skipped without an unavailable reason
+```
+
+The B32 registry command ran the entire `integration/installs` package even
+though its owner is `integration/installs.TestB32*`. The package also contains
+the unrelated `TestCleanEnvKeepsWindowsPackageManagerRoots`, whose
+Windows-contract skip is not a B32 proof. The evidence parser remains strict;
+the registry command was narrowed to its owning tests and a regression fixes
+that exact command:
+
+```sh
+go test -count=1 -timeout=20m -run '^TestB32' ./integration/installs/
+```
+
+On committed candidate `ed84f259c17043b81391ae758df2048faa950014`,
+the command passed in 45.813 seconds. The clean committed-candidate aggregate
+then completed:
+
+```sh
+go run ./cmd/evidence run
+```
+
+```text
+Rows: 35 passed, 0 failed, 32 unavailable
+Required rows: 35 of 55 passed, 0 failed, 20 unavailable
+External resources created: 1; cleanup verified 1, failed 0
+```
+
+This result is deliberately **incomplete**, not passed: all 20 required rows
+that did not execute remain unavailable with named missing prerequisites or
+unwired owning proofs. B32 passed and no required row failed.
+
+After `main` advanced to `069a17d3acf63bcd6050acf4bbadd4ef3d90ad61`
+with four Windows-lane test corrections, that commit was merged without
+overwriting the follow-up changes. On committed candidate
+`ff23e7e29c3c96dd676de4e516b9d317da93f380`, the direct B32 proof passed again
+in 49.368 seconds, the affected workspace packages passed under the race
+detector, and the aggregate repeated the same 35 passed, 0 failed, 32
+unavailable result with verified cleanup.
+
+Built-binary conformance on the same candidate:
+
+```sh
+go run ./cmd/conformance --build .
+```
+
+```text
+60 passed, 0 failed, 8 unavailable of 68 requirements
+required: 53 passed, 0 failed, 0 unavailable
+cleanup: verified
+```
+
+After the original pull request merged, the unmerged work was moved to a
+follow-up branch based on current `main`. The exact Linux host proof was
+re-run:
+
+```sh
+sudo -n env \
+  REMOUNT_GVISOR_ROOTFS=/home/ubuntu/firecracker-artifacts/gvisor-rootfs-alpine-3.22 \
+  scripts/gvisor-spike.sh
+```
+
+Linux 5.15 again rejected the guest netdev egress hook with `Operation not
+supported`. The host-veth ingress fallback installed; the positive control,
+all denial probes, and post-revoke denial passed; the script reported
+`gVisor E4 spike passed`. Its exit trap removed the runsc sandbox, nftables
+tables, namespace, veth pair, bind mount, bundle, and state root. B32 removed
+its temporary install and build directories. **Status: verified.**
