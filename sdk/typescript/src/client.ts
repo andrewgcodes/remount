@@ -1,4 +1,6 @@
 import { Decoder, Encoder } from "cbor-x";
+import * as credentials from "./credentials.js";
+import type { BindingSpec, PrincipalSessionCreateRes } from "./types.js";
 
 const encoder = new Encoder({ useRecords: false, variableMapSize: true });
 const decoder = new Decoder({ mapsAsObjects: true });
@@ -71,7 +73,12 @@ interface WebSocketLike {
 export type WebSocketFactory = (url: string) => Promise<WebSocketLike>;
 
 export class ProtocolError extends Error {
-  constructor(public readonly code: string, message = "", public readonly oldest = 0) {
+  /**
+   * `code` is the stable wire code and `reason` is its optional
+   * sub-classification (`egress_denied`, `revoked`, `quota_exceeded`, …).
+   * Match on the pair; the message is prose and may change.
+   */
+  constructor(public readonly code: string, message = "", public readonly oldest = 0, public readonly reason = "") {
     super(message ? `${code}: ${message}` : code);
     this.name = "ProtocolError";
   }
@@ -485,7 +492,7 @@ export class Client {
     }).then((response: Frame) => {
       if (response.err) {
         const message = String(response.err.msg ?? "").split(this.token).join("[redacted]");
-        throw new ProtocolError(response.err.code ?? "internal", message, Number(response.err.oldest ?? 0));
+        throw new ProtocolError(response.err.code ?? "internal", message, Number(response.err.oldest ?? 0), String(response.err.reason ?? ""));
       }
       return response;
     });
@@ -600,6 +607,51 @@ export class Client {
     if (await sha256(result) !== id.slice("art_sha256:".length)) throw new ProtocolError("conflict", "artifact digest mismatch");
     return result;
   }
+
+  // Brokered credentials. The implementations live in credentials.ts; these
+  // are the ergonomic form, so a binding is created on the same reconnecting
+  // connection as the workspace that will use it. `secret` is write-only and
+  // is never returned by any of them.
+
+  /** Define a tenant-scoped brokered credential. */
+  createBinding(binding: BindingSpec, idempotencyKey?: string): Promise<BindingSpec> {
+    return credentials.createBinding(this, binding, idempotencyKey);
+  }
+
+  /** List the bindings visible to the caller's tenant, without secrets. */
+  listBindings(options: { tenant?: string; includeRevoked?: boolean } = {}): Promise<BindingSpec[]> {
+    return credentials.listBindings(this, options);
+  }
+
+  /** Return one binding definition without its secret. */
+  getBinding(id: string, tenant = ""): Promise<BindingSpec> {
+    return credentials.getBinding(this, id, tenant);
+  }
+
+  /** Replace the credential behind a binding and bump its revision. */
+  rotateBinding(id: string, options: { secret?: string; source?: string; tenant?: string; idempotencyKey?: string } = {}): Promise<BindingSpec> {
+    return credentials.rotateBinding(this, id, options);
+  }
+
+  /** Permanently stop substitution for a binding. Not provider-side revocation. */
+  revokeBinding(id: string, options: { reason?: string; tenant?: string; idempotencyKey?: string } = {}): Promise<BindingSpec> {
+    return credentials.revokeBinding(this, id, options);
+  }
+
+  /** Mint an ephemeral principal and its generation-bound capability. */
+  createSessionPrincipal(workspace: string, options: { subject?: string; roles?: string[]; tenant?: string; ttlSec?: number; idempotencyKey?: string } = {}): Promise<PrincipalSessionCreateRes> {
+    return credentials.createSessionPrincipal(this, workspace, options);
+  }
+
+  /** Invalidate every credential and live workspace authority of a principal. */
+  revokePrincipal(principal: string, options: { tenant?: string; idempotencyKey?: string } = {}): Promise<number> {
+    return credentials.revokePrincipal(this, principal, options);
+  }
+
+  /** The credential-use audit trail: who used which binding, where, with what outcome. */
+  credentialEvents(filter: credentials.CredentialFilter = {}): Promise<credentials.CredentialEvent[]> {
+    return credentials.credentialEvents(this, filter);
+  }
 }
 
 export async function raiseHTTP(response: Response, secret = ""): Promise<void> {
@@ -618,5 +670,5 @@ export async function raiseHTTP(response: Response, secret = ""): Promise<void> 
   } catch { /* bounded status only */ }
   const detail = body.error && typeof body.error === "object" ? body.error : body;
   const message = String(detail.message ?? `HTTP ${response.status}`).split(secret).join(secret ? "[redacted]" : "");
-  throw new ProtocolError(String(detail.code ?? "internal"), message);
+  throw new ProtocolError(String(detail.code ?? "internal"), message, 0, String(detail.reason ?? ""));
 }

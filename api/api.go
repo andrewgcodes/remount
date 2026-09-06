@@ -75,6 +75,7 @@ type (
 	// accepted on create and rotate and never appears in a response.
 	BindingSpec             = proto.BindingSpec
 	BindingRetention        = proto.BindingRetention
+	BindingSubstitution     = proto.BindingSubstitution
 	BindingRotateRequest    = proto.BindingRotateReq
 	Principal               = proto.Principal
 	SessionPrincipalRequest = proto.PrincipalSessionCreateReq
@@ -190,6 +191,13 @@ const (
 	BindingKindBearer = proto.BindingKindBearer
 	BindingKindCookie = proto.BindingKindCookie
 	BindingKindHeader = proto.BindingKindHeader
+
+	// Substitution locations. A binding declares exactly one; the broker
+	// refuses a request whose placeholder is anywhere else.
+	SubstitutionHeader   = proto.SubstitutionHeader
+	SubstitutionQuery    = proto.SubstitutionQuery
+	SubstitutionBodyForm = proto.SubstitutionBodyForm
+	SubstitutionBodyJSON = proto.SubstitutionBodyJSON
 )
 
 // Computer resources. A computer is a browser a node drives inside a

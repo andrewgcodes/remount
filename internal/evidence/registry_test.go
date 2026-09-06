@@ -30,8 +30,17 @@ func TestRegistryCoversEveryHandoffAndPlanBScenario(t *testing.T) {
 			t.Errorf("%s from the Plan B phase tables is missing", id)
 		}
 	}
-	if len(have) != 57 {
-		t.Fatalf("registry holds %d rows, want E1-E25 plus B1-B32", len(have))
+	// The rows above are mandated by the handoff and the Plan B tables and must
+	// never disappear. Rows a later gap brief adds are additive, so the count is
+	// a floor rather than an equality; what keeps a new row honest is that it
+	// still has to name the source its recorded outcome comes from.
+	if len(have) < 57 {
+		t.Fatalf("registry holds %d rows, want at least E1-E25 plus B1-B32", len(have))
+	}
+	for _, s := range Scenarios() {
+		if s.Recorded != "" && s.Source == "" {
+			t.Errorf("%s records an outcome without naming its source", s.ID)
+		}
 	}
 }
 
@@ -81,6 +90,7 @@ var wiredScenarios = map[string]string{
 	"B8":  "internal/provision/e2b contract tests against fixtures captured from the real api.e2b.app",
 	"B9":  "ambiguous-create recovery, including the unresolvable case that must stay unknown",
 	"B10": "provider stall proves control authority is not held across a provider call",
+	"B35": "the three brokered-credential examples against a loopback fake provider, with no network and no key",
 }
 
 func TestOnlyDeliberatelyWiredScenariosAreWired(t *testing.T) {

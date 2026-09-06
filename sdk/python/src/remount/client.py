@@ -14,6 +14,7 @@ import cbor2
 import httpx
 from websockets.asyncio.client import connect as websocket_connect
 
+from .credentials import CredentialOperations
 from .types import (
     FSApplyTarRes,
     FSEntry,
@@ -43,12 +44,18 @@ PEER_CAPABILITIES = ["v1", "authz-push", "controller-epoch", "session-cap", "chu
 
 
 class ProtocolError(Exception):
-    """A stable Remount protocol error."""
+    """A stable Remount protocol error.
 
-    def __init__(self, code: str, message: str = "", oldest: int = 0):
+    ``code`` is the wire code and ``reason`` is its optional
+    sub-classification (``egress_denied``, ``revoked``, ``quota_exceeded``, …).
+    Match on the pair; the message is prose and may change.
+    """
+
+    def __init__(self, code: str, message: str = "", oldest: int = 0, reason: str = ""):
         self.code = code
         self.message = message
         self.oldest = oldest
+        self.reason = reason
         super().__init__(f"{code}: {message}" if message else code)
 
 
@@ -250,7 +257,7 @@ class Session:
             self.last_input_seq = sequence
 
 
-class Client:
+class Client(CredentialOperations):
     """A reconnecting Remount protocol client."""
 
     def __init__(
@@ -449,7 +456,7 @@ class Client:
         error = response.get("err")
         if error:
             message = str(error.get("msg", "")).replace(self.token, "[redacted]") if self.token else str(error.get("msg", ""))
-            raise ProtocolError(error.get("code", "internal"), message, int(error.get("oldest", 0)))
+            raise ProtocolError(error.get("code", "internal"), message, int(error.get("oldest", 0)), str(error.get("reason", "")))
         return response
 
     async def call(self, op: str, body: dict[str, Any] | None = None, *, to: str = CONTROL) -> dict[str, Any]:
@@ -875,4 +882,4 @@ class Client:
         message = str(detail.get("message", f"HTTP {response.status_code}"))
         if self.token:
             message = message.replace(self.token, "[redacted]")
-        raise ProtocolError(str(detail.get("code", "internal")), message)
+        raise ProtocolError(str(detail.get("code", "internal")), message, 0, str(detail.get("reason", "")))

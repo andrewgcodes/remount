@@ -2432,3 +2432,155 @@ seconds); and nine bounded fuzz targets (110 seconds total). This is the
 complete local gate set, not a hosted CI or native multi-platform pass.
 Only this ledger entry was added after the tested code commit; documentation
 generation, lint, generated-document tests, and diff checks were rechecked.
+
+---
+
+## 2026-09-05 — gap 2C: binding CLI, rotation, revocation and audit against real providers
+
+**Status: verified, with one step unavailable (externally gated).** The new
+`remount binding` and `remount principal session` commands were exercised
+against `api.openai.com` and `api.anthropic.com` with the real keys from the
+git-ignored root `.env`. Substitution, the typed leak refusal, rotation,
+revocation-within-one-renew and the audit filters were all observed live. The
+session-principal step could not run: no local deployment on this host can
+both mint a session principal and hold a claimed workspace (below).
+
+Host: macOS arm64 (Darwin 25.3.0). Worktree
+`.claude/worktrees/agent-aa7d4eb2fd0d4efcc`, branch
+`worktree-agent-aa7d4eb2fd0d4efcc`, cut from `claude/gap-brief-2026-09-06` at
+`3a96156`; the binary under test was built from the working tree of this gap
+2C change with `go build -trimpath -o remount ./cmd/remount`.
+
+**Credential handling.** The provider keys were never a command-line argument
+and were never loaded into the server process. `remount binding preset apply`
+and `remount binding rotate` read them from the environment variable named by
+`--secret-env`, so `.env` was sourced only into the single wrapper process that
+executed those three commands (`set -a; . .env; set +a; exec …`), with tracing
+off. No key value appears in this entry, in any command recorded here, or in
+any output shown.
+
+### What ran
+
+```sh
+# 1. server, with no provider key in its environment at all
+remount standalone --listen 127.0.0.1:7744 --data ./data        # healthz 200
+
+# 2. bindings, secrets named rather than passed
+env.sh remount binding preset apply openai    --secret-env OPENAI_API_KEY    --ttl 15m --json
+env.sh remount binding preset apply anthropic --secret-env ANTHROPIC_API_KEY --ttl 15m --json
+remount binding ls
+
+# 3. a workspace that holds only placeholders
+remount ws create --name gap2c-live --backend process \
+  --binding b_openai --binding b_anthropic \
+  --env OPENAI_API_KEY=ref:b_openai --env ANTHROPIC_API_KEY=ref:b_anthropic \
+  --env 'OPENAI_BASE_URL=${REMOUNT_BROKER}/d/api.openai.com/v1' \
+  --env 'ANTHROPIC_BASE_URL=${REMOUNT_BROKER}/d/api.anthropic.com'
+
+# 4-9. probes run inside the workspace with `remount exec … -- sh -c`
+env.sh remount binding rotate b_openai --secret-env OPENAI_API_KEY --json
+remount binding revoke b_openai --reason "gap 2C live verification" --json
+remount events --binding b_openai --json
+remount events --host api.anthropic.com --json
+remount events --type binding --json
+```
+
+| Step | Command shape | Observed |
+|---|---|---|
+| bindings created | `binding preset apply openai\|anthropic --secret-env …` | `b_openai` and `b_anthropic`, tenant `local`, kind `api_key`, revision 1; the JSON response carried no `secret` field |
+| `binding ls` | — | both rows, substitution column `header` |
+| workspace | `ws create --binding … --env …=ref:…` | `ws_06g797abmwgw89y8r9j1ctbv3g`, `claimed`, generation 1 |
+| OpenAI at its bound host | `curl "$OPENAI_BASE_URL/models" -H "Authorization: Bearer $OPENAI_API_KEY"` | **HTTP 200**, a real model list; the workspace held only the placeholder |
+| Anthropic at its bound host | `curl "$ANTHROPIC_BASE_URL/v1/models" -H "x-api-key: $ANTHROPIC_API_KEY"` | **HTTP 200**, a real model list (a non-`Authorization` header substitutes identically) |
+| OpenAI placeholder at the Anthropic host | same URL as above with `Authorization: Bearer $OPENAI_API_KEY` | **HTTP 403**, `X-Remount-Reason: egress_denied`, body `{"error":{"code":"denied","reason":"egress_denied","binding":"b_openai","host":"api.anthropic.com:443","message":"remount broker: credential b_openai is not bound to api.anthropic.com:443"}}` — audited `leak_blocked`, no upstream byte |
+| rotation | `binding rotate b_openai --secret-env OPENAI_API_KEY` | revision 2, `rotated_at` set; eleven probes over the next 37 s all returned **HTTP 200**, so the workspace kept working across the re-lease |
+| revocation | `binding revoke b_openai --reason …` | revision 3, `revoked_at` and `revoked_reason` set. The next probe at **+1 s** still returned 200; the probe at **+4 s** returned **HTTP 403 with `X-Remount-Reason: revoked`** and body `{"error":{"code":"unauthorized","reason":"revoked","binding":"b_openai",…}}` — inside one renew interval |
+| revocation is set-wide | `b_anthropic` probe after the `b_openai` revocation | **HTTP 403 `revoked`** naming `b_anthropic`. Control refuses the whole lease set when one binding in it is revoked (ADR 0091), so the node holds no lease for either. Before this change the same situation sent the inert placeholder to the provider for its own 401; it is now a typed refusal |
+| `binding ls` after | `--include-revoked` | `b_openai` shown as `revoked (gap 2C live verification)` at revision 3; omitted without the flag |
+| session principal | `remount principal session --ws … --roles agent --ttl 5m` | **unavailable** — see below |
+
+### Audit
+
+`remount events --binding b_openai --json` returned 18 events for the binding:
+`binding.created` ×1, `binding.rotated` ×1, `binding.revoked` ×1,
+`cred.used`/`substituted` ×13, `egress.denied`/`leak_blocked` ×1 and
+`egress.denied`/`revoked` ×1. `remount events --host api.anthropic.com`
+returned 4, and `remount events --type binding` returned the 4 lifecycle rows.
+No event payload carried a credential value.
+
+One defect was found and fixed by this run: the new `revoked` broker decision
+was initially recorded under `egress.allowed`, because the decision-to-event
+mapping defaulted to "allowed" for a decision nobody had added a case for. It
+now maps to `egress.denied`, and `internal/node.TestEveryBrokerDecisionHasAnEventType`
+enumerates every decision constant so the default can never silently swallow a
+refusal again. The table above is from the re-run on the corrected binary.
+
+### Leak scan
+
+The instrument was proved on a planted synthetic canary before any clean
+result was trusted, and the decisive scan compares the **exact key bytes**
+rather than a `sk-…` shape, so a key format the pattern does not know cannot
+slip past.
+
+Inside the workspace: `env | grep -cE 'sk-[A-Za-z0-9_-]{8,}'` → **0**,
+`env | grep -c 'sk-ant-'` → **0**, with the canary file in the same session
+scoring 2 and 1 respectively. `env | grep -c 'ref:b_'` → 2, and both
+`OPENAI_API_KEY` and `ANTHROPIC_API_KEY` were present holding placeholders.
+
+On the host, `grep -c -F` against each key value, with a positive control file
+that deliberately contained one (`openai=1`, so the comparison works):
+
+| Subject | openai | anthropic |
+|---|---|---|
+| `server.log` | 0 | 0 |
+| `ws.json`, both `binding preset apply` responses | 0 | 0 |
+| all three `remount events --json` captures | 0 | 0 |
+| `data/server/control.db` | 0 | 0 |
+| `data/server/control.db-wal` | 4 | 3 |
+| snapshot artifact (server and node copies) | 0 | 0 |
+| workspace tree `data/node/ws` (recursive) | 0 | 0 |
+
+The only place either credential exists is the control plane's own SQLite
+write-ahead log, which is exactly where ADR 0091 says a binding's secret
+lives, at the same trust level the `--bindings` file already had. A regex-only
+scan additionally flagged the two snapshot artifacts; the exact-value scan
+shows those were binary false positives.
+
+### The session-principal step, and why it is unavailable
+
+`remount principal session --ws … --json` against the standalone returned
+`unsupported: principal authority is not configured`. Standalone mode never
+constructs an identity store, so there is nothing to mint an ephemeral
+principal against — a typed refusal, not a silent failure.
+
+A production-mode server was then started to get one:
+
+```sh
+remount server --listen 127.0.0.1:7745 --data ./data-srv \
+  --mode production-single-tenant \
+  --bootstrap-principal a_gap2c_operator --bootstrap-token-file ./op.token
+```
+
+That needed `REMOUNT_MASTER_KEY` (a synthetic 32-byte key was generated for the
+throwaway directory, which was deleted afterwards) and then came up healthy
+with a bootstrap operator bearer. It has no node, and attaching one is where
+this stops: `remount up --token "$(cat op.token)"` was refused with
+`unauthorized: node enrollment failed`, and no CLI command in this build mints
+a one-time node enrollment credential — `docs/operations.md` §"Production
+onboarding and OIDC" documents tenant, invite, principal and token creation
+but no node-enrollment step.
+
+So on this host there is no deployment that has both a principal authority and
+a claimed workspace, and `principal.session.create` cannot be exercised end to
+end live. It is covered by `internal/sim` (2A) instead. **The missing
+node-enrollment CLI is a separate product gap and is recorded here as a
+finding, not as a pass.**
+
+### Cleanup
+
+The workspace was destroyed, `b_anthropic` was revoked, both servers were
+killed, and both data directories — including the SQLite WAL that held the
+credentials — were removed. `lsof -i :7744` and `lsof -i :7745` reported the
+ports free and `ps` showed no process from this run. Nothing from this run
+remains on disk; the remaining `remount` processes visible at cleanup belong to
+an unrelated concurrent session under a different scratchpad directory.
