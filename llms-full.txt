@@ -335,11 +335,11 @@ browsing — and [ADR 0088](docs/adr/0088-computer-sessions-over-port-substrate.
 ```
 
 ```
-   1 13:24:18.402 ws.created      ws_06g6…  andrewgao  {"name":"hello"}
+   1 13:24:18.402 ws.created      ws_06g6…  you  {"name":"hello"}
    4 13:24:18.551 ws.claiming     ws_06g6…             {"gen":1}
    6 13:24:18.702 ws.claimed      ws_06g6…             {"gen":1}
-   9 13:24:31.461 cred.used       ws_06g6…  andrewgao  {"binding":"b_openai","host":"api.openai.com","status":200}
-  12 13:24:59.942 egress.denied   ws_06g6…  andrewgao  {"decision":"leak_blocked","host":"api.anthropic.com"}
+   9 13:24:31.461 cred.used       ws_06g6…  you  {"binding":"b_openai","host":"api.openai.com","status":200}
+  12 13:24:59.942 egress.denied   ws_06g6…  you  {"decision":"leak_blocked","host":"api.anthropic.com"}
 ```
 
 SQLite resource rows are the transactional source of lifecycle state; the
@@ -1795,7 +1795,7 @@ ws_06g67jv89e2jx29427b99pq8jg
 
 ```
 session s_06g67k1hy1rf4fb2c78tbawzdr
-hello from mac-mini.local
+hello from your-mac.local
 /Users/you/remount/data/node/ws/ws_06g67jv89e2jx29427b99pq8jg
 ```
 
@@ -2418,13 +2418,13 @@ event log is the ordered audit and observation history. Follow it live:
 ```
 
 ```
-     1 13:24:18.402 ws.created         ws_06g67jv89e2jx29427b99pq8jg  andrewgao      {"name":"live",...}
+     1 13:24:18.402 ws.created         ws_06g67jv89e2jx29427b99pq8jg  you      {"name":"live",...}
      4 13:24:18.551 ws.claiming        ws_06g67jv89e2jx29427b99pq8jg                 {"gen":1,"restore_from":""}
      6 13:24:18.702 ws.claimed         ws_06g67jv89e2jx29427b99pq8jg                 {"gen":1,"restore_from":""}
-     8 13:24:31.102 s.opened           ws_06g67jv89e2jx29427b99pq8jg  andrewgao      {"kind":"exec","program":["sh","-c","curl ..."],"s":"s_06g67k…"}
-     9 13:24:31.461 cred.used          ws_06g67jv89e2jx29427b99pq8jg  andrewgao      {"binding":"b_openai","decision":"substituted","host":"api.openai.com","method":"POST","path":"/v1/chat/completions","status":200}
-    12 13:24:59.942 egress.denied      ws_06g67jv89e2jx29427b99pq8jg  andrewgao      {"binding":"b_openai","decision":"leak_blocked","host":"api.anthropic.com","reason":"placeholder for b_openai sent to api.anthropic.com"}
-    15 13:24:59.983 egress.denied      ws_06g67jv89e2jx29427b99pq8jg  andrewgao      {"decision":"denied","host":"example.com","reason":"destination not in bindings or allow list"}
+     8 13:24:31.102 s.opened           ws_06g67jv89e2jx29427b99pq8jg  you      {"kind":"exec","program":["sh","-c","curl ..."],"s":"s_06g67k…"}
+     9 13:24:31.461 cred.used          ws_06g67jv89e2jx29427b99pq8jg  you      {"binding":"b_openai","decision":"substituted","host":"api.openai.com","method":"POST","path":"/v1/chat/completions","status":200}
+    12 13:24:59.942 egress.denied      ws_06g67jv89e2jx29427b99pq8jg  you      {"binding":"b_openai","decision":"leak_blocked","host":"api.anthropic.com","reason":"placeholder for b_openai sent to api.anthropic.com"}
+    15 13:24:59.983 egress.denied      ws_06g67jv89e2jx29427b99pq8jg  you      {"decision":"denied","host":"example.com","reason":"destination not in bindings or allow list"}
 ```
 
 Drop `--ws` to see the whole deployment, `--from N` to start at a sequence, and

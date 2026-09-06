@@ -217,31 +217,3 @@ tests and engineering notes do not.
   origin challenges so a site login prompt never receives it, and passes every
   other request through unchanged
   ([ADR 0095](docs/adr/0095-browser-proxy-auth-through-cdp.md)).
-
-### In progress
-
-These are the [2026-09-06 gap brief](docs/engineering/gap-brief-2026-09-06.md)
-implementation order. Each line is a placeholder a later editor replaces with
-the change it actually shipped, or deletes if it did not land.
-
-- Brokered credentials as the documented default: higher-level binding and
-  principal APIs, provider-neutral schemas, revocation and audit.
-- Runtime profiles have landed and are listed above: `remount up --profile`
-  (env `REMOUNT_PROFILE`) is a fail-closed startup gate that refuses `process`
-  or `docker` under a production profile, `ws create --requires-profile` and
-  `requires.profile` schedule against advertised backend capabilities and park
-  an unplaceable workspace as `profile_unschedulable`, a reprobe loop emits
-  `node.profile.{verified,unschedulable,restored}` on drift, and
-  `remount doctor --profile` joins `remount conformance --profile` on the
-  three-valued 0/1/2 contract.
-- Browser and computer-use sessions have landed and are listed above:
-  `remount computer` plus the Go, Python and TypeScript `Computer` handles cover
-  create, screenshot, click, type, key, scroll, navigate, eval, downloads and
-  close, with `iseq` deduplication across a reconnect. What broker-aware browser
-  egress does and does not currently reach is documented in
-  [docs/using-remount.md](docs/using-remount.md#computer-sessions-the-built-in-browser-api).
-- SDK, conformance and observability polish: attachable conformance evidence.
-  Typed errors, the support matrix, tracing and log redaction have landed and
-  are listed above.
-
-[Unreleased]: https://github.com/andrewgcodes/remount/commits/main

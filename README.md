@@ -331,11 +331,11 @@ browsing — and [ADR 0088](docs/adr/0088-computer-sessions-over-port-substrate.
 ```
 
 ```
-   1 13:24:18.402 ws.created      ws_06g6…  andrewgao  {"name":"hello"}
+   1 13:24:18.402 ws.created      ws_06g6…  you  {"name":"hello"}
    4 13:24:18.551 ws.claiming     ws_06g6…             {"gen":1}
    6 13:24:18.702 ws.claimed      ws_06g6…             {"gen":1}
-   9 13:24:31.461 cred.used       ws_06g6…  andrewgao  {"binding":"b_openai","host":"api.openai.com","status":200}
-  12 13:24:59.942 egress.denied   ws_06g6…  andrewgao  {"decision":"leak_blocked","host":"api.anthropic.com"}
+   9 13:24:31.461 cred.used       ws_06g6…  you  {"binding":"b_openai","host":"api.openai.com","status":200}
+  12 13:24:59.942 egress.denied   ws_06g6…  you  {"decision":"leak_blocked","host":"api.anthropic.com"}
 ```
 
 SQLite resource rows are the transactional source of lifecycle state; the

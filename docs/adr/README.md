@@ -87,6 +87,8 @@ carries 0020-0038, 0042 or 0046.
 | [0092](0092-broker-substitution-locations-and-redaction.md) | Broker substitution locations, typed refusals, and redaction |
 | [0093](0093-typed-errors-support-matrix-and-dependency-free-tracing.md) | Typed errors, a generated support matrix, and dependency-free tracing |
 | [0094](0094-a-resumed-computer-handle-reads-the-input-sequence.md) | A resumed computer handle reads the node's input sequence |
+| [0095](0095-browser-proxy-auth-through-cdp.md) | Browser proxy auth through CDP |
+| [0096](0096-the-credential-surface-is-the-cli-the-sdks-and-runnable-examples.md) | The credential surface is the CLI, the SDKs and runnable examples |
 
 ## Where to start
 
