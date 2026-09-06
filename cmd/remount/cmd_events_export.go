@@ -88,7 +88,7 @@ func cmdEventsExport(ctx context.Context, args []string) error {
 }
 
 type eventReader interface {
-	ReadEventPage(ctx context.Context, from uint64, workspace string) ([]proto.Event, error)
+	ReadEventPage(ctx context.Context, from uint64, workspace string, filters ...client.EventFilterOption) ([]proto.Event, error)
 }
 
 type clientEventExporter struct {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/proto"
 )
 
@@ -14,7 +15,7 @@ type fakeEventReader struct {
 	from  []uint64
 }
 
-func (r *fakeEventReader) ReadEventPage(_ context.Context, from uint64, _ string) ([]proto.Event, error) {
+func (r *fakeEventReader) ReadEventPage(_ context.Context, from uint64, _ string, _ ...client.EventFilterOption) ([]proto.Event, error) {
 	r.from = append(r.from, from)
 	if len(r.pages) == 0 {
 		return nil, r.err

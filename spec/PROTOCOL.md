@@ -508,7 +508,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `fleet.quarantine` | C | `FleetQuarantineReq{selector, action, deadline?\|timeout_ms?, idem}` → `FleetOperation` |
 | `fleet.get` | C | `FleetGetReq{id}` → `FleetOperation` |
 | `fleet.list` | C | → `FleetListRes{operations}` |
-| `events.tail` | C | `EventsTailReq{from, follow, ws, sub}` → history, or a stream of `ev` frames with `op: "log"` |
+| `events.tail` | C | `EventsTailReq{from, follow, ws, sub, binding?, host?, types?}` → history, or a stream of `ev` frames with `op: "log"`; `binding` and `host` match the payload fields the broker records, `types` are event-type prefixes (`egress` selects every `egress.*`), and all three narrow the follow stream and the historical page identically. An omitted filter matches everything, so a peer that predates them sees the stream it always saw |
 | `events.stop` | C | `EventsStopReq{sub}` → `{}` |
 | `events.post` | C N | `EventPost{events}` → `{}` |
 | `ws.claim` | N | `WSClaimReq{id}` → `WSClaimRes{workspace, lease_sec}` |
@@ -1065,17 +1065,24 @@ A binding leased to a node looks like:
 ```
 BindingLeaseReq { ws, gen } // gen fences a source resolution that crosses a move
 BindingLease { id, secret, destinations: [host patterns],
-               shape, principals, placeholder, expires_at }
+               shape, principals, placeholder, expires_at,
+               substitution?: { location, name?, json_pointer? } }
 ```
 
 The broker's rules, in order, for every request:
 
-1. For each header value containing a binding's placeholder:
+1. For each header value, query parameter, or buffered request body
+   containing a binding's placeholder:
    - If the destination does not match that binding's `destinations`, **block the
      request** and emit `egress.denied` with decision `leak_blocked`. The
      placeholder was aimed at the wrong host, which is an exfiltration attempt.
+     This is location-independent: a placeholder in a query or a body is the
+     same attempt in a different envelope.
    - If the lease has expired, block and emit decision `expired`. Fail closed.
-   - Otherwise substitute the real secret and emit `cred.used`.
+   - If the upstream is not HTTPS, block. A credential is never sent in the
+     clear.
+   - Otherwise substitute the real secret **at the binding's declared
+     location** and emit `cred.used`.
 2. If a typed `NetworkPolicy` exists, evaluate its rules in declaration order.
    The first rule matching protocol, canonical host, effective port, method and
    path-prefix segment is authoritative. It replaces, rather than widens into,
@@ -1169,6 +1176,75 @@ readiness, and synchronously revoke it during fencing and shutdown.
 Placeholders should be **shape-preserving**: same prefix and length as the real
 secret, so client-side format validation in a harness does not reject the
 placeholder before it ever reaches the broker.
+
+### Substitution locations
+
+A binding declares where its placeholder is replaced. `substitution` is
+optional; omitting it means `header`, which is what every binding did before
+the field existed.
+
+| `location` | Field | Where the secret is placed |
+|---|---|---|
+| `header` | — | any header value, including inside a Basic credential |
+| `query` | `name` | the named query parameter |
+| `body_form` | `name` | the named `application/x-www-form-urlencoded` field |
+| `body_json` | `json_pointer` | the JSON string at that RFC 6901 pointer |
+
+Body locations are a reverse-proxy (`/d/`, `/http/`) capability only. The
+package and git connectors substitute in headers alone: their grammars forbid
+the shapes body substitution needs, and a CONNECT tunnel is opaque and stays
+host-granular.
+
+A body location makes the broker buffer the request. The bound is the matching
+rule's `max_request_bytes` when it declares one, and otherwise a broker option
+whose default is 1 MiB: a credential-bearing body is a form or a small JSON
+document, never an upload. A workspace with no body-substituting binding keeps
+streaming request bodies straight through.
+
+**Every ambiguity is a refusal**, audited as a denial, before any upstream
+byte. Guessing which occurrence of a placeholder the workspace meant is how a
+credential reaches a location nobody authorized. The refusals are: a body over
+the bound; a content type the declared location cannot parse; a malformed form
+or JSON document; a named parameter or field that occurs other than exactly
+once; a pointer that names no member, traverses a non-container, or names
+anything but a string; and a placeholder that appears anywhere other than its
+declared location. A binding that declares nothing keeps the original
+header-only behavior, including for a stray placeholder elsewhere in the
+request, which is still scanned for scope but never substituted.
+
+A substitution re-serializes what it rewrites. A `query` substitution
+re-encodes the query string, and a `body_json` one re-encodes the document, so
+both come back with parameters or keys in sorted order; numbers round-trip
+exactly and no character is HTML-escaped. A caller that needs byte-identical
+requests declares a header location instead.
+
+### Refusal responses
+
+Every broker refusal carries `X-Remount-Reason` — one of `egress_denied`,
+`approval_required`, `quota_exceeded`, `binding_missing`, `grant_expired`,
+`revoked` (§2) — and a JSON body:
+
+```json
+{"error":{"code":"denied","reason":"egress_denied",
+          "binding":"b_x","host":"api.example:443",
+          "message":"remount broker: credential b_x is not bound to api.example:443"}}
+```
+
+`code` is a wire code (§2) and `reason` repeats the header, so a workspace
+matches the same pair the control plane returns for the same situation.
+`message` is diagnostic prose only; callers never match on it. A refusal
+carries no secret value, no header the workspace sent, and no byte of the
+request or the upstream response, and its `message` is scrubbed of
+credential-shaped strings before it is written. The same scrubbing is applied
+to the `reason` and `error` fields of every audit.
+
+Revoking egress cuts the gateway synchronously: the listener closes and every
+connection is severed, including a response already streaming. A graceful
+close would let an allowed transfer keep running after the operator was told
+the workspace was contained. The reference `process` and `docker` backends can
+cut the broker this way because the broker owns the socket; what they cannot
+do is stop a workspace reaching the network around the broker, which is why
+they are rejected by production security profiles.
 
 ## 10. Artifacts and snapshots
 
@@ -1411,6 +1487,19 @@ payload's `status` is the upstream response status when headers arrived, or
 `connection_reset`, `timeout`, `tls`, `canceled`, `eof`, `redirect_rejected`,
 `response_limit`, `non_public_address`, `connector`, `upstream`) when they did
 not. `error` is a class, never the transport's error text.
+
+`cred.used`, `egress.allowed`, `egress.denied` and `egress.redacted` carry
+`binding` and `host`, which is what `events.tail`'s `binding` and `host`
+filters match (§6); `host` is the canonical `host:port`, and a filter naming a
+bare host matches it. Their `reason` and `error` fields are scrubbed of
+credential-shaped strings before the event is appended. Redaction is defence
+in depth, not the control that keeps secrets out of the audit trail: the
+broker records binding ids and decision classes and never carries a secret
+value in the first place.
+
+`ws.fenced` for a containment operation carries `operation`, `action` (the
+fleet action that caused it, such as `revoke_egress`), `snapshot`, `warning`
+and `network_revoked`.
 
 `POST /v1/events` appends an event out of band. This is how a webhook wakes a
 sleeping workspace. The Remount body is `{type, stream?, payload?, agent?}`;

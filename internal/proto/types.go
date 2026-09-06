@@ -1009,6 +1009,16 @@ type EventsTailReq struct {
 	Follow       bool   `cbor:"follow" json:"follow"`             // keep streaming
 	WS           string `cbor:"ws,omitempty" json:"ws,omitempty"` // filter by workspace
 	Subscription string `cbor:"sub,omitempty" json:"sub,omitempty"`
+	// Binding, Host and Types narrow the stream server-side so an audit
+	// question ("what did this binding do against this host?") is one call
+	// rather than a full history the caller filters itself. Binding and Host
+	// match the payload fields the broker records; Types are event-type
+	// prefixes, so "egress" selects every egress.* type. All are additive:
+	// an omitted filter matches everything, and a peer that predates them
+	// still receives the unfiltered stream it asked for.
+	Binding string   `cbor:"binding,omitempty" json:"binding,omitempty"`
+	Host    string   `cbor:"host,omitempty" json:"host,omitempty"`
+	Types   []string `cbor:"types,omitempty" json:"types,omitempty"`
 }
 
 type EventsStopReq struct {
@@ -1064,6 +1074,59 @@ type BindingLease struct {
 	// means "ref:<id>". A shape-preserving value (same prefix/length as the
 	// real secret) keeps client-side format validation happy.
 	Placeholder string `cbor:"placeholder,omitempty" json:"placeholder,omitempty"`
+	// Substitution names where in a request the broker replaces the
+	// placeholder. Nil means SubstitutionHeader, which is what every binding
+	// did before this field existed.
+	Substitution *BindingSubstitution `cbor:"substitution,omitempty" json:"substitution,omitempty"`
+}
+
+// Substitution locations. A binding declares exactly one; the broker refuses
+// a request whose placeholder is anywhere else, because a placeholder that
+// silently travels unsubstituted is an opaque upstream failure.
+const (
+	SubstitutionHeader   = "header"    // an HTTP header value (the default)
+	SubstitutionQuery    = "query"     // a named query parameter
+	SubstitutionBodyForm = "body_form" // a named application/x-www-form-urlencoded field
+	SubstitutionBodyJSON = "body_json" // the JSON string at an RFC 6901 pointer
+)
+
+// BindingSubstitution names where a binding's placeholder is replaced.
+// Name applies to SubstitutionQuery and SubstitutionBodyForm; JSONPointer to
+// SubstitutionBodyJSON. Body locations require the broker to buffer the
+// request, so they are bounded and fail closed on any ambiguity (§9).
+type BindingSubstitution struct {
+	Location    string `cbor:"location" json:"location"`
+	Name        string `cbor:"name,omitempty" json:"name,omitempty"`
+	JSONPointer string `cbor:"json_pointer,omitempty" json:"json_pointer,omitempty"`
+}
+
+// SubstitutionLocation returns the effective location of a lease: the
+// declared one, or SubstitutionHeader when the binding declares none.
+func SubstitutionLocation(l BindingLease) string {
+	if l.Substitution == nil || l.Substitution.Location == "" {
+		return SubstitutionHeader
+	}
+	return l.Substitution.Location
+}
+
+// ValidSubstitution reports whether a declared substitution is well formed.
+// An unrecognized location, or a location missing the field it needs, is a
+// configuration error the control plane refuses rather than a request the
+// broker fails one at a time.
+func ValidSubstitution(s *BindingSubstitution) bool {
+	if s == nil {
+		return true
+	}
+	switch s.Location {
+	case "", SubstitutionHeader:
+		return s.Name == "" && s.JSONPointer == ""
+	case SubstitutionQuery, SubstitutionBodyForm:
+		return s.Name != "" && s.JSONPointer == ""
+	case SubstitutionBodyJSON:
+		return s.Name == "" && strings.HasPrefix(s.JSONPointer, "/")
+	default:
+		return false
+	}
 }
 
 type BindingLeaseRes struct {
