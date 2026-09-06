@@ -566,7 +566,7 @@ REMOUNT_MODAL_APP=remount-planb make modal-deploy
 The deployment came up with a real public HTTPS endpoint:
 
 ```
-https://action-dev--remount-planb-control.modal.run
+https://<workspace>--remount-planb-control.modal.run
 GET /healthz → 200 {"ok":true,"peers":1,"security_mode":"standalone",
                     "security_ready":true,"serving":true}
 ```
@@ -589,7 +589,7 @@ hello-from-modal
 internet**, in `--endpoint` mode with no source access to the target:
 
 ```
-CONFORMANT: https://action-dev--remount-planb-control.modal.run
+CONFORMANT: https://<workspace>--remount-planb-control.modal.run
   53 passed, 0 failed, 14 unavailable of 67 requirements in 55.88s
     required         52 passed, 0 failed, 0 unavailable
     capability-gated  1 passed, 0 failed, 13 unavailable
@@ -1212,7 +1212,7 @@ is now **CONFORMANT** across the public internet.
 | `make modal-deploy` then `GET /healthz` | 303 after 150 s, twice | the finding, not a flake |
 | `modal app logs remount-demo` | `ExecutionError: Function has 3 dependencies but container got 4 object ids` | root cause |
 | `GET /healthz` after the fix | **200 in 1.4 s**, then 0.47 s warm | verified |
-| `go run ./cmd/conformance --endpoint https://action-dev--remount-demo-control.modal.run --external --token …` | **CONFORMANT**, required **53 passed, 0 failed, 0 unavailable**, 1 m 38 s | verified |
+| `go run ./cmd/conformance --endpoint https://<workspace>--remount-demo-control.modal.run --external --token …` | **CONFORMANT**, required **53 passed, 0 failed, 0 unavailable**, 1 m 38 s | verified |
 | Same suite against a local build | `CONFORMANT`, 53/0/0 — unchanged | verified |
 
 **Defect 1: the Modal deployment could not start at all.**
@@ -2423,7 +2423,7 @@ created. GitHub jobs on the pre-integration main were refused before startup
 by account billing/spending limits. Native Windows, Linux/runsc, KVM, cloud
 deployment, and release-signing qualification remain unavailable here.
 
-`PATH=/Users/andrewgao/go/bin:$PATH make verify` completed with all 17
+`PATH=/Users/you/go/bin:$PATH make verify` completed with all 17
 portable local gates passing: formatting; host/Linux/Windows/Darwin vet;
 lock discipline; the main suite (556 seconds) and external public SDK suite;
 distribution builds; module verification/tidy; staticcheck; govulncheck;
