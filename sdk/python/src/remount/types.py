@@ -608,6 +608,7 @@ ComputerGetRes = TypedDict("ComputerGetRes", {
     "reason": NotRequired[str],
     "viewport": NotRequired["ComputerViewport"],
     "s": NotRequired[str],
+    "last_iseq": NotRequired[int],
 }, total=False)
 
 ComputerInputReq = TypedDict("ComputerInputReq", {

@@ -58,6 +58,7 @@ const (
 	sourceHandoff = "docs/engineering/handoff-2026-09-03.md (outcome: docs/engineering/implementation-closure-2026-09-03.md)"
 	sourcePlanB   = "docs/engineering/plan-b-repository-executable-2026-09-03.md"
 	sourceLinux   = "docs/engineering/verification-2026-09.md (Linux host verification 2026-09-04)"
+	sourceBrowser = "docs/engineering/verification-2026-09.md (browser computer-session conformance 2026-09-05)"
 )
 
 // notLanded is the only honest thing to say about a Plan B row whose ticket
@@ -480,6 +481,15 @@ var scenarios = []Scenario{
 		Argv:     []string{"go", "test", "-count=1", "-timeout=20m", "-run", "^TestB32", "./integration/installs/"},
 		Recorded: StatusPassed,
 		Note:     "the dist binary and both release images passed manifest 1.1.0 black-box conformance; the wheel, npm tarball and external Go module drove an installed server without a source-tree dependency, and the checksums, static-link, inventory and SPDX SBOM lanes passed",
+	},
+	{
+		ID: "B34", Title: "a real browser answers every computer operation on a real backend",
+		Layer: LayerHostCI, Required: true, Source: sourceBrowser,
+		Owner:    "integration/browser.TestB34BrowserComputerConformance, scripts/browser-conformance.sh",
+		Env:      []string{"REMOUNT_BROWSER_IMAGE", "REMOUNT_BROWSER_BROKER_HOST"},
+		Argv:     []string{"./scripts/browser-conformance.sh"},
+		Recorded: StatusPassed,
+		Note:     "Chromium 152 in the reference image passed create, navigate, click, typing into an input, a contenteditable and an iframe, a screenshot that changed with the DOM, a download published and byte-verified as an artifact, a refused navigation to an unbound host with its broker egress event, a killed browser reported as closed/browser_crashed, and a sleep/wake that left no computer and no profile. The refusal was recorded as unauthenticated rather than by host policy: Chromium does not present the workspace capability as proxy authentication, so the broker refuses every destination for a browser, allowed or not",
 	},
 }
 

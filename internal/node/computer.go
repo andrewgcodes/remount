@@ -39,18 +39,115 @@ const DownloadDir = EnvFileDir + "/downloads"
 // computer.create request names no program. It is a variable so a workspace
 // image with a differently named or differently flagged browser can replace it
 // at build time without a protocol change.
-var DefaultBrowserProgram = func(port int, profileDir string, v proto.ComputerViewport) []string {
-	return []string{
+//
+// addr is the address the node will dial for this backend (see
+// devtoolsBindAddress). When that is loopback the browser is started directly.
+// When it is not, the program becomes a two-process launch, because Chromium's
+// DevTools HTTP server binds 127.0.0.1 and ignores --remote-debugging-address
+// entirely: verified against Chromium 152, where the flag left the listener on
+// 127.0.0.1 and every dial to the container address was refused. The forwarder
+// is what makes a container or sandbox address reachable at all, so an image
+// used for computer sessions on those backends needs socat as well as a
+// browser (docs/images.md).
+//
+// The browser stays the foreground process so that its exit is the session's
+// exit and a crash remains observable; the forwarder is killed with it rather
+// than left holding the port.
+var DefaultBrowserProgram = func(addr string, port int, profileDir string, v proto.ComputerViewport) []string {
+	listen := port
+	if !loopbackAddress(addr) {
+		listen = forwardedDevToolsPort(port)
+	}
+	argv := []string{
 		"chromium",
 		"--headless=new",
 		"--no-sandbox",
 		"--disable-gpu",
 		"--remote-debugging-address=127.0.0.1",
-		fmt.Sprintf("--remote-debugging-port=%d", port),
+		fmt.Sprintf("--remote-debugging-port=%d", listen),
 		"--user-data-dir=" + profileDir,
 		fmt.Sprintf("--window-size=%d,%d", v.Width, v.Height),
 		"about:blank",
 	}
+	if listen == port {
+		return argv
+	}
+	return []string{"sh", "-c", fmt.Sprintf(
+		"%s & browser=$!; socat TCP-LISTEN:%d,fork,reuseaddr TCP:127.0.0.1:%d & forwarder=$!; "+
+			"wait $browser; status=$?; kill $forwarder 2>/dev/null; exit $status",
+		shellCommand(argv), port, listen)}
+}
+
+// forwardedDevToolsPort is the loopback port the browser itself listens on
+// when the node has to reach it through a forwarder. It is derived from the
+// requested port so an operator reading the process list can see the pair.
+func forwardedDevToolsPort(port int) int {
+	if port < 65535 {
+		return port + 1
+	}
+	return port - 1
+}
+
+// shellCommand renders argv for `sh -c`. Every word is single-quoted, so a
+// profile path with a space or a shell metacharacter stays one word.
+func shellCommand(argv []string) string {
+	quoted := make([]string, 0, len(argv))
+	for _, word := range argv {
+		quoted = append(quoted, "'"+strings.ReplaceAll(word, "'", `'\''`)+"'")
+	}
+	return strings.Join(quoted, " ")
+}
+
+// browserEnv points a spawned browser's HOME at its own profile directory.
+//
+// A browser writes far more than its profile: caches, crash reports, NSS
+// databases and a $HOME/.config tree appear whatever --user-data-dir says.
+// Left at the workspace root those files become snapshot payload, and a real
+// Chromium made `ws.sleep` fail outright with `openat .config: permission
+// denied` because the container writes them as root and the node reads them as
+// itself. The profile tree is node-local and excluded from every snapshot,
+// which is exactly where that state belongs. An explicit HOME in the request
+// still wins; this is a default, not a policy.
+func browserEnv(env map[string]string, profileDir string) map[string]string {
+	merged := make(map[string]string, len(env)+1)
+	merged["HOME"] = profileDir
+	for name, value := range env {
+		merged[name] = value
+	}
+	return merged
+}
+
+// loopbackAddress reports whether the node will dial the workspace's own
+// loopback, which is the one case where a browser needs no forwarder.
+func loopbackAddress(addr string) bool {
+	if addr == "" || addr == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(addr)
+	return ip != nil && ip.IsLoopback()
+}
+
+// devtoolsBindAddress is the address a spawned browser must listen on for this
+// backend. The node dials whatever Backend.Prepare resolves for a workspace
+// port, so a browser bound to the workspace's own loopback is unreachable on
+// every backend that resolves a port to a container or sandbox address: the
+// docker backend answers with the container IP and gVisor with the sandbox's.
+// Loopback stays the default where the node dials loopback - the process
+// backend, and the firecracker relay, which reaches the guest over vsock.
+func (n *Node) devtoolsBindAddress(w *ws, claims proto.GrantClaims, port int) string {
+	spec := session.Spec{
+		WS: w.ID, Generation: w.Generation, Kind: proto.SessionPort,
+		Port: port, Principal: claims.Principal, Tenant: claims.Tenant,
+	}
+	if err := w.handle.Prepare(&spec); err != nil {
+		// The dial will fail for the same reason and report it properly. Keep
+		// the loopback answer rather than widening exposure on a guess.
+		return "127.0.0.1"
+	}
+	if loopbackAddress(spec.Host) {
+		return "127.0.0.1"
+	}
+	return spec.Host
 }
 
 // profileName is deliberately narrow: the value becomes a directory name
@@ -269,11 +366,11 @@ func (n *Node) computerCreateOnce(ctx context.Context, claims proto.GrantClaims,
 	if !launch.Attach {
 		program := launch.Program
 		if len(program) == 0 {
-			program = DefaultBrowserProgram(port, profileDir, viewport)
+			program = DefaultBrowserProgram(n.devtoolsBindAddress(w, claims, port), port, profileDir, viewport)
 		}
 		spec := session.Spec{
 			WS: w.ID, Generation: w.Generation, Kind: proto.SessionExec,
-			Program: program, Env: n.sessionEnv(w, req.Env),
+			Program: program, Env: n.sessionEnv(w, browserEnv(req.Env, profileDir)),
 			Principal: claims.Principal, Tenant: claims.Tenant,
 		}
 		if err := w.handle.Prepare(&spec); err != nil {
@@ -658,7 +755,11 @@ func (n *Node) computerGet(w *ws, req *proto.ComputerGetReq) (any, error) {
 		return nil, err
 	}
 	state, reason := h.snapshot()
+	h.mu.Lock()
+	lastISeq := h.lastISeq
+	h.mu.Unlock()
 	return proto.ComputerGetRes{
-		Computer: h.id, State: state, Reason: reason, Viewport: h.viewport, Session: h.session,
+		Computer: h.id, State: state, Reason: reason, Viewport: h.viewport,
+		Session: h.session, LastInputSeq: lastISeq,
 	}, nil
 }

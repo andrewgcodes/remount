@@ -77,7 +77,7 @@ func run(ctx context.Context, argv []string) error {
 	}
 	cmd, args := argv[0], argv[1:]
 	switch cmd {
-	case "ws", "fs", "fleet", "pool", "volume", "budget", "run", "agent", "mcp", "tenant", "principal", "token", "audit":
+	case "ws", "fs", "fleet", "pool", "volume", "budget", "run", "agent", "mcp", "tenant", "principal", "token", "audit", "computer":
 		if len(args) > 0 && !isFlag(args[0]) {
 			args = append(append([]string{args[0]}, globals...), args[1:]...)
 		} else {
@@ -117,6 +117,8 @@ func run(ctx context.Context, argv []string) error {
 		return cmdPull(ctx, args)
 	case "port":
 		return cmdPort(ctx, args)
+	case "computer":
+		return cmdComputer(ctx, args)
 	case "fleet":
 		return cmdFleet(ctx, args)
 	case "base":
@@ -233,6 +235,10 @@ func usage() {
   remount push WS [--dir .] [--include-git=false] [--exclude GLOB]...   upload a local directory over the workspace
   remount pull WS [--dir .] [--force]                                   snapshot the workspace and write what differs locally
   remount port WS PORT [--local 127.0.0.1:PORT]
+  remount computer create WS [--viewport 1280x720] [--profile default] [--port 9222] [--attach] [-- program args…]
+  remount computer get|screenshot --out F.png|downloads|close WS COMPUTER | click|scroll WS COMPUTER X Y …
+  remount computer type|key WS COMPUTER TEXT|KEY | navigate WS COMPUTER URL | eval WS COMPUTER EXPR
+                                      drive a browser: CSS-pixel coordinates in the viewport declared at create
   remount fleet quarantine --action freeze (--all | SELECTORS...) | ls | get OPERATION
   remount base ls | rm NAME                                              named snapshots for ws create --base (pinned until rm)
   remount volume create ID --dir PATH | ls | get ID | rm ID | publish WS PATH [--volume ID]
