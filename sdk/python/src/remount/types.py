@@ -528,6 +528,138 @@ ChunkBody = TypedDict("ChunkBody", {
     "d": NotRequired[bytes],
 }, total=False)
 
+ComputerAction = TypedDict("ComputerAction", {
+    "kind": Required[str],
+    "x": NotRequired[int],
+    "y": NotRequired[int],
+    "dx": NotRequired[int],
+    "dy": NotRequired[int],
+    "tox": NotRequired[int],
+    "toy": NotRequired[int],
+    "text": NotRequired[str],
+    "key": NotRequired[str],
+    "button": NotRequired[str],
+    "mod": NotRequired[int],
+}, total=False)
+
+ComputerCloseReq = TypedDict("ComputerCloseReq", {
+    "ws": Required[str],
+    "computer": Required[str],
+    "grant": NotRequired[Optional["Grant"]],
+    "idem": NotRequired[str],
+}, total=False)
+
+ComputerCreateReq = TypedDict("ComputerCreateReq", {
+    "ws": Required[str],
+    "idem": NotRequired[str],
+    "grant": NotRequired[Optional["Grant"]],
+    "launch": NotRequired[Optional["ComputerLaunch"]],
+    "viewport": NotRequired["ComputerViewport"],
+    "profile": NotRequired[str],
+    "env": NotRequired[dict[str, str]],
+}, total=False)
+
+ComputerCreateRes = TypedDict("ComputerCreateRes", {
+    "computer": Required[str],
+    "s": NotRequired[str],
+    "cdp": NotRequired[str],
+    "viewport": NotRequired["ComputerViewport"],
+}, total=False)
+
+ComputerDownload = TypedDict("ComputerDownload", {
+    "artifact": NotRequired[str],
+    "filename": NotRequired[str],
+    "url": NotRequired[str],
+    "bytes": NotRequired[int],
+    "state": Required[str],
+    "reason": NotRequired[str],
+}, total=False)
+
+ComputerDownloadsReq = TypedDict("ComputerDownloadsReq", {
+    "ws": Required[str],
+    "computer": Required[str],
+    "grant": NotRequired[Optional["Grant"]],
+}, total=False)
+
+ComputerDownloadsRes = TypedDict("ComputerDownloadsRes", {
+    "downloads": NotRequired[list["ComputerDownload"]],
+}, total=False)
+
+ComputerEvalReq = TypedDict("ComputerEvalReq", {
+    "ws": Required[str],
+    "computer": Required[str],
+    "grant": NotRequired[Optional["Grant"]],
+    "expr": Required[str],
+}, total=False)
+
+ComputerEvalRes = TypedDict("ComputerEvalRes", {
+    "value": NotRequired[bytes],
+}, total=False)
+
+ComputerGetReq = TypedDict("ComputerGetReq", {
+    "ws": Required[str],
+    "computer": Required[str],
+    "grant": NotRequired[Optional["Grant"]],
+}, total=False)
+
+ComputerGetRes = TypedDict("ComputerGetRes", {
+    "computer": Required[str],
+    "state": Required[str],
+    "reason": NotRequired[str],
+    "viewport": NotRequired["ComputerViewport"],
+    "s": NotRequired[str],
+}, total=False)
+
+ComputerInputReq = TypedDict("ComputerInputReq", {
+    "ws": Required[str],
+    "computer": Required[str],
+    "grant": NotRequired[Optional["Grant"]],
+    "iseq": Required[int],
+    "actions": NotRequired[list["ComputerAction"]],
+}, total=False)
+
+ComputerInputRes = TypedDict("ComputerInputRes", {
+    "applied": Required[bool],
+    "last_iseq": Required[int],
+}, total=False)
+
+ComputerLaunch = TypedDict("ComputerLaunch", {
+    "program": NotRequired[list[str]],
+    "port": NotRequired[int],
+    "attach": NotRequired[bool],
+}, total=False)
+
+ComputerNavigateReq = TypedDict("ComputerNavigateReq", {
+    "ws": Required[str],
+    "computer": Required[str],
+    "grant": NotRequired[Optional["Grant"]],
+    "url": Required[str],
+    "idem": NotRequired[str],
+}, total=False)
+
+ComputerNavigateRes = TypedDict("ComputerNavigateRes", {
+    "url": NotRequired[str],
+    "title": NotRequired[str],
+    "status": NotRequired[str],
+}, total=False)
+
+ComputerScreenshotReq = TypedDict("ComputerScreenshotReq", {
+    "ws": Required[str],
+    "computer": Required[str],
+    "grant": NotRequired[Optional["Grant"]],
+}, total=False)
+
+ComputerScreenshotRes = TypedDict("ComputerScreenshotRes", {
+    "png": Required[bytes],
+    "w": Required[int],
+    "h": Required[int],
+}, total=False)
+
+ComputerViewport = TypedDict("ComputerViewport", {
+    "w": NotRequired[int],
+    "h": NotRequired[int],
+}, total=False)
+
 ControlDiag = TypedDict("ControlDiag", {
     "now": Required[int],
     "uptime_sec": Required[int],
@@ -1953,6 +2085,14 @@ OPERATIONS: dict[str, dict[str, object]] = {
     "budget.remove": {"constant": "OpBudgetRemove", "request": "BudgetRemoveReq", "response": ""},
     "budget.reserve": {"constant": "OpBudgetReserve", "request": "BudgetReserveReq", "response": "BudgetReservation"},
     "budget.settle": {"constant": "OpBudgetSettle", "request": "BudgetSettleReq", "response": "BudgetSettlement"},
+    "computer.close": {"constant": "OpComputerClose", "request": "ComputerCloseReq", "response": ""},
+    "computer.create": {"constant": "OpComputerCreate", "request": "ComputerCreateReq", "response": "ComputerCreateRes"},
+    "computer.downloads": {"constant": "OpComputerDownloads", "request": "ComputerDownloadsReq", "response": "ComputerDownloadsRes"},
+    "computer.eval": {"constant": "OpComputerEval", "request": "ComputerEvalReq", "response": "ComputerEvalRes"},
+    "computer.get": {"constant": "OpComputerGet", "request": "ComputerGetReq", "response": "ComputerGetRes"},
+    "computer.input": {"constant": "OpComputerInput", "request": "ComputerInputReq", "response": "ComputerInputRes"},
+    "computer.navigate": {"constant": "OpComputerNavigate", "request": "ComputerNavigateReq", "response": "ComputerNavigateRes"},
+    "computer.screenshot": {"constant": "OpComputerScreenshot", "request": "ComputerScreenshotReq", "response": "ComputerScreenshotRes"},
     "controller.state": {"constant": "OpControllerState", "request": "", "response": ""},
     "diag": {"constant": "OpDiag", "request": "DiagReq", "response": "ControlDiag"},
     "e2ee.kx": {"constant": "OpE2EEKeyExchange", "request": "", "response": ""},
