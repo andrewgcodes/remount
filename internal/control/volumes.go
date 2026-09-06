@@ -193,7 +193,7 @@ func (c *Control) volumeCreate(ctx context.Context, subject Subject, req *proto.
 	}
 	if count >= c.opts.MaxVolumesPerTenant {
 		metrics.VolumeQuotaRejected.Inc()
-		return nil, proto.Err(proto.CodeResourceExhausted, "tenant volume limit %d reached", c.opts.MaxVolumesPerTenant)
+		return nil, proto.ErrReason(proto.CodeResourceExhausted, proto.ReasonQuotaExceeded, "tenant volume limit %d reached", c.opts.MaxVolumesPerTenant)
 	}
 	if err := c.transact(func(tx *eventlog.Tx) error {
 		if _, err := tx.Exec(`INSERT INTO volumes(tenant,id,data) VALUES(?,?,?)`, volume.Tenant, volume.ID, proto.MustMarshal(volume)); err != nil {

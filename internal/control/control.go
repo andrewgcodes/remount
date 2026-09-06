@@ -40,7 +40,10 @@ import (
 	"remount.dev/remount/internal/transport"
 )
 
-// Binding is a secret the control plane can lease to nodes.
+// Binding is a secret the control plane can lease to nodes. It is also the
+// durable row: bindings created through binding.create live in the bindings
+// table, and entries supplied by --bindings are seeded into that table on the
+// first start that does not already have them.
 type Binding struct {
 	ID           string   `json:"id"`
 	Secret       string   `json:"secret,omitempty"`
@@ -50,6 +53,29 @@ type Binding struct {
 	Workspaces   []string `json:"workspaces,omitempty"` // empty = any authorized workspace
 	Placeholder  string   `json:"placeholder,omitempty"`
 	TTLSec       int64    `json:"ttl_sec,omitempty"` // default 600
+	// Tenant scopes the binding. Empty means the binding is global, which
+	// only file-configured bindings may be; binding.create always writes an
+	// exact tenant.
+	Tenant string `json:"tenant,omitempty"`
+	// Kind is one of the proto.BindingKind* constants.
+	Kind string `json:"kind,omitempty"`
+	// Methods and PathPrefixes narrow the binding beyond its destinations.
+	Methods      []string `json:"methods,omitempty"`
+	PathPrefixes []string `json:"path_prefixes,omitempty"`
+	// Retention records the provider data-retention requirement the operator
+	// asserted. Remount records it; it cannot enforce a provider's policy.
+	Retention proto.BindingRetention `json:"retention,omitempty"`
+	// Owner is the principal that created the binding, empty for a seeded one.
+	Owner string `json:"owner,omitempty"`
+	// Revision increments on every rotation, so a lease minted from an older
+	// credential is recognisable as stale.
+	Revision  uint64 `json:"revision,omitempty"`
+	CreatedAt int64  `json:"created_at,omitempty"`
+	RotatedAt int64  `json:"rotated_at,omitempty"`
+	// RevokedAt is non-zero once revoked. The row is retained so an audit can
+	// still resolve a binding id that appears in an older event.
+	RevokedAt     int64  `json:"revoked_at,omitempty"`
+	RevokedReason string `json:"revoked_reason,omitempty"`
 }
 
 // SecretResolver fetches an external binding value at lease time. Resolved
@@ -600,6 +626,7 @@ func New(opts Options) (*Control, error) {
 		metrics.ControllerReconciling.Set(0)
 	}
 	metrics.ControllerEpoch.Set(int64(controllerEpoch))
+	seen := map[string]struct{}{}
 	for _, b := range opts.Bindings {
 		if b.ID == "" || (b.Secret == "") == (b.Source == "") || len(b.Destinations) == 0 {
 			return nil, fmt.Errorf("control: binding %q needs an id, exactly one secret source, and destinations", b.ID)
@@ -607,10 +634,10 @@ func New(opts Options) (*Control, error) {
 		if b.Source != "" && opts.SecretResolver == nil {
 			return nil, fmt.Errorf("control: binding %q has an external source but no resolver", b.ID)
 		}
-		if _, exists := c.bindings[b.ID]; exists {
+		if _, exists := seen[bindingKey(b.Tenant, b.ID)]; exists {
 			return nil, fmt.Errorf("control: duplicate binding %q", b.ID)
 		}
-		c.bindings[b.ID] = b
+		seen[bindingKey(b.Tenant, b.ID)] = struct{}{}
 	}
 	budgetConfig := opts.BudgetConfig
 	if len(budgetConfig.Budgets) != 0 {
@@ -652,6 +679,15 @@ func New(opts Options) (*Control, error) {
 	}
 	if err := c.loadBudgets(); err != nil {
 		return nil, err
+	}
+	if err := c.loadBindings(); err != nil {
+		return nil, fmt.Errorf("control: load bindings: %w", err)
+	}
+	// Seeding happens after the durable rows are in memory so a binding that
+	// was rotated or revoked through the API is not reset by restarting with
+	// the file it was originally declared in.
+	if err := c.seedBindings(opts.Bindings); err != nil {
+		return nil, fmt.Errorf("control: seed bindings: %w", err)
 	}
 	// A previous process may have committed a resource and died before its
 	// staged event reached the log; deliver it before anyone reads either.
@@ -726,6 +762,14 @@ CREATE TABLE IF NOT EXISTS bases (tenant TEXT NOT NULL, name TEXT NOT NULL, data
 CREATE TABLE IF NOT EXISTS session_logs (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, expires_at INTEGER NOT NULL, data BLOB NOT NULL);
 CREATE INDEX IF NOT EXISTS session_logs_expiry ON session_logs(expires_at);
 CREATE TABLE IF NOT EXISTS volumes (tenant TEXT NOT NULL, id TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(tenant, id));
+CREATE TABLE IF NOT EXISTS bindings (
+	tenant TEXT NOT NULL,
+	id TEXT NOT NULL,
+	revision INTEGER NOT NULL,
+	revoked_at INTEGER NOT NULL,
+	data BLOB NOT NULL,
+	PRIMARY KEY(tenant, id)
+);
 CREATE TABLE IF NOT EXISTS pools (tenant TEXT NOT NULL, name TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(tenant, name));
 CREATE TABLE IF NOT EXISTS pool_retirements (node TEXT PRIMARY KEY, tenant TEXT NOT NULL, pool TEXT NOT NULL, machine TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS queues (id TEXT PRIMARY KEY, data BLOB NOT NULL);
@@ -1956,11 +2000,11 @@ func (c *Control) check(ctx context.Context, subject Subject, action string, res
 	// refine roles and ACLs, but it must never be able to grant a subject from
 	// one tenant access to another tenant's resource.
 	if resource.Tenant != "" && subject.Tenant != resource.Tenant && subject.Tenant != "*" {
-		return proto.Err(proto.CodeDenied, "resource belongs to another tenant")
+		return proto.ErrReason(proto.CodeDenied, proto.ReasonPermissionDenied, "resource belongs to another tenant")
 	}
 	if c.opts.Authorizer != nil {
 		if err := c.opts.Authorizer.Check(ctx, subject, action, resource); err != nil {
-			return proto.Err(proto.CodeDenied, "authorization denied: %v", err)
+			return proto.ErrReason(proto.CodeDenied, proto.ReasonPermissionDenied, "authorization denied: %v", err)
 		}
 		return nil
 	}
@@ -1968,16 +2012,16 @@ func (c *Control) check(ctx context.Context, subject Subject, action string, res
 		return nil
 	}
 	if action == ActionAdmin {
-		return proto.Err(proto.CodeDenied, "administrator role required")
+		return proto.ErrReason(proto.CodeDenied, proto.ReasonPermissionDenied, "administrator role required")
 	}
 	if subject.Tenant == "" || (resource.Tenant != "" && subject.Tenant != resource.Tenant) {
-		return proto.Err(proto.CodeDenied, "resource belongs to another tenant")
+		return proto.ErrReason(proto.CodeDenied, proto.ReasonPermissionDenied, "resource belongs to another tenant")
 	}
 	if subject.ID == resource.Owner {
 		return nil
 	}
 	if action == ActionACL {
-		return proto.Err(proto.CodeDenied, "subject %s does not own %s %s", subject.ID, resource.Kind, resource.ID)
+		return proto.ErrReason(proto.CodeDenied, proto.ReasonPermissionDenied, "subject %s does not own %s %s", subject.ID, resource.Kind, resource.ID)
 	}
 	if action == ActionRead {
 		if contains(resource.Readers, subject.ID) || contains(resource.Writers, subject.ID) {
@@ -1986,7 +2030,7 @@ func (c *Control) check(ctx context.Context, subject Subject, action string, res
 	} else if contains(resource.Writers, subject.ID) {
 		return nil
 	}
-	return proto.Err(proto.CodeDenied, "subject %s may not %s %s %s", subject.ID, action, resource.Kind, resource.ID)
+	return proto.ErrReason(proto.CodeDenied, proto.ReasonPermissionDenied, "subject %s may not %s %s %s", subject.ID, action, resource.Kind, resource.ID)
 }
 
 func workspaceResource(ws *proto.Workspace) Resource {
@@ -2131,6 +2175,66 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return c.principalList(ctx, subject, req)
+	case proto.OpBindingCreate:
+		req, err := decode[proto.BindingCreateReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.bindingCreate(ctx, subject, req)
+	case proto.OpBindingList:
+		req, err := decode[proto.BindingListReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.bindingList(ctx, subject, req)
+	case proto.OpBindingGet:
+		req, err := decode[proto.BindingGetReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.bindingGet(ctx, subject, req)
+	case proto.OpBindingRotate:
+		req, err := decode[proto.BindingRotateReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.bindingRotate(ctx, subject, req)
+	case proto.OpBindingRevoke:
+		req, err := decode[proto.BindingRevokeReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.bindingRevoke(ctx, subject, req)
+	case proto.OpPrincipalSessionCreate:
+		req, err := decode[proto.PrincipalSessionCreateReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.principalSessionCreate(ctx, subject, req)
 	case proto.OpPrincipalTokenIssue:
 		req, err := decode[proto.PrincipalTokenIssueReq](f)
 		if err != nil {
@@ -3032,9 +3136,14 @@ func (c *Control) wsCreateResolved(ctx context.Context, subject Subject, req *pr
 	}
 	c.mu.Lock()
 	for _, b := range req.Spec.Bindings {
-		if _, ok := c.bindings[b]; !ok {
+		binding, ok := c.lookupBindingLocked(subject.Tenant, b)
+		if !ok {
 			c.mu.Unlock()
-			return nil, proto.Err(proto.CodeNotFound, "binding %q is not defined", b)
+			return nil, proto.ErrReason(proto.CodeNotFound, proto.ReasonBindingMissing, "binding %q is not defined", b)
+		}
+		if binding.RevokedAt != 0 {
+			c.mu.Unlock()
+			return nil, proto.ErrReason(proto.CodeUnauthorized, proto.ReasonRevoked, "binding %q was revoked", b)
 		}
 	}
 	for i, mount := range resolvedVolumes {
@@ -4573,6 +4682,10 @@ func (c *Control) wsRenew(ctx context.Context, node string, req *proto.WSRenewRe
 		result.LeaseUntil = until
 		result.Action = "continue"
 		result.AuthzRevision = ws.AuthzRevision
+		// The binding fingerprint travels with every renew so a rotation or
+		// revocation reaches a running workspace within one renew interval
+		// instead of waiting for the lease TTL to expire.
+		result.BindingRevision = c.bindingSetRevisionLocked(ws.Tenant, ws.Spec.Bindings)
 		if known, ok := req.Authz[id]; ok && known < ws.AuthzRevision {
 			result.Revoked, result.AuthzReset = revokedSince(ws, known)
 		}
@@ -6022,20 +6135,35 @@ func (c *Control) bindingLease(ctx context.Context, node, wsID string, generatio
 		c.mu.Unlock()
 		return nil, proto.Err(proto.CodeDenied, "workspace %s is not claimed by %s", wsID, node)
 	}
-	gen, principal := ws.Generation, ws.Spec.Principal
+	gen, principal, tenant := ws.Generation, ws.Spec.Principal, ws.Tenant
 	requested := append([]string(nil), ws.Spec.Bindings...)
 	bindings := make([]Binding, 0, len(requested))
+	var missing, revoked string
 	for _, id := range requested {
-		if binding, ok := c.bindings[id]; ok {
-			binding.Destinations = append([]string(nil), binding.Destinations...)
-			binding.Principals = append([]string(nil), binding.Principals...)
-			binding.Workspaces = append([]string(nil), binding.Workspaces...)
-			bindings = append(bindings, binding)
+		binding, ok := c.lookupBindingLocked(tenant, id)
+		if !ok {
+			missing = id
+			break
 		}
+		if binding.RevokedAt != 0 {
+			revoked = id
+			break
+		}
+		bindings = append(bindings, cloneBinding(binding))
 	}
+	revision := c.bindingSetRevisionLocked(tenant, requested)
 	c.mu.Unlock()
+	// A binding that disappeared or was revoked is a refusal, not a silently
+	// shorter lease set: a workspace whose placeholder stops being substituted
+	// must learn why rather than send the placeholder upstream.
+	if missing != "" {
+		return nil, proto.ErrReason(proto.CodeNotFound, proto.ReasonBindingMissing, "binding %q is not defined", missing)
+	}
+	if revoked != "" {
+		return nil, proto.ErrReason(proto.CodeUnauthorized, proto.ReasonRevoked, "binding %q was revoked", revoked)
+	}
 
-	out := &proto.BindingLeaseRes{}
+	out := &proto.BindingLeaseRes{Revision: revision}
 	for _, b := range bindings {
 		if len(b.Principals) > 0 && !contains(b.Principals, principal) {
 			continue
@@ -6058,6 +6186,8 @@ func (c *Control) bindingLease(ctx context.Context, node, wsID string, generatio
 		out.Leases = append(out.Leases, proto.BindingLease{
 			ID: b.ID, Secret: secret, Destinations: b.Destinations, Principals: b.Principals,
 			Placeholder: b.Placeholder, ExpiresAt: c.now().Add(time.Duration(ttl) * time.Second).UnixMilli(),
+			Kind: b.Kind, Methods: b.Methods, PathPrefixes: b.PathPrefixes,
+			Revision: b.Revision, Generation: gen,
 		})
 	}
 	// Resolution may block on an external provider. Revalidate the authority
@@ -6067,9 +6197,16 @@ func (c *Control) bindingLease(ctx context.Context, node, wsID string, generatio
 	current := c.workspaces[wsID]
 	valid := current != nil && current.Node == node && current.Generation == gen &&
 		(current.State == proto.WSClaimed || current.State == proto.WSClaiming) && current.Spec.Principal == principal
+	// A revoke or rotate committed while the source was being fetched must not
+	// be papered over by a lease minted from the credential we already had.
+	stillCurrent := valid && c.bindingSetRevisionLocked(tenant, requested) == revision
 	c.mu.Unlock()
 	if !valid {
 		return nil, proto.Err(proto.CodeDenied, "workspace %s authority changed while leasing bindings", wsID)
+	}
+	if !stillCurrent {
+		return nil, proto.ErrReason(proto.CodeConflict, proto.ReasonRevoked,
+			"bindings for workspace %s changed while leasing", wsID)
 	}
 	return out, nil
 }
@@ -6126,7 +6263,7 @@ func VerifyGrant(pub ed25519.PublicKey, g *proto.Grant, now time.Time) error {
 		return proto.Err(proto.CodeUnauthorized, "bad grant signature")
 	}
 	if now.UnixMilli() > g.Claims.ExpiresAt {
-		return proto.Err(proto.CodeUnauthorized, "grant expired")
+		return proto.ErrReason(proto.CodeUnauthorized, proto.ReasonGrantExpired, "grant expired")
 	}
 	return nil
 }
@@ -6260,13 +6397,24 @@ func (c *Control) Tick(ctx context.Context) {
 	c.expireStaleApprovals(ctx)
 }
 
-// Bindings returns the configured binding ids (for the CLI).
+// Bindings returns the live binding ids (for the CLI). Revoked bindings are
+// omitted: the id is retained for audit, but it can no longer be leased.
 func (c *Control) Bindings() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	seen := make(map[string]struct{}, len(c.bindings))
 	out := make([]string, 0, len(c.bindings))
-	for id := range c.bindings {
-		out = append(out, id)
+	for _, b := range c.bindings {
+		if b.RevokedAt != 0 {
+			continue
+		}
+		// A tenant-scoped binding may shadow a global one with the same id;
+		// the CLI lists a name once.
+		if _, done := seen[b.ID]; done {
+			continue
+		}
+		seen[b.ID] = struct{}{}
+		out = append(out, b.ID)
 	}
 	sort.Strings(out)
 	return out
