@@ -46,6 +46,46 @@ static Go binary, one open protocol, Apache-2.0, nothing hosted.
 - **Go, Python and TypeScript SDKs**, a CLI, and an MCP server, with the same
   typed errors everywhere.
 
+## Introduction
+
+An agent runtime is the machine an agent works on, plus whatever keeps that
+work alive when you are not looking. You use it to start an agent on a task,
+walk away, and find the work still going, or paused exactly where it stopped,
+with a record of everything it did.
+
+Most sandboxes tie the agent's work to one container and one connection: when
+either goes away, so does the work. Remount separates the two things that
+usually get fused. The **workspace** (files, processes, policy) is separate
+from the **machine** that happens to run it, so it can be snapshotted and
+restored somewhere else. The **session** (a command and its output) is
+separate from the **socket** carrying it, so a client can disconnect and
+reattach without losing a byte. Everything that decides what happens next,
+from credentials to deadlines, lives in a small control plane rather than in
+the workspace or in your process.
+
+## What it's for
+
+- **You, with a coding agent and a laptop.** You started Claude Code or Codex
+  on a refactor and need to leave. `remount handoff` moves the conversation
+  and the checkout to a cloud machine; the agent keeps going; `remount resume`
+  opens the same conversation from wherever you are tomorrow. A task queue
+  runs your backlog overnight on a durable timer.
+- **A team shipping an agent product.** Every customer's agent is a durable
+  Agent resource with a transcript, a sleep and wake policy, approvals for
+  sensitive egress, and children it can fork. Provider keys are bound once
+  and brokered at the node; the workspace never sees them and revocation is a
+  single call. Every action lands in an event log you can stream to
+  customers or auditors.
+- **A platform team hosting other people's agents.** Nodes declare a runtime
+  profile and refuse to start unless they can prove it. gVisor and Firecracker
+  backends enforce deny-first egress and sibling isolation. `remount
+  conformance --profile` produces the evidence a security review wants, and
+  quotas, leases and idle policy bound what any tenant can hold.
+- **Anything that needs a browser, a shell and time.** Research agents,
+  data-collection agents, operations agents: a workspace with a browser,
+  files that become artifacts, egress policy on every request, and a deadline
+  that outlives the process that started it.
+
 ## Quick start
 
 ```sh
@@ -154,19 +194,31 @@ Every row about Remount is backed by a test or a recorded live run in
 [docs/engineering/](docs/engineering/); the other columns are from those
 projects' own READMEs and may lag.
 
-The design decisions behind the table:
+Some of this borrows from tools you already know: sessions that survive a
+dropped connection, as in tmux and mosh; a claim queue with leases and
+generation fencing, as in Kubernetes; microVM and syscall-filtered isolation
+from Firecracker and gVisor; secrets substituted at a proxy rather than handed
+to the workload. The ideas Remount adds on top have names, because they show
+up everywhere in the protocol:
 
-- **A session is a log, not a socket.** Output is kept with sequence numbers;
-  clients replay from where they were, and a range that retention dropped is
-  an explicit gap.
-- **A workspace is a value.** Snapshot, move, sleep and wake, with every grant
-  bound to a generation so a stale client cannot act on a moved workspace.
-- **The workspace is trusted with nothing.** Secrets, policy and lifecycle
-  live in the node and the control plane.
-- **Lifecycle belongs to the control plane.** Leases, idle policy, sleep and
-  wake are durable timers, not a `setTimeout` in your worker.
-- **Isolation is a checked promise.** A check that cannot run is reported
-  unavailable, never healthy.
+- **Sessions are logs.** Every session's output is an append-only log with
+  sequence numbers, and a client reads from an offset. Reconnecting is a
+  read, not a reconnection; a range that retention dropped is an explicit
+  gap, never silence.
+- **The workspace is a value.** It has a generation. Snapshot, move, sleep
+  and wake produce a new generation, and every grant a client holds is bound
+  to one, so a stale client cannot act on a workspace that has moved.
+- **Secret-blind execution.** The workspace holds placeholders. The node's
+  broker swaps them for real credentials only on requests to the hosts a
+  binding allows, and records who used which credential where.
+- **Lifecycle belongs to the control plane.** Sleep, wake, leases and idle
+  policy are durable timers that survive the client, the node and a
+  control-plane restart.
+- **Runtime profiles fail closed.** A node claims a profile at startup and is
+  refused unless its backends can prove it; a check that cannot run is
+  reported unavailable, never healthy.
+- **Hand-off of a live conversation.** A harness's saved transcript is a
+  first-class thing that travels with the checkout and resumes by id.
 - **Everything is an event**, committed in the same transaction as the state
   it describes.
 
@@ -279,27 +331,32 @@ system is the generated [support matrix](docs/security-profiles.md).
 | `web/` | the embedded operator console |
 | `docs/` | everything above, plus one ADR per decision |
 
-## Status and limits
+## Status
 
 Everything in this README is implemented and tested, including under the race
-detector and in a one-process simulator with fault injection. The newer parts
-(runtime profiles, leases, computer sessions, typed errors, tracing, runtime
-binding lifecycle, node enrollment) were also exercised live against real
-servers, real providers and a real browser; the runs are in
-[the verification ledger](docs/engineering/verification-2026-09.md).
+detector and in a one-process simulator with fault injection. The rows marked
+live were also exercised against real servers, real providers and a real
+browser; the runs are in [the verification ledger](docs/engineering/verification-2026-09.md).
 
-Limits worth knowing:
+| Area | Status |
+|---|---|
+| Exec and pty sessions with replayable reconnect | ✅ |
+| Snapshots, cross-node move, sleep and wake on timers and events | ✅ |
+| Durable leases and idle policy in the control plane | ✅ live |
+| Brokered credentials with runtime create, rotate and revoke | ✅ live, real OpenAI and Anthropic |
+| Hand-off and resume of Claude Code and Codex conversations | ✅ |
+| Durable Agents: transcripts, approvals, fork, task queues | ✅ |
+| Computer sessions with brokered browsing | ✅ live, Chromium in Docker |
+| Runtime profiles, drift detection, `doctor` and `conformance --profile` | ✅ live, gVisor passed `multi-tenant-isolated` |
+| Firecracker `microvm` profile | ⚠️ backend implemented; no live profile pass yet |
+| Go, Python and TypeScript SDKs with typed errors | ✅ |
+| OpenTelemetry traces, Prometheus metrics, operator console | ✅ |
+| Tagged release and published packages | ❌ not yet; install with `go install` or from source |
+| Apple Virtualization, peer-to-peer transport, a hosted service | ❌ not planned |
 
-- `process` and `docker` use cooperative proxying, so the production runtime
-  profiles refuse them. `gvisor` and `firecracker` enforce networking and
-  probe the host at startup; a gVisor node has passed `multi-tenant-isolated`
-  live, Firecracker's `microvm` profile has no live pass yet.
-- Moving a workspace moves files and policy, not running processes; harnesses
-  resume from their own saved state.
-- A browser profile does not survive a sleep or a move, on purpose.
-- No release has been tagged yet. Install with `go install` or from source.
-- Not part of this project: Apple Virtualization, a full virtual desktop as a
-  protocol resource, peer-to-peer transport, or any hosted service.
+Two limits to plan around: moving a workspace moves files and policy, not
+running processes (harnesses resume from their own saved state), and a
+browser profile does not survive a sleep or a move, on purpose.
 
 ## Contributing and security
 
