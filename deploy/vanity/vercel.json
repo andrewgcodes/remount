@@ -1,17 +1,31 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "cleanUrls": true,
   "rewrites": [
-    { "source": "/install.sh", "destination": "https://raw.githubusercontent.com/andrewgcodes/remount/main/install.sh" },
-    { "source": "/remount", "destination": "/index.html" },
-    { "source": "/remount/:path*", "destination": "/index.html" }
+    {
+      "source": "/install.sh",
+      "destination": "https://raw.githubusercontent.com/andrewgcodes/remount/main/install.sh"
+    },
+    {
+      "source": "/remount",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/remount/(.*)",
+      "destination": "/index.html"
+    }
   ],
   "headers": [
     {
       "source": "/(.*)",
       "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=300" },
-        { "key": "X-Content-Type-Options", "value": "nosniff" }
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300"
+        },
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        }
       ]
     }
   ]

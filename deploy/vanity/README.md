@@ -12,17 +12,26 @@ redirect.
 
 ## Deploy on Vercel
 
-The domain is registered through Vercel Domains, so DNS is already managed
-there.
+Deployed on 2026-09-05 as project `remount-vanity` under the Vercel scope
+`andrew-gaos-projects-7ae0e473`, with `remount.dev` and `get.remount.dev`
+attached and verified; `https://remount.dev/remount/cmd/remount?go-get=1`
+answers 200 with the meta tag. The domain is registered through Vercel
+Domains, so DNS is managed there. The `*.vercel.app` deployment URLs sit
+behind Vercel's deployment protection and redirect to a login; only the
+custom domains are public, which is what Go and `curl` use.
+
+To redeploy after editing this directory:
 
 ```sh
 npm i -g vercel            # once
 cd deploy/vanity
-vercel link                # create a new project named "remount-vanity" when asked
-vercel domains add remount.dev
-vercel domains add get.remount.dev   # optional alias for install.sh
-vercel --prod
+vercel login
+vercel link --yes --scope andrew-gaos-projects-7ae0e473 --project remount-vanity
+vercel deploy --prod --yes --scope andrew-gaos-projects-7ae0e473
 ```
+
+The first-time setup was `vercel domains add remount.dev remount-vanity` and
+the same for `get.remount.dev`; both are already assigned.
 
 Then verify from any machine:
 
@@ -42,5 +51,7 @@ credentials, which means public, or a tagged release once one exists.
 - `/install.sh`: proxies the installer from the repository's `main` branch.
   Point `get.remount.dev` at the same project so
   `curl -fsSL https://get.remount.dev/install.sh | sh` matches
-  `docs/releases.md`. Until a release is tagged the installer's download step
-  will report that no release exists, which is the truthful outcome.
+  `docs/releases.md`. While the repository is private the raw URL answers
+  404, so `get.remount.dev/install.sh` does too; once it is public the
+  installer will run and, until a release is tagged, truthfully report that
+  no release exists.
