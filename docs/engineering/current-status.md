@@ -1,8 +1,8 @@
 # Current implementation status
 
-This is the maintained status index, checked against branch
-`claude/gap-brief-2026-09-06` at `60b8ed9` on 2026-09-05, which is
-`origin/main` `9b5dff6` plus the 2026-09-06 gap-brief work. It supersedes the
+This is the maintained status index, checked against `main` on 2026-09-05
+after the 2026-09-06 gap-brief work landed (the pre-brief baseline was
+`9b5dff6`). It supersedes the
 earlier reconciliation against PR #30 (`6b301c2`, merged as `b76d21d`) and the
 documentation-only PR #31 merge `fd4f507`. It separates implemented code, dated
 verification and remaining deployment requirements. It is not a

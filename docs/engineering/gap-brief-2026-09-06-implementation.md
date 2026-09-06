@@ -1,8 +1,8 @@
 # Gap brief 2026-09-06 — implementation record
 
 This dispositions every item of [the gap brief](./gap-brief-2026-09-06.md)
-against code, tests and dated evidence on branch
-`claude/gap-brief-2026-09-06` (cut from `origin/main` `9b5dff6`). It is a
+against code, tests and dated evidence on `main` (the pre-brief baseline
+was `9b5dff6`). It is a
 ledger, not a certificate: a row says what exists and how it was proven, and
 an `unavailable` result is never a pass. Update it when the boundary moves.
 
