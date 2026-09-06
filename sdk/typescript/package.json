@@ -46,7 +46,7 @@
     "runtime",
     "remount"
   ],
-  "author": "Andrew Kean Gao",
+  "author": "Andrew Gao",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/andrewgcodes/remount.git",
