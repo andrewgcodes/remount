@@ -203,6 +203,14 @@ tests and engineering notes do not.
   produced had no subscriber left to receive it and an attached reader hung
   forever on a stream that went quiet and never closed. Subscribers now deliver
   the exit chunk their joined sessions produced, bounded, before they are cut.
+- A computer session can now browse to a host the broker allows. Chromium
+  discards proxy user-info and never volunteers `Proxy-Authorization`, so the
+  broker refused every destination as `unauthenticated` and a browser was
+  contained but useless. The node now answers the browser's proxy challenge
+  over CDP with the capability the browser's own `HTTPS_PROXY` carries, cancels
+  origin challenges so a site login prompt never receives it, and passes every
+  other request through unchanged
+  ([ADR 0095](docs/adr/0095-browser-proxy-auth-through-cdp.md)).
 
 ### In progress
 

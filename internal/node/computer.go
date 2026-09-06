@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"remount.dev/remount/internal/computer"
 	"remount.dev/remount/internal/ids"
 	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/redact"
 	"remount.dev/remount/internal/session"
 	"remount.dev/remount/internal/workspace"
 )
@@ -63,6 +66,21 @@ var DefaultBrowserProgram = func(addr string, port int, profileDir string, v pro
 		"--headless=new",
 		"--no-sandbox",
 		"--disable-gpu",
+		// Chromium's own component, sync, metrics and first-run traffic is
+		// issued by the network service outside any page target, so CDP
+		// request interception never sees it and the node cannot answer the
+		// broker's proxy challenge for it (ADR 0095). Left on, every session
+		// files a handful of `unauthenticated` egress denials against Google
+		// hosts nobody asked for, which is both noise an operator has to
+		// explain away and a workspace announcing itself to a third party.
+		// A headless browser under automation needs none of it.
+		"--disable-background-networking",
+		"--disable-component-update",
+		"--disable-default-apps",
+		"--disable-sync",
+		"--metrics-recording-only",
+		"--no-first-run",
+		"--no-default-browser-check",
 		"--remote-debugging-address=127.0.0.1",
 		fmt.Sprintf("--remote-debugging-port=%d", listen),
 		"--user-data-dir=" + profileDir,
@@ -115,6 +133,69 @@ func browserEnv(env map[string]string, profileDir string) map[string]string {
 		merged[name] = value
 	}
 	return merged
+}
+
+// proxyOrderPreference is the order the node reads a proxy URL out of a
+// session environment. HTTPS comes first because a browser's navigation is
+// what this credential exists for, and the upper-case spelling first because
+// that is the one the broker writes.
+var proxyOrderPreference = []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"}
+
+// proxyCredentialsFromEnv reads the credential a browser must present when the
+// workspace's broker challenges it, out of the session environment the node
+// just built for that browser.
+//
+// There is deliberately no second credential path. The value is whatever
+// user-info the browser's own HTTP(S)_PROXY carries, so the node can never
+// answer a challenge with an authority the browser was not already handed —
+// and a workspace with no broker, or one whose env a caller overrode with an
+// unauthenticated proxy, yields nothing and leaves interception off.
+func proxyCredentialsFromEnv(env []string) computer.ProxyCredentials {
+	assigned := map[string]string{}
+	for _, entry := range env {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if slices.Contains(proxyOrderPreference, name) {
+			// Last assignment wins, which is what every backend's environment
+			// does with a repeated name.
+			assigned[name] = value
+		}
+	}
+	for _, name := range proxyOrderPreference {
+		raw, ok := assigned[name]
+		if !ok {
+			continue
+		}
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.User == nil {
+			continue
+		}
+		password, _ := parsed.User.Password()
+		creds := computer.ProxyCredentials{Username: parsed.User.Username(), Password: password}
+		if creds.Set() {
+			return creds
+		}
+	}
+	return computer.ProxyCredentials{}
+}
+
+// redactProxyCredential removes the broker capability from words the node is
+// about to publish. computer.create emits the browser's own command line, and
+// the capability authorizes every egress this workspace has, so a launch
+// program that names the proxy URL would otherwise land in the durable event
+// log and every export of it.
+func redactProxyCredential(words []string, creds computer.ProxyCredentials) []string {
+	if !creds.Set() || len(words) == 0 {
+		return words
+	}
+	scrub := redact.NewRedactor([]string{creds.Username, creds.Password})
+	out := make([]string, len(words))
+	for i, word := range words {
+		out[i] = scrub.String(word)
+	}
+	return out
 }
 
 // loopbackAddress reports whether the node will dial the workspace's own
@@ -362,6 +443,13 @@ func (n *Node) computerCreateOnce(ctx context.Context, claims proto.GrantClaims,
 		stop:         make(chan struct{}),
 	}
 
+	// One environment, built once: it is what a spawned browser starts with
+	// and it is where the proxy credential the node answers challenges with
+	// comes from. A browser the client attached to was started from the same
+	// workspace environment, so the same read applies to it.
+	sessionEnv := n.sessionEnv(w, browserEnv(req.Env, profileDir))
+	proxyAuth := proxyCredentialsFromEnv(sessionEnv)
+
 	var browser *session.Session
 	if !launch.Attach {
 		program := launch.Program
@@ -370,7 +458,7 @@ func (n *Node) computerCreateOnce(ctx context.Context, claims proto.GrantClaims,
 		}
 		spec := session.Spec{
 			WS: w.ID, Generation: w.Generation, Kind: proto.SessionExec,
-			Program: program, Env: n.sessionEnv(w, browserEnv(req.Env, profileDir)),
+			Program: program, Env: sessionEnv,
 			Principal: claims.Principal, Tenant: claims.Tenant,
 		}
 		if err := w.handle.Prepare(&spec); err != nil {
@@ -386,7 +474,8 @@ func (n *Node) computerCreateOnce(ctx context.Context, claims proto.GrantClaims,
 		browser = s
 		h.session = s.ID
 		n.emitSession(proto.EvSOpened, w.ID, claims.Principal, s.ID, map[string]any{
-			"s": s.ID, "kind": proto.SessionExec, "program": program, "client": "computer",
+			"s": s.ID, "kind": proto.SessionExec,
+			"program": redactProxyCredential(program, proxyAuth), "client": "computer",
 		})
 	}
 
@@ -395,6 +484,7 @@ func (n *Node) computerCreateOnce(ctx context.Context, claims proto.GrantClaims,
 		Endpoint:     net.JoinHostPort("127.0.0.1", fmt.Sprint(port)),
 		Viewport:     viewport,
 		DownloadPath: downloadDir,
+		ProxyAuth:    proxyAuth,
 		OnDownload:   h.enqueueDownload,
 		OnClosed:     func(reason string) { n.computerCrashed(h, reason) },
 	})

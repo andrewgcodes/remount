@@ -527,11 +527,12 @@ var scenarios = []Scenario{
 	{
 		ID: "B34", Title: "a real browser answers every computer operation on a real backend",
 		Layer: LayerHostCI, Required: true, Source: sourceBrowser,
-		Owner:    "integration/browser.TestB34BrowserComputerConformance, scripts/browser-conformance.sh",
-		Env:      []string{"REMOUNT_BROWSER_IMAGE", "REMOUNT_BROWSER_BROKER_HOST"},
+		Owner: "integration/browser.TestB34BrowserComputerConformance, scripts/browser-conformance.sh",
+		Env: []string{"REMOUNT_BROWSER_IMAGE", "REMOUNT_BROWSER_BROKER_HOST",
+			"REMOUNT_BROWSER_ALLOWED_HOST", "REMOUNT_BROWSER_DENIED_HOST"},
 		Argv:     []string{"./scripts/browser-conformance.sh"},
 		Recorded: StatusPassed,
-		Note:     "Chromium 152 in the reference image passed create, navigate, click, typing into an input, a contenteditable and an iframe, a screenshot that changed with the DOM, a download published and byte-verified as an artifact, a refused navigation to an unbound host with its broker egress event, a killed browser reported as closed/browser_crashed, and a sleep/wake that left no computer and no profile. The refusal was recorded as unauthenticated rather than by host policy: Chromium does not present the workspace capability as proxy authentication, so the broker refuses every destination for a browser, allowed or not",
+		Note:     "Chromium 152 in the reference image passed create, navigate, click, typing into an input, a contenteditable and an iframe, a screenshot that changed with the DOM, a download published and byte-verified as an artifact, a killed browser reported as closed/browser_crashed, and a sleep/wake that left no computer and no profile. Brokered browsing is proved both ways against real public hosts: https://example.com/ loaded with HTTP 200 over https and the broker recorded egress.allowed, while an unbound host was refused with decision denied by host policy rather than unauthenticated, because the node now answers the browser's proxy challenge over CDP (ADR 0095). The lane needs a docker host that routes to container addresses and can reach the allowed destination; both absences skip as unavailable and neither renders as a pass",
 	},
 	{
 		ID: "B35", Title: "the brokered-credential examples run against a fake provider with no network and no key",
