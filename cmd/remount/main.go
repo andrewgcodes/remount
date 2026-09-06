@@ -829,13 +829,17 @@ func cmdStandalone(ctx context.Context, args []string) error {
 
 func cmdWS(ctx context.Context, args []string) error {
 	if len(args) == 0 || isHelp(args[0]) {
-		return errors.New("ws: create|ls|get|destroy|move|sleep|wake|snapshot|acl")
+		return errors.New("ws: create|ls|get|destroy|move|sleep|wake|snapshot|acl|lease|idle-policy|mark-idle|mark-active")
 	}
 	sub, rest := args[0], args[1:]
 	fs := flag.NewFlagSet("ws "+sub, flag.ExitOnError)
 	var c common
 	c.flags(fs)
 	switch sub {
+	// Durable holds and idle policy (ADR 0090) build their own flag set,
+	// because `ws lease renew` is a sub-verb with different flags.
+	case "lease", "idle-policy", "mark-idle", "mark-active":
+		return cmdWSLifecycle(ctx, sub, rest)
 	case "create":
 		name := fs.String("name", "", "name")
 		backend := fs.String("backend", "", "required backend")
@@ -992,6 +996,12 @@ func cmdWS(ctx context.Context, args []string) error {
 			return err
 		}
 		printJSON(ws)
+		if !c.json {
+			// The derived lifecycle view (ADR 0090) in words: a raw
+			// millisecond field in the JSON does not tell a reader that this
+			// workspace is about to be put to sleep by the control plane.
+			printLifecycleDeadline(os.Stderr, ws.LifecycleDeadline)
+		}
 	case "destroy":
 		parse(fs, rest)
 		if err := arity(fs, 1, 1, "ws destroy WS"); err != nil {
