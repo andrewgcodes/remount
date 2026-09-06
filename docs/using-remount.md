@@ -284,6 +284,7 @@ Filesystem mutations are jailed to the workspace root:
 ./remount fs ls "$WS"
 ./remount fs search "$WS" 'pattern'
 ./remount fs edit "$WS" notes.md 'old text' 'new text'
+./remount fs mkdir "$WS" archive
 ./remount fs mv "$WS" notes.md archive/notes.md
 ./remount fs rm "$WS" archive/notes.md
 ```
@@ -305,7 +306,7 @@ Workspace lifecycle:
 
 ```sh
 ./remount ws get "$WS"
-./remount ws snapshot "$WS" --authoritative
+./remount ws snapshot "$WS" --authoritative   # at most one snapshot per second
 ./remount ws sleep "$WS" --after 1h
 ./remount ws wake "$WS"
 ./remount ws destroy "$WS"
@@ -327,7 +328,7 @@ and the workspace then runs until somebody notices the bill. The deadline has
 to live where the workspace lives.
 
 ```sh
-./remount ws lease "$WS" --max 20m --min 30s --reason background_job
+LEASE=$(./remount ws lease "$WS" --max 20m --min 30s --reason background_job --json | jq -r .id)
 ./remount ws lease renew "$WS" "$LEASE" --extend 10m
 ./remount ws lease get "$WS"
 ./remount ws lease cancel "$WS" "$LEASE"

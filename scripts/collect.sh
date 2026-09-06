@@ -13,6 +13,10 @@
 set -eu
 
 REMOUNT="${REMOUNT:-remount}"
+if ! command -v "$REMOUNT" >/dev/null 2>&1 && [ ! -x "$REMOUNT" ]; then
+	echo "collect.sh: remount binary not found; set REMOUNT=./remount or put remount on PATH" >&2
+	exit 2
+fi
 DEEP=""
 ONLY_WS=""
 

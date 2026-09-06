@@ -174,6 +174,7 @@ uploads the artifact, and commits the reference before returning success.
 
 ```sh
 ./remount ws snapshot $WS                 # consistency=live, not failover state
+sleep 1                                   # snapshots are rate limited to one per second
 ./remount ws snapshot $WS --authoritative # quiesced and durably committed
 ```
 
@@ -204,7 +205,7 @@ partition takes a `setTimeout` with it; the workspace then runs until somebody
 notices the bill.
 
 ```sh
-./remount ws lease $WS --max 20m --min 30s --reason background_job
+LEASE=$(./remount ws lease $WS --max 20m --min 30s --reason background_job --json | jq -r .id)
 ./remount ws lease renew $WS $LEASE --extend 10m
 ./remount ws idle-policy $WS --sleep-after 10m --destroy-after 2h
 ./remount ws mark-active $WS --reason new_turn
@@ -427,8 +428,9 @@ remount inspect $WS       # one workspace, down to session log positions on disk
 remount doctor --deep     # re-hash every snapshot and report anything damaged
 ```
 
-All three take `--json`. `scripts/collect.sh` gathers everything into one
-document and `scripts/explain.py` turns it into prose that leads with the
+All three take `--json`. `REMOUNT=./remount scripts/collect.sh` gathers
+everything into one document (the variable names the binary when it is not on
+your `PATH`) and `scripts/explain.py` turns it into prose that leads with the
 verdict. See [docs/observability.md](docs/observability.md).
 
 Spans go to a collector you run, or nowhere: `--otlp-endpoint` (or
