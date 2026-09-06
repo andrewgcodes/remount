@@ -3059,7 +3059,7 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		n.subscribe(p, f.From, s, req.From, req.Subscription)
-		return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq()}, nil
+		return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq(), Kind: s.Kind}, nil
 	case proto.OpSInput:
 		req, err := decode[proto.SInputReq](f)
 		if err != nil {
@@ -3787,7 +3787,7 @@ func (n *Node) sOpen(ctx context.Context, p *transport.Peer, client string, clai
 	if !req.NoSubscribe {
 		n.subscribe(p, client, s, 0, "")
 	}
-	return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq()}, nil
+	return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq(), Kind: s.Kind}, nil
 }
 
 func (n *Node) portOpen(ctx context.Context, p *transport.Peer, client string, claims proto.GrantClaims, w *ws, req *proto.PortOpenReq) (any, error) {
@@ -3829,7 +3829,7 @@ func (n *Node) portOpen(ctx context.Context, p *transport.Peer, client string, c
 		return nil, proto.Err(proto.CodeUnreachable, "port %d: %s", req.Port, msg)
 	}
 	n.subscribe(p, client, s, 0, "")
-	return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq()}, nil
+	return proto.SOpenRes{S: s.ID, Next: s.Log.Next(), LastInputSeq: s.LastInputSeq(), Kind: s.Kind}, nil
 }
 
 // subscribe streams s's log to client from seq `from` until the client

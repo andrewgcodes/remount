@@ -214,3 +214,47 @@ func TestE11TieredSessionRecordSurvivesNodeRestart(t *testing.T) {
 		t.Fatalf("replay after node restart differs: got=%d want=%d", len(got), len(original))
 	}
 }
+
+func TestE11ArchivedPTYRetainsKindAfterMove(t *testing.T) {
+	w := newWorld(t)
+	n1 := w.nodeWith("e11-pty-n1", func(options *node.Options) {
+		options.Labels = map[string]string{"e11-pty": "yes"}
+		options.SessionSegmentBytes = 64 << 10
+	})
+	n2 := w.nodeWith("e11-pty-n2", func(options *node.Options) {
+		options.Labels = map[string]string{"e11-pty": "yes"}
+		options.SessionSegmentBytes = 64 << 10
+	})
+	c := w.client("e11-pty-client")
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	ws := mustWS(t, c, proto.WorkspaceSpec{Placement: proto.Placement{Node: n1.ID()}})
+
+	s, err := c.Exec(ctx, proto.SOpenReq{
+		WS: ws.ID, Kind: proto.SessionPTY, Program: []string{"sh", "-c", "printf 'one\\ntwo\\n'"},
+		Rows: 20, Cols: 90,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := collectSessionChunks(t, ctx, s)
+	waitSessionLogComplete(t, ctx, c, s.ID)
+
+	moved, err := c.MoveWorkspace(ctx, ws.ID, nil, &proto.Placement{Node: n2.ID()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.WaitClaimed(ctx, moved.ID); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := c.Attach(ctx, ws.ID, s.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Kind != proto.SessionPTY {
+		t.Fatalf("archived session kind = %q, want %q", replayed.Kind, proto.SessionPTY)
+	}
+	if got := collectSessionChunks(t, ctx, replayed); !sameReplay(got, original) {
+		t.Fatalf("PTY replay after move differs: got=%d want=%d", len(got), len(original))
+	}
+}

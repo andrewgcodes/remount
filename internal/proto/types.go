@@ -1695,6 +1695,7 @@ type SOpenRes struct {
 	S            string `cbor:"s" json:"s"`
 	Next         uint64 `cbor:"next" json:"next"` // next seq the node will emit (for attach: where live begins)
 	LastInputSeq uint64 `cbor:"last_iseq,omitempty" json:"last_iseq,omitempty"`
+	Kind         string `cbor:"kind,omitempty" json:"kind,omitempty"`
 }
 
 type SAttachReq struct {

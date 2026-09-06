@@ -1600,6 +1600,7 @@ SOpenRes = TypedDict("SOpenRes", {
     "s": Required[str],
     "next": Required[int],
     "last_iseq": NotRequired[int],
+    "kind": NotRequired[str],
 }, total=False)
 
 SResizeReq = TypedDict("SResizeReq", {

@@ -872,8 +872,8 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 
 | op | Body → Response |
 |---|---|
-| `s.open` | `SOpenReq{ws, kind, program, cwd, env, rows, cols, stdin, timeout_sec, idem, run?}` → `SOpenRes{s, next}` |
-| `s.attach` | `SAttachReq{s, from, subscription?}` → `SOpenRes{s, next}` |
+| `s.open` | `SOpenReq{ws, kind, program, cwd, env, rows, cols, stdin, timeout_sec, idem, run?}` → `SOpenRes{s, next, kind?}` |
+| `s.attach` | `SAttachReq{s, from, subscription?}` → `SOpenRes{s, next, kind?}` |
 | `s.input` | `SInputReq{s, iseq, d, eof}` → `{}` |
 | `s.resize` | `SResizeReq{s, rows, cols}` → `{}` |
 | `s.signal` | `SSignalReq{s, signal}` → `{}` |
@@ -912,7 +912,9 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 | `ws.quarantine` | control only: `WSQuarantineReq{operation, ws, gen, action, backend, exclude, security, tenant, volumes}` → `WSQuarantineRes{fenced, gen, action, backend, snapshot?, warning?}`; recovery declarations identify exact pins to detach before phase-one acknowledgement |
 | `ws.quarantine.commit` | control only: `WSQuarantineCommitReq{operation, ws, gen, backend, snapshot}` → `{}` and authorizes deletion only after an exact durable phase-one proof |
 
-Session kinds are `exec`, `pty` and `port`.
+Session kinds are `exec`, `pty` and `port`. `s.attach` returns the authoritative
+kind from the attached session, including a session restored from its durable
+log after a move or node restart.
 
 A **computer** is not a fourth session kind. It is a Chrome DevTools Protocol
 conversation the node holds with a browser inside the workspace, carried over

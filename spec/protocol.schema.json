@@ -5533,6 +5533,9 @@
     "SOpenRes": {
       "type": "object",
       "properties": {
+        "kind": {
+          "type": "string"
+        },
         "last_iseq": {
           "type": "integer"
         },

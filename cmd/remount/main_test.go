@@ -283,22 +283,6 @@ func TestDriveKillOnInterruptForwardsSIGINTThenDetaches(t *testing.T) {
 	}
 }
 
-func TestAttachUsesRawTerminalOnlyForPTYSession(t *testing.T) {
-	sessions := []proto.SessionStatus{
-		{Info: proto.SessionInfo{ID: "exec", Kind: proto.SessionExec}},
-		{Info: proto.SessionInfo{ID: "pty", Kind: proto.SessionPTY}},
-	}
-	if attachUsesRawTerminal(sessions, "exec") {
-		t.Fatal("exec attach enabled raw terminal mode")
-	}
-	if !attachUsesRawTerminal(sessions, "pty") {
-		t.Fatal("PTY attach did not enable raw terminal mode")
-	}
-	if attachUsesRawTerminal(sessions, "missing") {
-		t.Fatal("unknown session enabled raw terminal mode")
-	}
-}
-
 func TestDoctorUnavailableIsIncompleteNotHealthy(t *testing.T) {
 	rep := doctorReport{OK: true}
 	rep.add(proto.Finding{
@@ -322,6 +306,18 @@ func TestDoctorUnavailableIsIncompleteNotHealthy(t *testing.T) {
 	})
 	if !strings.Contains(jsonOutput, `"ok": false`) || !strings.Contains(jsonOutput, `"incomplete": true`) {
 		t.Fatalf("json=%s", jsonOutput)
+	}
+}
+
+func TestAttachUsesRawTerminalOnlyForPTYOnTerminal(t *testing.T) {
+	if attachUsesRawTerminal(proto.SessionExec, true) {
+		t.Fatal("exec attach enabled raw terminal mode")
+	}
+	if attachUsesRawTerminal(proto.SessionPTY, false) {
+		t.Fatal("non-terminal PTY attach enabled raw terminal mode")
+	}
+	if !attachUsesRawTerminal(proto.SessionPTY, true) {
+		t.Fatal("terminal PTY attach did not enable raw mode")
 	}
 }
 

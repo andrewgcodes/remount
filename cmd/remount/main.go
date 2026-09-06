@@ -1463,26 +1463,16 @@ func cmdAttach(ctx context.Context, args []string) error {
 	}
 	cl := c.client()
 	defer cl.Close()
-	raw := false
-	if term.IsTerminal(int(os.Stdin.Fd())) {
-		if sessions, listErr := cl.ListSessions(ctx, fs.Arg(0)); listErr == nil {
-			raw = attachUsesRawTerminal(sessions, fs.Arg(1))
-		}
-	}
 	s, err := cl.Attach(ctx, fs.Arg(0), fs.Arg(1), *from)
 	if err != nil {
 		return err
 	}
+	raw := attachUsesRawTerminal(s.Kind, term.IsTerminal(int(os.Stdin.Fd())))
 	return drive(ctx, s, driveOptions{WS: fs.Arg(0), Session: fs.Arg(1), Raw: raw, ForwardStdin: true, KillOnInterrupt: *killOnInterrupt})
 }
 
-func attachUsesRawTerminal(sessions []proto.SessionStatus, id string) bool {
-	for _, status := range sessions {
-		if status.Info.ID == id {
-			return status.Info.Kind == proto.SessionPTY
-		}
-	}
-	return false
+func attachUsesRawTerminal(kind string, terminal bool) bool {
+	return kind == proto.SessionPTY && terminal
 }
 
 // liveSession is what drive needs from a client session. client.Session

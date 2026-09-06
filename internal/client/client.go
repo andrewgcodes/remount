@@ -1721,6 +1721,7 @@ func (c *Client) Attach(ctx context.Context, wsID, sid string, from uint64) (*Se
 	}
 	s.mu.Lock()
 	s.attached = true
+	s.Kind = res.Kind
 	s.mu.Unlock()
 	s.seedInputSeq(res.LastInputSeq)
 	go s.reattach(context.Background(), c.generation())
