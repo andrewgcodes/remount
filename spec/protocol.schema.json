@@ -1766,6 +1766,478 @@
       ],
       "additionalProperties": true
     },
+    "ComputerAction": {
+      "type": "object",
+      "properties": {
+        "button": {
+          "type": "string"
+        },
+        "dx": {
+          "type": "integer"
+        },
+        "dy": {
+          "type": "integer"
+        },
+        "key": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "mod": {
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "tox": {
+          "type": "integer"
+        },
+        "toy": {
+          "type": "integer"
+        },
+        "x": {
+          "type": "integer"
+        },
+        "y": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": true
+    },
+    "ComputerCloseReq": {
+      "type": "object",
+      "properties": {
+        "computer": {
+          "type": "string"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idem": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "computer",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "ComputerCreateReq": {
+      "type": "object",
+      "properties": {
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idem": {
+          "type": "string"
+        },
+        "launch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComputerLaunch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "profile": {
+          "type": "string"
+        },
+        "viewport": {
+          "$ref": "#/$defs/ComputerViewport"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "ComputerCreateRes": {
+      "type": "object",
+      "properties": {
+        "cdp": {
+          "type": "string"
+        },
+        "computer": {
+          "type": "string"
+        },
+        "s": {
+          "type": "string"
+        },
+        "viewport": {
+          "$ref": "#/$defs/ComputerViewport"
+        }
+      },
+      "required": [
+        "computer"
+      ],
+      "additionalProperties": true
+    },
+    "ComputerDownload": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string"
+        },
+        "bytes": {
+          "type": "integer"
+        },
+        "filename": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "additionalProperties": true
+    },
+    "ComputerDownloadsReq": {
+      "type": "object",
+      "properties": {
+        "computer": {
+          "type": "string"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "computer",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "ComputerDownloadsRes": {
+      "type": "object",
+      "properties": {
+        "downloads": {
+          "items": {
+            "$ref": "#/$defs/ComputerDownload"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": true
+    },
+    "ComputerEvalReq": {
+      "type": "object",
+      "properties": {
+        "computer": {
+          "type": "string"
+        },
+        "expr": {
+          "type": "string"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "computer",
+        "expr",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "ComputerEvalRes": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "contentEncoding": "base64",
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "ComputerGetReq": {
+      "type": "object",
+      "properties": {
+        "computer": {
+          "type": "string"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "computer",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "ComputerGetRes": {
+      "type": "object",
+      "properties": {
+        "computer": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "s": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "viewport": {
+          "$ref": "#/$defs/ComputerViewport"
+        }
+      },
+      "required": [
+        "computer",
+        "state"
+      ],
+      "additionalProperties": true
+    },
+    "ComputerInputReq": {
+      "type": "object",
+      "properties": {
+        "actions": {
+          "items": {
+            "$ref": "#/$defs/ComputerAction"
+          },
+          "type": "array"
+        },
+        "computer": {
+          "type": "string"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "iseq": {
+          "type": "integer"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "computer",
+        "iseq",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "ComputerInputRes": {
+      "type": "object",
+      "properties": {
+        "applied": {
+          "type": "boolean"
+        },
+        "last_iseq": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "applied",
+        "last_iseq"
+      ],
+      "additionalProperties": true
+    },
+    "ComputerLaunch": {
+      "type": "object",
+      "properties": {
+        "attach": {
+          "type": "boolean"
+        },
+        "port": {
+          "type": "integer"
+        },
+        "program": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": true
+    },
+    "ComputerNavigateReq": {
+      "type": "object",
+      "properties": {
+        "computer": {
+          "type": "string"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idem": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "computer",
+        "url",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "ComputerNavigateRes": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "ComputerScreenshotReq": {
+      "type": "object",
+      "properties": {
+        "computer": {
+          "type": "string"
+        },
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "computer",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "ComputerScreenshotRes": {
+      "type": "object",
+      "properties": {
+        "h": {
+          "type": "integer"
+        },
+        "png": {
+          "contentEncoding": "base64",
+          "type": "string"
+        },
+        "w": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "h",
+        "png",
+        "w"
+      ],
+      "additionalProperties": true
+    },
+    "ComputerViewport": {
+      "type": "object",
+      "properties": {
+        "h": {
+          "type": "integer"
+        },
+        "w": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": true
+    },
     "ControlDiag": {
       "type": "object",
       "properties": {
@@ -2242,6 +2714,9 @@
         },
         "oldest": {
           "type": "integer"
+        },
+        "reason": {
+          "type": "string"
         }
       },
       "required": [
@@ -6880,6 +7355,53 @@
       "name": "budget.settle",
       "request": "BudgetSettleReq",
       "response": "BudgetSettlement"
+    },
+    {
+      "constant": "OpComputerClose",
+      "name": "computer.close",
+      "request": "ComputerCloseReq"
+    },
+    {
+      "constant": "OpComputerCreate",
+      "name": "computer.create",
+      "request": "ComputerCreateReq",
+      "response": "ComputerCreateRes"
+    },
+    {
+      "constant": "OpComputerDownloads",
+      "name": "computer.downloads",
+      "request": "ComputerDownloadsReq",
+      "response": "ComputerDownloadsRes"
+    },
+    {
+      "constant": "OpComputerEval",
+      "name": "computer.eval",
+      "request": "ComputerEvalReq",
+      "response": "ComputerEvalRes"
+    },
+    {
+      "constant": "OpComputerGet",
+      "name": "computer.get",
+      "request": "ComputerGetReq",
+      "response": "ComputerGetRes"
+    },
+    {
+      "constant": "OpComputerInput",
+      "name": "computer.input",
+      "request": "ComputerInputReq",
+      "response": "ComputerInputRes"
+    },
+    {
+      "constant": "OpComputerNavigate",
+      "name": "computer.navigate",
+      "request": "ComputerNavigateReq",
+      "response": "ComputerNavigateRes"
+    },
+    {
+      "constant": "OpComputerScreenshot",
+      "name": "computer.screenshot",
+      "request": "ComputerScreenshotReq",
+      "response": "ComputerScreenshotRes"
     },
     {
       "constant": "OpControllerState",

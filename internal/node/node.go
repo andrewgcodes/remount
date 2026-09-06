@@ -178,6 +178,9 @@ type Node struct {
 	// than restarted; entries age out, see pruneAgentRunsDoneLocked.
 	agentRuns     map[string]*agentRun
 	agentRunsDone map[string]time.Time
+	// computers are the live CDP conversations this node holds on behalf of
+	// clients, keyed by computer id. See computer.go and ADR 0088.
+	computers map[string]*computerHandle
 	// agentReportSink replaces the uplink for agent reports in tests.
 	agentReportSink func(context.Context, *proto.AgentReport) error
 	// materializing holds workspaces this node has claimed but not finished
@@ -506,6 +509,7 @@ func New(opts Options) (*Node, error) {
 		producerSeqPath: producerSeqPath, producerSeqHigh: producerSeq,
 		workspaces: map[string]*ws{}, materializing: map[string]*materialization{},
 		agentRuns: map[string]*agentRun{}, agentRunsDone: map[string]time.Time{},
+		computers: map[string]*computerHandle{},
 		deadlines: map[string]time.Time{}, quarantined: map[string]struct{}{},
 		grants: map[string]*proto.Grant{}, subs: map[string]*subscriber{}, sessionCapabilities: map[string]*localSessionCapability{},
 		prepared: map[string]*preparedRelease{}, committed: map[string]uint64{},
@@ -1855,6 +1859,9 @@ func appendWarning(existing, warning string) string {
 // resulting session. Callers must remove the workspace from the serving map
 // first so queued starters fail their post-lock serviceability check.
 func (n *Node) stopWorkspaceSessions(w *ws) error {
+	// Computers hold a CDP conversation over a live port path, so they are
+	// closed and joined before the sessions they talk to are terminated.
+	n.stopComputers(w.ID, proto.ComputerClosedReasonWorkspaceReleased)
 	w.treeMu.Lock()
 	err := n.sessions.TerminateWorkspace(w.ID, "workspace released")
 	w.treeMu.Unlock()
@@ -2655,6 +2662,86 @@ func (n *Node) dispatch(ctx context.Context, p *transport.Peer, f *proto.Frame) 
 			return nil, err
 		}
 		return n.portOpen(ctx, p, f.From, claims, w, req)
+	case proto.OpComputerCreate:
+		req, err := decode[proto.ComputerCreateReq](f)
+		if err != nil {
+			return nil, err
+		}
+		w, claims, err := n.authorizeClaims(f.From, req.WS, req.Grant)
+		if err != nil {
+			return nil, err
+		}
+		return n.computerCreate(ctx, f.From, claims, w, req)
+	case proto.OpComputerScreenshot:
+		req, err := decode[proto.ComputerScreenshotReq](f)
+		if err != nil {
+			return nil, err
+		}
+		w, err := n.authorize(f.From, req.WS, req.Grant)
+		if err != nil {
+			return nil, err
+		}
+		return n.computerScreenshot(ctx, w, req)
+	case proto.OpComputerInput:
+		req, err := decode[proto.ComputerInputReq](f)
+		if err != nil {
+			return nil, err
+		}
+		w, err := n.authorize(f.From, req.WS, req.Grant)
+		if err != nil {
+			return nil, err
+		}
+		return n.computerInput(ctx, w, req)
+	case proto.OpComputerNavigate:
+		req, err := decode[proto.ComputerNavigateReq](f)
+		if err != nil {
+			return nil, err
+		}
+		w, err := n.authorize(f.From, req.WS, req.Grant)
+		if err != nil {
+			return nil, err
+		}
+		return n.computerNavigate(ctx, f.From, w, req)
+	case proto.OpComputerEval:
+		req, err := decode[proto.ComputerEvalReq](f)
+		if err != nil {
+			return nil, err
+		}
+		w, err := n.authorize(f.From, req.WS, req.Grant)
+		if err != nil {
+			return nil, err
+		}
+		return n.computerEval(ctx, w, req)
+	case proto.OpComputerDownloads:
+		req, err := decode[proto.ComputerDownloadsReq](f)
+		if err != nil {
+			return nil, err
+		}
+		w, err := n.authorize(f.From, req.WS, req.Grant)
+		if err != nil {
+			return nil, err
+		}
+		return n.computerDownloads(w, req)
+	case proto.OpComputerClose:
+		req, err := decode[proto.ComputerCloseReq](f)
+		if err != nil {
+			return nil, err
+		}
+		w, err := n.authorize(f.From, req.WS, req.Grant)
+		if err != nil {
+			return nil, err
+		}
+		return n.computerClose(ctx, f.From, w, req)
+	case proto.OpComputerGet:
+		req, err := decode[proto.ComputerGetReq](f)
+		if err != nil {
+			return nil, err
+		}
+		w, err := n.authorize(f.From, req.WS, req.Grant)
+		if err != nil {
+			return nil, err
+		}
+		return n.computerGet(w, req)
 	case proto.OpSAttach:
 		req, err := decode[proto.SAttachReq](f)
 		if err != nil {

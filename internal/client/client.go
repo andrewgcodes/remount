@@ -2123,3 +2123,184 @@ func (c *Client) NodeStatus(ctx context.Context, nodeID string) (*proto.NodeStat
 	err := c.call(ctx, nodeID, proto.OpNodeStatus, struct{}{}, &st)
 	return &st, err
 }
+
+// ---------------------------------------------------------------------------
+// Computers (browser/computer use). See ADR 0088.
+// ---------------------------------------------------------------------------
+
+// Computer is a handle on one browser conversation a node holds inside a
+// workspace. It is safe for concurrent use; the input sequence it keeps makes
+// a retried action batch idempotent the way session input already is.
+type Computer struct {
+	client   *Client
+	ws       string
+	id       string
+	session  string
+	version  string
+	viewport proto.ComputerViewport
+
+	mu   sync.Mutex
+	iseq uint64
+}
+
+// CreateComputer starts, or attaches to, a browser in the workspace.
+func (c *Client) CreateComputer(ctx context.Context, req proto.ComputerCreateReq, options ...OperationOption) (*Computer, error) {
+	idem, _ := operationKey(options)
+	var res proto.ComputerCreateRes
+	err := c.nodeCall(ctx, req.WS, proto.OpComputerCreate, func(g *proto.Grant) any {
+		body := req
+		body.IdempotencyKey = idem
+		body.Grant = g
+		return body
+	}, &res)
+	if err != nil {
+		return nil, err
+	}
+	return &Computer{
+		client: c, ws: req.WS, id: res.Computer, session: res.Session,
+		version: res.CDPVersion, viewport: res.Viewport,
+	}, nil
+}
+
+// Computer returns a handle on a computer this client did not create, so a
+// reconnecting caller can resume against an id it recorded.
+func (c *Client) Computer(wsID, id string) *Computer {
+	return &Computer{client: c, ws: wsID, id: id}
+}
+
+// ID is the computer's stable identifier.
+func (m *Computer) ID() string { return m.id }
+
+// WS is the workspace the computer belongs to.
+func (m *Computer) WS() string { return m.ws }
+
+// Session is the browser's exec session id, or "" when the node attached to a
+// browser the workspace started itself.
+func (m *Computer) Session() string { return m.session }
+
+// CDPVersion is the browser's DevTools identification string.
+func (m *Computer) CDPVersion() string { return m.version }
+
+// Viewport is the CSS-pixel rectangle every coordinate refers to.
+func (m *Computer) Viewport() proto.ComputerViewport { return m.viewport }
+
+// Get reports the computer's current state, so a reconnecting client can tell
+// a live browser from one that crashed while it was away.
+func (m *Computer) Get(ctx context.Context) (*proto.ComputerGetRes, error) {
+	var res proto.ComputerGetRes
+	err := m.client.nodeCall(ctx, m.ws, proto.OpComputerGet, func(g *proto.Grant) any {
+		return proto.ComputerGetReq{WS: m.ws, Computer: m.id, Grant: g}
+	}, &res)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	m.viewport, m.session = res.Viewport, res.Session
+	m.mu.Unlock()
+	return &res, nil
+}
+
+// Screenshot captures the viewport as a PNG.
+func (m *Computer) Screenshot(ctx context.Context) (*proto.ComputerScreenshotRes, error) {
+	var res proto.ComputerScreenshotRes
+	err := m.client.nodeCall(ctx, m.ws, proto.OpComputerScreenshot, func(g *proto.Grant) any {
+		return proto.ComputerScreenshotReq{WS: m.ws, Computer: m.id, Grant: g}
+	}, &res)
+	if err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// Input applies a batch of actions. The batch carries the next input sequence,
+// so a retry after a dropped connection is applied at most once.
+func (m *Computer) Input(ctx context.Context, actions ...proto.ComputerAction) error {
+	m.mu.Lock()
+	m.iseq++
+	iseq := m.iseq
+	m.mu.Unlock()
+	var res proto.ComputerInputRes
+	return m.client.nodeCall(ctx, m.ws, proto.OpComputerInput, func(g *proto.Grant) any {
+		return proto.ComputerInputReq{WS: m.ws, Computer: m.id, Grant: g, ISeq: iseq, Actions: actions}
+	}, &res)
+}
+
+// Click presses and releases the left button at a viewport coordinate.
+func (m *Computer) Click(ctx context.Context, x, y int) error {
+	return m.Input(ctx, proto.ComputerAction{Kind: proto.ComputerActionClick, X: x, Y: y})
+}
+
+// Move moves the pointer without pressing a button.
+func (m *Computer) Move(ctx context.Context, x, y int) error {
+	return m.Input(ctx, proto.ComputerAction{Kind: proto.ComputerActionMove, X: x, Y: y})
+}
+
+// Type inserts text into whatever has focus.
+func (m *Computer) Type(ctx context.Context, text string) error {
+	return m.Input(ctx, proto.ComputerAction{Kind: proto.ComputerActionType, Text: text})
+}
+
+// Key presses one named key, such as Enter or ArrowDown.
+func (m *Computer) Key(ctx context.Context, key string, modifiers int) error {
+	return m.Input(ctx, proto.ComputerAction{Kind: proto.ComputerActionKey, Key: key, Modifiers: modifiers})
+}
+
+// Scroll dispatches a wheel event at a viewport coordinate.
+func (m *Computer) Scroll(ctx context.Context, x, y, dx, dy int) error {
+	return m.Input(ctx, proto.ComputerAction{Kind: proto.ComputerActionScroll, X: x, Y: y, DX: dx, DY: dy})
+}
+
+// Drag presses at one coordinate, moves, and releases at another.
+func (m *Computer) Drag(ctx context.Context, x, y, toX, toY int) error {
+	return m.Input(ctx, proto.ComputerAction{Kind: proto.ComputerActionDrag, X: x, Y: y, ToX: toX, ToY: toY})
+}
+
+// Navigate loads a URL and waits for the page's load event or the node's load
+// timeout. The response says which of the two happened.
+func (m *Computer) Navigate(ctx context.Context, url string, options ...OperationOption) (*proto.ComputerNavigateRes, error) {
+	idem, _ := operationKey(options)
+	var res proto.ComputerNavigateRes
+	err := m.client.nodeCall(ctx, m.ws, proto.OpComputerNavigate, func(g *proto.Grant) any {
+		return proto.ComputerNavigateReq{WS: m.ws, Computer: m.id, Grant: g, URL: url, IdempotencyKey: idem}
+	}, &res)
+	if err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// Eval runs an expression in the page and returns its JSON value. The value is
+// page-controlled data: decode it, never execute it.
+func (m *Computer) Eval(ctx context.Context, expression string) ([]byte, error) {
+	var res proto.ComputerEvalRes
+	err := m.client.nodeCall(ctx, m.ws, proto.OpComputerEval, func(g *proto.Grant) any {
+		return proto.ComputerEvalReq{WS: m.ws, Computer: m.id, Grant: g, Expression: expression}
+	}, &res)
+	if err != nil {
+		return nil, err
+	}
+	return res.Value, nil
+}
+
+// Downloads lists what the browser has fetched and, for the ones the node
+// published, the artifact id holding the file.
+func (m *Computer) Downloads(ctx context.Context) ([]proto.ComputerDownload, error) {
+	var res proto.ComputerDownloadsRes
+	err := m.client.nodeCall(ctx, m.ws, proto.OpComputerDownloads, func(g *proto.Grant) any {
+		return proto.ComputerDownloadsReq{WS: m.ws, Computer: m.id, Grant: g}
+	}, &res)
+	if err != nil {
+		return nil, err
+	}
+	return res.Downloads, nil
+}
+
+// Close ends the conversation and kills a browser the node spawned. Closing a
+// computer that is already gone succeeds.
+func (m *Computer) Close(ctx context.Context, options ...OperationOption) error {
+	idem, _ := operationKey(options)
+	var res struct{}
+	return m.client.nodeCall(ctx, m.ws, proto.OpComputerClose, func(g *proto.Grant) any {
+		return proto.ComputerCloseReq{WS: m.ws, Computer: m.id, Grant: g, IdempotencyKey: idem}
+	}, &res)
+}
