@@ -27,7 +27,9 @@
 //	target.go     the three target modes of Plan B §12.2
 //	session.go    the observation surfaces one run is given
 //	checks*.go    one function per requirement, grouped by semantic category
+//	profile.go    the §5 runtime profiles, transcribed, and the rows they add
 //	runner.go     manifest x target -> results
 //	report.go     JUnit XML and the Plan B §6 evidence record
+//	markdown.go   the review document: one table per tier plus a verdict
 //	shim/         a minimal implementation with switchable defects (B21)
 package conformance

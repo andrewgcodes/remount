@@ -3,9 +3,11 @@ VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev
 LDFLAGS  := -s -w -X main.version=$(VERSION)
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 
-.PHONY: all build test race fuzz cover vet fmt lint docs acpgen clean dist install demo conformance public-api modal-binary modal-deploy modal-smoke verify verify-fast
+.PHONY: all build test race fuzz cover vet fmt lint docs acpgen clean dist install demo conformance conformance-report public-api modal-binary modal-deploy modal-smoke verify verify-fast
 
 FUZZTIME ?= 5s
+OUT      ?= dist
+PROFILE  ?= dev
 
 all: lint test build
 
@@ -122,6 +124,14 @@ conformance:
 		./internal/fsops ./internal/node ./internal/proto ./internal/relay \
 		./internal/server ./internal/session ./internal/sim ./internal/transport \
 		./internal/workspace
+
+# The product-facing report, which is a different proof from the target above
+# and deliberately does not replace it: build this commit's binary, boot it as
+# a standalone deployment, judge it black-box against the protocol manifest and
+# a runtime profile, and leave JSON, markdown and a Plan B §6 record in OUT.
+# Exits 1 on a failure and 2 when something could not be observed.
+conformance-report:
+	@./scripts/conformance-report.sh $(OUT) $(PROFILE)
 
 # Compile and test the SDK from a module outside remount.dev/remount. This
 # catches accidental exposure of internal-only types that an in-module test

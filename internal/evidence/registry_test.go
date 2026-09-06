@@ -30,8 +30,13 @@ func TestRegistryCoversEveryHandoffAndPlanBScenario(t *testing.T) {
 			t.Errorf("%s from the Plan B phase tables is missing", id)
 		}
 	}
-	if len(have) != 57 {
-		t.Fatalf("registry holds %d rows, want E1-E25 plus B1-B32", len(have))
+	for _, id := range []string{"E26", "B33"} {
+		if _, ok := have[id]; !ok {
+			t.Errorf("%s from the 2026-09-06 gap brief is missing", id)
+		}
+	}
+	if len(have) != 59 {
+		t.Fatalf("registry holds %d rows, want E1-E26 plus B1-B33", len(have))
 	}
 }
 
@@ -81,6 +86,8 @@ var wiredScenarios = map[string]string{
 	"B8":  "internal/provision/e2b contract tests against fixtures captured from the real api.e2b.app",
 	"B9":  "ambiguous-create recovery, including the unresolvable case that must stay unknown",
 	"B10": "provider stall proves control authority is not held across a provider call",
+	"B33": "a freshly booted standalone judged black-box against the manifest and a named runtime profile",
+	"E26": "a real gVisor node loses a host prerequisite out of band and stops receiving profile-constrained work",
 }
 
 func TestOnlyDeliberatelyWiredScenariosAreWired(t *testing.T) {

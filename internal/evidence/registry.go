@@ -58,6 +58,7 @@ const (
 	sourceHandoff = "docs/engineering/handoff-2026-09-03.md (outcome: docs/engineering/implementation-closure-2026-09-03.md)"
 	sourcePlanB   = "docs/engineering/plan-b-repository-executable-2026-09-03.md"
 	sourceLinux   = "docs/engineering/verification-2026-09.md (Linux host verification 2026-09-04)"
+	sourceProfile = "docs/engineering/verification-2026-09.md (runtime-profile conformance 2026-09-05)"
 )
 
 // notLanded is the only honest thing to say about a Plan B row whose ticket
@@ -480,6 +481,30 @@ var scenarios = []Scenario{
 		Argv:     []string{"go", "test", "-count=1", "-timeout=20m", "-run", "^TestB32", "./integration/installs/"},
 		Recorded: StatusPassed,
 		Note:     "the dist binary and both release images passed manifest 1.1.0 black-box conformance; the wheel, npm tarball and external Go module drove an installed server without a source-tree dependency, and the checksums, static-link, inventory and SPDX SBOM lanes passed",
+	},
+	{
+		ID: "B33", Title: "a deployment produces a machine-readable per-check verdict for a named runtime profile",
+		Layer: LayerArtifact, Required: true, Source: sourceProfile,
+		Owner:    "cmd/remount conformance --profile, scripts/conformance-report.sh",
+		Argv:     []string{"./scripts/conformance-report.sh", "dist", "dev"},
+		Recorded: StatusPassed,
+		Note: "darwin/arm64, process backend: `remount conformance --launch self --profile dev` judged a freshly booted standalone " +
+			"at 70 checks, 62 passed, 0 failed, 8 unavailable, cleanup verified, exit 0, and emitted JSON plus the markdown review " +
+			"document. The same binary under --profile multi-tenant-isolated returned exit 1 with 7 profile obligations failing by " +
+			"name and 25 required rows unavailable because the workspaces parked with pending_reason profile_unschedulable. " +
+			"A dev-profile pass is a protocol verdict and makes no isolation claim; the isolation profiles are proved by E26 and B28/B29 on a Linux host.",
+	},
+	{
+		ID: "E26", Title: "profile drift makes a node unschedulable and recovery makes it schedulable again",
+		Layer: LayerHostCI, Required: true, Source: sourceProfile,
+		Env:      []string{"REMOUNT_GVISOR_INTEGRATION", "REMOUNT_GVISOR_ROOTFS"},
+		Owner:    "internal/sim.TestE26ProfileDriftMakesNodeUnschedulable, scripts/gvisor-conformance.sh drift",
+		Argv:     []string{"./scripts/gvisor-conformance.sh", "drift"},
+		Recorded: StatusUnavailable,
+		Note: "unavailable on the darwin/arm64 host this landed on: the lane needs a privileged Linux host with runsc on PATH and " +
+			"REMOUNT_GVISOR_ROOTFS pointing at an unpacked rootfs, because it constructs a real gvisor backend, removes a host " +
+			"prerequisite out of band and waits for node.profile.unschedulable. The scripted-backend half of the same loop " +
+			"(internal/sim.TestProfileDriftMakesNodeUnschedulable) does run here and passes; it proves the control loop, not the host mechanism.",
 	},
 }
 
