@@ -63,6 +63,9 @@ const (
 	// sourceColima is the first run of the gVisor isolation, profile and
 	// drift lanes against a real Linux host with runsc, in a local Colima VM.
 	sourceColima = "docs/engineering/verification-2026-09.md (live gVisor isolation, profile and drift lanes in a Colima VM, 2026-09-05)"
+	// sourceGapBrief owns the rows added while closing the 2026-09-06 gap
+	// brief. Their outcomes are re-earned by the runner, never asserted here.
+	sourceGapBrief = "docs/engineering/gap-brief-2026-09-06.md (outcome: docs/engineering/verification-2026-09.md)"
 )
 
 // notLanded is the only honest thing to say about a Plan B row whose ticket
@@ -524,11 +527,20 @@ var scenarios = []Scenario{
 	{
 		ID: "B34", Title: "a real browser answers every computer operation on a real backend",
 		Layer: LayerHostCI, Required: true, Source: sourceBrowser,
-		Owner:    "integration/browser.TestB34BrowserComputerConformance, scripts/browser-conformance.sh",
-		Env:      []string{"REMOUNT_BROWSER_IMAGE", "REMOUNT_BROWSER_BROKER_HOST"},
+		Owner: "integration/browser.TestB34BrowserComputerConformance, scripts/browser-conformance.sh",
+		Env: []string{"REMOUNT_BROWSER_IMAGE", "REMOUNT_BROWSER_BROKER_HOST",
+			"REMOUNT_BROWSER_ALLOWED_HOST", "REMOUNT_BROWSER_DENIED_HOST"},
 		Argv:     []string{"./scripts/browser-conformance.sh"},
 		Recorded: StatusPassed,
-		Note:     "Chromium 152 in the reference image passed create, navigate, click, typing into an input, a contenteditable and an iframe, a screenshot that changed with the DOM, a download published and byte-verified as an artifact, a refused navigation to an unbound host with its broker egress event, a killed browser reported as closed/browser_crashed, and a sleep/wake that left no computer and no profile. The refusal was recorded as unauthenticated rather than by host policy: Chromium does not present the workspace capability as proxy authentication, so the broker refuses every destination for a browser, allowed or not",
+		Note:     "Chromium 152 in the reference image passed create, navigate, click, typing into an input, a contenteditable and an iframe, a screenshot that changed with the DOM, a download published and byte-verified as an artifact, a killed browser reported as closed/browser_crashed, and a sleep/wake that left no computer and no profile. Brokered browsing is proved both ways against real public hosts: https://example.com/ loaded with HTTP 200 over https and the broker recorded egress.allowed, while an unbound host was refused with decision denied by host policy rather than unauthenticated, because the node now answers the browser's proxy challenge over CDP (ADR 0095). The lane needs a docker host that routes to container addresses and can reach the allowed destination; both absences skip as unavailable and neither renders as a pass",
+	},
+	{
+		ID: "B35", Title: "the brokered-credential examples run against a fake provider with no network and no key",
+		Layer: LayerCode, Required: true, Source: sourceGapBrief,
+		Owner:    "integration/examples.TestB35*",
+		Argv:     []string{"go", "test", "-count=1", "-timeout=15m", "-run", "^TestB35", "./integration/examples/"},
+		Recorded: StatusPassed,
+		Note:     "model, search and custom-HTTP examples each drive their own substitution location through a loopback TLS fake that answers 401 without the exact credential; the foreign upstream received nothing, no example places a provider key in a workspace env, and both halves run with no provider credential present",
 	},
 }
 

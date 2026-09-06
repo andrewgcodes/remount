@@ -38,6 +38,7 @@ import (
 	"os"
 	pathpkg "path"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,6 +65,7 @@ const (
 	DecisionUnauthenticated = "unauthenticated" // caller lacks this workspace broker's capability
 	DecisionLimitExceeded   = "limit_exceeded"  // a typed rule exhausted its request or byte budget
 	DecisionRedacted        = "redacted"        // an allowed response was rewritten by a typed rule
+	DecisionRevoked         = "revoked"         // the placeholder's binding was withdrawn
 )
 
 // Upstream failure classes recorded on a credential-use audit whose request
@@ -173,6 +175,7 @@ type Broker struct {
 	opts          Options
 	mu            sync.RWMutex
 	leases        []proto.BindingLease
+	withdrawn     []Withdrawn
 	srv           *http.Server
 	ln            net.Listener
 	base          string
@@ -434,6 +437,34 @@ func (b *Broker) Revoke() error {
 func (b *Broker) SetLeases(leases []proto.BindingLease) {
 	b.mu.Lock()
 	b.leases = cloneLeases(leases)
+	b.mu.Unlock()
+}
+
+// Withdrawn names a binding the control plane will no longer lease: it was
+// revoked or removed. The broker keeps the placeholder without a secret so a
+// request still carrying it is refused as `revoked`, rather than travelling
+// upstream as an inert string the provider rejects with its own 401 — which
+// tells the workspace nothing about why, and hands the placeholder to a third
+// party on the way.
+type Withdrawn struct {
+	ID          string
+	Placeholder string
+}
+
+// Token is the string a workspace holds for a withdrawn binding.
+func (w Withdrawn) Token() string {
+	if w.Placeholder != "" {
+		return w.Placeholder
+	}
+	return "ref:" + w.ID
+}
+
+// SetWithdrawn replaces the set of placeholders whose binding is gone. It is
+// additive to SetLeases: a live lease and a withdrawal never name the same id,
+// because revocation is permanent and a binding id is never reusable.
+func (b *Broker) SetWithdrawn(withdrawn []Withdrawn) {
+	b.mu.Lock()
+	b.withdrawn = append([]Withdrawn(nil), withdrawn...)
 	b.mu.Unlock()
 }
 
@@ -1404,16 +1435,16 @@ type credentialRejection struct {
 // binding the request to a destination. The caller must emit the returned
 // rejection and must record every returned binding before attempting
 // outbound I/O.
-func (b *Broker) rewriteCredentials(header http.Header, scheme, host string) (map[string]bool, *credentialRejection) {
-	parts := &credentialParts{Header: header}
+func (b *Broker) rewriteCredentials(header http.Header, scheme, host, method, path string) (map[string]bool, *credentialRejection) {
+	parts := &credentialParts{Header: header, Method: method, Path: path}
 	return b.processCredentials(parts, scheme, host, true)
 }
 
 // inspectCredentials validates placeholders in a header set and returns their
 // binding ids without bringing a real secret into the request before
 // governance admits it.
-func (b *Broker) inspectCredentials(header http.Header, scheme, host string) (map[string]bool, *credentialRejection) {
-	parts := &credentialParts{Header: header}
+func (b *Broker) inspectCredentials(header http.Header, scheme, host, method, path string) (map[string]bool, *credentialRejection) {
+	parts := &credentialParts{Header: header, Method: method, Path: path}
 	return b.processCredentials(parts, scheme, host, false)
 }
 
@@ -1447,6 +1478,37 @@ func checkLease(lease proto.BindingLease, scheme, host string) *credentialReject
 	return nil
 }
 
+// checkLeaseScope enforces the narrowing a binding declares beyond its
+// destination hosts. `methods` and `path_prefixes` are how an operator says
+// "this key may only be spent on completions"; carrying them to the node and
+// then ignoring them would make the stated policy and the broker's behaviour
+// disagree silently, with the real credential attached to the difference.
+//
+// An unknown method or path fails closed for a scoped binding: a surface that
+// cannot say what it is about to send is not a surface that can prove the
+// request is in scope.
+func checkLeaseScope(lease proto.BindingLease, method, path string) *credentialRejection {
+	deny := func(detail string) *credentialRejection {
+		return &credentialRejection{
+			decision: DecisionDenied, binding: lease.ID,
+			reason: "binding " + lease.ID + " is not scoped to " + detail,
+			public: "credential " + lease.ID + " is not scoped to " + detail,
+			status: http.StatusForbidden, code: proto.CodeDenied, denialReason: proto.ReasonEgressDenied,
+		}
+	}
+	if len(lease.Methods) > 0 {
+		if method == "" || !slices.Contains(lease.Methods, strings.ToUpper(method)) {
+			return deny("this method")
+		}
+	}
+	if len(lease.PathPrefixes) > 0 {
+		if path == "" || !pathPrefixMatches(path, lease.PathPrefixes) {
+			return deny("this path")
+		}
+	}
+	return nil
+}
+
 // processCredentials runs one credential pass over the parts of a request the
 // surface can read.
 //
@@ -1463,7 +1525,21 @@ func checkLease(lease proto.BindingLease, scheme, host string) *credentialReject
 func (b *Broker) processCredentials(parts *credentialParts, scheme, host string, substitute bool) (map[string]bool, *credentialRejection) {
 	b.mu.RLock()
 	leases := append([]proto.BindingLease(nil), b.leases...)
+	withdrawn := append([]Withdrawn(nil), b.withdrawn...)
 	b.mu.RUnlock()
+	// A placeholder whose binding is gone is refused before anything else,
+	// because there is no lease left to match it against and letting it fall
+	// through would send it upstream as an ordinary string.
+	for _, gone := range withdrawn {
+		if parts.locate(gone.Token()) != 0 {
+			return nil, &credentialRejection{
+				decision: DecisionRevoked, binding: gone.ID,
+				reason: "binding " + gone.ID + " was withdrawn",
+				public: "credential " + gone.ID + " is no longer available",
+				status: http.StatusForbidden, code: proto.CodeUnauthorized, denialReason: proto.ReasonRevoked,
+			}
+		}
+	}
 	sort.SliceStable(leases, func(i, j int) bool {
 		return len(Placeholder(leases[i])) > len(Placeholder(leases[j]))
 	})
@@ -1475,6 +1551,9 @@ func (b *Broker) processCredentials(parts *credentialParts, scheme, host string,
 			continue
 		}
 		if rejection := checkLease(lease, scheme, host); rejection != nil {
+			return nil, rejection
+		}
+		if rejection := checkLeaseScope(lease, parts.Method, parts.Path); rejection != nil {
 			return nil, rejection
 		}
 		location := proto.SubstitutionLocation(lease)
@@ -1574,7 +1653,7 @@ func (b *Broker) packageProxy(w http.ResponseWriter, r *http.Request, host, requ
 		b.denyStatus(w, audit, http.StatusServiceUnavailable)
 		return
 	}
-	used, rejected := b.inspectCredentials(r.Header, proto.EgressProtocolHTTPS, authority)
+	used, rejected := b.inspectCredentials(r.Header, proto.EgressProtocolHTTPS, authority, r.Method, requestPath)
 	if rejected != nil {
 		audit.Decision, audit.Binding, audit.Reason = rejected.decision, rejected.binding, rejected.reason
 		b.emit(audit)
@@ -1616,7 +1695,7 @@ func (b *Broker) packageProxy(w http.ResponseWriter, r *http.Request, host, requ
 	if !ok {
 		return
 	}
-	used, rejected = b.rewriteCredentials(r.Header, proto.EgressProtocolHTTPS, authority)
+	used, rejected = b.rewriteCredentials(r.Header, proto.EgressProtocolHTTPS, authority, r.Method, requestPath)
 	if rejected != nil {
 		_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
 		audit.Decision, audit.Binding, audit.Reason = rejected.decision, rejected.binding, rejected.reason
@@ -1772,7 +1851,7 @@ func (b *Broker) gitProxy(w http.ResponseWriter, r *http.Request, host, requestP
 		fail(DecisionDenied, decision.Reason, http.StatusForbidden)
 		return
 	}
-	used, rejected := b.inspectCredentials(r.Header, proto.EgressProtocolHTTPS, authority)
+	used, rejected := b.inspectCredentials(r.Header, proto.EgressProtocolHTTPS, authority, r.Method, requestPath)
 	if rejected != nil {
 		audit.Binding = rejected.binding
 		audit.Decision, audit.Reason = rejected.decision, rejected.reason
@@ -1803,7 +1882,7 @@ func (b *Broker) gitProxy(w http.ResponseWriter, r *http.Request, host, requestP
 	if !ok {
 		return
 	}
-	used, rejected = b.rewriteCredentials(r.Header, proto.EgressProtocolHTTPS, authority)
+	used, rejected = b.rewriteCredentials(r.Header, proto.EgressProtocolHTTPS, authority, r.Method, requestPath)
 	if rejected != nil {
 		_ = b.settleBudget(r.Context(), admission, budget.SettlementIncomplete, 0, 0)
 		audit.Binding = rejected.binding
@@ -1918,7 +1997,8 @@ func (b *Broker) proxy(w http.ResponseWriter, r *http.Request, scheme, host, pat
 	// budget authority run before a real credential enters the request. The
 	// query travels with the headers; the body joins the pass once it is
 	// buffered, below.
-	parts := &credentialParts{Header: r.Header, Query: query, ContentType: r.Header.Get("Content-Type")}
+	parts := &credentialParts{Header: r.Header, Query: query, ContentType: r.Header.Get("Content-Type"),
+		Method: r.Method, Path: path}
 	used, rejected := b.processCredentials(parts, scheme, matchHost, false)
 	if rejected != nil {
 		audit.Decision, audit.Binding, audit.Reason = rejected.decision, rejected.binding, rejected.reason

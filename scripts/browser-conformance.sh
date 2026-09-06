@@ -9,10 +9,18 @@
 # A missing prerequisite exits 77 and names what is absent. It never reports a
 # pass: a browser lane that passed without a browser would be worse than no
 # lane at all. The Go test applies the same rule to the prerequisites only it
-# can see, including whether this host routes to container addresses.
+# can see, including whether this host routes to container addresses and
+# whether it can reach the allowed destination the lane browses to.
+#
+# The lane allows exactly one real host and refuses another, so it can tell a
+# host-policy decision from a browser that never authenticated to the broker
+# (ADR 0095). Override either with REMOUNT_BROWSER_ALLOWED_HOST and
+# REMOUNT_BROWSER_DENIED_HOST when this host reaches neither default.
 set -eu
 
 image="${REMOUNT_BROWSER_IMAGE:-remount-browser:local}"
+allowed="${REMOUNT_BROWSER_ALLOWED_HOST:-example.com}"
+denied="${REMOUNT_BROWSER_DENIED_HOST:-example.org}"
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
@@ -34,8 +42,13 @@ build() {
 run() {
   docker image inspect "$image" >/dev/null 2>&1 ||
     unavailable "image $image is absent; run '$0 build'"
-  REMOUNT_BROWSER_IMAGE="$image" go test -count=1 -v -timeout=20m \
-    -run '^TestB34BrowserComputerConformance$' ./integration/browser/
+  [ "$allowed" != "$denied" ] ||
+    unavailable "the allowed and denied hosts are both $allowed; the lane cannot tell one decision from the other"
+  REMOUNT_BROWSER_IMAGE="$image" \
+  REMOUNT_BROWSER_ALLOWED_HOST="$allowed" \
+  REMOUNT_BROWSER_DENIED_HOST="$denied" \
+    go test -count=1 -v -timeout=20m \
+      -run '^TestB34BrowserComputerConformance$' ./integration/browser/
 }
 
 case "${1:-run}" in

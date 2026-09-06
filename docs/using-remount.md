@@ -495,13 +495,22 @@ What the API promises, and what it does not:
 - **Egress policy is per host, never per URL.** The broker tunnels CONNECT
   opaquely and terminates no TLS, so it can see the host a browser asked for
   and nothing else. Read no per-path guarantee into this.
-- **A browser cannot currently reach a host the broker allows.** Chromium honors
-  `http_proxy`/`https_proxy` and does route through the workspace's broker, but
-  it does not present the workspace capability as proxy authentication, so the
-  broker refuses every destination as unauthenticated and the navigation
-  surfaces as `denied`/`navigation_denied`. Browser traffic is therefore
-  contained but not yet usable against allowed hosts; a workspace that must
-  browse the network needs a node whose broker is not in the path.
+- **A browser reaches the hosts the broker allows, and only those.** Chromium
+  routes through the workspace's broker but discards the capability in the proxy
+  URL and never volunteers `Proxy-Authorization`; it waits to be challenged, and
+  a headless browser has nobody to ask. The node answers that challenge itself
+  over CDP, with the same capability the browser's own `HTTPS_PROXY` carries, so
+  an allowed host loads normally and an unbound one is refused by host policy as
+  `denied`/`navigation_denied`
+  ([ADR 0095](adr/0095-browser-proxy-auth-through-cdp.md)). Two consequences are
+  worth knowing before you read an audit trail. A site that asks for a password
+  itself gets `CancelAuth` — the workspace capability is never handed to an
+  origin — so an HTTP-authenticated page fails rather than logging in. And the
+  first `CONNECT` of a proxy connection is recorded as an `unauthenticated`
+  `egress.denied`: that is the `407` challenge, and the retry that carries the
+  credential is the `allowed` record beside it. Chromium's own component and
+  metrics traffic is issued outside any page and cannot be authenticated at all,
+  so it stays denied.
 - **Profiles do not survive a move, a sleep or a `remount pull`.** A profile
   lives in `.remount/browser/<profile>`, which every snapshot excludes on
   purpose: a live browser profile contains singleton symlinks and lock files
@@ -577,8 +586,98 @@ checklist are in
 
 ## Broker provider credentials
 
-Provider keys belong in the server or node environment, never in a workspace
-or committed bindings file. A bindings file refers to an environment variable:
+Provider keys belong in the control plane, never in a workspace. Define a
+**binding** — the credential plus the hosts, methods and paths it may be spent
+on — and the workspace receives only an opaque placeholder. The node's broker
+substitutes the real value at the network edge for an authorized destination,
+records `cred.used`, and blocks that placeholder anywhere else.
+
+Create one from the shell. The secret is read from a named environment
+variable of the command, never from an argument:
+
+```sh
+export OPENAI_API_KEY=...
+remount binding preset apply openai --secret-env OPENAI_API_KEY
+```
+
+`binding preset apply` uses the provider shapes `remount binding preset ls`
+lists, so the hosts, the key variable and the broker base URL come from one
+place. Anything else is a full `create`:
+
+```sh
+remount binding create b_search \
+  --destination api.search.example \
+  --secret-env SEARCH_API_KEY \
+  --substitution query:key \
+  --ttl 15m --method GET --path-prefix /v1/
+```
+
+Attach it to a workspace, which sees the placeholder and the broker's URL:
+
+```sh
+remount ws create --name agent \
+  --binding b_openai \
+  --env OPENAI_API_KEY=ref:b_openai \
+  --env 'OPENAI_BASE_URL=${REMOUNT_BROKER}/d/api.openai.com/v1'
+```
+
+`remount run RECIPE --binding b_openai` does the same thing for a harness.
+Inside, the variable holds the placeholder and the call still works.
+Substitution happens on the broker's reverse-proxy path (`/d/<host>/…`); a
+`CONNECT` tunnel is opaque and stays host-granular, so point the harness's base
+URL at the broker rather than relying on the proxy variables.
+
+The same workflow is a method in every SDK — `CreateBinding` in Go,
+`create_binding` in Python, `createBinding` in TypeScript — with
+`list`, `get`, `rotate`, `revoke`, `create_session_principal` and
+`credential_events` alongside it.
+
+Rotate and revoke without a restart. Both reach a running workspace within one
+renew interval:
+
+```sh
+remount binding rotate b_openai --secret-env OPENAI_API_KEY   # new key, same id
+remount binding revoke b_openai --reason "credential leaked"  # stop substituting
+remount binding ls --include-revoked
+```
+
+**Broker revocation is not provider-side revocation.** `binding revoke` stops
+Remount substituting the credential; the key stays valid at the provider until
+you rotate or delete it there. Do both.
+
+Hand one task a scoped, self-expiring authority instead of a shared token:
+
+```sh
+TOKEN=$(remount principal session --ws "$WS" --roles agent --ttl 15m)
+```
+
+The bearer is printed once. It stops verifying when the workspace moves, when
+the TTL passes, or when the principal is revoked.
+
+Every broker refusal carries an `X-Remount-Reason` header and a JSON body
+`{"error":{"code","reason","binding","host","message"}}`. Match on `code` and
+`reason` — `egress_denied`, `approval_required`, `quota_exceeded`,
+`binding_missing`, `grant_expired`, `revoked` — never on the message. Audit in
+one call:
+
+```sh
+remount events --binding b_openai --json
+remount events --host api.openai.com --type egress --follow
+```
+
+Binding lifecycle events stream under the binding id rather than a workspace,
+so read them without `--ws`.
+
+[`credentials.md`](credentials.md) is the detailed guide: substitution
+locations, method and path scope, cookie bindings, retention metadata, what
+each kind of revocation stops, and three runnable examples
+([brokered-model-call](../examples/brokered-model-call),
+[brokered-search-api](../examples/brokered-search-api),
+[brokered-custom-http](../examples/brokered-custom-http)) that CI executes
+against a fake provider with no network and no key.
+
+A bindings **file** (`--bindings ./bindings.json`) is still accepted, as a
+bootstrap for a first start:
 
 ```json
 [
@@ -586,35 +685,30 @@ or committed bindings file. A bindings file refers to an environment variable:
     "id": "b_openai",
     "secret": "$OPENAI_API_KEY",
     "destinations": ["api.openai.com"],
-    "placeholder": "sk-proj-REMOUNT-PLACEHOLDER-NOT-A-REAL-KEY",
     "ttl_sec": 900
   }
 ]
 ```
 
-Start standalone with the binding:
+Its entries are seeded into the durable store on the first start that does not
+already have them. **After that the store wins**: editing the file changes
+nothing, because a rotation or a revocation must not be undone by restarting
+with the original file. Use `binding rotate` and `binding revoke`.
+
+Hosts a workspace reaches *without* a credential still need `--allow`:
 
 ```sh
-export OPENAI_API_KEY=...
-./remount standalone \
-  --data ./data \
-  --bindings ./bindings.json \
-  --allow api.openai.com \
+./remount standalone --data ./data \
   --allow registry.npmjs.org \
-  --allow models.dev \
-  --allow models.opencode.ai \
-  --allow opencode.ai
+  --allow models.dev --allow models.opencode.ai --allow opencode.ai
 ```
 
-A recipe binding such as `--binding b_openai` gives the workspace a
-shape-preserving placeholder and a broker URL. The node substitutes the real
-credential only for an authorized destination and records `cred.used`.
-Sending that placeholder to another host is blocked and recorded.
-The additional hosts above are the OpenCode recipe's install and model-catalog
-destinations. OpenCode's default model selection reaches `opencode.ai`; an
-explicit model does not remove the need to allow the other checked-in recipe
-hosts. Automatic local standalone derives these allowances from the recipe,
-but an explicitly started server must receive them through `--allow`.
+Those are the OpenCode recipe's install and model-catalog destinations;
+OpenCode's default model selection reaches `opencode.ai`, and naming an
+explicit model does not remove the need for the other checked-in recipe hosts.
+Automatic local standalone derives these allowances from the recipe, but an
+explicitly started server must receive them through `--allow`. A host covered
+by a binding needs no `--allow` entry.
 
 The process backend provides no host isolation. The built-in Docker backend is
 container isolation with cooperative proxy egress. Neither may be described
@@ -982,6 +1076,10 @@ document.
 - [`mcp.md`](mcp.md): exposing Remount and wrapped servers over MCP.
 - [`images.md`](images.md): the default workspace image, the reference browser
   image, and what any substitute image must provide.
+
+- [`credentials.md`](credentials.md): brokered credentials end to end -
+  bindings, substitution locations, rotation, revocation, session principals,
+  the refusal contract, and audit.
 
 **Running it for real**
 

@@ -134,6 +134,27 @@ because approvals are returned as values; the process backend can cut its
 broker but cannot stop a workspace reaching the network around it; the
 package and git connectors substitute in headers only.
 
+Follow-up delivered (ADR [0096](../adr/0096-the-credential-surface-is-the-cli-the-sdks-and-runnable-examples.md)):
+`remount binding create|ls|get|rotate|revoke|preset apply` (secrets read from
+a named environment variable of the CLI process, never an argument),
+`remount principal session`, Python and TypeScript credential helpers,
+`docs/credentials.md`, `internal/testutil/fakeprovider`, and three keyless
+examples (`brokered-model-call` header, `brokered-search-api` query,
+`brokered-custom-http` JSON pointer) run in-process by `integration/examples`
+as evidence B35. It fixed three 2A/2B defects with failing-first tests:
+`methods`/`path_prefixes` on a binding were not enforced, a revoked binding's
+placeholder was forwarded upstream as an inert string, and the new `revoked`
+decision was logged as `egress.allowed`. Live with the real keys: presets for
+OpenAI and Anthropic answered 200 at their bound hosts, the OpenAI placeholder
+at the Anthropic host got a typed `egress_denied` refusal, rotation moved to
+revision 2 with every probe still 200, revocation was refused as `revoked`
+within 4 s, `remount events --binding` showed the lifecycle and denials, and
+an exact-bytes scan found the keys only in the control plane's database.
+Revoking one binding withdraws every binding the workspace declares, now as
+a typed refusal rather than silently. `principal session` could not be
+exercised live because no CLI mints a one-time node enrollment credential for
+a production-mode server; that gap has its own follow-up.
+
 ## Gap 3 — computer/browser sessions
 
 Delivered (ADR [0088](../adr/0088-computer-sessions-over-port-substrate.md)):
@@ -175,10 +196,22 @@ the filesystem survived. It found and fixed three defects: Chromium ignores
 `$HOME/.config` broke `ws.sleep` (the browser's home is now its profile
 directory), and a fresh handle restarted `iseq` at 1 so every CLI action
 after the first was dropped (`computer.get` now returns `last_iseq` and
-handles resume from it; ADR 0094). Open: Chromium never sends
-`Proxy-Authorization`, so brokered navigation to an allowed host is refused
-as unauthenticated; the fix is the CDP `Fetch.authRequired` handler, in
-progress.
+handles resume from it; ADR 0094).
+
+Brokered browsing (ADR [0095](../adr/0095-browser-proxy-auth-through-cdp.md)):
+Chromium never sends `Proxy-Authorization` on its own, so the node now arms
+CDP `Fetch` auth handling on the page and every auto-attached target and
+answers proxy challenges with the workspace's broker capability exactly once
+per request, cancels origin (site) challenges so a login prompt never sees
+the egress authority, and passes every other request through. Live in the
+Colima VM with a real public host: navigation to the allowed `example.com`
+loaded with status 200 and an `egress.allowed` audit; navigation to the
+unbound `example.org` was denied by host policy; the whole B34 lane passed
+three times and the CLI was driven by hand. Two facts an operator must know:
+the first CONNECT of each proxy connection is a `407` recorded as an
+`unauthenticated` denial beside the `allowed` retry, and Chromium's own
+component and metrics traffic runs outside any page target, so it stays
+denied (containment working).
 
 ## Gap 4 — durable lifecycle for running work
 
@@ -243,10 +276,10 @@ Delivered so far:
 
 | Builder | Scope | Status |
 |---|---|---|
-| Browser lane | `images/browser`, `remount computer` CLI, Python/TS `Computer`, real-Chromium conformance (B34) run live in the Colima VM, docs | merged (5a425b6); brokered browsing to an allowed host still needs CDP proxy auth (follow-up running) |
+| Browser lane | `images/browser`, `remount computer` CLI, Python/TS `Computer`, real-Chromium conformance (B34) run live in the Colima VM, docs | merged (5a425b6); brokered browsing fixed and verified live (9ba6f46) |
 | Conformance product | `cmd/conformance --profile`, markdown report, `remount conformance`, evidence E26/B33, gVisor drift lane script, operator docs | merged (ced0f00) |
 | Linux lanes | gVisor E4/E5/B28, E26 drift, a real `multi-tenant-isolated` gVisor node with `doctor` and `conformance --profile`, Firecracker B29 if its environment survived, all inside the Colima VM | merged (e55593d); gVisor verified, Firecracker unavailable |
-| Credentials | `remount binding`/`principal session` CLI, Python/TS helpers, keyless examples against a fake provider (B35), docs, live `.env` run with rotate and revoke | in progress |
+| Credentials | `remount binding`/`principal session` CLI, Python/TS helpers, keyless examples against a fake provider (B35), docs, live `.env` run with rotate and revoke | merged (29bae6b); `principal session` live test unavailable until a node can enroll in production mode from the CLI (follow-up running) |
 | Lifecycle | `remount ws lease`/idle CLI, Python/TS methods, auto-sleep example, docs, live timer run across a server restart | merged (39f951d) |
 | Typed errors and observability | typed error classes in three languages, support matrix, dependency-free OTLP tracing, log redaction, ADR 0093 | merged (b94530d); spans verified live against a local collector |
 

@@ -270,38 +270,8 @@ func cmdRun(ctx context.Context, args []string) error {
 	return drive(ctx, s, driveOptions{WS: ws.ID, Session: s.ID, Raw: usePTY, ForwardStdin: usePTY || o.Stdin, KillOnInterrupt: *killOnInterrupt})
 }
 
-// ---------------------------------------------------------------------------
-// binding preset ls
-// ---------------------------------------------------------------------------
-
-func cmdBinding(ctx context.Context, args []string) error {
-	if len(args) < 2 || args[0] != "preset" || args[1] != "ls" {
-		return errors.New("binding: preset ls")
-	}
-	fs := flag.NewFlagSet("binding preset ls", flag.ExitOnError)
-	var c common
-	c.flags(fs)
-	parse(fs, args[2:])
-	if err := arity(fs, 0, 0, "binding preset ls"); err != nil {
-		return err
-	}
-	presets := launch.Presets()
-	if c.json {
-		printJSON(presets)
-		return nil
-	}
-	tw := tabWriter()
-	fmt.Fprintln(tw, "PRESET\tHOSTS\tKEY ENV\tBASE URL ENV\tHEADER\tNOTE")
-	for _, p := range presets {
-		hosts := strings.Join(p.Hosts, ",")
-		if p.HostParam != "" {
-			hosts += " (?host=" + p.HostParam + ")"
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", p.Name, hosts, p.KeyEnv, p.BaseURLEnv, p.Header, p.Note)
-	}
-	tw.Flush()
-	return nil
-}
+// The binding command moved to cmd_binding.go, where `preset ls` sits beside
+// the create, rotate and revoke operations that share its flag vocabulary.
 
 // readQueueFile parses the task list at path, or stdin for "-".
 func readQueueFile(path string) ([]string, error) {

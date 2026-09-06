@@ -294,6 +294,14 @@ authoritative checkpoint unchanged. Host processes that escaped the local
 
 ## Bindings
 
+A binding is a credential plus the destinations, methods, paths and
+substitution location it may be spent on. The operational surface is
+`remount binding create|ls|get|rotate|revoke` and `binding preset apply`, and
+the complete guide — including rotation, the four kinds of revocation, session
+principals, the refusal contract and audit — is
+[`credentials.md`](credentials.md). This section covers the file that seeds
+them on a first start.
+
 The bindings file is a JSON array. Each binding is a secret, the destinations
 it may be sent to, and the placeholder the workspace holds.
 
@@ -323,6 +331,15 @@ Use `$ENV` references and keep the real values in a secret manager or systemd
 credentials. The file then contains nothing worth stealing. Nodes receive
 leases with the real value and refuse to substitute after the TTL, then renew
 about a minute before expiry.
+
+The file is a **bootstrap**, not the source of truth. Its entries are seeded
+into the durable store on the first start that does not already have them;
+after that the store wins, so editing the file changes nothing. A rotation or
+a revocation is a durable decision and must not be undone by restarting with
+the original file — use `remount binding rotate` and `remount binding revoke`,
+which reach a running workspace within one renew interval. `remount binding ls
+--include-revoked` shows the retained rows an audit needs to resolve an id seen
+in an older event.
 
 ## Network policy
 

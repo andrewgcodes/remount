@@ -1818,12 +1818,17 @@ func (n *Node) refreshLeases(ctx context.Context, w *ws, expected uint64) {
 			// Control has decided this workspace may no longer substitute:
 			// a binding it names was revoked or removed. Keeping the leases
 			// until TTL would keep substituting a credential the operator
-			// already withdrew, so drop them now and fail closed.
+			// already withdrew, so drop them now and fail closed. The
+			// placeholders stay behind as withdrawals so a request still
+			// carrying one is refused as `revoked` instead of reaching the
+			// provider as an inert string.
 			n.mu.Lock()
+			withdrawn := withdrawnBindings(w)
 			w.leases = nil
 			w.bindingRevision = expected
 			if w.broker != nil {
 				w.broker.SetLeases(nil)
+				w.broker.SetWithdrawn(withdrawn)
 			}
 			n.mu.Unlock()
 			n.logger.Warn("binding lease refused; substitution disabled for this workspace", "ws", w.ID, "err", err)
@@ -1839,6 +1844,54 @@ func (n *Node) refreshLeases(ctx context.Context, w *ws, expected uint64) {
 		w.broker.SetLeases(res.Leases)
 	}
 	n.mu.Unlock()
+}
+
+// egressEventType maps one broker decision to the event type it is recorded
+// under. It is a named function rather than an inline switch because the
+// default is `allowed`: a decision nobody adds a case for is silently recorded
+// as a success, which is the one mistake this mapping must not make.
+// TestEveryBrokerDecisionHasAnEventType enumerates the constants.
+func egressEventType(decision string) string {
+	switch decision {
+	case broker.DecisionSubstituted:
+		return proto.EvCredUsed
+	case broker.DecisionDenied, broker.DecisionLeakBlocked, broker.DecisionExpired,
+		broker.DecisionUnauthenticated, broker.DecisionLimitExceeded, broker.DecisionRevoked:
+		return proto.EvEgressDenied
+	case broker.DecisionRedacted:
+		return proto.EvEgressRedacted
+	default:
+		return proto.EvEgressAllowed
+	}
+}
+
+// withdrawnBindings names every placeholder this workspace may still be
+// holding for a binding control refuses to lease. Callers hold n.mu.
+//
+// Two sources, because neither alone is complete. The leases the node is about
+// to drop carry the exact placeholder, including a shape-preserving custom one,
+// but exist only if this materialization ever held them. The workspace's
+// declared binding ids always exist and yield the default `ref:<id>` form. A
+// custom placeholder for a binding this node never leased is therefore not
+// recognized; that request still fails, as an ordinary unbound destination.
+func withdrawnBindings(w *ws) []broker.Withdrawn {
+	seen := map[string]bool{}
+	out := make([]broker.Withdrawn, 0, len(w.leases)+len(w.Spec.Bindings))
+	for _, lease := range w.leases {
+		if seen[lease.ID] {
+			continue
+		}
+		seen[lease.ID] = true
+		out = append(out, broker.Withdrawn{ID: lease.ID, Placeholder: lease.Placeholder})
+	}
+	for _, id := range w.Spec.Bindings {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, broker.Withdrawn{ID: id})
+	}
+	return out
 }
 
 // bindingLeaseRefused reports whether control definitively refused to lease,
@@ -4118,16 +4171,7 @@ func (n *Node) materializeWithReadyHook(ctx context.Context, w proto.Workspace, 
 			return &res, nil
 		},
 		Audit: func(a broker.Audit) {
-			typ := proto.EvEgressAllowed
-			switch a.Decision {
-			case broker.DecisionSubstituted:
-				typ = proto.EvCredUsed
-			case broker.DecisionDenied, broker.DecisionLeakBlocked, broker.DecisionExpired,
-				broker.DecisionUnauthenticated, broker.DecisionLimitExceeded:
-				typ = proto.EvEgressDenied
-			case broker.DecisionRedacted:
-				typ = proto.EvEgressRedacted
-			}
+			typ := egressEventType(a.Decision)
 			n.emit(typ, a.WS, a.Principal, map[string]any{
 				"generation": a.Generation, "decision": a.Decision, "binding": a.Binding,
 				"rule": a.Rule, "protocol": a.Protocol, "shared_state": a.SharedState,

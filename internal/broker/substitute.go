@@ -44,6 +44,12 @@ type credentialParts struct {
 	Body        []byte
 	BodyPresent bool
 	ContentType string
+	// Method and Path are the request's own verb and upstream path. A binding
+	// that declares Methods or PathPrefixes is checked against them, so the
+	// narrowing an operator wrote is enforced where the credential is placed
+	// rather than only carried on the lease.
+	Method string
+	Path   string
 
 	// parsed views, populated lazily and reused by the locate and rewrite
 	// passes so one malformed document is diagnosed once.
