@@ -2432,3 +2432,65 @@ seconds); and nine bounded fuzz targets (110 seconds total). This is the
 complete local gate set, not a hosted CI or native multi-platform pass.
 Only this ledger entry was added after the tested code commit; documentation
 generation, lint, generated-document tests, and diff checks were rechecked.
+
+## Runtime-profile conformance, 2026-09-05 (darwin/arm64)
+
+Host: darwin 25.3.0, arm64, 12 CPUs. Tree: the `claude/gap-brief-2026-09-06`
+worktree at `682ccaa` plus the uncommitted Gap 1B change; the candidate id the
+runs recorded is therefore `682ccaa189c984c9cde9b00d2ac8853a330b78ef`, which is
+the parent of the commit this entry lands in. Both runs built a fresh
+`CGO_ENABLED=0` binary from that tree, booted it as `remount standalone` on a
+free loopback port with the conformance binding fixture, judged it black-box
+through `/v1/link`, `/v1/artifacts` and `/v1/events`, and killed it again.
+
+```sh
+./scripts/conformance-report.sh <outdir> dev
+./scripts/conformance-report.sh <outdir> multi-tenant-isolated
+```
+
+Each expands to `remount conformance --launch self --profile P --report
+conformance.json --markdown conformance.md --evidence conformance-evidence.json
+--scenario B33`.
+
+**`--profile dev`** — exit 0, `CONFORMANT`, 8.957 s. 70 checks: 62 passed,
+0 failed, 8 unavailable. By tier: required 55 passed / 0 failed / 0
+unavailable; capability-gated 7 / 0 / 7; extension 0 / 0 / 1. `cleanup:
+verified`. The two profile rows are `CONF-PROF-BACKEND-REGISTERED` (pass) and
+`CONF-PROF-SCHEDULING` (pass: a workspace with `requires.profile: dev` was
+claimed). Every unavailable row is a prerequisite this runner does not arrange
+— `node-fault`, `session-eviction`, `egress-approval` ×3, `transcript-eviction`,
+`event-eviction` — plus the `CONF-EVT-009` extension, and each names what was
+missing. A `dev` pass is a protocol verdict and asserts no isolation property.
+
+**`--profile multi-tenant-isolated`** — exit 1, `NOT CONFORMANT`, 39.04 s.
+78 checks: 31 passed, 7 failed, 40 unavailable. By tier: required 31 / 7 / 25;
+capability-gated 0 / 0 / 14; extension 0 / 0 / 1. `cleanup: verified`.
+The seven failures are the profile obligations this host cannot satisfy, each
+naming the node, the backend and the observed field value:
+`CONF-PROF-BACKEND-ISOLATED` (`process isolation=none`),
+`-UNTRUSTED-ABSENT` (`process is a shared-kernel development backend`),
+`-SIBLING-ISOLATION` (`sibling_isolation=false`),
+`-ENFORCED-EGRESS` (`egress_mode=cooperative_proxy`),
+`-NETWORK-NAMESPACE` (`network_namespace=false`),
+`-CONTAINER-OR-MICROVM` (`isolation=none`), and `CONF-PROF-SCHEDULING`
+(`the workspace stayed pending with pending_reason "profile_unschedulable"`).
+`CONF-PROF-BACKEND-REGISTERED`, `-BROKERED-SECRETS` and `-RUNTIME-HEALTHY`
+passed. The 25 unavailable required rows are the protocol requirements that
+need a claimed workspace: under a named profile every workspace the run creates
+carries `requires.profile`, the control plane parked them all with
+`pending_reason: profile_unschedulable`, and each row says so rather than
+reporting a pass or vanishing. Nothing exited 0.
+
+Both runs left `conformance.json`, `conformance.md` and a Plan B §6 evidence
+record in the output directory, and no `remount` process survived either run
+(`pgrep -f remount-conformance-candidate` empty afterwards). The output
+directories were under the session scratchpad, not the repository.
+
+Gate `E26` — a real gVisor node losing a host prerequisite out of band and
+becoming unschedulable — is **unavailable** here and is recorded that way. Its
+exact prerequisite is a privileged Linux host with `runsc` on `PATH` and
+`REMOUNT_GVISOR_ROOTFS` pointing at an unpacked rootfs; the lane is
+`./scripts/gvisor-conformance.sh drift`. The scripted-backend half of the same
+loop (`internal/sim.TestProfileDriftMakesNodeUnschedulable`) does run here and
+passes; it proves the control loop, not the host mechanism. `runsc`,
+`multi-tenant-isolated` and `microvm` remain unprovable on darwin.

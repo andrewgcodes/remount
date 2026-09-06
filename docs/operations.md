@@ -156,12 +156,41 @@ requirement and every `--label` in the placement matches.
 
 ## Choosing a backend
 
-| Backend | Isolation | What the agent gets | Use when |
-|---|---|---|---|
-| `process` | none | a directory on the host, processes as the node's user | the machine is yours and you already trust the agent with it |
-| `docker` | container, cooperative egress | a long-lived container with the workspace mounted at `/work` | local/single-owner containment where Docker's default boundary is sufficient |
-| `gvisor` | Linux `runsc`, node-owned enforced gateway | container filesystem and sessions with deny-first network setup | an `isolated` profile on a host whose runtime probes and E4 denial checks pass |
-| `firecracker` | Linux KVM microVM, jailer and enforced gateway | a guest filesystem and sessions; compatible full disk/state/memory checkpoints | an explicitly prepared KVM host with passing construction probes and exact-host conformance |
+| Backend | Isolation | Highest runtime profile | What the agent gets | Use when |
+|---|---|---|---|---|
+| `process` | none | `dev` | a directory on the host, processes as the node's user | the machine is yours and you already trust the agent with it |
+| `docker` | container, cooperative egress | `trusted-single-tenant` | a long-lived container with the workspace mounted at `/work` | local/single-owner containment where Docker's default boundary is sufficient |
+| `gvisor` | Linux `runsc`, node-owned enforced gateway | `multi-tenant-isolated` | container filesystem and sessions with deny-first network setup | an `isolated` profile on a host whose runtime probes and E4 denial checks pass |
+| `firecracker` | Linux KVM microVM, jailer and enforced gateway | `microvm` (verified build only) | a guest filesystem and sessions; compatible full disk/state/memory checkpoints | an explicitly prepared KVM host with passing construction probes and exact-host conformance |
+
+The runtime-profile column is the node-level posture of `--profile`
+(ADR 0089), not the per-workspace `security.profile`. The two are different
+contracts: gVisor satisfies the `multi-tenant-isolated` *runtime* profile but
+not a workspace asking for `security.profile: multi_tenant`, which
+additionally requires a microVM. Every runtime-profile predicate holds over
+*every* backend a node registered, so a node serving both `gvisor` and
+`process` is a `dev` node. Firecracker's column applies only to a backend
+whose construction probes passed; the unverified zero value satisfies nothing
+beyond `dev`.
+
+**Drift.** A node re-probes its host prerequisites every
+`--profile-health-interval` (30s by default) and reports the findings on
+renewal. When a prerequisite disappears — `runsc` replaced, the rootfs gone,
+`/dev/kvm` unloaded, `CAP_NET_ADMIN` dropped — the control plane emits
+`node.profile.unschedulable` naming the failing check, stops placing
+workspaces whose `requires.profile` the node no longer satisfies (they stay
+`pending` with `pending_reason: profile_unschedulable`), and moves
+`remount_nodes_profile_unschedulable` and `remount_profile_drift_total`.
+Work that asked for nothing keeps running on the same machine: drift removes
+only what the profile promised. Recovery emits `node.profile.restored` and
+the parked workspaces are placed. A node claiming `dev` never becomes
+unschedulable, because `dev` claims nothing to lose.
+
+Ask a live deployment rather than this table:
+`remount doctor --profile multi-tenant-isolated --json` for the per-node,
+per-check answer, and `remount conformance --profile multi-tenant-isolated
+--markdown report.md` for a reviewable document. Both exit 0 only when every
+check passed, 1 when one failed, and 2 when something could not be checked.
 
 Be honest with yourself about `process`. The agent runs as the same user as the
 node with the host's full network and filesystem. The workspace root is only a

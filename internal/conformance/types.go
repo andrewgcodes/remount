@@ -22,6 +22,10 @@ type WorkspaceSpec struct {
 type Requires struct {
 	Backend string   `cbor:"backend,omitempty"`
 	Caps    []string `cbor:"caps,omitempty"`
+	// Profile is §5's node-level runtime-profile constraint. A workspace
+	// naming one is placed only on a node whose backend evidence satisfies
+	// it, and stays pending with pending_reason otherwise.
+	Profile string `cbor:"profile,omitempty"`
 }
 
 // SecuritySpec is §5's enforceable security contract, reduced to the profile
@@ -43,6 +47,9 @@ type Workspace struct {
 	Tenant        string        `cbor:"tenant,omitempty"`
 	Owner         string        `cbor:"owner,omitempty"`
 	AuthzRevision uint64        `cbor:"authz_revision,omitempty"`
+	// PendingReason is §5's explanation for a workspace that has not been
+	// placed. It is empty unless the workspace is pending.
+	PendingReason string `cbor:"pending_reason,omitempty"`
 }
 
 // Workspace states of §5's transition table.

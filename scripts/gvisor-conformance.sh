@@ -35,9 +35,20 @@ case "${1:-all}" in
     sudo -n env REMOUNT_GVISOR_INTEGRATION=1 REMOUNT_GVISOR_ROOTFS="$REMOUNT_GVISOR_ROOTFS" \
       "$tmp/node.test" -test.run '^TestE5TenantIsolationConformance$' -test.v -test.timeout=2m
     ;;
-  e4) ;;
+  e4|drift) ;;
   *)
-    echo "usage: $0 [e4|e5|all]" >&2
+    echo "usage: $0 [e4|e5|drift|all]" >&2
     exit 2
+    ;;
+esac
+# E26: a real gVisor node claiming multi-tenant-isolated loses a host
+# prerequisite out of band and the control plane stops scheduling on it. The
+# test drives the whole loop through a control plane, so it lives in
+# internal/sim rather than in the backend package.
+case "${1:-all}" in
+  drift|all)
+    go test -c -o "$tmp/sim.test" ./internal/sim
+    sudo -n env REMOUNT_GVISOR_INTEGRATION=1 REMOUNT_GVISOR_ROOTFS="$REMOUNT_GVISOR_ROOTFS" \
+      "$tmp/sim.test" -test.run '^TestE26ProfileDriftMakesNodeUnschedulable$' -test.v -test.timeout=6m
     ;;
 esac

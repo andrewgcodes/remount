@@ -163,6 +163,8 @@ func run(ctx context.Context, argv []string) error {
 		return cmdInspect(ctx, args)
 	case "doctor":
 		return cmdDoctor(ctx, args)
+	case "conformance":
+		return cmdConformance(ctx, args)
 	case "metrics":
 		return cmdMetrics(ctx, args)
 	case "nodes":
@@ -264,6 +266,8 @@ Inspection, at three depths. All take --json.
   remount status [--watch 5s]         the fleet in one screen
   remount inspect WS                  one workspace, down to session log positions
   remount doctor                      every check for damage, loss or disagreement
+  remount conformance [--profile P]   judge this deployment against the protocol manifest and a runtime profile;
+                                      --markdown FILE writes a review document. Exits 0 pass, 1 fail, 2 unobservable
   remount metrics [--node ID]         raw counters
 
 Common flags (or env), before or after the command: --server REMOUNT_SERVER (default http://127.0.0.1:7443) --token REMOUNT_TOKEN --json

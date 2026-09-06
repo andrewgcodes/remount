@@ -506,6 +506,76 @@ Do not delete a shared model secret. Modal singleton, persistence, readiness,
 and backup constraints are detailed in
 [`operations.md`](operations.md#deploying-the-control-plane-on-serverless-platforms).
 
+## Choose a runtime profile
+
+A runtime profile is what a **machine** claims, as distinct from
+`security.profile`, which is what one **workspace** requires. There are four,
+weakest first:
+
+| `--profile` | Guarantees | Refuses |
+|---|---|---|
+| `dev` | nothing. It is the default and makes no security claim | nothing; a node with no backend at all still fails to start |
+| `trusted-single-tenant` | every registered backend isolates the workspace from the host and authenticates to the broker | a node registering `process` |
+| `multi-tenant-isolated` | mutually untrusted workloads: deny-first enforced egress, sibling isolation, a private network namespace, container-or-microVM isolation, and passing host checks | a node registering `process` or `docker` at all |
+| `microvm` | `multi-tenant-isolated` restricted to verified microVM backends, plus a live host compatibility result | anything that is not a microVM |
+
+Every predicate holds over **every** backend a node registered, so a node
+serving `gvisor` and `process` together is a `dev` node. A strong backend
+never launders a weak one sharing the machine.
+
+Claim one when you start a node, and it is a startup gate rather than a label:
+
+```sh
+./remount up --profile multi-tenant-isolated   # or REMOUNT_PROFILE
+```
+
+Require one when you create a workspace, through `requires.profile` on the
+workspace spec. The control plane schedules against the backend capabilities a
+node actually advertised, never against operator labels:
+
+```go
+ws, err := c.CreateWorkspace(ctx, proto.WorkspaceSpec{
+    Requires: proto.Requires{Profile: "multi-tenant-isolated"},
+})
+```
+
+A workspace nobody can place stays `pending` with
+`pending_reason: profile_unschedulable` instead of landing somewhere weaker.
+A node that loses a prerequisite while serving becomes unschedulable within
+one probe interval and emits `node.profile.unschedulable`; recovery emits
+`node.profile.restored` and the parked workspaces are placed. See
+[`operations.md`](operations.md#choosing-a-backend) for the drift behavior and
+the per-backend table.
+
+Two commands answer "is this fleet fit", and both are three-valued:
+
+```sh
+./remount doctor --profile multi-tenant-isolated --json   # per node, per check
+./remount conformance --profile multi-tenant-isolated \
+    --markdown conformance.md --report conformance.json
+```
+
+`doctor --profile` asks the control plane what it believes about each node.
+`conformance --profile` additionally judges the protocol manifest black-box
+and creates a workspace requiring the profile, so it proves scheduling
+honours the constraint rather than merely reporting on it. It writes a review
+document whose footer states how many checks were unavailable.
+
+| Exit | Meaning |
+|---|---|
+| 0 | every check passed |
+| 1 | at least one check failed |
+| 2 | nothing failed, but something could not be checked |
+
+There is no path on which an unavailable check exits 0. Treat exit 2 exactly
+as you would treat a failure until you know which check could not run.
+
+Be honest about where this can hold. `multi-tenant-isolated` and `microvm`
+depend on Linux kernel mechanisms — `runsc`, network namespaces, nftables,
+KVM — so only a Linux host can satisfy them. On macOS and Windows the
+strongest honest answer is `dev`, and asking for more returns named failures
+rather than a weaker pass.
+
 ## Provider-backed nodes are not credential checks
 
 Fly, E2B, Modal, ix.dev, and SSH pool drivers create whole Remount nodes. A

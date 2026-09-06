@@ -14,7 +14,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 
+	"remount.dev/remount/internal/profile"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/workspace"
 	"remount.dev/remount/internal/workspace/firecracker"
@@ -96,22 +98,40 @@ backend is absent, not healthy.
 
 ## Profile compatibility
 
-| Backend | local | isolated | multi_tenant |
-|---|---:|---:|---:|
+The first three columns are the per-workspace placement contract of
+`+"`proto.SecuritySpec.Profile`"+`. The last is the node-level runtime profile
+of `+"`internal/profile`"+` (ADR 0089): the strongest `+"`--profile`"+` a node
+registering only this backend could satisfy on its capabilities alone. They are
+different contracts with similar names, and a backend can satisfy one and not
+the other — gVisor satisfies the `+"`multi-tenant-isolated`"+` runtime profile
+but not a workspace asking for `+"`multi_tenant`"+`, because that additionally
+requires a microVM.
+
+| Backend | local | isolated | multi_tenant | Runtime profiles satisfied |
+|---|---:|---:|---:|---|
 `)
 	profiles := []string{proto.SecurityLocal, proto.SecurityIsolated, proto.SecurityMultiTenant}
 	for _, descriptor := range registry.Descriptors() {
 		fmt.Fprintf(&out, "| `%s`", descriptor.Name)
-		for _, profile := range profiles {
+		for _, workspaceProfile := range profiles {
 			mark := "yes"
-			if err := proto.ValidateBackendSecurity(proto.SecuritySpec{Profile: profile}, descriptor); err != nil {
+			if err := proto.ValidateBackendSecurity(proto.SecuritySpec{Profile: workspaceProfile}, descriptor); err != nil {
 				mark = "no"
 			}
 			fmt.Fprintf(&out, " | %s", mark)
 		}
-		fmt.Fprintln(&out, " |")
+		fmt.Fprintf(&out, " | %s |\n", runtimeProfiles(descriptor))
 	}
 	fmt.Fprint(&out, `
+A node registers more than one backend at a time, and every runtime-profile
+predicate holds over *every* registered backend, so a fleet's real answer is
+the weakest row it registers rather than the strongest. The column also assumes
+no failing host check: `+"`profile.runtime.healthy`"+` folds what a live node's
+`+"`Reprobe`"+` reports, and `+"`microvm`"+` additionally needs a live host
+compatibility result, which a generated table cannot supply. Ask a running
+deployment with `+"`remount doctor --profile`"+` or
+`+"`remount conformance --profile`"+`.
+
 `+"`local`"+` defaults to minimum isolation `+"`none`"+`. `+"`isolated`"+` requires
 container isolation, a deny-default network, brokered secrets, required audit,
 and an `+"`enforced_gateway`"+`. `+"`multi_tenant`"+` additionally requires a
@@ -201,6 +221,25 @@ func registeredBackendNames() (map[string]bool, error) {
 		return nil, fmt.Errorf("runtime backend registry is empty")
 	}
 	return result, nil
+}
+
+// runtimeProfiles names every runtime profile (ADR 0089) one backend's own
+// advertised capabilities satisfy, read from the same predicate the control
+// plane schedules with rather than from a second hand-kept list. It is
+// evaluated against a one-backend fleet with no host findings, which is the
+// only thing a static document can honestly say: a real node's answer is a
+// function of every backend it registered and of what its Reprobe reported a
+// moment ago.
+func runtimeProfiles(descriptor proto.BackendDescriptor) string {
+	satisfied := profile.Satisfied([]proto.BackendDescriptor{descriptor}, nil)
+	if len(satisfied) == 0 {
+		return "none"
+	}
+	names := make([]string, 0, len(satisfied))
+	for _, p := range satisfied {
+		names = append(names, "`"+string(p)+"`")
+	}
+	return strings.Join(names, ", ")
 }
 
 func yesNo(value bool) string {
