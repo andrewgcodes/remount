@@ -1,7 +1,11 @@
 package providerauth
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -35,6 +39,35 @@ func TestProgramUsesApprovedProviderContract(t *testing.T) {
 		if !strings.Contains(program[2], tc.want) {
 			t.Errorf("%s %s script = %q, want %q", tc.recipe, tc.action, program[2], tc.want)
 		}
+	}
+}
+
+func TestProgramFindsRecipeInstalledProviderCLI(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: provider auth commands use the recipe's Unix shell contract")
+	}
+	home := t.TempDir()
+	bin := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	claude := filepath.Join(bin, "claude")
+	if err := os.WriteFile(claude, []byte("#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\" \"${ANTHROPIC_API_KEY-unset}\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	program, err := Program("claude", proto.AuthActionStatus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(program[0], program[1:]...)
+	cmd.Env = append(os.Environ(), "HOME="+home, "PATH=/usr/bin:/bin", "ANTHROPIC_API_KEY=ambient")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Join([]string{claude, "auth", "status", "unset", ""}, "\n")
+	if string(out) != want {
+		t.Fatalf("provider command output = %q, want %q", out, want)
 	}
 }
 

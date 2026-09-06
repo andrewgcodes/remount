@@ -547,6 +547,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `ws.move` | C | `WSMoveReq{id, requires?, placement?, idem}` → `Workspace` |
 | `ws.sleep` | C | `WSSleepReq{id, after_sec\|at\|on, match?, idem}` → `Timer`; `match` is a bounded exact payload-field predicate used only with `on` |
 | `ws.wake` | C | `WSGetReq{id, idem}` → `Workspace` |
+| `ws.launch.record` | C | `WSLaunchRecordReq{id, labels, idem}` → `Workspace`; replaces only the bounded `remount.recipe`, `remount.auth`, `remount.bindings`, `remount.model`, `remount.conversation`, and `remount.conversation.path` labels used to reconstruct the latest launch |
 | `ws.lease` | C | `WSLeaseReq{id, min_alive_sec?, max_alive_sec, on_expiry?, reason?, idem}` → `WorkspaceLease`; a durable hold on a `claimed` workspace. `on_expiry` is `sleep` (default) or `destroy`; `max_alive_sec` may not exceed the deployment's maximum hold. One hold per workspace: a new key replaces the previous one. Refused `conflict`/`workspace_not_ready` unless the workspace is `claimed`, and `resource_exhausted`/`quota_exceeded` at the tenant held-workspace limit |
 | `ws.lease.renew` | C | `WSLeaseRenewReq{id, lease, extend_sec, min_alive_sec?, idem}` → `WorkspaceLease`; extends both bounds from now. Refused `conflict`/`lifecycle_deadline_expired` once the deadline fired or the hold was cancelled, and `conflict`/`generation_mismatch` once the workspace was moved or re-placed |
 | `ws.lease.cancel` | C | `WSLeaseCancelReq{id, lease, idem}` → `Workspace`; removes the hold. The workspace stays `claimed` under its idle policy, if any |
@@ -1109,8 +1110,10 @@ Guarantees:
    profile. It MUST stream to the opening client, refuse later `s.attach`,
    disable spill and durable session-log publication, omit raw `program` from
    `SessionInfo` and `s.opened`, and retain the completed in-memory session only
-   for a bounded interval (five minutes in the reference node). A sensitive
-   session cannot also carry `run` or set `no_sub`.
+   for a bounded interval (five minutes in the reference node). The opening
+   client MUST NOT issue `s.attach` for that session; if its connection is lost,
+   local delivery ends immediately rather than entering the ordinary reattach
+   retry loop. A sensitive session cannot also carry `run` or set `no_sub`.
 
 Retention is a bounded in-memory ring plus a spill file. The reference node uses
 2 MiB of memory and 128 MiB of spill per session, and evicts on both a byte cap
@@ -1619,7 +1622,7 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `node.profile.v
 `node.profile.unschedulable`, `node.profile.restored`, `ws.created`,
 `ws.claiming`, `ws.claimed`, `ws.released`, `ws.moved`, `ws.paused`,
 `ws.resumed`, `ws.snapshot`, `ws.restored`, `ws.destroyed`,
-`ws.lease_expired`, `ws.acl`, `authz.revoked`, `s.opened`, `s.exited`,
+`ws.launch_recorded`, `ws.lease_expired`, `ws.acl`, `authz.revoked`, `s.opened`, `s.exited`,
 `fs.write`, `fs.edit`, `fs.remove`, `fs.apply_tar`,
 `cred.used`, `egress.allowed`, `egress.denied`, `egress.redacted`, `timer.set`, `timer.fired`,
 `peer.gone`, `ws.fenced`, `ws.state_changed`, `event.producer_gap`,

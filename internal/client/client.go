@@ -234,24 +234,48 @@ func (c *Client) Connect(ctx context.Context) (*transport.Peer, error) {
 	// connection so a drop while sessions are streaming triggers a
 	// reconnect even when the caller is only ranging over chunks.
 	for _, s := range sessions {
-		go s.reattach(context.Background(), gen)
+		if !s.activeClientOnly {
+			go s.reattach(context.Background(), gen)
+		}
 	}
 	for _, sub := range subs {
 		go sub.reattach(gen)
 	}
-	go c.supervise(p)
+	go c.supervise(p, gen)
 	return p, nil
 }
 
 // supervise reconnects after p dies, as long as the client is open and has
 // live sessions to resume. Each successful Connect installs a fresh
 // supervisor, so this forms a chain of exactly one watcher per connection.
-func (c *Client) supervise(p *transport.Peer) {
+func (c *Client) supervise(p *transport.Peer, generation uint64) {
 	<-p.Done()
+	c.mu.Lock()
+	sessions := make([]*Session, 0, len(c.sessions))
+	for _, s := range c.sessions {
+		sessions = append(sessions, s)
+	}
+	c.mu.Unlock()
+	for _, s := range sessions {
+		if !s.activeClientOnly {
+			continue
+		}
+		s.mu.Lock()
+		lost := s.attached && !s.closed && s.activeGeneration == generation
+		s.mu.Unlock()
+		if lost {
+			s.fail(proto.Err(proto.CodeClosed, "active-client-only session lost its opening connection"))
+		}
+	}
 	backoff := 100 * time.Millisecond
 	for {
 		c.mu.Lock()
-		closed, current, n := c.closed, c.peer == p, len(c.sessions)+len(c.eventSubs)
+		closed, current, n := c.closed, c.peer == p, len(c.eventSubs)
+		for _, s := range c.sessions {
+			if !s.activeClientOnly {
+				n++
+			}
+		}
 		c.mu.Unlock()
 		if closed || !current || n == 0 {
 			return
@@ -353,6 +377,23 @@ func (c *Client) call(ctx context.Context, to, op string, body, out any) error {
 	return lastErr
 }
 
+// callOnce performs a request on one identified connection without retrying an
+// ambiguous disconnect. The returned generation identifies that exact peer.
+func (c *Client) callOnce(ctx context.Context, to, op string, body, out any) (*transport.Peer, uint64, error) {
+	p, err := c.Connect(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	c.mu.Lock()
+	if c.peer != p {
+		c.mu.Unlock()
+		return nil, 0, transport.ErrClosed
+	}
+	generation := c.gen
+	c.mu.Unlock()
+	return p, generation, p.Call(ctx, to, op, body, out)
+}
+
 // ---------------------------------------------------------------------------
 // control plane
 // ---------------------------------------------------------------------------
@@ -398,6 +439,16 @@ func (c *Client) ListWorkspaces(ctx context.Context) ([]proto.Workspace, error) 
 	var res proto.WSListRes
 	err := c.call(ctx, proto.PeerControl, proto.OpWSList, nil, &res)
 	return res.Workspaces, err
+}
+
+// RecordWorkspaceLaunch replaces the non-secret launch metadata used by
+// remount resume. It commits before the harness process starts.
+func (c *Client) RecordWorkspaceLaunch(ctx context.Context, id string, labels map[string]string, options ...OperationOption) (*proto.Workspace, error) {
+	var ws proto.Workspace
+	idem, _ := operationKey(options)
+	req := proto.WSLaunchRecordReq{ID: id, Labels: labels, IdempotencyKey: idem}
+	err := c.call(ctx, proto.PeerControl, proto.OpWSLaunchRecord, req, &ws)
+	return &ws, err
 }
 
 // DestroyWorkspace destroys a workspace.
@@ -1111,6 +1162,16 @@ const (
 // conflict from an authorization push still in flight, and a node whose uplink
 // is reconnecting, are retried the same way against the shorter budget.
 func (c *Client) nodeCall(ctx context.Context, wsID, op string, body func(g *proto.Grant) any, out any) error {
+	return c.nodeCallWith(ctx, wsID, op, body, out, c.call)
+}
+
+func (c *Client) nodeCallWith(
+	ctx context.Context,
+	wsID, op string,
+	body func(g *proto.Grant) any,
+	out any,
+	call func(context.Context, string, string, any, any) error,
+) error {
 	start := time.Now()
 	backoff := 25 * time.Millisecond
 	for attempt := 0; ; attempt++ {
@@ -1118,7 +1179,7 @@ func (c *Client) nodeCall(ctx context.Context, wsID, op string, body func(g *pro
 		if err != nil {
 			return err
 		}
-		err = c.call(ctx, g.Node, op, body(g), out)
+		err = call(ctx, g.Node, op, body(g), out)
 		var pe *proto.Error
 		if !errors.As(err, &pe) {
 			return err
@@ -1619,6 +1680,10 @@ type Session struct {
 	inputMu      sync.Mutex
 	iseq         uint64
 	node         string // expected output producer, derived only from a control grant
+	// activeClientOnly sessions are subscribed only by the s.open connection.
+	// They cannot enter the replayable s.attach path after a disconnect.
+	activeClientOnly bool
+	activeGeneration uint64
 }
 
 // Exec starts an exec/pty session. Chunks arrive on Session.Chunks().
@@ -1633,15 +1698,30 @@ func (c *Client) Exec(ctx context.Context, req proto.SOpenReq) (*Session, error)
 	// Register a placeholder before the call so chunks arriving before the
 	// response are not lost.
 	s := c.newSession("", req.WS, req.Kind)
+	s.activeClientOnly = req.Sensitive
 	c.mu.Lock()
 	c.sessions["pending:"+req.IdempotencyKey] = s
 	c.mu.Unlock()
-	err := c.nodeCall(ctx, req.WS, proto.OpSOpen, func(g *proto.Grant) any {
+	open := func(g *proto.Grant) any {
 		s.bindNode(g.Node)
 		r := req
 		r.Grant = g
 		return r
-	}, &res)
+	}
+	var (
+		openingPeer       *transport.Peer
+		openingGeneration uint64
+		err               error
+	)
+	if req.Sensitive {
+		err = c.nodeCallWith(ctx, req.WS, proto.OpSOpen, open, &res, func(ctx context.Context, to, op string, body, out any) error {
+			var callErr error
+			openingPeer, openingGeneration, callErr = c.callOnce(ctx, to, op, body, out)
+			return callErr
+		})
+	} else {
+		err = c.nodeCall(ctx, req.WS, proto.OpSOpen, open, &res)
+	}
 	c.mu.Lock()
 	delete(c.sessions, "pending:"+req.IdempotencyKey)
 	c.mu.Unlock()
@@ -1651,6 +1731,7 @@ func (c *Client) Exec(ctx context.Context, req proto.SOpenReq) (*Session, error)
 	}
 	s.mu.Lock()
 	s.attached = true
+	s.activeGeneration = openingGeneration
 	s.mu.Unlock()
 	s.seedInputSeq(res.LastInputSeq)
 	registered := c.register(res.S, s)
@@ -1664,6 +1745,14 @@ func (c *Client) Exec(ctx context.Context, req proto.SOpenReq) (*Session, error)
 		registered.mu.Lock()
 		registered.unsubscribed = true
 		registered.mu.Unlock()
+		return registered, nil
+	}
+	if registered.activeClientOnly {
+		select {
+		case <-openingPeer.Done():
+			registered.fail(proto.Err(proto.CodeClosed, "active-client-only session lost its opening connection"))
+		default:
+		}
 		return registered, nil
 	}
 	go registered.reattach(context.Background(), c.generation())
@@ -1988,6 +2077,9 @@ func (s *Session) seedInputSeq(seq uint64) {
 
 // reattach re-subscribes after a reconnect from the last delivered seq.
 func (s *Session) reattach(ctx context.Context, generation uint64) {
+	if s.activeClientOnly {
+		return
+	}
 	s.attachMu.Lock()
 	defer s.attachMu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)

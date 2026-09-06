@@ -68,7 +68,7 @@ func Program(recipe, action string) ([]string, error) {
 	for _, name := range spec.UnsetEnv {
 		fmt.Fprintf(&script, "unset %s\n", name)
 	}
-	script.WriteString(`PATH="$HOME/.remount/tools/bin:$PATH"` + "\nexport PATH\nexec")
+	script.WriteString(`PATH="$HOME/.local/bin:$PATH"` + "\nexport PATH\nexec")
 	for _, arg := range command {
 		script.WriteByte(' ')
 		script.WriteString(shellQuote(arg))

@@ -1258,6 +1258,22 @@
       },
       "additionalProperties": true
     },
+    "AuthOperation": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "recipe": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "recipe"
+      ],
+      "additionalProperties": true
+    },
     "AuthzRevocation": {
       "type": "object",
       "properties": {
@@ -5462,6 +5478,16 @@
     "SOpenReq": {
       "type": "object",
       "properties": {
+        "auth_operation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthOperation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "cols": {
           "type": "integer"
         },
@@ -5511,6 +5537,9 @@
               "type": "null"
             }
           ]
+        },
+        "sensitive": {
+          "type": "boolean"
         },
         "stdin": {
           "type": "boolean"
@@ -5795,6 +5824,16 @@
     "SessionInfo": {
       "type": "object",
       "properties": {
+        "auth_operation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthOperation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "id": {
           "type": "string"
         },
@@ -5822,6 +5861,9 @@
               "type": "null"
             }
           ]
+        },
+        "sensitive": {
+          "type": "boolean"
         },
         "ws": {
           "type": "string"
@@ -7061,6 +7103,28 @@
       "required": [
         "backend",
         "ws"
+      ],
+      "additionalProperties": true
+    },
+    "WSLaunchRecordReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "labels"
       ],
       "additionalProperties": true
     },
@@ -8700,6 +8764,12 @@
       "name": "ws.info",
       "request": "WSGetReq",
       "response": "WSInfoRes"
+    },
+    {
+      "constant": "OpWSLaunchRecord",
+      "name": "ws.launch.record",
+      "request": "WSLaunchRecordReq",
+      "response": "Workspace"
     },
     {
       "constant": "OpWSLease",

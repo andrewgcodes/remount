@@ -438,6 +438,7 @@ const (
 	OpWSMove               = "ws.move"                 // WSMoveReq -> Workspace (re-queued)
 	OpWSSleep              = "ws.sleep"                // WSSleepReq -> Timer
 	OpWSWake               = "ws.wake"                 // WSGetReq -> Workspace
+	OpWSLaunchRecord       = "ws.launch.record"        // WSLaunchRecordReq -> Workspace
 	OpWSACL                = "ws.acl"                  // WSACLReq -> Workspace (bumps authz_revision)
 	OpWSClaim              = "ws.claim"                // node: WSClaimReq -> WSClaimRes
 	OpWSRenew              = "ws.renew"                // node: WSRenewReq -> WSRenewRes
@@ -505,6 +506,14 @@ type WSGetReq struct {
 
 type WSListRes struct {
 	Workspaces []Workspace `cbor:"workspaces" json:"workspaces"`
+}
+
+// WSLaunchRecordReq replaces the non-secret launch metadata that remount run needs
+// to reconstruct the latest harness invocation on resume.
+type WSLaunchRecordReq struct {
+	ID             string            `cbor:"id" json:"id"`
+	Labels         map[string]string `cbor:"labels" json:"labels"`
+	IdempotencyKey string            `cbor:"idem,omitempty" json:"idem,omitempty"`
 }
 
 type WSMoveReq struct {
@@ -2231,6 +2240,7 @@ const (
 	EvWSSnapshot               = "ws.snapshot"
 	EvWSRestored               = "ws.restored"
 	EvWSDestroyed              = "ws.destroyed"
+	EvWSLaunchRecorded         = "ws.launch_recorded"
 	EvWSLeaseExpired           = "ws.lease_expired"
 	EvWSFenced                 = "ws.fenced"
 	EvWSStateChanged           = "ws.state_changed"

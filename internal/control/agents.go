@@ -439,6 +439,9 @@ func validateAgentSpec(spec *proto.AgentSpec) error {
 	default:
 		return proto.Err(proto.CodeBadRequest, "spec.auth %q is not api-key, subscription or workspace-resident", spec.Auth)
 	}
+	if spec.Auth == "" && agentRecipeRequiresExplicitAuth(spec) {
+		return proto.Err(proto.CodeBadRequest, "spec.auth is required for recipe %s; choose api-key or subscription", spec.Recipe)
+	}
 	if spec.Auth == proto.RunAuthSubscription && len(spec.ACPCommand) != 0 {
 		return proto.Err(proto.CodeBadRequest, "spec.auth subscription cannot be combined with spec.acp_command")
 	}
@@ -448,6 +451,19 @@ func validateAgentSpec(spec *proto.AgentSpec) error {
 		return proto.Err(proto.CodeBadRequest, "spec.sandbox %q is not read-only, workspace-write or full", spec.Sandbox)
 	}
 	return nil
+}
+
+func agentRecipeRequiresExplicitAuth(spec *proto.AgentSpec) bool {
+	var (
+		recipe *launch.Recipe
+		err    error
+	)
+	if spec.RecipeYAML != "" {
+		recipe, err = launch.Parse([]byte(spec.RecipeYAML))
+	} else {
+		recipe, err = launch.Load(spec.Recipe)
+	}
+	return err == nil && recipe.Subscription != nil
 }
 
 func normalizeAgentSpec(spec *proto.AgentSpec) error {

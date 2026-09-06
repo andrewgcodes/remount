@@ -143,9 +143,9 @@ owns the browser/device authorization, token format, refresh, and logout.
 Auth operations use a confidential active-client-only session. Their output is
 kept in memory, cannot be replayed or reattached, is not spilled or published
 as a session-log artifact, and is omitted from durable session events. If the
-connection is interrupted, rerun the operation. The node accepts only the exact
-built-in provider command with no client-supplied environment or working
-directory.
+opening connection is interrupted, local delivery ends immediately; rerun the
+operation. The node accepts only the exact built-in provider command with no
+client-supplied environment or working directory.
 
 A subscription launch verifies the expected provider-native login and fails
 closed if it is absent, API-key based, console based, or ambiguous. It also
@@ -163,11 +163,12 @@ For API-key billing, name a real brokered binding:
 ```
 
 API-key mode refuses a missing or incompatible binding and never falls back to
-a subscription login. `remount resume WS` preserves the recorded auth mode; a
-conflicting `--auth` override is refused. `remount handoff` supports
-`--auth api-key` but refuses subscription mode because a laptop's provider
-login is not imported into another workspace; authenticate inside the remote
-workspace instead.
+a subscription login. Remount records the selected mode before launching,
+including with `run --ws` on an existing workspace. `remount resume WS`
+preserves that mode; a conflicting `--auth` override is refused.
+`remount handoff` supports `--auth api-key` but refuses subscription mode
+because a laptop's provider login is not imported into another workspace;
+authenticate inside the remote workspace instead.
 - Ctrl-C detaches by default; it does not kill the agent. Use
   `--kill-on-interrupt` only when termination is intended.
 - `--detach` prints the Agent/workspace identifiers and returns immediately.

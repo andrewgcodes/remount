@@ -255,6 +255,10 @@ variables before verification and execution, so subscription mode cannot
 silently become API billing. API-key mode requires a compatible brokered
 binding and never falls back to subscription state.
 
+The selected mode and other resumable launch metadata commit to the control
+plane before a harness starts, including when `run --ws` reuses an existing
+workspace. Resume preserves that mode and refuses a conflicting override.
+
 The trust boundary is intentionally narrow in v1. Provider credentials remain
 in the `local` workspace filesystem, under the provider CLI's own storage and
 refresh rules. Same-UID or root code in the VM can read them; isolated and

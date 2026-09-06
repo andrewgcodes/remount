@@ -81,8 +81,9 @@ type Result struct {
 // Plan is what Start will do, computed without talking to the server so the
 // CLI can validate flags and tests can inspect the derived policy.
 type Plan struct {
-	Auth string
-	Spec proto.WorkspaceSpec
+	Auth         string
+	Spec         proto.WorkspaceSpec
+	LaunchLabels map[string]string
 	// SessionEnv is passed at open so a reused workspace also sees the
 	// binding placeholders and base URLs.
 	SessionEnv map[string]string
@@ -204,6 +205,24 @@ func (o *Options) Validate() (*Plan, error) {
 	} else {
 		plan.Run.TaskHash = TaskHash(strings.Join(o.Args, "\x00"))
 	}
+	plan.LaunchLabels = map[string]string{
+		LabelRecipe: r.Name,
+		LabelAuth:   auth,
+	}
+	specs := make([]string, 0, len(o.Bindings))
+	for _, b := range o.Bindings {
+		specs = append(specs, b.String())
+	}
+	if len(specs) > 0 {
+		plan.LaunchLabels[LabelBindings] = strings.Join(specs, ",")
+	}
+	if o.Model != "" {
+		plan.LaunchLabels[LabelModel] = o.Model
+	}
+	if o.Conversation != "" {
+		plan.LaunchLabels[LabelConversation] = o.Conversation
+		plan.LaunchLabels[LabelConversationPath] = o.ConversationPath
+	}
 	if o.WS != "" {
 		return plan, nil
 	}
@@ -225,29 +244,14 @@ func (o *Options) Validate() (*Plan, error) {
 	for k, v := range o.Labels {
 		spec.Labels[k] = v
 	}
-	// The recipe and its bindings are recorded so `remount resume` can
-	// rebuild the launch without the original command line.
-	spec.Labels[LabelRecipe] = r.Name
-	spec.Labels[LabelAuth] = auth
+	for k, v := range plan.LaunchLabels {
+		spec.Labels[k] = v
+	}
 	if spec.Image == "" {
 		spec.Image = r.Image
 	}
-	specs := make([]string, 0, len(o.Bindings))
 	for _, b := range o.Bindings {
 		spec.Bindings = append(spec.Bindings, b.ID)
-		specs = append(specs, b.String())
-	}
-	if len(specs) > 0 {
-		spec.Labels[LabelBindings] = strings.Join(specs, ",")
-	}
-	if o.Model != "" {
-		spec.Labels[LabelModel] = o.Model
-	}
-	delete(spec.Labels, LabelConversation)
-	delete(spec.Labels, LabelConversationPath)
-	if o.Conversation != "" {
-		spec.Labels[LabelConversation] = o.Conversation
-		spec.Labels[LabelConversationPath] = o.ConversationPath
 	}
 	for k, v := range sessionEnv {
 		spec.Env[k] = v
@@ -382,6 +386,10 @@ func Start(ctx context.Context, cl *client.Client, o Options) (*Result, error) {
 		}
 		if (plan.Auth == AuthWorkspaceResident || plan.Auth == AuthSubscription) && ws.Spec.Security.Profile != "" && ws.Spec.Security.Profile != proto.SecurityLocal {
 			return nil, fmt.Errorf("workspace %s has security profile %s, which forbids a login kept inside the workspace", ws.ID, ws.Spec.Security.Profile)
+		}
+		ws, err = cl.RecordWorkspaceLaunch(ctx, ws.ID, plan.LaunchLabels)
+		if err != nil {
+			return nil, fmt.Errorf("record workspace launch: %w", err)
 		}
 		res.Workspace = ws
 	}
