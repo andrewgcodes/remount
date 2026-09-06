@@ -485,6 +485,19 @@ func (c *Client) ListNodes(ctx context.Context) ([]proto.NodeStatus, error) {
 	return res.Nodes, err
 }
 
+// NodeProfiles evaluates a runtime profile against the fleet. An empty node
+// asks about every node; an empty profile asks each node about the profile it
+// was configured with. A report whose Status is not "pass" is not healthy,
+// and "unavailable" is never a pass.
+func (c *Client) NodeProfiles(ctx context.Context, node, runtimeProfile string) (*proto.NodeProfileGetRes, error) {
+	var res proto.NodeProfileGetRes
+	err := c.call(ctx, proto.PeerControl, proto.OpNodeProfileGet, proto.NodeProfileGetReq{Node: node, Profile: runtimeProfile}, &res)
+	if err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // QuarantineFleet creates a durable incident-containment operation. The
 // returned object may still be running; use WaitFleetOperation or GetFleetOperation
 // to observe per-target acknowledgement.

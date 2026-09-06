@@ -673,6 +673,8 @@ func cmdUp(ctx context.Context, args []string) error {
 	labels := kvFlag{}
 	fs.Var(labels, "label", "node label k=v (repeatable)")
 	backends := fs.String("backend", "process", "comma-separated backends: process,docker,gvisor,firecracker")
+	runtimeProfile := fs.String("profile", envOr("REMOUNT_PROFILE", "dev"), "runtime profile: dev, trusted-single-tenant, multi-tenant-isolated, microvm; the node refuses to start if it cannot prove it")
+	profileInterval := fs.Duration("profile-health-interval", 0, "how often to re-probe host isolation prerequisites (0 selects 30s)")
 	image := fs.String("image", workspace.DefaultImage(version), "default docker image (ubuntu:24.04 for a plain distro)")
 	fcKernel := fs.String("firecracker-kernel", envOr("REMOUNT_FIRECRACKER_KERNEL", ""), "trusted guest kernel image")
 	fcRootFS := fs.String("firecracker-rootfs", envOr("REMOUNT_FIRECRACKER_ROOTFS", ""), "base ext4 image containing remount guest-agent")
@@ -732,6 +734,7 @@ func cmdUp(ctx context.Context, args []string) error {
 		sessionMemoryChunks: *sessionMemoryChunks, maxConcurrentRequests: *maxConcurrentRequests,
 		mutationRetention: *mutationRetention, maxMutationRecords: *maxMutationRecords,
 		maxConcurrentSnapshots: *maxConcurrentSnapshots, snapshotMinInterval: *snapshotMinInterval,
+		profile: *runtimeProfile, profileHealthInterval: *profileInterval,
 		firecracker: firecrackerNodeOptions{
 			kernel: *fcKernel, rootfs: *fcRootFS, binary: *fcBinary, jailer: *fcJailer,
 			guestManifest: *fcGuestManifest, chroot: *fcChroot, uid: *fcUID, gid: *fcGID,

@@ -93,6 +93,12 @@ type (
 	NodeDiagnostics      = proto.NodeDiag
 	WorkspaceDiagnostics = proto.WSDiag
 	Finding              = proto.Finding
+
+	// Runtime-profile conformance (ADR 0089). A NodeProfileReport's Status is
+	// "pass" only when every check passed; "unavailable" is never a pass.
+	NodeProfileRequest = proto.NodeProfileGetReq
+	NodeProfileResult  = proto.NodeProfileGetRes
+	NodeProfileReport  = proto.NodeProfileReport
 )
 
 // SessionOpenRequest starts an exec or PTY session. It is intentionally a
