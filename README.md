@@ -4,7 +4,7 @@
 
 <h1>vMotion for AI agents.</h1>
 
-<p><b>The failure-tested runtime for cloud agents: pause, move, resume, reattach, never hold a key. Self-hosted, one binary.</b></p>
+<p><b>Infrastructure for cloud agents that survive anything: a dropped connection, a dead node, a control-plane restart, a revoked key. Pause, move, resume, reattach, on machines you own.</b></p>
 
 [Quick start](#quick-start) · [Harnesses](#harnesses) · [Why Remount](#why-remount) · [Docs](docs/using-remount.md) · [Protocol](spec/PROTOCOL.md) · [Website](https://remount.dev)
 
