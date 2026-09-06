@@ -6,7 +6,9 @@
 
 <img src="docs/assets/remount-banner.svg" alt="Remount" width="820">
 
-<h1>Long-running agents on your own machines</h1>
+<h1>vMotion for AI agents.</h1>
+
+<p><b>Infrastructure for cloud agents that survive anything: a dropped connection, a dead node, a control-plane restart, a revoked key. Pause, move, resume, reattach, on machines you own.</b></p>
 
 [Quick start](#quick-start) · [Harnesses](#harnesses) · [Why Remount](#why-remount) · [Docs](docs/using-remount.md) · [Protocol](spec/PROTOCOL.md) · [Website](https://remount.dev)
 
@@ -17,19 +19,22 @@
 
 </div>
 
-Remount is a self-hosted runtime for AI agents that need to keep working after
-you close the laptop. It runs [Claude Code](https://github.com/anthropics/claude-code),
+Remount is the open-source infrastructure for cloud agents. You bring the
+harness, whether that is [Claude Code](https://github.com/anthropics/claude-code),
 [Codex](https://github.com/openai/codex), [OpenCode](https://github.com/sst/opencode),
 [Pi](https://github.com/earendil-works/pi), [Gemini CLI](https://github.com/google-gemini/gemini-cli),
 [Aider](https://github.com/Aider-AI/aider), [Goose](https://github.com/block/goose),
-[Cline](https://github.com/cline/cline), [OpenHands](https://github.com/All-Hands-AI/OpenHands)
-or any agent loop you wrote, as background agents in workspaces that snapshot,
-move between machines, sleep, wake on events, and never hold an API key. One
-static Go binary, one open protocol, Apache-2.0, nothing hosted.
+[Cline](https://github.com/cline/cline), [OpenHands](https://github.com/All-Hands-AI/OpenHands),
+or the loop your product runs in Go, Python or TypeScript. Remount gives it a
+computer: a **workspace** that runs on your laptop, a VM, a GPU box,
+Kubernetes, Modal or Fly, moves between them with its files, policy and saved
+state, replays its sessions, sleeps and wakes on events, and never holds an
+API key. One static Go binary, one open protocol, Apache-2.0, nothing hosted.
 
-- **Hand off a live conversation.** `remount handoff` copies your checkout and
-  the harness's saved conversation into a workspace and keeps going there;
-  `remount resume` reopens that exact conversation from any machine.
+- **Move between local and cloud.** Start an agent on your laptop and hand it
+  to a cloud node with `remount handoff`; pull it back with `remount resume`
+  from any machine. Claude Code and Codex conversations travel by transcript
+  id; every other harness carries its state directory.
 - **Run agents overnight.** A task queue runs in one workspace, sleeps on a
   control-plane timer between tasks and continues on whichever node wakes it.
   A durable Agent sleeps when idle, wakes on a message or a merged PR, forks
@@ -52,10 +57,10 @@ static Go binary, one open protocol, Apache-2.0, nothing hosted.
 
 ## Introduction
 
-An agent runtime is the machine an agent works on, plus whatever keeps that
-work alive when you are not looking. You use it to start an agent on a task,
-walk away, and find the work still going, or paused exactly where it stopped,
-with a record of everything it did.
+An agent runtime is the machine an agent works on, plus the control that
+keeps that work alive across machines, connections and restarts. You use it to
+run agents where the compute is, keep them running when nothing is watching,
+pause them where they stand, and get a record of everything they did.
 
 Most sandboxes tie the agent's work to one container and one connection: when
 either goes away, so does the work. Remount separates the two things that
@@ -69,11 +74,10 @@ the workspace or in your process.
 
 ## What it's for
 
-- **You, with a coding agent and a laptop.** You started Claude Code or Codex
-  on a refactor and need to leave. `remount handoff` moves the conversation
-  and the checkout to a cloud machine; the agent keeps going; `remount resume`
-  opens the same conversation from wherever you are tomorrow. A task queue
-  runs your backlog overnight on a durable timer.
+- **An agent that lives in both places.** Start it locally where the checkout
+  is, move it to a cloud node when it needs hours or a GPU, and bring it back
+  to inspect. `remount handoff` and `remount resume` do the move; a task queue
+  runs a backlog on a durable timer wherever the workspace happens to be.
 - **A team shipping an agent product.** Every customer's agent is a durable
   Agent resource with a transcript, a sleep and wake policy, approvals for
   sensitive egress, and children it can fork. Provider keys are bound once
@@ -180,8 +184,12 @@ what state each harness carries, is in
 ## Why Remount
 
 Sandbox APIs give you a container in someone else's cloud for the length of a
-request. Remount is built for agents whose work lasts longer than a request
-and longer than the process that started it.
+request, and they compete on how many milliseconds it takes to start one.
+Remount is built for what happens after the first hour: agents whose work
+lasts longer than a request, longer than a connection, and longer than the
+process that started it. Self-hosting is the only mode, not the enterprise
+tier, and it sits underneath the harness you already use instead of replacing
+it.
 
 | | Remount | Hosted sandbox APIs (E2B, Daytona, Modal) | Coder | OpenSandbox |
 |---|---|---|---|---|
