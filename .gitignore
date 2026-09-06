@@ -1,6 +1,7 @@
 # Secrets — never commit
 .env
 .env.*
+!.env.example
 bindings.json
 bindings.*.json
 
@@ -27,8 +28,12 @@ __pycache__/
 # JavaScript tooling
 node_modules/
 
-# stray example binaries
+# stray local builds of cmd/ programs
 /agentloop
+/evidence
+
+# per-agent git worktrees created by coding assistants
+/.claude/worktrees/
 
 # OpenTofu / Terraform working directories
 .terraform/
