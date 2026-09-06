@@ -64,6 +64,43 @@ func curlStatus(t *testing.T, ctx context.Context, c *client.Client, wsID string
 	return strings.TrimSpace(string(out))
 }
 
+// curlRefusal asks the workspace to send its placeholder through the broker and
+// returns the status together with the X-Remount-Reason the broker set, which
+// is the pair a harness matches on.
+func curlRefusal(t *testing.T, ctx context.Context, c *client.Client, wsID string) (status, reason string) {
+	t.Helper()
+	out, _, _, err := c.Run(ctx, wsID, "sh", "-c",
+		`curl -s -o /dev/null -D head -w "%{http_code}" -H "Authorization: Bearer $API_KEY" "$API_URL/v1/thing"; `+
+			`printf ' '; grep -i '^x-remount-reason:' head | tr -d '\r' | awk '{print $2}'`)
+	if err != nil {
+		t.Fatalf("broker request failed to run: %v", err)
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		t.Fatalf("broker request printed nothing")
+	}
+	if len(fields) > 1 {
+		return fields[0], fields[1]
+	}
+	return fields[0], ""
+}
+
+// awaitRefusal drives brokered requests until the broker refuses one, and
+// returns the status and reason it refused with. Each attempt opens a session,
+// so the interval is deliberately larger than the world's renew period rather
+// than a spin.
+func awaitRefusal(t *testing.T, ctx context.Context, c *client.Client, wsID string) (status, reason string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		status, reason = curlRefusal(t, ctx, c, wsID)
+		if status != "200" || !time.Now().Before(deadline) {
+			return status, reason
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 // awaitUpstreamAuth drives brokered requests until the upstream stops seeing
 // stale and returns what it saw. Each attempt opens a session, so the interval
 // is deliberately larger than the world's renew period rather than a spin.
@@ -125,9 +162,9 @@ func bindingEventsOf(t *testing.T, ctx context.Context, c *client.Client, bindin
 // TestBindingRevokeStopsSubstitutionWithinRenew is the revocation-propagation
 // proof. A workspace substitutes a credential successfully, the operator
 // revokes the binding, and within one renew interval the credential stops
-// reaching the upstream - the workspace's inert placeholder goes instead - and
-// every request is still audited. The lease TTL here is an hour, so only
-// renew-driven invalidation can produce that result.
+// reaching the upstream: the next request is refused with `revoked` before any
+// upstream byte, and every request is still audited. The lease TTL here is an
+// hour, so only renew-driven invalidation can produce that result.
 func TestBindingRevokeStopsSubstitutionWithinRenew(t *testing.T) {
 	up := newBrokeredUpstream(t)
 	w := newWorld(t)
@@ -160,14 +197,19 @@ func TestBindingRevokeStopsSubstitutionWithinRenew(t *testing.T) {
 		client.WithIdempotencyKey("revoke-revocable")); err != nil {
 		t.Fatalf("revoke binding: %v", err)
 	}
-	seen := awaitUpstreamAuth(t, ctx, c, ws.ID, up, "Bearer sk-LIVE-SECRET")
-	if seen == "Bearer sk-LIVE-SECRET" {
+	status, reason := awaitRefusal(t, ctx, c, ws.ID)
+	if status == "200" {
 		t.Fatalf("substitution continued %s after revocation", time.Since(revokedAt))
 	}
-	// What reaches the upstream now is the inert placeholder the workspace
-	// holds, never the credential.
-	if !strings.Contains(seen, "ref:b_revocable") {
-		t.Fatalf("post-revocation upstream credential = %q", seen)
+	// The workspace is told why in the pair it matches on, rather than having
+	// its inert placeholder forwarded to the provider for a confusing 401.
+	if status != "403" || reason != proto.ReasonRevoked {
+		t.Fatalf("post-revocation refusal = %s reason=%q", status, reason)
+	}
+	// The upstream never saw the placeholder, and never saw the credential
+	// again: the last thing it was sent is still the pre-revocation request.
+	if seen, _ := up.auth.Load().(string); !strings.Contains(seen, "sk-LIVE-SECRET") {
+		t.Fatalf("the upstream was sent %q after revocation", seen)
 	}
 
 	// Substitution has stopped; prove it stays stopped and stays audited.
@@ -175,19 +217,20 @@ func TestBindingRevokeStopsSubstitutionWithinRenew(t *testing.T) {
 	if substituted == 0 {
 		t.Fatal("the pre-revocation request was not audited as a substitution")
 	}
-	unbrokered := 0
+	refused := 0
 	for i := 0; i < 2; i++ {
-		if status := curlStatus(t, ctx, c, ws.ID); status != "200" {
-			t.Fatalf("post-revocation request returned %s", status)
+		if status, reason := curlRefusal(t, ctx, c, ws.ID); status != "403" || reason != proto.ReasonRevoked {
+			t.Fatalf("later post-revocation request = %s reason=%q", status, reason)
 		}
-		if seen, _ := up.auth.Load().(string); seen == "Bearer sk-LIVE-SECRET" {
-			t.Fatal("a later request was substituted again after revocation")
+		if seen, _ := up.auth.Load().(string); !strings.Contains(seen, "sk-LIVE-SECRET") {
+			t.Fatalf("a later request reached the upstream as %q", seen)
 		}
-		unbrokered++
+		refused++
 	}
 	if again := countCredentialUse(t, ctx, c, ws.ID, up.host); again != substituted {
 		t.Fatalf("substitution resumed after revocation: %d then %d", substituted, again)
 	}
+	unbrokered := refused
 	audit, err := c.CredentialEvents(ctx, client.CredentialFilter{WS: ws.ID, Binding: "", Since: 1})
 	if err != nil {
 		t.Fatal(err)

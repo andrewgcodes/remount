@@ -58,6 +58,9 @@ const (
 	sourceHandoff = "docs/engineering/handoff-2026-09-03.md (outcome: docs/engineering/implementation-closure-2026-09-03.md)"
 	sourcePlanB   = "docs/engineering/plan-b-repository-executable-2026-09-03.md"
 	sourceLinux   = "docs/engineering/verification-2026-09.md (Linux host verification 2026-09-04)"
+	// sourceGapBrief owns the rows added while closing the 2026-09-06 gap
+	// brief. Their outcomes are re-earned by the runner, never asserted here.
+	sourceGapBrief = "docs/engineering/gap-brief-2026-09-06.md (outcome: docs/engineering/verification-2026-09.md)"
 )
 
 // notLanded is the only honest thing to say about a Plan B row whose ticket
@@ -480,6 +483,14 @@ var scenarios = []Scenario{
 		Argv:     []string{"go", "test", "-count=1", "-timeout=20m", "-run", "^TestB32", "./integration/installs/"},
 		Recorded: StatusPassed,
 		Note:     "the dist binary and both release images passed manifest 1.1.0 black-box conformance; the wheel, npm tarball and external Go module drove an installed server without a source-tree dependency, and the checksums, static-link, inventory and SPDX SBOM lanes passed",
+	},
+	{
+		ID: "B35", Title: "the brokered-credential examples run against a fake provider with no network and no key",
+		Layer: LayerCode, Required: true, Source: sourceGapBrief,
+		Owner:    "integration/examples.TestB35*",
+		Argv:     []string{"go", "test", "-count=1", "-timeout=15m", "-run", "^TestB35", "./integration/examples/"},
+		Recorded: StatusPassed,
+		Note:     "model, search and custom-HTTP examples each drive their own substitution location through a loopback TLS fake that answers 401 without the exact credential; the foreign upstream received nothing, no example places a provider key in a workspace env, and both halves run with no provider credential present",
 	},
 }
 

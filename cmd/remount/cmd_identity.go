@@ -82,7 +82,7 @@ func cmdTenant(ctx context.Context, args []string) error {
 
 func cmdPrincipal(ctx context.Context, args []string) error {
 	if len(args) == 0 || isHelp(args[0]) {
-		return errors.New("principal: create|ls|revoke")
+		return errors.New("principal: create|session|ls|revoke")
 	}
 	sub, rest := args[0], args[1:]
 	fs := flag.NewFlagSet("principal "+sub, flag.ExitOnError)
@@ -111,6 +111,16 @@ func cmdPrincipal(ctx context.Context, args []string) error {
 		} else {
 			fmt.Printf("%s\t%s\t%s\n", value.Tenant, value.ID, strings.Join(value.Roles, ","))
 		}
+	case "session":
+		// The one-call session-scoped principal: an ephemeral principal plus
+		// the workspace- and generation-bound capability it acts with.
+		var options sessionPrincipalOptions
+		options.flags(fs)
+		parse(fs, rest)
+		if err := arity(fs, 0, 0, "principal session --ws WS [--roles agent] [--ttl 15m]"); err != nil {
+			return err
+		}
+		return runPrincipalSession(ctx, commonFlags, *tenant, options)
 	case "ls":
 		parse(fs, rest)
 		if err := arity(fs, 0, 0, "principal ls [--tenant TENANT]"); err != nil {
