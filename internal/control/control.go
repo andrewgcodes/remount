@@ -76,6 +76,10 @@ type Binding struct {
 	// still resolve a binding id that appears in an older event.
 	RevokedAt     int64  `json:"revoked_at,omitempty"`
 	RevokedReason string `json:"revoked_reason,omitempty"`
+	// Substitution names where the broker replaces this binding's
+	// placeholder: a header (the default), a query parameter, a form field or
+	// a JSON pointer. It travels to the node inside the lease.
+	Substitution *proto.BindingSubstitution `json:"substitution,omitempty"`
 }
 
 // SecretResolver fetches an external binding value at lease time. Resolved
@@ -633,6 +637,9 @@ func New(opts Options) (*Control, error) {
 		}
 		if b.Source != "" && opts.SecretResolver == nil {
 			return nil, fmt.Errorf("control: binding %q has an external source but no resolver", b.ID)
+		}
+		if !proto.ValidSubstitution(b.Substitution) {
+			return nil, fmt.Errorf("control: binding %q declares an unusable substitution location", b.ID)
 		}
 		if _, exists := seen[bindingKey(b.Tenant, b.ID)]; exists {
 			return nil, fmt.Errorf("control: duplicate binding %q", b.ID)
@@ -5753,7 +5760,7 @@ func (c *Control) nodeList() *proto.NodeListRes {
 // events.stop or disconnect. Historical events are delivered first.
 func (c *Control) eventsTail(ctx context.Context, from string, subject Subject, req *proto.EventsTailReq) (any, error) {
 	if !req.Follow {
-		evs, err := c.readAuthorizedEvents(ctx, subject, req.From, req.WS, 1000)
+		evs, err := c.readAuthorizedEvents(ctx, subject, req.From, req.WS, req.Filter(), 1000)
 		if err != nil {
 			return nil, err
 		}
@@ -5808,6 +5815,9 @@ func (c *Control) eventsTail(ctx context.Context, from string, subject Subject, 
 		}()
 		sub := c.log.Subscribe(req.From, req.WS)
 		defer sub.Close()
+		// The follow stream and the historical page answer the same question,
+		// so they apply the same predicate.
+		filter := req.Filter()
 		for {
 			evs, err := sub.Next(tctx)
 			if err != nil {
@@ -5815,7 +5825,7 @@ func (c *Control) eventsTail(ctx context.Context, from string, subject Subject, 
 			}
 			filtered := evs[:0]
 			for _, event := range evs {
-				if c.eventVisible(subject, event) {
+				if c.eventVisible(subject, event) && filter.Match(event) {
 					filtered = append(filtered, event)
 				}
 			}
@@ -5837,7 +5847,7 @@ func (c *Control) eventVisible(subject Subject, event proto.Event) bool {
 	return event.Tenant != "" && event.Tenant == subject.Tenant
 }
 
-func (c *Control) readAuthorizedEvents(ctx context.Context, subject Subject, from uint64, ws string, limit int) ([]proto.Event, error) {
+func (c *Control) readAuthorizedEvents(ctx context.Context, subject Subject, from uint64, ws string, filter proto.EventFilter, limit int) ([]proto.Event, error) {
 	cursor := from
 	var out []proto.Event
 	for len(out) < limit {
@@ -5849,7 +5859,7 @@ func (c *Control) readAuthorizedEvents(ctx context.Context, subject Subject, fro
 			break
 		}
 		for _, event := range events {
-			if c.eventVisible(subject, event) {
+			if c.eventVisible(subject, event) && filter.Match(event) {
 				out = append(out, event)
 				if len(out) == limit {
 					break
@@ -6188,6 +6198,7 @@ func (c *Control) bindingLease(ctx context.Context, node, wsID string, generatio
 			Placeholder: b.Placeholder, ExpiresAt: c.now().Add(time.Duration(ttl) * time.Second).UnixMilli(),
 			Kind: b.Kind, Methods: b.Methods, PathPrefixes: b.PathPrefixes,
 			Revision: b.Revision, Generation: gen,
+			Substitution: b.Substitution,
 		})
 	}
 	// Resolution may block on an external provider. Revalidate the authority

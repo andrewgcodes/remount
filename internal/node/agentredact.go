@@ -3,86 +3,42 @@ package node
 import (
 	"bytes"
 	"encoding/json"
-	"regexp"
 	"strconv"
 
 	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/redact"
 )
 
 // redactedMark replaces every secret-shaped value in a recorded frame. It is
 // plain ASCII with no JSON metacharacters, so substituting it inside a JSON
 // string leaves the frame parseable.
-const redactedMark = "[redacted]"
+const redactedMark = redact.Mark
 
-// secretPatterns are the shapes of well-known credentials plus the generic
-// "key = value" forms a harness echoes when it prints its environment. Each
-// pattern's last group is the part to replace; earlier groups are kept.
-// Values never legitimately appear in a transcript: the workspace holds only
-// broker placeholders, and even those are replaced because a placeholder
-// together with the broker token is a usable credential on this node.
-var secretPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`()(sk-[A-Za-z0-9_-]{20,})`),                                                                           // OpenAI, Anthropic, Stripe
-	regexp.MustCompile(`()(AKIA[0-9A-Z]{16})`),                                                                                // AWS access key id
-	regexp.MustCompile(`()(gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})`),                                         // GitHub tokens
-	regexp.MustCompile(`()(xox[abprs]-[A-Za-z0-9-]{10,})`),                                                                    // Slack
-	regexp.MustCompile(`()(AIza[0-9A-Za-z_-]{35})`),                                                                           // Google API key
-	regexp.MustCompile(`()(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})`),                                   // JWT
-	regexp.MustCompile(`(?i)(bearer\s+)([A-Za-z0-9._~+/=-]{16,})`),                                                            // Authorization header value
-	regexp.MustCompile(`(https?://[^\s"'/]+/c/)([A-Za-z0-9._~-]{16,})`),                                                       // broker capability URL
-	regexp.MustCompile(`(?i)((?:api[_-]?key|secret|token|password|passwd)(?:\\?["'])?\s*[:=]\s*(?:\\?["'])?)([^"'\s\\]{8,})`), // KEY=value, "key": "value", also JSON-escaped inside a string
-}
-
-// redactor scrubs transcript frames. It knows the literals that must never
-// leave the node (the broker token, lease placeholders and the secrets behind
-// them) and falls back to shape matching for anything else.
+// redactor scrubs transcript frames. The scrubbing itself lives in
+// internal/redact so the broker's rejection bodies, audit reasons and wire
+// errors are scrubbed by the same expressions; this type is the node-local
+// spelling its transcript call sites already use.
+//
+// It knows the literals that must never leave the node (the broker token,
+// lease placeholders and the secrets behind them) and falls back to shape
+// matching for anything else. Values never legitimately appear in a
+// transcript: the workspace holds only broker placeholders, and even those are
+// replaced because a placeholder together with the broker token is a usable
+// credential on this node.
 type redactor struct {
-	literals [][]byte
+	*redact.Redactor
 }
 
 // newRedactor builds a redactor for the given literals. Short literals are
 // dropped: replacing every occurrence of a three-character string would
 // destroy the transcript without protecting anything.
 func newRedactor(literals []string) *redactor {
-	r := &redactor{}
-	for _, lit := range literals {
-		if len(lit) < 8 {
-			continue
-		}
-		r.literals = append(r.literals, []byte(lit))
-		// The same value may be JSON-escaped inside a frame.
-		if esc, err := json.Marshal(lit); err == nil {
-			esc = esc[1 : len(esc)-1]
-			if !bytes.Equal(esc, []byte(lit)) {
-				r.literals = append(r.literals, esc)
-			}
-		}
-	}
-	return r
+	return &redactor{Redactor: redact.NewRedactor(literals)}
 }
 
 // apply returns frame with every secret-shaped value replaced and whether
 // anything changed. The input is not modified.
-func (r *redactor) apply(frame []byte) ([]byte, bool) {
-	out := frame
-	changed := false
-	for _, lit := range r.literals {
-		if bytes.Contains(out, lit) {
-			out = bytes.ReplaceAll(out, lit, []byte(redactedMark))
-			changed = true
-		}
-	}
-	for _, re := range secretPatterns {
-		if !re.Match(out) {
-			continue
-		}
-		out = re.ReplaceAll(out, []byte("${1}"+redactedMark))
-		changed = true
-	}
-	if !changed {
-		return frame, false
-	}
-	return out, true
-}
+func (r *redactor) apply(frame []byte) ([]byte, bool) { return r.Redactor.Apply(frame) }
 
 // boundFrame cuts a frame that exceeds proto.MaxACPTranscriptFrame. The
 // result is still one JSON object carrying the envelope (id, method) so a

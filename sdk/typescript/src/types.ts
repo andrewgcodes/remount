@@ -445,6 +445,7 @@ export interface BindingLease {
   "path_prefixes"?: Array<string>;
   "revision"?: number;
   "gen"?: number;
+  "substitution"?: BindingSubstitution | null;
 }
 
 export interface BindingLeaseReq {
@@ -500,11 +501,18 @@ export interface BindingSpec {
   "methods"?: Array<string>;
   "path_prefixes"?: Array<string>;
   "retention"?: BindingRetention;
+  "substitution"?: BindingSubstitution | null;
   "revision"?: number;
   "created_at"?: number;
   "rotated_at"?: number;
   "revoked_at"?: number;
   "revoked_reason"?: string;
+}
+
+export interface BindingSubstitution {
+  "location": string;
+  "name"?: string;
+  "json_pointer"?: string;
 }
 
 export interface Budget {
@@ -882,6 +890,9 @@ export interface Event {
   "cause"?: number;
 }
 
+export interface EventFilter {
+}
+
 export interface EventPost {
   "events": Array<Event>;
   "sub"?: string;
@@ -896,6 +907,9 @@ export interface EventsTailReq {
   "follow": boolean;
   "ws"?: string;
   "sub"?: string;
+  "binding"?: string;
+  "host"?: string;
+  "types"?: Array<string>;
 }
 
 export interface ExitInfo {

@@ -65,6 +65,9 @@ type BindingSpec struct {
 	Methods      []string         `cbor:"methods,omitempty" json:"methods,omitempty"`
 	PathPrefixes []string         `cbor:"path_prefixes,omitempty" json:"path_prefixes,omitempty"`
 	Retention    BindingRetention `cbor:"retention,omitempty" json:"retention,omitempty"`
+	// Substitution names where the broker replaces the placeholder; nil means
+	// a header value, which is what every binding did before the field.
+	Substitution *BindingSubstitution `cbor:"substitution,omitempty" json:"substitution,omitempty"`
 	// Revision increments on every rotation. A lease carries the revision it
 	// was minted from, so a node can tell a stale lease from a live one.
 	Revision  uint64 `cbor:"revision,omitempty" json:"revision,omitempty"`

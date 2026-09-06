@@ -448,6 +448,7 @@ BindingLease = TypedDict("BindingLease", {
     "path_prefixes": NotRequired[list[str]],
     "revision": NotRequired[int],
     "gen": NotRequired[int],
+    "substitution": NotRequired[Optional["BindingSubstitution"]],
 }, total=False)
 
 BindingLeaseReq = TypedDict("BindingLeaseReq", {
@@ -503,11 +504,18 @@ BindingSpec = TypedDict("BindingSpec", {
     "methods": NotRequired[list[str]],
     "path_prefixes": NotRequired[list[str]],
     "retention": NotRequired["BindingRetention"],
+    "substitution": NotRequired[Optional["BindingSubstitution"]],
     "revision": NotRequired[int],
     "created_at": NotRequired[int],
     "rotated_at": NotRequired[int],
     "revoked_at": NotRequired[int],
     "revoked_reason": NotRequired[str],
+}, total=False)
+
+BindingSubstitution = TypedDict("BindingSubstitution", {
+    "location": Required[str],
+    "name": NotRequired[str],
+    "json_pointer": NotRequired[str],
 }, total=False)
 
 Budget = TypedDict("Budget", {
@@ -885,6 +893,9 @@ Event = TypedDict("Event", {
     "cause": NotRequired[int],
 }, total=False)
 
+EventFilter = TypedDict("EventFilter", {
+}, total=False)
+
 EventPost = TypedDict("EventPost", {
     "events": Required[list["Event"]],
     "sub": NotRequired[str],
@@ -899,6 +910,9 @@ EventsTailReq = TypedDict("EventsTailReq", {
     "follow": Required[bool],
     "ws": NotRequired[str],
     "sub": NotRequired[str],
+    "binding": NotRequired[str],
+    "host": NotRequired[str],
+    "types": NotRequired[list[str]],
 }, total=False)
 
 ExitInfo = TypedDict("ExitInfo", {

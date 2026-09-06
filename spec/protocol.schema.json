@@ -1513,6 +1513,16 @@
         },
         "shape": {
           "type": "string"
+        },
+        "substitution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BindingSubstitution"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -1702,6 +1712,16 @@
         "source": {
           "type": "string"
         },
+        "substitution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BindingSubstitution"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "tenant": {
           "type": "string"
         },
@@ -1717,6 +1737,24 @@
       },
       "required": [
         "id"
+      ],
+      "additionalProperties": true
+    },
+    "BindingSubstitution": {
+      "type": "object",
+      "properties": {
+        "json_pointer": {
+          "type": "string"
+        },
+        "location": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "location"
       ],
       "additionalProperties": true
     },
@@ -3015,6 +3053,10 @@
       ],
       "additionalProperties": true
     },
+    "EventFilter": {
+      "type": "object",
+      "additionalProperties": true
+    },
     "EventPost": {
       "type": "object",
       "properties": {
@@ -3045,14 +3087,26 @@
     "EventsTailReq": {
       "type": "object",
       "properties": {
+        "binding": {
+          "type": "string"
+        },
         "follow": {
           "type": "boolean"
         },
         "from": {
           "type": "integer"
         },
+        "host": {
+          "type": "string"
+        },
         "sub": {
           "type": "string"
+        },
+        "types": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "ws": {
           "type": "string"

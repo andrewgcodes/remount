@@ -23,12 +23,24 @@ const maxBindingsPerTenant = 256
 // two namespaces cannot collide.
 func bindingKey(tenant, id string) string { return tenant + "\x00" + id }
 
+func cloneSubstitution(s *proto.BindingSubstitution) *proto.BindingSubstitution {
+	if s == nil {
+		return nil
+	}
+	cp := *s
+	return &cp
+}
+
 func cloneBinding(b Binding) Binding {
 	b.Destinations = append([]string(nil), b.Destinations...)
 	b.Principals = append([]string(nil), b.Principals...)
 	b.Workspaces = append([]string(nil), b.Workspaces...)
 	b.Methods = append([]string(nil), b.Methods...)
 	b.PathPrefixes = append([]string(nil), b.PathPrefixes...)
+	if b.Substitution != nil {
+		substitution := *b.Substitution
+		b.Substitution = &substitution
+	}
 	return b
 }
 
@@ -45,6 +57,7 @@ func publicBinding(b Binding) proto.BindingSpec {
 		Methods:       append([]string(nil), b.Methods...),
 		PathPrefixes:  append([]string(nil), b.PathPrefixes...),
 		Retention:     b.Retention,
+		Substitution:  cloneSubstitution(b.Substitution),
 		Revision:      b.Revision,
 		CreatedAt:     b.CreatedAt,
 		RotatedAt:     b.RotatedAt,
@@ -172,6 +185,9 @@ func (c *Control) seedBindings(configured []Binding) error {
 // deliberately strict about the credential: exactly one of an inline secret
 // and an external source, because "both" hides which one is authoritative.
 func (c *Control) validateBindingSpec(spec *proto.BindingSpec) error {
+	if !proto.ValidSubstitution(spec.Substitution) {
+		return proto.Err(proto.CodeBadRequest, "binding %q declares an unusable substitution location", spec.ID)
+	}
 	if spec.ID == "" {
 		return proto.Err(proto.CodeBadRequest, "binding id is required")
 	}
@@ -222,7 +238,8 @@ func bindingFromSpec(spec proto.BindingSpec, tenant, owner string, now int64) Bi
 		Placeholder:  spec.Placeholder, TTLSec: spec.TTLSec,
 		Methods:      append([]string(nil), spec.Methods...),
 		PathPrefixes: append([]string(nil), spec.PathPrefixes...),
-		Retention:    spec.Retention, Owner: owner, Revision: 1, CreatedAt: now,
+		Retention:    spec.Retention, Substitution: cloneSubstitution(spec.Substitution),
+		Owner: owner, Revision: 1, CreatedAt: now,
 	}
 }
 
