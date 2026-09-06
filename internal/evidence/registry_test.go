@@ -30,8 +30,8 @@ func TestRegistryCoversEveryHandoffAndPlanBScenario(t *testing.T) {
 			t.Errorf("%s from the Plan B phase tables is missing", id)
 		}
 	}
-	if len(have) != 57 {
-		t.Fatalf("registry holds %d rows, want E1-E25 plus B1-B32", len(have))
+	if len(have) != 58 {
+		t.Fatalf("registry holds %d rows, want E1-E25 plus B1-B32 and B34", len(have))
 	}
 }
 
@@ -78,6 +78,7 @@ var wiredScenarios = map[string]string{
 	"B30": "10,000 reconnecting cursors and the remaining bounded resource workloads settle within declared ceilings",
 	"B31": "reproducible builds across a cold cache and a different TMPDIR",
 	"B32": "clean installs of the binary, images, wheel, tarball and module, each with a source-tree control",
+	"B34": "a real Chromium answers every computer operation on the docker backend",
 	"B8":  "internal/provision/e2b contract tests against fixtures captured from the real api.e2b.app",
 	"B9":  "ambiguous-create recovery, including the unresolvable case that must stay unknown",
 	"B10": "provider stall proves control authority is not held across a provider call",

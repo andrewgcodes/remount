@@ -654,6 +654,116 @@ wake, ACLs, and moves between two machines, is
 
 ## Run browser and virtual desktop workloads
 
+### Computer sessions: the built-in browser API
+
+A **computer** is a browser the node drives inside a workspace on your behalf.
+The node holds the DevTools conversation over the same path `remount port`
+uses, so every backend that can forward a workspace port can host one and
+nothing extra runs inside the workspace. Screenshots, clicks, typing,
+navigation, downloads and crash reporting are protocol operations, not a script
+you assemble yourself.
+
+Build the reference image once ([`images.md`](images.md)), then drive it:
+
+```sh
+docker build -t remount-browser:local images/browser
+WS=$(./remount ws create --backend docker --image remount-browser:local --json | jq -r .id)
+
+CMP=$(./remount computer create "$WS" --json | jq -r .computer)
+./remount computer navigate "$WS" "$CMP" https://example.internal/
+./remount computer screenshot "$WS" "$CMP" --out shot.png
+./remount computer click "$WS" "$CMP" 640 360
+./remount computer type "$WS" "$CMP" 'search text'
+./remount computer key "$WS" "$CMP" Enter
+./remount computer eval "$WS" "$CMP" 'document.title'
+./remount computer downloads "$WS" "$CMP" --json
+./remount computer close "$WS" "$CMP"
+```
+
+Every subcommand takes `--json`. The same operations are in the Go, Python and
+TypeScript SDKs:
+
+```python
+computer = await client.create_computer(workspace, viewport={"w": 1280, "h": 720})
+await computer.navigate("https://example.internal/")
+await computer.click(640, 360)
+await computer.type("search text")
+shot = await computer.screenshot()          # shot["png"] is PNG bytes
+title = await computer.eval("document.title")
+for download in await computer.downloads():
+    print(download["state"], download.get("artifact", ""))
+await computer.close()
+```
+
+```ts
+const computer = await client.createComputer(workspace, { viewport: { w: 1280, h: 720 } });
+await computer.navigate("https://example.internal/");
+await computer.click(640, 360);
+await computer.type("search text");
+const shot = await computer.screenshot();
+const title = await computer.eval("document.title");
+await computer.close();
+```
+
+What the API promises, and what it does not:
+
+- **Coordinates are CSS pixels from the top-left of the viewport** declared at
+  `create` (1280x720 by default), and a screenshot is a PNG clipped to that
+  same rectangle. The picture and the click that follows it agree.
+- **Typing uses text insertion, not synthesized keystrokes**, so it behaves the
+  same in an ordinary field, a contenteditable region and an iframe, and does
+  not depend on a keyboard layout the image may not carry. `key` presses one
+  named key (`Enter`, `Tab`, `ArrowDown`, …); an unknown name is refused rather
+  than guessed.
+- **Every action batch carries an input sequence.** A retried click after a
+  dropped connection is dropped by the node, never applied twice. A handle
+  addressed by id — every CLI invocation is one — reads the node's sequence
+  before its first action instead of restarting it, so nothing is silently
+  swallowed ([ADR 0094](adr/0094-a-resumed-computer-handle-reads-the-input-sequence.md)).
+  `computer get --json` reports it as `last_iseq`.
+- **One computer per DevTools port.** A second `create` on the same workspace
+  needs `--port`; without it the second browser cannot bind and is reported as
+  `browser_crashed`.
+- **Downloads become artifacts.** A finished file is published to the tenant's
+  artifact store and announced as a `computer.download` event; the id is in
+  `computer downloads`. A file that finished but could not be published is
+  listed with state `blocked` and a reason rather than vanishing.
+- **Failures are typed.** A dead browser is `closed`/`browser_crashed` on every
+  later operation and in `computer get`, never a hang; a refused navigation is
+  `denied`/`navigation_denied`; a backend with no workspace port path is
+  `unsupported`/`backend_unsupported`.
+- **Egress policy is per host, never per URL.** The broker tunnels CONNECT
+  opaquely and terminates no TLS, so it can see the host a browser asked for
+  and nothing else. Read no per-path guarantee into this.
+- **A browser cannot currently reach a host the broker allows.** Chromium honors
+  `http_proxy`/`https_proxy` and does route through the workspace's broker, but
+  it does not present the workspace capability as proxy authentication, so the
+  broker refuses every destination as unauthenticated and the navigation
+  surfaces as `denied`/`navigation_denied`. Browser traffic is therefore
+  contained but not yet usable against allowed hosts; a workspace that must
+  browse the network needs a node whose broker is not in the path.
+- **Profiles do not survive a move, a sleep or a `remount pull`.** A profile
+  lives in `.remount/browser/<profile>`, which every snapshot excludes on
+  purpose: a live browser profile contains singleton symlinks and lock files
+  that artifact validation correctly refuses, and restoring one host's profile
+  onto another is not meaningful. A computer after a wake is a fresh browser on
+  the same filesystem. Durable state belongs in ordinary files, which snapshots
+  do carry.
+- **Backends.** Any backend that forwards a workspace port: `process`, `docker`
+  and `gvisor`. `firecracker` can drive a browser but cannot yet publish what
+  it downloaded, which is reported as a `blocked` download with
+  `backend_unsupported`.
+
+The conformance lane behind these claims is
+[`scripts/browser-conformance.sh`](../scripts/browser-conformance.sh); its
+recorded run is in
+[verification-2026-09.md](engineering/verification-2026-09.md).
+
+### A full desktop, assembled by hand
+
+A computer session is a browser, not a desktop. When you need X11, a window
+manager or a VNC client, Remount hosts those processes and you compose them.
+
 Remount does not ship a browser, display server, window manager, VNC server, or
 mobile client. It can host those processes when the selected node image already
 contains them. A validated Linux composition is Xvfb, Openbox, Chromium, and
@@ -1747,6 +1857,17 @@ subscription token; their terms restrict third-party use and the broker is not
 the place to argue with that.
 
 ## Browser and virtual desktop workloads
+
+For a browser, reach for the built-in computer session first: `remount
+computer` and the SDK `Computer` handles drive screenshots, input, navigation
+and downloads as protocol operations, against the reference image in
+[`images/browser`](../images/browser/Dockerfile). The user-facing walkthrough,
+including the coordinate system, the typed failures, the per-host egress
+ceiling and the profile-persistence limit, is in
+[using-remount.md](using-remount.md#run-browser-and-virtual-desktop-workloads);
+the design is [ADR 0088](adr/0088-computer-sessions-over-port-substrate.md).
+The recipe below is what you compose when you need a whole desktop - X11, a
+window manager, a VNC client - rather than a browser.
 
 Remount supervises filesystem and process sessions; it does not implement a
 display server or VNC protocol. A node can nevertheless host a desktop stack,

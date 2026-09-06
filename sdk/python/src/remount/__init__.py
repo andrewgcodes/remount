@@ -2,5 +2,6 @@
 
 from .agent import AgentClient, ApprovalDecisionInput, Terminal
 from .client import Chunk, Client, ProtocolError, Session
+from .computer import Computer
 
-__all__ = ["AgentClient", "ApprovalDecisionInput", "Chunk", "Client", "ProtocolError", "Session", "Terminal"]
+__all__ = ["AgentClient", "ApprovalDecisionInput", "Chunk", "Client", "Computer", "ProtocolError", "Session", "Terminal"]

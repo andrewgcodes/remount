@@ -2042,6 +2042,9 @@
         "computer": {
           "type": "string"
         },
+        "last_iseq": {
+          "type": "integer"
+        },
         "reason": {
           "type": "string"
         },

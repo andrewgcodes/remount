@@ -20,6 +20,25 @@ tests and engineering notes do not.
 
 ### Added
 
+- `remount computer create|get|screenshot|click|type|key|scroll|navigate|eval|downloads|close`
+  drives a browser inside a workspace, and `Computer` handles with the same
+  operations are in the Python (`client.create_computer`) and TypeScript
+  (`client.createComputer`) SDKs alongside the existing Go one. Coordinates are
+  CSS pixels in the viewport declared at `create`, screenshots are PNGs clipped
+  to it, downloads become artifacts, and failures are typed
+  (`closed`/`browser_crashed`, `denied`/`navigation_denied`). Browser profiles
+  are node-local and do not survive a move or a sleep; navigation policy is per
+  host, never per URL.
+- `images/browser`: a reference browser workspace image (Chromium, fonts,
+  certificates, `socat`, and a `remount-browser-health` probe) documented in
+  [docs/images.md](docs/images.md), plus
+  `scripts/browser-conformance.sh`, the evidence gate B34 lane that drives a
+  real Chromium through every computer operation.
+- `ComputerGetRes` carries `last_iseq`, the highest input sequence the node has
+  applied. A computer handle addressed by id adopts it before its first action
+  instead of restarting at one, which the node would correctly drop as a
+  duplicate; a handle returned by `create` is unaffected
+  ([ADR 0094](docs/adr/0094-a-resumed-computer-handle-reads-the-input-sequence.md)).
 - Wire errors carry an optional `reason`: a stable sub-classification inside an
   existing `code` that a client may act on, alongside `proto.ErrReason` and the
   `proto.Reason*` constants. Older peers ignore the field and a code without a

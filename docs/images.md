@@ -32,6 +32,49 @@ digest and platform; layer contents and size change with source revisions.
 The Dockerfile pins its upstream image digests. Docker's `--init` option,
 set by the backend, supplies the running container's init process.
 
+## The reference browser image
+
+[`images/browser/Dockerfile`](../images/browser/Dockerfile) is the image a
+computer session (`remount computer`, ADR 0088) is meant to run in. It is not
+built by a release workflow; build it where you need it:
+
+```sh
+docker build -t remount-browser:local images/browser
+docker run --rm remount-browser:local chromium --version
+remount ws create --backend docker --image remount-browser:local
+```
+
+| Layer | What is in it | Why |
+|---|---|---|
+| `chromium` | Debian's Chromium, headless-capable | the browser a computer session drives over the DevTools protocol |
+| `socat` | one forwarder | Chromium's DevTools HTTP server binds `127.0.0.1` and **ignores `--remote-debugging-address`**. The node reaches a workspace port at the container's own address, so without a forwarder it cannot see the browser at all. The default launch starts one |
+| `fonts-liberation`, `fonts-dejavu-core` | a real font set | a screenshot of a fontless container is a grid of boxes |
+| `ca-certificates`, `curl` | trust roots and the health probe | `remount-browser-health [port]` prints the browser's DevTools identification and exits non-zero when the port is silent |
+| `procps` | `ps`, `pkill` | an operator has to be able to see and stop the browser |
+
+The image runs on the same digest-pinned `debian:bookworm-slim` the default
+workspace image builds on, so it builds in a clean checkout with nothing else
+present. To get the harness tooling as well, build the workspace image first
+and pass it as the base:
+
+```sh
+docker build -t remount-workspace:local images/workspace
+docker build -t remount-browser:local \
+  --build-arg BASE=remount-workspace:local images/browser
+```
+
+The image was built and driven on `linux/arm64`; it is an ordinary Debian
+build with no architecture-specific content, and `linux/amd64` has not been
+exercised here. Chromium is large: the arm64 image is roughly 1.1 GB.
+
+Substituting your own browser image is fine. It needs a browser that speaks
+the DevTools protocol on a TCP port, a way to expose that port on the address
+the backend resolves for the workspace (the default launch uses `socat`; the
+process backend needs none), and the fonts and certificates your pages need.
+`remount.dev/remount/internal/node.DefaultBrowserProgram` is a variable, so an
+image with a differently named or differently flagged browser can be paired
+with a build that replaces it.
+
 ## What every image must provide
 
 The node needs exactly this from an image, and nothing else:

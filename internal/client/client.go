@@ -2141,6 +2141,10 @@ type Computer struct {
 
 	mu   sync.Mutex
 	iseq uint64
+	// synced records that iseq is known to be ahead of what the node has
+	// applied. It is true for a handle that created the computer and false for
+	// one addressed by id, which has to learn the sequence before it acts.
+	synced bool
 }
 
 // CreateComputer starts, or attaches to, a browser in the workspace.
@@ -2158,12 +2162,15 @@ func (c *Client) CreateComputer(ctx context.Context, req proto.ComputerCreateReq
 	}
 	return &Computer{
 		client: c, ws: req.WS, id: res.Computer, session: res.Session,
-		version: res.CDPVersion, viewport: res.Viewport,
+		version: res.CDPVersion, viewport: res.Viewport, synced: true,
 	}, nil
 }
 
 // Computer returns a handle on a computer this client did not create, so a
-// reconnecting caller can resume against an id it recorded.
+// reconnecting caller can resume against an id it recorded. Its input sequence
+// is learned from the node before the first action rather than restarted,
+// because a restarted sequence is one the node has already applied and would
+// correctly drop.
 func (c *Client) Computer(wsID, id string) *Computer {
 	return &Computer{client: c, ws: wsID, id: id}
 }
@@ -2196,6 +2203,10 @@ func (m *Computer) Get(ctx context.Context) (*proto.ComputerGetRes, error) {
 	}
 	m.mu.Lock()
 	m.viewport, m.session = res.Viewport, res.Session
+	if res.LastInputSeq >= m.iseq {
+		m.iseq = res.LastInputSeq
+	}
+	m.synced = true
 	m.mu.Unlock()
 	return &res, nil
 }
@@ -2214,7 +2225,20 @@ func (m *Computer) Screenshot(ctx context.Context) (*proto.ComputerScreenshotRes
 
 // Input applies a batch of actions. The batch carries the next input sequence,
 // so a retry after a dropped connection is applied at most once.
+//
+// A handle that did not create the computer learns the node's sequence first.
+// Without that, every such handle would start at one, and every action after
+// the first would be dropped as a duplicate of something already applied -
+// which is exactly what a one-shot CLI invocation is.
 func (m *Computer) Input(ctx context.Context, actions ...proto.ComputerAction) error {
+	m.mu.Lock()
+	synced := m.synced
+	m.mu.Unlock()
+	if !synced {
+		if _, err := m.Get(ctx); err != nil {
+			return err
+		}
+	}
 	m.mu.Lock()
 	m.iseq++
 	iseq := m.iseq

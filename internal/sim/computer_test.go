@@ -176,23 +176,77 @@ func TestComputerInputDeduplicatesByISeq(t *testing.T) {
 	if first != 1 {
 		t.Fatalf("first type produced %d inserts", first)
 	}
-	// Replay the way a client that lost its response and reconnected does: a
-	// fresh handle restarts its sequence at 1, which the node already applied.
-	for i := 0; i < 3; i++ {
-		replay := c.Computer(ws.ID, cmp.ID())
-		if err := replay.Input(ctx, proto.ComputerAction{Kind: proto.ComputerActionType, Text: "again"}); err != nil {
-			t.Fatalf("replay %d: %v", i, err)
-		}
+	// Two handles addressed by id, each synced to the same point, send the
+	// same sequence. The node applies the first and drops the second: that is
+	// the dedup, proved without pretending a new action is a replay.
+	left, right := c.Computer(ws.ID, cmp.ID()), c.Computer(ws.ID, cmp.ID())
+	if _, err := left.Get(ctx); err != nil {
+		t.Fatalf("sync left: %v", err)
 	}
-	if got := countInserts(); got != first {
-		t.Fatalf("replayed input applied %d extra times", got-first)
+	if _, err := right.Get(ctx); err != nil {
+		t.Fatalf("sync right: %v", err)
 	}
-	// A new sequence still advances, so dedupe is not a stuck computer.
-	if err := cmp.Type(ctx, "twice"); err != nil {
-		t.Fatalf("second type: %v", err)
+	if err := left.Input(ctx, proto.ComputerAction{Kind: proto.ComputerActionType, Text: "again"}); err != nil {
+		t.Fatalf("left input: %v", err)
+	}
+	if err := right.Input(ctx, proto.ComputerAction{Kind: proto.ComputerActionType, Text: "again"}); err != nil {
+		t.Fatalf("right input: %v", err)
 	}
 	if got := countInserts(); got != first+1 {
-		t.Fatalf("a fresh sequence applied %d times", got-first)
+		t.Fatalf("the duplicated sequence applied %d times, want 1", got-first)
+	}
+	// A handle addressed by id resumes rather than restarting, which is what
+	// a one-shot CLI invocation is. Each of these is a new action and each
+	// must land exactly once. See ADR 0094.
+	before := countInserts()
+	for i := 0; i < 3; i++ {
+		fresh := c.Computer(ws.ID, cmp.ID())
+		if err := fresh.Input(ctx, proto.ComputerAction{Kind: proto.ComputerActionType, Text: "more"}); err != nil {
+			t.Fatalf("fresh handle %d: %v", i, err)
+		}
+	}
+	if got := countInserts(); got != before+3 {
+		t.Fatalf("three fresh handles applied %d actions, want 3", got-before)
+	}
+	// The original handle's counter fell behind while other handles advanced
+	// the node's. It is still deduplicated rather than re-applied, which is the
+	// guarantee a retried batch depends on.
+	if err := cmp.Type(ctx, "twice"); err != nil {
+		t.Fatalf("stale handle input: %v", err)
+	}
+	if got := countInserts(); got != before+3 {
+		t.Fatalf("a sequence the node already applied landed %d extra times", got-before-3)
+	}
+}
+
+// A resumed handle reports the sequence it adopted, so a caller can see that
+// it is continuing rather than restarting. See ADR 0094.
+func TestComputerGetReportsTheAppliedInputSequence(t *testing.T) {
+	fake := fakecdp.New()
+	defer fake.Close()
+
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("c1")
+	ws := mustWS(t, c, proto.WorkspaceSpec{})
+	ctx := ctxT(t, 90*time.Second)
+	cmp := attachComputer(t, ctx, c, ws.ID, fake.Port())
+	defer func() { _ = cmp.Close(ctx) }()
+
+	if got, err := cmp.Get(ctx); err != nil || got.LastInputSeq != 0 {
+		t.Fatalf("before any input: %+v %v", got, err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := cmp.Type(ctx, "x"); err != nil {
+			t.Fatalf("type %d: %v", i, err)
+		}
+	}
+	got, err := cmp.Get(ctx)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.LastInputSeq != 2 {
+		t.Fatalf("last_iseq = %d, want 2", got.LastInputSeq)
 	}
 }
 
