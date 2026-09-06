@@ -2242,6 +2242,9 @@
         },
         "oldest": {
           "type": "integer"
+        },
+        "reason": {
+          "type": "string"
         }
       },
       "required": [

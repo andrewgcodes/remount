@@ -21,6 +21,8 @@ make conformance # hostile-input and failure-model packages under -race
 make fuzz       # every registered fuzz target (FUZZTIME=... to extend)
 make public-api # compile the SDK from an external module
 make dist       # static binaries for every platform
+make protogen   # regenerate the JSON Schema and Python/TypeScript types from internal/proto
+make protogen-check # byte-compare those generated files; the CI gate
 ```
 
 Tests must pass under `-race`. Several real bugs in this codebase were found

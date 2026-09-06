@@ -145,6 +145,25 @@ Container publish, keyless signing and release uploads happen only in the
 automatic `workflow_run` path after the tag workflow succeeds; a manual
 dispatch is verification-only. None were invoked while preparing these files.
 
+## What a release promises, and what changed
+
+Two documents carry the parts of a release that exist today even though no tag
+does.
+
+- [`CHANGELOG.md`](../CHANGELOG.md) at the repository root records user-visible
+  changes in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) form.
+  Because nothing has been tagged, every entry is under `Unreleased`; the first
+  tag moves that section into a dated one.
+- [Compatibility policy](compatibility-policy.md) states which surfaces are
+  public — the Go `api` and `client` packages, the `remount` Python package,
+  the `@remount/sdk` npm package, the wire protocol with its negotiated
+  capabilities, and the CLI's documented flags and `--json` shapes — what
+  semantic versioning means for each, how the wire format stays additive within
+  a version, how a deprecation is announced, and the support window.
+
+Neither changes the disposition above: tagging, signing and publication remain
+deferred.
+
 ## Primary references
 
 - [Go versioned installs](https://go.dev/cmd/go/#hdr-Compile_and_install_packages_and_dependencies)

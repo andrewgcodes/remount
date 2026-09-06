@@ -658,6 +658,7 @@ export interface Error {
   "code": string;
   "msg"?: string;
   "oldest"?: number;
+  "reason"?: string;
 }
 
 export interface Event {
