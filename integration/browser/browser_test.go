@@ -46,15 +46,40 @@ const defaultImage = "remount-browser:local"
 // therefore the file:// prefix the page is served from.
 const mountPath = "/work"
 
+// allowedHost is the real public destination the lane browses to through the
+// broker. It is the one host this lane's node allows, so reaching it proves
+// the whole path: Chromium answers the broker's proxy challenge with the
+// workspace capability, the broker authenticates it, host policy permits the
+// destination, and the page loads (ADR 0095).
+const allowedHost = "example.com"
+
 // deniedHost is the unbound destination the egress step navigates to. It is
-// deliberately a host nothing in this lane allows.
-const deniedHost = "https://example.com/"
+// deliberately a host nothing in this lane allows, and it must now be refused
+// by host policy rather than for want of proxy authentication.
+const deniedHost = "example.org"
 
 func imageName() string {
 	if name := os.Getenv("REMOUNT_BROWSER_IMAGE"); name != "" {
 		return name
 	}
 	return defaultImage
+}
+
+// allowedHostName is the destination the lane browses to. It is overridable
+// because a host that cannot reach the public internet can still run the lane
+// against a destination it can reach.
+func allowedHostName() string {
+	if name := os.Getenv("REMOUNT_BROWSER_ALLOWED_HOST"); name != "" {
+		return name
+	}
+	return allowedHost
+}
+
+func deniedHostName() string {
+	if name := os.Getenv("REMOUNT_BROWSER_DENIED_HOST"); name != "" {
+		return name
+	}
+	return deniedHost
 }
 
 // TestB34BrowserComputerConformance drives one browser through every computer
@@ -192,18 +217,50 @@ func TestB34BrowserComputerConformance(t *testing.T) {
 	t.Logf("step download: %s -> %s (%d bytes), artifact bytes verified",
 		download.Filename, download.Artifact, download.Bytes)
 
+	// --- brokered browsing to an ALLOWED host actually loads -------------
+	//
+	// Chromium never volunteers Proxy-Authorization; it waits to be
+	// challenged. The node answers that challenge over CDP with the same
+	// workspace capability the browser's HTTPS_PROXY carries, so this step
+	// fails outright if that answer is missing, wrong, or never reaches the
+	// target that issued the request.
+	allowed := allowedHostName()
+	web, err := computer.Navigate(ctx, "https://"+allowed+"/")
+	if err != nil {
+		t.Fatalf("navigate to the allowed host %s: %v", allowed, err)
+	}
+	if web.Status != proto.ComputerNavigateLoaded {
+		t.Fatalf("navigate to %s status = %q, want %q", allowed, web.Status, proto.ComputerNavigateLoaded)
+	}
+	if web.Title == "" {
+		t.Fatalf("navigate to %s loaded no title; the page did not come from the network", allowed)
+	}
+	if status := navigationStatus(t, ctx, computer); status != 200 {
+		t.Fatalf("navigate to %s reported HTTP %d, want 200", allowed, status)
+	}
+	if got := evalString(t, ctx, computer, "document.location.protocol"); got != "https:" {
+		t.Fatalf("the allowed page is %s, not https", got)
+	}
+	allowedEgress := waitEgress(t, ctx, c, ws.ID, proto.EvEgressAllowed, allowed, "allowed")
+	t.Logf("step allowed egress: %q loaded over https with HTTP 200, broker recorded decision=%v host=%v",
+		web.Title, allowedEgress["decision"], allowedEgress["host"])
+
 	// --- navigation to an unbound host is refused, and recorded ----------
-	_, navErr := computer.Navigate(ctx, deniedHost)
+	denied := deniedHostName()
+	_, navErr := computer.Navigate(ctx, "https://"+denied+"/")
 	if navErr == nil {
-		t.Fatalf("navigate to %s succeeded; the broker allows no such destination", deniedHost)
+		t.Fatalf("navigate to %s succeeded; the broker allows no such destination", denied)
 	}
 	if code := codeOf(navErr); code != proto.CodeDenied {
-		t.Fatalf("navigate to %s = code %q (%v), want %q", deniedHost, code, navErr, proto.CodeDenied)
+		t.Fatalf("navigate to %s = code %q (%v), want %q", denied, code, navErr, proto.CodeDenied)
 	}
 	if reason := proto.ErrorReason(navErr); reason != proto.ReasonNavigationDenied {
-		t.Fatalf("navigate to %s = reason %q, want %q", deniedHost, reason, proto.ReasonNavigationDenied)
+		t.Fatalf("navigate to %s = reason %q, want %q", denied, reason, proto.ReasonNavigationDenied)
 	}
-	egress := waitEgress(t, ctx, c, ws.ID, "example.com")
+	// The refusal must be host policy, not a missing capability: an
+	// unauthenticated-only record would mean the browser never identified
+	// itself, which refuses every destination equally and proves nothing.
+	egress := waitEgress(t, ctx, c, ws.ID, proto.EvEgressDenied, denied, "denied")
 	t.Logf("step egress: navigate denied, broker recorded decision=%v reason=%q host=%v",
 		egress["decision"], egress["reason"], egress["host"])
 
@@ -275,7 +332,24 @@ func requireDocker(t *testing.T, ctx context.Context, image string) *workspace.D
 			image, err, image, out)
 	}
 	requireContainerNetwork(t, probe, image)
+	requireAllowedHostReachable(t, probe)
 	return d
+}
+
+// requireAllowedHostReachable proves this host can reach the destination the
+// allowed-egress step browses to. The broker dials out from here, so a host
+// with no route to the public internet is a missing prerequisite and must be
+// named as one: reported as a failure it would read as a proxy-auth defect.
+func requireAllowedHostReachable(t *testing.T, ctx context.Context) {
+	t.Helper()
+	host := allowedHostName()
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, "443"))
+	if err != nil {
+		t.Skipf("unavailable: this host cannot reach %s:443 (%v); the broker dials the allowed "+
+			"destination from here, so set REMOUNT_BROWSER_ALLOWED_HOST to one it can reach", host, err)
+	}
+	_ = conn.Close()
 }
 
 // requireContainerNetwork proves this host can reach a container's own address,
@@ -319,8 +393,10 @@ func requireContainerNetwork(t *testing.T, ctx context.Context, image string) {
 }
 
 // lane runs a control plane and one docker-backed node in this process and
-// returns a connected client. Its Allow list is empty on purpose: the egress
-// step needs a destination nothing permits.
+// returns a connected client. Exactly one host is allowed: the egress steps
+// need one destination policy permits and one it does not, and a lane that
+// allowed both or neither could not tell a policy decision from a missing
+// capability.
 func lane(t *testing.T, docker *workspace.Docker, image string) *client.Client {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -353,6 +429,7 @@ func lane(t *testing.T, docker *workspace.Docker, image string) *client.Client {
 		}),
 		Labels:      map[string]string{"browser": "true"},
 		Backends:    workspace.NewRegistry(docker),
+		Allow:       []string{allowedHostName()},
 		ArtifactURL: endpoint + "/v1/artifacts",
 		// The browser reaches the broker by name, and the name that works is a
 		// property of the docker host rather than of Remount.
@@ -686,30 +763,67 @@ func waitEvent(t *testing.T, ctx context.Context, c *client.Client, wsID, typ st
 	return proto.Event{}
 }
 
-// waitEgress returns the broker's own record of the refused destination. The
-// broker's CONNECT handler is opaque by design, so the host is all it can see
-// and all this asserts.
-func waitEgress(t *testing.T, ctx context.Context, c *client.Client, wsID, host string) map[string]any {
+// waitEgress returns the broker's own record of one decision about one
+// destination. The broker's CONNECT handler is opaque by design, so the host
+// is all it can see and all this asserts.
+//
+// The decision is part of what is waited for, not something read off the first
+// event that mentions the host. A proxy challenge is itself recorded as an
+// `unauthenticated` egress.denied — that is the 407 the browser is answered
+// with, not a refusal — so a test that took the first egress.denied for a host
+// would assert the handshake instead of the policy verdict, and would do so
+// differently depending on whether the browser had already cached the
+// capability for this proxy.
+func waitEgress(t *testing.T, ctx context.Context, c *client.Client, wsID, typ, host, decision string) map[string]any {
 	t.Helper()
 	deadline := time.Now().Add(60 * time.Second)
+	seen := map[string]int{}
 	for time.Now().Before(deadline) && ctx.Err() == nil {
 		events, err := c.ReadEvents(ctx, 0, wsID)
 		if err != nil {
 			t.Fatalf("read events: %v", err)
 		}
 		for _, e := range events {
-			if e.Type != proto.EvEgressDenied {
+			if e.Type != typ {
 				continue
 			}
 			payload := decodePayload(t, e)
-			if name, _ := payload["host"].(string); strings.Contains(name, host) {
+			name, _ := payload["host"].(string)
+			if !strings.Contains(name, host) {
+				continue
+			}
+			got, _ := payload["decision"].(string)
+			seen[got]++
+			if got == decision {
 				return payload
 			}
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatalf("no egress.denied event named %s", host)
+	t.Fatalf("no %s event for %s with decision %q; the decisions recorded for it were %v",
+		typ, host, decision, seen)
 	return nil
+}
+
+// navigationStatus reads the HTTP status the browser recorded for the document
+// itself. A title and a load event can both come from an error page, so the
+// status is what separates "the network answered" from "something rendered".
+// A build that does not report one answers 0, which is a failed assertion
+// rather than a quietly skipped one.
+func navigationStatus(t *testing.T, ctx context.Context, m *client.Computer) int {
+	t.Helper()
+	raw, err := m.Eval(ctx, `(function () {
+	  var e = performance.getEntriesByType("navigation");
+	  return (e.length && typeof e[0].responseStatus === "number") ? e[0].responseStatus : 0;
+	})()`)
+	if err != nil {
+		t.Fatalf("eval navigation status: %v", err)
+	}
+	var status int
+	if err := json.Unmarshal(raw, &status); err != nil {
+		t.Fatalf("decode navigation status from %s: %v", raw, err)
+	}
+	return status
 }
 
 func decodePayload(t *testing.T, e proto.Event) map[string]any {

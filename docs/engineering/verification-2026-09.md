@@ -2759,6 +2759,10 @@ either. Closing that needs the node to answer the browser's proxy auth
 challenge over CDP (`Fetch.authRequired` + `Fetch.continueWithAuth`); it is not
 done here and no claim of usable brokered browsing is made.
 
+> Closed on the same day by the next entry, "Brokered browsing to an allowed
+> host — 2026-09-05". This paragraph stays as the record of what this run
+> actually showed.
+
 ### The CLI, driven live
 
 A `remount` binary cross-compiled for `linux/arm64` was run inside the same VM
@@ -2815,3 +2819,113 @@ One host, one architecture, one Chromium build, and the docker backend only.
 gVisor and firecracker computer sessions are untested here. Docker remains
 cooperative isolation. `linux/amd64`, a published browser image, and any CI
 lane for this gate are absent.
+
+## Brokered browsing to an allowed host — 2026-09-05
+
+**Status: verified live in the Colima Linux VM. The egress caveat recorded
+above is closed: a browser now reaches the hosts the broker allows, and an
+unbound host is refused by host policy rather than for want of proxy
+authentication.**
+
+Candidate: `claude/gap-brief-2026-09-06` at `4e78a52` plus the change this
+entry lands with ([ADR 0095](../adr/0095-browser-proxy-auth-through-cdp.md)).
+Go 1.27.1. macOS 26.3 arm64; Colima VM kernel
+`Linux colima 6.8.0-117-generic #117-Ubuntu SMP PREEMPT_DYNAMIC Thu May 7
+17:26:37 UTC 2026 aarch64`, its own docker daemon. Image
+`remount-browser:local` (`cc31ada10723`, 1.13 GB, `linux/arm64`), which reports
+`Chromium 152.0.7977.82 built on Debian GNU/Linux 12 (bookworm)`.
+
+The VM has public internet — `colima ssh -- curl -sSI https://example.com`
+answered `HTTP/2 200` — so the lane browses to a real host rather than to a
+fake upstream. The node's allow list carries exactly one host, so the lane can
+tell a policy verdict from a missing capability.
+
+### Commands
+
+```sh
+./scripts/browser-conformance.sh build                 # on the macOS host
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+  go test -c -o browser.test ./integration/browser/
+colima ssh -- <worktree>/browser.test \
+  -test.run '^TestB34BrowserComputerConformance$' -test.v -test.timeout=20m
+```
+
+`--- PASS: TestB34BrowserComputerConformance (3.57s)`. The lane was run three
+times across the change (2.72 s, 4.35 s, 3.57 s); every run passed.
+
+### Per-step result
+
+| Step | Result |
+|---|---|
+| `computer.create`, default launch | verified: `Chrome/152.0.7977.82`, viewport 1280x720 |
+| `computer.navigate` to `file:///work/page.html` | verified: status `loaded`, title `Remount browser conformance` |
+| click, screenshot, typing into input/contenteditable/iframe | verified: unchanged from the entry above, 7,655-byte PNG before and 8,093-byte after, digests differ |
+| download becomes an artifact | verified: `remount-conformance.txt` published as `art_sha256:1bd90ba6…`, 37 bytes, archive bytes compared |
+| **`computer.navigate` to the ALLOWED host** | **verified: `https://example.com/` returned status `loaded`, title `Example Domain`, `performance.getEntriesByType("navigation")[0].responseStatus` = `200`, `document.location.protocol` = `https:`, and the broker recorded `egress.allowed` for `example.com:443`** |
+| **`computer.navigate` to the UNBOUND host** | **verified: `https://example.org/` failed `denied`/`navigation_denied`, and the broker recorded `egress.denied` with decision `denied`, reason `CONNECT requires an explicit allow or typed CONNECT rule`, host `example.org:443` — host policy, not `unauthenticated`** |
+| killing the browser | verified: `closed`/`browser_crashed` on `computer.get` and on a later screenshot; `computer.degraded` and `computer.closed` both emitted |
+| sleep/wake | verified: `computer.get` returned `not_found`, `.remount/browser/default` absent, `page.html` survived |
+
+### The CLI, driven by hand
+
+A `linux/arm64` `remount` was run inside the same VM against
+`remount standalone --backend docker --allow example.com`:
+
+```
+remount ws create --image remount-browser:local --backend docker
+remount computer create $WS
+  -> cmp_… s_… 1280x720 Chrome/152.0.7977.82
+remount computer navigate $WS $CMP https://example.com/
+  -> loaded  https://example.com/  Example Domain
+remount computer eval --json $WS $CMP 'document.title'
+  -> "Example Domain"
+remount computer eval --json $WS $CMP 'performance.getEntriesByType("navigation")[0].responseStatus'
+  -> 200
+remount computer eval --json $WS $CMP 'document.location.protocol'
+  -> "https:"
+remount computer screenshot --out shot.png $WS $CMP
+  -> 17,117 bytes at 1280x720
+remount computer navigate $WS $CMP https://example.org/
+  -> remount: denied: navigate https://example.org/: net::ERR_TUNNEL_CONNECTION_FAILED (exit 1)
+```
+
+The workspace's own egress record for that run held one `allowed` decision for
+`example.com:443` and `denied` decisions for `example.org:443`.
+
+### Two things an operator will see, stated exactly
+
+- **A `407` shows up as an `unauthenticated` `egress.denied`.** Chromium cannot
+  present the capability before it is challenged, so the first `CONNECT` of a
+  proxy connection is refused and the retry that carries the credential is the
+  `allowed` record beside it. An `unauthenticated` record for a host that also
+  has an `allowed` record is the handshake, not a refusal. The conformance
+  assertion waits for the decision it means rather than for the first event
+  naming the host, so it reads the same whichever navigation ran first.
+- **Chromium's own background traffic cannot be authenticated at all.** It is
+  issued by the network service outside any page target, so CDP interception
+  never sees it. It is denied, which is containment working. Measured on this
+  host: 14 `unauthenticated` denials per session against Google endpoints
+  before, 10 after adding `--disable-background-networking`,
+  `--disable-component-update`, `--disable-default-apps`, `--disable-sync`,
+  `--metrics-recording-only`, `--no-first-run` and `--no-default-browser-check`
+  to the default launch. Reduced, not eliminated; what remains stays denied.
+
+### Cleanup
+
+The lane's own cleanup destroyed its workspace and asserted
+`docker ps -aq --filter label=remount.workspace=<id>` was empty. The CLI smoke
+closed its computer, destroyed its workspace and left `remount ws ls` empty.
+Afterwards, inside the VM, `docker ps -aq --filter label=remount.workspace`
+returned `0` and `docker ps -aq` returned `0`. The standalone process was
+killed and `/tmp/remount-cli-smoke` removed; the cross-compiled `browser.test`
+and `remount` binaries were deleted from the worktree. No credential was used,
+printed or recorded — the lane needs none, and the only credential in play is
+the per-workspace broker capability the node generates and never logs.
+
+### What this still does not prove
+
+One host, one architecture, one Chromium build, the docker backend only, and
+one public destination. gVisor and firecracker computer sessions remain
+untested. Nothing here proves per-URL policy, which the opaque CONNECT tunnel
+makes impossible (ADR 0088), and nothing here proves a site that authenticates
+its *own* users works: an origin challenge is deliberately cancelled.
