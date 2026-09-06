@@ -143,7 +143,7 @@ const (
 	ReasonNavigationDenied         = "navigation_denied"          // denied: egress policy blocked a browser navigation
 	ReasonProfileCorrupt           = "profile_corrupt"            // conflict: a persisted browser profile could not be opened
 	ReasonDownloadBlocked          = "download_blocked"           // denied: policy refused a browser download
-	ReasonProfileUnschedulable     = "profile_unschedulable"      // unsupported: no node currently satisfies the runtime profile
+	ReasonProfileUnschedulable     = "profile_unschedulable"      // denied or unsupported: no node currently satisfies the runtime profile
 )
 
 // Err builds an *Error.
