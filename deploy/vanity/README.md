@@ -6,9 +6,9 @@ resolve it by fetching `https://remount.dev/remount?go-get=1` and reading the
 GitHub repository. `install.sh` is served from the same host so the documented
 one-liner works.
 
-This is a static site with no build step and no runtime. It is the only
-piece of Remount that is hosted, and it hosts nothing but two meta tags and a
-redirect.
+This is a static site with no build step and no runtime: one HTML page
+that carries the meta tags and a short developer-facing landing page, plus
+the installer rewrite. It is the only piece of Remount that is hosted.
 
 ## Deploy on Vercel
 

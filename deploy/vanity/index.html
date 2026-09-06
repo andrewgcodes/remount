@@ -2,14 +2,160 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>remount.dev/remount</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Remount — a durable computer for AI agents</title>
+  <meta name="description" content="Remount is a self-hosted runtime that gives an AI agent a real computer: a workspace it can keep, move, sleep and reattach to, with credentials it never sees. One Go binary, one protocol, Apache-2.0.">
   <meta name="go-import" content="remount.dev/remount git https://github.com/andrewgcodes/remount">
   <meta name="go-source" content="remount.dev/remount https://github.com/andrewgcodes/remount https://github.com/andrewgcodes/remount/tree/main{/dir} https://github.com/andrewgcodes/remount/blob/main{/dir}/{file}#L{line}">
-  <meta http-equiv="refresh" content="0; url=https://github.com/andrewgcodes/remount">
+  <meta property="og:title" content="Remount">
+  <meta property="og:description" content="A durable computer for AI agents. Self-hosted, one binary, one protocol.">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b0f14'/%3E%3Cpath d='M9 22V10h6.5a4 4 0 0 1 0 8H12l6 4' fill='none' stroke='%237ee787' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <style>
+    :root {
+      --bg: #0b0f14; --bg2: #10161d; --line: #1f2a36; --fg: #d7dee7; --dim: #8b98a8;
+      --accent: #7ee787; --accent2: #79c0ff; --warn: #f0b429; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html { background: var(--bg); }
+    body { margin: 0; color: var(--fg); font: 16px/1.6 var(--sans); background: var(--bg); }
+    a { color: var(--accent2); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, pre { font-family: var(--mono); font-size: 0.92em; }
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+    header { border-bottom: 1px solid var(--line); }
+    header .wrap { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+    .brand { font-family: var(--mono); font-weight: 600; color: var(--fg); letter-spacing: 0.02em; }
+    .brand span { color: var(--accent); }
+    nav a { margin-left: 22px; color: var(--dim); font-size: 14px; }
+    nav a:hover { color: var(--fg); text-decoration: none; }
+    .hero { padding: 72px 0 40px; }
+    .hero h1 { font-size: clamp(30px, 4.6vw, 48px); line-height: 1.12; margin: 0 0 18px; letter-spacing: -0.01em; }
+    .hero h1 em { font-style: normal; color: var(--accent); }
+    .hero p { font-size: 18px; color: var(--dim); max-width: 720px; margin: 0 0 26px; }
+    .install { display: grid; gap: 10px; max-width: 760px; }
+    .cmd { display: flex; align-items: center; gap: 12px; background: var(--bg2); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; font-family: var(--mono); font-size: 14px; overflow-x: auto; white-space: nowrap; }
+    .cmd .p { color: var(--accent); user-select: none; }
+    .cmd .c { color: var(--dim); }
+    .badges { margin-top: 18px; display: flex; gap: 10px; flex-wrap: wrap; font-family: var(--mono); font-size: 12px; color: var(--dim); }
+    .badges span { border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; }
+    section { padding: 40px 0; border-top: 1px solid var(--line); }
+    h2 { font-size: 22px; margin: 0 0 20px; letter-spacing: -0.01em; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 14px; }
+    .card { background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+    .card h3 { margin: 0 0 8px; font-size: 15px; font-family: var(--mono); color: var(--accent2); font-weight: 600; }
+    .card p { margin: 0; color: var(--dim); font-size: 14.5px; }
+    .diff { list-style: none; padding: 0; margin: 0; display: grid; gap: 12px; }
+    .diff li { padding-left: 18px; position: relative; color: var(--dim); }
+    .diff li::before { content: "›"; position: absolute; left: 0; color: var(--accent); }
+    .diff b { color: var(--fg); font-weight: 600; }
+    pre { margin: 0; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; overflow-x: auto; line-height: 1.5; font-size: 13.5px; }
+    pre .k { color: var(--accent); } pre .c { color: var(--dim); } pre .s { color: var(--warn); }
+    .two { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    @media (max-width: 800px) { .two { grid-template-columns: 1fr; } }
+    .diagram { font-size: 12.5px; color: var(--dim); }
+    footer { border-top: 1px solid var(--line); padding: 28px 0 40px; color: var(--dim); font-size: 14px; }
+    footer .wrap { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+  </style>
 </head>
 <body>
-  <p>Remount, a self-hosted runtime for AI agents. Source and documentation:
-  <a href="https://github.com/andrewgcodes/remount">github.com/andrewgcodes/remount</a>.</p>
-  <p>Go import path: <code>remount.dev/remount</code>.</p>
+<header>
+  <div class="wrap">
+    <a class="brand" href="/">remount<span>.dev</span></a>
+    <nav>
+      <a href="https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md">Docs</a>
+      <a href="https://github.com/andrewgcodes/remount/blob/main/spec/PROTOCOL.md">Protocol</a>
+      <a href="https://github.com/andrewgcodes/remount/blob/main/docs/adr/README.md">Decisions</a>
+      <a href="https://github.com/andrewgcodes/remount">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="hero">
+    <h1>A durable computer for <em>AI agents</em>.</h1>
+    <p>Remount gives an agent a workspace it can keep: a filesystem and the processes in it, on a machine you control. Snapshot it, move it to a GPU box, put it to sleep, reattach to a command that is still running, and call APIs with keys the workspace never sees. One static Go binary, one wire protocol, self-hosted, Apache-2.0.</p>
+    <div class="install">
+      <div class="cmd"><span class="p">$</span><span>go install remount.dev/remount/cmd/remount@main</span></div>
+      <div class="cmd"><span class="p">$</span><span>curl -fsSL https://get.remount.dev/install.sh | sh</span><span class="c"># once a release is tagged</span></div>
+    </div>
+    <div class="badges">
+      <span>go · python · typescript</span><span>process · docker · gvisor · firecracker</span><span>linux · macos · windows client</span><span>no hosted service</span>
+    </div>
+  </div>
+
+  <section>
+    <h2>What you can do with it</h2>
+    <div class="grid">
+      <div class="card"><h3>reattach, never lose output</h3><p>Run a coding agent for hours. Close the laptop, reopen it, <code>attach</code>, and read what you missed. The session lives on the node, not in your terminal, and a dropped range is an explicit gap.</p></div>
+      <div class="card"><h3>move a workspace mid-task</h3><p>Start on your laptop and <code>ws move</code> to a GPU box. The filesystem is snapshotted and restored; files and policy follow, and a stale client cannot act on the old placement.</p></div>
+      <div class="card"><h3>keys the agent never sees</h3><p>The workspace holds a placeholder. The node's broker substitutes the real key only for the hosts that binding allows, records every use, and a revocation reaches a live workspace within one renewal.</p></div>
+      <div class="card"><h3>background work with a deadline</h3><p>A lease keeps a workspace awake until a deadline stored in the control plane. It survives your own service crashing, then sleeps the workspace instead of billing you forever.</p></div>
+      <div class="card"><h3>a browser inside the workspace</h3><p>Navigate, screenshot, click, type, and download files that become artifacts. Browser traffic goes through the same egress policy as everything else.</p></div>
+      <div class="card"><h3>isolation you can check</h3><p>A node declares a runtime profile and refuses to start unless its backends can meet it. <code>conformance --profile</code> reports every check as pass, fail or unavailable, never healthy by omission.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>How it differs from a sandbox API</h2>
+    <ul class="diff">
+      <li><b>A session is a log, not a socket.</b> Output is kept with sequence numbers; clients replay from where they were.</li>
+      <li><b>A workspace is a value.</b> Snapshot, move, sleep and wake, with every grant bound to a generation.</li>
+      <li><b>The workspace is trusted with nothing.</b> Secrets, policy and lifecycle live in the node and the control plane.</li>
+      <li><b>Lifecycle belongs to the control plane.</b> Leases and idle policy are durable timers, not a <code>setTimeout</code> in your worker.</li>
+      <li><b>Everything is an event</b>, committed in the same transaction as the state it describes.</li>
+      <li><b>Nothing is hosted.</b> The protocol is public; replace the reference implementation if you can do better.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Quick start</h2>
+    <div class="two">
+      <pre><span class="c"># build, then run a control plane and one node in one process</span>
+<span class="k">make</span> build
+./remount standalone --data ./data &amp;
+<span class="k">export</span> REMOUNT_SERVER=http://127.0.0.1:7443
+
+WS=$(./remount ws create --name hello)
+./remount exec $WS -- sh -c <span class="s">'echo hello from $(hostname)'</span>
+./remount sh $WS                 <span class="c"># interactive shell, real pty</span>
+./remount fs write $WS notes.md &lt; README.md
+
+<span class="c"># start something long, ^C, come back later</span>
+./remount attach $WS &lt;session-id&gt; --from 0</pre>
+      <pre class="diagram">   your laptop                  control plane                 a GPU box
+  ┌────────────┐   outbound    ┌──────────────┐   outbound   ┌────────────┐
+  │  remount   │──────────────▶│  claim queue │◀─────────────│  remount   │
+  │    up      │   wss:443     │  event log   │   wss:443    │    up      │
+  └────────────┘               │  policy      │              └────────────┘
+                               │  bindings    │
+  ┌────────────┐               └──────────────┘
+  │  remount   │──────────────────────▲
+  │  exec/sh   │   frames relayed, never interpreted
+  └────────────┘
+
+Nodes and clients both dial the control plane; nothing
+needs a public inbound port.</pre>
+    </div>
+  </section>
+
+  <section>
+    <h2>Read next</h2>
+    <div class="grid">
+      <div class="card"><h3><a href="https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md">docs/using-remount.md</a></h3><p>From a first workspace to a moved one, with every command.</p></div>
+      <div class="card"><h3><a href="https://github.com/andrewgcodes/remount/blob/main/docs/design.md">docs/design.md</a></h3><p>Data model, failure model, threat model, performance budget.</p></div>
+      <div class="card"><h3><a href="https://github.com/andrewgcodes/remount/blob/main/spec/PROTOCOL.md">spec/PROTOCOL.md</a></h3><p>The wire protocol: one frame type, negotiated capabilities, stable error codes and reasons.</p></div>
+      <div class="card"><h3><a href="https://github.com/andrewgcodes/remount/blob/main/docs/security-profiles.md">docs/security-profiles.md</a></h3><p>The generated support matrix by operating system, backend and runtime profile.</p></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Apache-2.0 · <a href="https://github.com/andrewgcodes/remount">github.com/andrewgcodes/remount</a></span>
+    <span><code>import "remount.dev/remount/client"</code></span>
+  </div>
+</footer>
 </body>
 </html>
