@@ -928,7 +928,9 @@ app, region, network, server URL, enrollment, and binary metadata.
 
 Treat a lane whose prerequisites are absent as **unavailable**, not healthy.
 The provider registry and pool lifecycle are covered in
-[`operations.md`](operations.md#provider-backed-node-pools).
+[`operations.md`](operations.md#provider-backed-node-pools), with per-vendor
+notes for E2B, ix.dev and Modal, including why a production control plane
+only admits `--backend gvisor` pool machines.
 
 ## Verify outcomes and clean up
 

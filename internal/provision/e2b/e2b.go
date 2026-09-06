@@ -2,11 +2,15 @@
 package e2b
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -17,9 +21,15 @@ import (
 
 const defaultEndpoint = "https://api.e2b.app"
 
-// Config configures an E2B template whose startup reads the REMOUNT_* env and
-// execs the candidate node binary. Templates, rather than the API response,
-// own that boot-time behavior.
+// Config configures an E2B template whose start command waits for the
+// bootstrap file this driver delivers, sources it, and execs the node binary.
+//
+// E2B snapshots a template after its start command has run, and every sandbox
+// resumes from that snapshot, so the start command never sees environment
+// variables passed at sandbox creation. The driver therefore writes the
+// REMOUNT_* bootstrap values to BootstrapPath through the sandbox's envd file
+// API immediately after creation; images/e2b holds the template that consumes
+// it.
 type Config struct {
 	Endpoint        string
 	APIKey          string
@@ -28,7 +38,28 @@ type Config struct {
 	TimeoutSeconds  int
 	ProviderRetries int
 	Network         *NetworkConfig
+	// SandboxDomain is the domain sandboxes are reachable under
+	// (port-sandboxID-clientID.<domain>). Empty derives it from Endpoint by
+	// dropping a leading "api." label.
+	SandboxDomain string
+	// EnvdEndpoint, when set, replaces the per-sandbox envd URL for every
+	// sandbox. Tests point it at a fake; production leaves it empty.
+	EnvdEndpoint string
+	// BootstrapPath is where the bootstrap file lands inside the sandbox.
+	// Empty means DefaultBootstrapPath.
+	BootstrapPath string
+	// BootstrapUser is the sandbox user envd writes the file as. Empty means
+	// "user", the E2B default template account.
+	BootstrapUser string
 }
+
+// DefaultBootstrapPath is where the driver writes the bootstrap file unless
+// Config.BootstrapPath overrides it. The template's start command polls this
+// path, so the two must agree.
+const DefaultBootstrapPath = "/home/user/remount-bootstrap.env"
+
+// envdPort is the port envd, the E2B in-sandbox agent, listens on.
+const envdPort = 49983
 
 // NetworkConfig is optional defense-in-depth E2B egress policy. It never
 // contributes to the workspace backend's advertised security capabilities.
@@ -40,11 +71,16 @@ type NetworkConfig struct {
 
 // Driver provisions E2B sandboxes through its public REST API.
 type Driver struct {
-	api      *providerutil.HTTP
-	template string
-	timeout  int
-	network  *NetworkConfig
-	mu       sync.Mutex
+	api           *providerutil.HTTP
+	envd          *http.Client
+	template      string
+	timeout       int
+	network       *NetworkConfig
+	sandboxDomain string
+	envdEndpoint  string
+	bootstrapPath string
+	bootstrapUser string
+	mu            sync.Mutex
 }
 
 // New validates config without contacting E2B.
@@ -75,7 +111,34 @@ func New(config Config) (*Driver, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Driver{api: api, template: config.Template, timeout: timeout, network: network}, nil
+	domain := config.SandboxDomain
+	if domain == "" {
+		parsed, err := url.Parse(config.Endpoint)
+		if err != nil || parsed.Hostname() == "" {
+			return nil, errors.New("e2b: endpoint must be a URL")
+		}
+		domain = strings.TrimPrefix(parsed.Hostname(), "api.")
+	}
+	bootstrapPath := config.BootstrapPath
+	if bootstrapPath == "" {
+		bootstrapPath = DefaultBootstrapPath
+	}
+	if !strings.HasPrefix(bootstrapPath, "/") {
+		return nil, errors.New("e2b: bootstrap path must be absolute")
+	}
+	bootstrapUser := config.BootstrapUser
+	if bootstrapUser == "" {
+		bootstrapUser = "user"
+	}
+	envd := config.HTTPClient
+	if envd == nil {
+		envd = &http.Client{Timeout: 30 * time.Second}
+	}
+	return &Driver{
+		api: api, envd: envd, template: config.Template, timeout: timeout, network: network,
+		sandboxDomain: domain, envdEndpoint: config.EnvdEndpoint,
+		bootstrapPath: bootstrapPath, bootstrapUser: bootstrapUser,
+	}, nil
 }
 
 // Name implements provision.Driver.
@@ -108,14 +171,6 @@ func (d *Driver) Create(ctx context.Context, request provision.Request) (provisi
 	body := newSandbox{
 		TemplateID: d.template, Timeout: d.timeout, Secure: true,
 		Metadata: metadata, Network: d.network,
-		EnvVars: map[string]string{
-			"REMOUNT_ENROLL_TOKEN": request.Bootstrap.EnrollmentToken,
-			"REMOUNT_SERVER":       request.Bootstrap.ServerURL,
-			"REMOUNT_BINARY_URL":   request.Bootstrap.BinaryURL,
-			"REMOUNT_BACKEND":      request.Bootstrap.Backend,
-			"REMOUNT_DATA_DIR":     request.Bootstrap.DataDir,
-			"REMOUNT_NODE_ID":      request.Bootstrap.NodeID,
-		},
 	}
 	var response sandbox
 	if err := d.api.JSON(ctx, http.MethodPost, "/sandboxes", nil, body, &response, http.StatusCreated); err != nil {
@@ -131,7 +186,100 @@ func (d *Driver) Create(ctx context.Context, request provision.Request) (provisi
 	machine.Name = request.Name
 	machine.Tenant = request.Tenant
 	machine.Labels = request.Labels
+	if err := d.deliverBootstrap(ctx, response, request.Bootstrap); err != nil {
+		// A sandbox that never receives its bootstrap never enrolls and would
+		// sit as paid, unusable capacity until its timeout; release it now so
+		// the reconciler's retry starts clean.
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		_ = d.api.JSON(cleanup, http.MethodDelete, "/sandboxes/"+url.PathEscape(machine.ID), nil, nil, nil, http.StatusNoContent, http.StatusNotFound)
+		return provision.Machine{}, err
+	}
 	return machine, nil
+}
+
+// deliverBootstrap writes the REMOUNT_* values the node needs to the sandbox
+// through envd, the in-sandbox agent, authenticating with the one-time access
+// token the create response carried. The token is used for this request and
+// never logged, stored, or returned.
+func (d *Driver) deliverBootstrap(ctx context.Context, s sandbox, bootstrap provision.Bootstrap) error {
+	if s.EnvdAccessToken == "" {
+		return errors.New("e2b: create response carried no envd access token; the sandbox was not created secure")
+	}
+	base := d.envdEndpoint
+	if base == "" {
+		host := s.SandboxID
+		if s.ClientID != "" {
+			host += "-" + s.ClientID
+		}
+		base = fmt.Sprintf("https://%d-%s.%s", envdPort, host, d.sandboxDomain)
+	}
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	part, err := form.CreateFormFile("file", path.Base(d.bootstrapPath))
+	if err != nil {
+		return fmt.Errorf("e2b: build bootstrap upload: %w", err)
+	}
+	if _, err := part.Write(bootstrapFile(bootstrap)); err != nil {
+		return fmt.Errorf("e2b: build bootstrap upload: %w", err)
+	}
+	if err := form.Close(); err != nil {
+		return fmt.Errorf("e2b: build bootstrap upload: %w", err)
+	}
+	query := url.Values{"path": {d.bootstrapPath}, "username": {d.bootstrapUser}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/files?"+query.Encode(), &body)
+	if err != nil {
+		return fmt.Errorf("e2b: build bootstrap upload: %w", err)
+	}
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	req.Header.Set("X-Access-Token", s.EnvdAccessToken)
+	var last error
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("e2b: deliver bootstrap: %w", ctx.Err())
+			case <-time.After(time.Duration(attempt) * 2 * time.Second):
+			}
+			req.Body = io.NopCloser(bytes.NewReader(body.Bytes()))
+		}
+		resp, err := d.envd.Do(req)
+		if err != nil {
+			// The transport error may quote the URL, never the token.
+			last = fmt.Errorf("e2b: deliver bootstrap: %w", err)
+			continue
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+			return nil
+		}
+		last = fmt.Errorf("e2b: deliver bootstrap: envd returned HTTP %d", resp.StatusCode)
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusRequestTimeout && resp.StatusCode != http.StatusTooManyRequests {
+			return last
+		}
+	}
+	return last
+}
+
+// bootstrapFile renders the values as a POSIX shell fragment the template's
+// start command sources. Single quotes keep every value literal.
+func bootstrapFile(b provision.Bootstrap) []byte {
+	var out bytes.Buffer
+	for _, kv := range [][2]string{
+		{"REMOUNT_SERVER", b.ServerURL},
+		{"REMOUNT_ENROLL_TOKEN", b.EnrollmentToken},
+		{"REMOUNT_BINARY_URL", b.BinaryURL},
+		{"REMOUNT_BACKEND", b.Backend},
+		{"REMOUNT_DATA_DIR", b.DataDir},
+		{"REMOUNT_NODE_ID", b.NodeID},
+	} {
+		if kv[1] == "" {
+			continue
+		}
+		fmt.Fprintf(&out, "%s='%s'\n", kv[0], strings.ReplaceAll(kv[1], "'", `'\''`))
+	}
+	return out.Bytes()
 }
 
 // Destroy kills a sandbox. A missing sandbox is already destroyed.
@@ -209,15 +357,20 @@ type newSandbox struct {
 	Timeout    int               `json:"timeout"`
 	Secure     bool              `json:"secure"`
 	Metadata   map[string]string `json:"metadata"`
-	EnvVars    map[string]string `json:"envVars"`
 	Network    *NetworkConfig    `json:"network,omitempty"`
 }
 
+// sandbox is what both the create response and a list item decode into. The
+// create response alone carries clientID and envdAccessToken; the token is
+// consumed by deliverBootstrap and must never reach a log, an event, or a
+// Machine.
 type sandbox struct {
-	SandboxID string            `json:"sandboxID"`
-	StartedAt time.Time         `json:"startedAt"`
-	State     string            `json:"state"`
-	Metadata  map[string]string `json:"metadata"`
+	SandboxID       string            `json:"sandboxID"`
+	ClientID        string            `json:"clientID"`
+	EnvdAccessToken string            `json:"envdAccessToken"`
+	StartedAt       time.Time         `json:"startedAt"`
+	State           string            `json:"state"`
+	Metadata        map[string]string `json:"metadata"`
 }
 
 func (s sandbox) machine() provision.Machine {

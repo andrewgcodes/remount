@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Provider helper for the ix.dev pool driver.
+
+The Remount control plane's `ix` provisioner shells out to this program with
+one operation on argv (`create`, `list`, `destroy`) and a JSON request on
+stdin, and reads one JSON response from stdout. It wraps the vendor's `ix`
+CLI, which authenticates from `IX_TOKEN` in the environment the driver
+passes. The enrollment credential travels to the VM through
+a per-VM entry in the ix secret store (`ix secret set` reads the value from a
+mode-0600 file, `ix new --secret-env` attaches it, and the entry is removed
+once the VM holds its copy), so it is never placed on a command line or in
+provider metadata.
+
+ix.dev VMs have no labels, so the tenant and pool labels Remount needs for
+inventory are kept in a small local state file next to the helper's config
+directory. That is a documented limitation of this helper, not of Remount.
+
+Configure it in provisioners.json:
+
+    {"vendor": "ix", "helper": "/path/to/remount-ix-helper",
+     "token_env": "IX_TOKEN", "region": "us-east-1",
+     "tenant": "acme", "pool": "ix"}
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+STATE_DIR = os.environ.get("REMOUNT_IX_HELPER_STATE", os.path.expanduser("~/.remount/ix-helper"))
+STATE = os.path.join(STATE_DIR, "machines.json")
+IX = os.environ.get("REMOUNT_IX_CLI", "ix")
+
+
+def die(message: str, code: int = 1) -> None:
+    sys.stderr.write(f"remount-ix-helper: {message}\n")
+    sys.exit(code)
+
+
+def run(args: list[str], env: dict | None = None, timeout: int = 600) -> str:
+    merged = dict(os.environ)
+    if env:
+        merged.update(env)
+    proc = subprocess.run([IX, *args], capture_output=True, text=True, env=merged, timeout=timeout)
+    if proc.returncode != 0:
+        die(f"ix {args[0]} failed: {proc.stderr.strip()[-400:]}", 2)
+    return proc.stdout
+
+
+def load_state() -> dict:
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE)
+
+
+def secret_name(vm_name: str) -> str:
+    """ix secret names are lower snake_case; derive one from the VM name."""
+    return "remount_enroll_" + re.sub(r"[^a-z0-9]+", "_", vm_name.lower()).strip("_")
+
+
+def stage_secret(name: str, value: str) -> None:
+    """Store the enrollment credential under a per-VM name, from a 0600 file."""
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix="enroll-", dir=STATE_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(value)
+        run(["secret", "set", name, "--value-file", path, "--message-format", "json"], timeout=120)
+    finally:
+        os.unlink(path)
+
+
+def drop_secret(name: str) -> None:
+    """Remove the store entry; a VM that already attached it keeps its copy."""
+    subprocess.run([IX, "secret", "rm", name, "--message-format", "json"], capture_output=True, text=True, timeout=120)
+
+
+# Pinned gVisor release and Alpine minirootfs for `--backend gvisor` pools;
+# update the digests together. The VM has KVM, and runsc picks it up.
+RUNSC_URL = "https://storage.googleapis.com/gvisor/releases/release/20260817.0/x86_64/runsc"
+RUNSC_SHA = "84936438d583ec976800f464e75a83e1515f0890b451b9b4db219c4472b54ca9b106a6772ee683f1e64cce2128871d7637b14d800591f8451b8137f6c39fb2ef"
+ROOTFS_URL = "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.1-x86_64.tar.gz"
+ROOTFS_SHA = "0e5cc5702ad72a4e151f219976ba946d50161c3acce210ef3b122a529aba1270"
+
+
+def gvisor_setup() -> str:
+    """Shell that installs runsc and an immutable rootfs under the data dir."""
+    return (
+        "G=$D/gvisor; mkdir -p $G/bin $G/rootfs; "
+        f"[ -x $G/bin/runsc ] || {{ curl -fsSL https://storage.googleapis.com/gvisor/releases/release/20260817.0/x86_64/runsc -o $G/bin/runsc.dl; echo '84936438d583ec976800f464e75a83e1515f0890b451b9b4db219c4472b54ca9b106a6772ee683f1e64cce2128871d7637b14d800591f8451b8137f6c39fb2ef  '$G/bin/runsc.dl | sha512sum -c - >/dev/null; chmod +x $G/bin/runsc.dl; mv $G/bin/runsc.dl $G/bin/runsc; }}; "
+        f"[ -x $G/rootfs/bin/sh ] || {{ curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.1-x86_64.tar.gz -o $G/rootfs.tgz; echo '0e5cc5702ad72a4e151f219976ba946d50161c3acce210ef3b122a529aba1270  '$G/rootfs.tgz | sha256sum -c - >/dev/null; tar -xzf $G/rootfs.tgz -C $G/rootfs; rm -f $G/rootfs.tgz; }}; "
+        "export PATH=$G/bin:$PATH REMOUNT_GVISOR_ROOTFS=$G/rootfs; "
+    )
+
+
+def vm_list() -> list[dict]:
+    out = run(["ls", "--output", "json"])
+    start = out.find("[")
+    return json.loads(out[start:]) if start >= 0 else []
+
+
+def vm_field(vm: dict, *names: str) -> str:
+    for n in names:
+        v = vm.get(n)
+        if v:
+            return str(v)
+    return ""
+
+
+def machine_for(vm: dict, state: dict) -> dict | None:
+    name = vm_field(vm, "name", "Name")
+    meta = state.get(name)
+    if not meta:
+        return None
+    return {
+        "id": name,
+        "name": name,
+        "provider": "ix",
+        "tenant": meta.get("tenant", ""),
+        "region": vm_field(vm, "region", "Region") or meta.get("region", ""),
+        "state": vm_field(vm, "state", "status", "State", "Status").lower(),
+        "labels": meta.get("labels", {}),
+        "created_at": meta.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def op_create(req: dict) -> dict:
+    request = req.get("request") or {}
+    boot = request.get("Bootstrap") or {}
+    name = request.get("Name") or ""
+    region = req.get("region") or request.get("Region") or ""
+    if not name or not boot.get("ServerURL") or not boot.get("EnrollmentToken") or not boot.get("BinaryURL"):
+        die("create needs a name, server URL, enrollment token and binary URL")
+    state = load_state()
+    if name not in state:
+        args = ["new", "default", "--name", name, "--no-shell", "--message-format", "json"]
+        if region:
+            args += ["--region", region]
+        for key, value in (
+            ("REMOUNT_SERVER", boot["ServerURL"]),
+            ("REMOUNT_BINARY_URL", boot["BinaryURL"]),
+            ("REMOUNT_BACKEND", boot.get("Backend") or "process"),
+            ("REMOUNT_DATA_DIR", boot.get("DataDir") or "/var/lib/remount"),
+            ("REMOUNT_NODE_ID", boot.get("NodeID") or ""),
+        ):
+            if value:
+                args += ["--env", f"{key}={value}"]
+        secret = secret_name(name)
+        args += ["--secret-env", f"{secret}=REMOUNT_ENROLL_TOKEN"]  # <store key>=<env name>
+        stage_secret(secret, boot["EnrollmentToken"])
+        try:
+            run(args, timeout=900)
+        finally:
+            drop_secret(secret)
+        state[name] = {
+            "tenant": request.get("Tenant", ""),
+            "labels": request.get("Labels") or {},
+            "region": region,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        save_state(state)
+    # Start the node inside the VM. `ix new --env/--secret-env` attached the
+    # bootstrap values, credential included, to the VM's init environment; an
+    # `ix shell` session does not inherit them, so the script imports them
+    # from PID 1 without ever echoing them or putting them on a command line.
+    node_id = boot.get("NodeID") or ""
+    data_dir = boot.get("DataDir") or "/var/lib/remount"
+    # The binary lives inside the data directory: the base image is NixOS,
+    # where /usr is a read-only store path.
+    bootstrap = (
+        "set -e; umask 077; "
+        f"D={shlex.quote(data_dir)}; mkdir -p $D 2>/dev/null || D=$HOME/remount; mkdir -p $D; B=$D/remount; "
+        f"[ -x $B ] || {{ curl -fsSL {shlex.quote(boot['BinaryURL'])} -o $B.dl; chmod +x $B.dl; mv $B.dl $B; }}; "
+        + (gvisor_setup() if "gvisor" in (boot.get("Backend") or "") else "")
+        +
+        "tr '\\0' '\\n' < /proc/1/environ | grep '^REMOUNT_' > $D/.env-import; "
+        "while IFS= read -r line; do export \"$line\"; done < $D/.env-import; rm -f $D/.env-import; "
+        f"nohup $B up --server {shlex.quote(boot['ServerURL'])} --backend {shlex.quote(boot.get('Backend') or 'process')} --data $D --label vendor=ix"
+        + (f" --node-id {shlex.quote(node_id)}" if node_id else "")
+        + " > $D/node.log 2>&1 & sleep 2; kill -0 $! && echo REMOUNT_BOOTSTRAP_OK"
+    )
+    # `ix shell` exits 0 whatever the remote command did, so the marker on
+    # stdout is the only evidence the node started.
+    out = run(["shell", name, "--", "sh", "-c", bootstrap], timeout=600)
+    if "REMOUNT_BOOTSTRAP_OK" not in out:
+        die(f"bootstrap did not start the node on {name}: {out.strip()[-300:]}", 3)
+    for vm in vm_list():
+        if vm_field(vm, "name", "Name") == name:
+            return machine_for(vm, state) or {}
+    return {"id": name, "name": name, "provider": "ix", "tenant": request.get("Tenant", ""), "region": region, "state": "running", "labels": request.get("Labels") or {}}
+
+
+def op_list(req: dict) -> dict:
+    opts = req.get("list") or {}
+    state = load_state()
+    machines = []
+    for vm in vm_list():
+        m = machine_for(vm, state)
+        if not m:
+            continue
+        if opts.get("Tenant") and m["tenant"] != opts["Tenant"]:
+            continue
+        if opts.get("Pool") and m["labels"].get("remount.pool") != opts["Pool"]:
+            continue
+        machines.append(m)
+    return {"machines": machines}
+
+
+def op_destroy(req: dict) -> dict:
+    vm_id = req.get("id") or ""
+    if not vm_id or any(c in vm_id for c in "/\\\r\n\x00"):
+        die("destroy needs a VM name")
+    names = {vm_field(vm, "name", "Name") for vm in vm_list()}
+    if vm_id in names:
+        run(["rm", "--force", vm_id], timeout=300)
+    state = load_state()
+    if vm_id in state:
+        del state[vm_id]
+        save_state(state)
+    return {}
+
+
+def main() -> None:
+    if len(sys.argv) != 2 or sys.argv[1] not in ("create", "list", "destroy"):
+        die("usage: remount-ix-helper create|list|destroy  (JSON request on stdin)", 64)
+    try:
+        req = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        die("request is not JSON")
+    result = {"create": op_create, "list": op_list, "destroy": op_destroy}[sys.argv[1]](req)
+    sys.stdout.write(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()

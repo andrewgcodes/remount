@@ -309,6 +309,95 @@ Reference deployments for Docker Compose, Helm, Modal and Fly are under
 [deploy/](deploy/). Which backend satisfies which profile on which operating
 system is the generated [support matrix](docs/security-profiles.md).
 
+## Quick starts on Modal, E2B and ix.dev
+
+Three ways to get a Remount control plane and nodes without owning a
+server. Each was run as written, with the vendor's real API key in the
+environment, before it went into this file.
+
+**Modal hosts the control plane.** The reference app runs `remount server`
+in production mode on a persistent volume, with the master key and the
+operator credential in Modal secrets:
+
+```sh
+pip install modal && modal setup
+make modal-deploy          # deploys deploy/modal_app.py, prints the URL
+make modal-smoke           # creates a workspace, runs a command, destroys it
+```
+
+Modal cannot host nodes: a Modal sandbox already runs under gVisor without
+`CAP_SYS_ADMIN`, so `runsc` cannot start inside it, and production control
+planes refuse the `process` backend.
+
+**E2B and ix.dev host nodes.** A pool asks the vendor for machines, each
+machine enrolls itself as a node with a one-time credential, and the control
+plane scales the pool between `--min` and `--max`. Nodes run `--backend
+gvisor`, which is what a production control plane admits. Start from a
+control plane the machines can reach:
+
+```sh
+export REMOUNT_MASTER_KEY="$(head -c 32 /dev/urandom | base64)"
+remount server --listen 0.0.0.0:7443 --data /var/lib/remount \
+  --mode production-single-tenant \
+  --bootstrap-principal root --bootstrap-token-file /run/remount/op.token \
+  --provisioners /etc/remount/provisioners.json
+export REMOUNT_SERVER=https://control.example REMOUNT_TOKEN="$(cat /run/remount/op.token)"
+```
+
+`/etc/remount/provisioners.json` names the vendors and where a new machine
+downloads the node binary from; the API keys are environment variables the
+server reads at startup, never values in the file:
+
+```json
+{
+  "bootstrap": {
+    "server_url": "https://control.example",
+    "binary_url": "https://control.example/downloads/remount",
+    "data_dir": "/var/lib/remount"
+  },
+  "drivers": [
+    {"vendor": "e2b", "token_env": "E2B_API_KEY", "template": "remount-node"},
+    {"vendor": "ix", "helper": "/usr/local/bin/remount-ix-helper",
+     "token_env": "IX_TOKEN", "region": "us-east-1", "tenant": "*", "pool": "ix"}
+  ]
+}
+```
+
+For E2B, build the node template once. It carries the binary, a pinned
+`runsc` and an Alpine rootfs; the driver delivers each sandbox's bootstrap
+through E2B's own file API because creation-time environment variables never
+reach a snapshotted start command:
+
+```sh
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o remount-linux-amd64 ./cmd/remount
+pip install e2b && export E2B_API_KEY=...
+python3 images/e2b/build.py remount-linux-amd64 remount-node
+remount pool create e2b --vendor e2b --backend gvisor --min 1 --max 4 --label zone=e2b
+```
+
+For ix.dev, install the vendor CLI next to the server and copy the helper
+into place. Each machine is a fresh VM with KVM, so `runsc` runs on its KVM
+platform there:
+
+```sh
+curl https://ix.dev/install.sh | sh && export IX_TOKEN=...
+install -m 0755 scripts/provision/remount-ix-helper /usr/local/bin/
+remount pool create ix --vendor ix --backend gvisor --min 1 --max 4 --region us-east-1 --label zone=ix
+```
+
+Then watch the machines arrive and use them like any other node:
+
+```sh
+remount events --type pool,node --follow   # pool.scaled, node.enrolled
+remount nodes                              # ONLINE true, BACKENDS gvisor
+remount ws create --name hello --label zone=e2b --json
+remount pool rm e2b                        # after the pool drains
+```
+
+The vendor-specific details, including what each driver does with the
+enrollment credential, are in the
+[operations guide](docs/operations.md#provider-backed-node-pools).
+
 ## Documentation
 
 - [docs/using-remount.md](docs/using-remount.md): using a deployment, from a first workspace to a moved one.

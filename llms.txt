@@ -19,6 +19,7 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/an
 - [How it fits together](https://github.com/andrewgcodes/remount/blob/main/README.md#how-it-fits-together): Every machine that runs workspaces is a node.
 - [SDKs](https://github.com/andrewgcodes/remount/blob/main/README.md#sdks): Go:
 - [Deploying it](https://github.com/andrewgcodes/remount/blob/main/README.md#deploying-it): `remount standalone` is for one machine.
+- [Quick starts on Modal, E2B and ix.dev](https://github.com/andrewgcodes/remount/blob/main/README.md#quick-starts-on-modal-e2b-and-ixdev): Three ways to get a Remount control plane and nodes without owning a server.
 - [Documentation](https://github.com/andrewgcodes/remount/blob/main/README.md#documentation)
 - [Repository layout](https://github.com/andrewgcodes/remount/blob/main/README.md#repository-layout)
 - [Status](https://github.com/andrewgcodes/remount/blob/main/README.md#status): Everything in this README is implemented and tested, including under the race detector and in a one-process simulator with fault injection.

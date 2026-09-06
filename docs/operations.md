@@ -989,6 +989,79 @@ mutation. A machine is eligible for idle destruction only when its
 `remount.node` label exactly matches an online control node reporting zero
 workspace assignments.
 
+A pool's `--backend` is what the machines run, and the machines are held to
+the same floor as any other node: a production control plane admits `gvisor`
+or `firecracker` and refuses `process` with `enrolled node backend process
+cannot satisfy isolated`. So the machine image has to carry `runsc` and an
+unpacked rootfs, and the pool is created with `--backend gvisor`:
+
+```sh
+remount pool create e2b --vendor e2b --backend gvisor --min 1 --max 4 --label zone=e2b
+remount pool create ix  --vendor ix  --backend gvisor --min 1 --max 4 --region us-east-1 --label zone=ix
+```
+
+### E2B
+
+The `e2b` entry names a template built from [`images/e2b/`](../images/e2b/):
+the node binary, a pinned `runsc`, an Alpine minirootfs at
+`/opt/remount/rootfs`, and a start command that runs the node as root.
+
+```sh
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o remount-linux-amd64 ./cmd/remount
+pip install e2b && export E2B_API_KEY=...
+python3 images/e2b/build.py remount-linux-amd64 remount-node
+```
+
+E2B snapshots a template after its start command has run and resumes every
+sandbox from that snapshot, so nothing passed at sandbox creation reaches the
+start command as an environment variable. The driver therefore creates the
+sandbox with `secure: true`, then writes the `REMOUNT_*` bootstrap values,
+enrollment credential included, to `/home/user/remount-bootstrap.env` through
+the sandbox's envd file API, authenticating with the one-time access token the
+create response carries. That token is used for that request and never logged
+or stored. The start command waits for the file, imports it, deletes it, and
+execs `remount up`, logging to `/var/lib/remount/node.log`. A sandbox whose
+bootstrap cannot be delivered is killed immediately so the retry starts clean.
+Optional entry fields: `sandbox_domain` (default: the API endpoint host
+without its `api.` label), `bootstrap_path`, `bootstrap_user`.
+
+### ix.dev
+
+The `ix` entry runs [`scripts/provision/remount-ix-helper`](../scripts/provision/remount-ix-helper),
+a Python program over the vendor's `ix` CLI (`curl https://ix.dev/install.sh | sh`),
+authenticated by the variable `token_env` names. Its `tenant` and `pool`
+fields bind the helper to exactly one pool, and `region` is the default
+placement.
+
+```json
+{"vendor": "ix", "helper": "/usr/local/bin/remount-ix-helper",
+ "token_env": "IX_TOKEN", "region": "us-east-1", "tenant": "*", "pool": "ix"}
+```
+
+Each machine is a VM from the vendor's default image, which is NixOS with a
+read-only `/usr`, so everything the node needs lives under the data
+directory. The helper stores the enrollment credential as a per-VM entry in
+the `ix` secret store (`ix secret set` from a mode-0600 file), attaches it
+with `ix new --secret-env`, removes the store entry once the VM holds its
+copy, and then runs a bootstrap over `ix shell` that downloads the node
+binary, a pinned `runsc` and rootfs when the pool backend is `gvisor`, imports
+the `REMOUNT_*` values from the VM's init environment, and starts
+`remount up`. `ix shell` exits 0 whatever the remote command did, so the
+helper treats a missing `REMOUNT_BOOTSTRAP_OK` marker as a failed create. ix
+VMs carry no labels, so tenant and pool inventory is kept in a small local
+state file (`REMOUNT_IX_HELPER_STATE`, default `~/.remount/ix-helper`),
+which is the helper's limitation rather than Remount's.
+
+### Modal
+
+Modal hosts the control plane well: [`deploy/modal_app.py`](../deploy/modal_app.py)
+is the reference deployment (`make modal-deploy`). It cannot host pool nodes.
+A Modal Sandbox already runs under gVisor without `CAP_SYS_ADMIN`, so `runsc`
+cannot start inside it, and the only backend it could run, `process`, is
+refused by every production mode. The `modal` provisioner entry stays for
+deployments that ship their own helper against a different runtime; no helper
+is bundled.
+
 ## Provider webhooks and outbound notifications
 
 `remount server --notifications /etc/remount/notifications.json` enables

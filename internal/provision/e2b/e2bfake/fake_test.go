@@ -254,8 +254,10 @@ func TestContractsAreValidAndNameTheFieldsTheDriverReads(t *testing.T) {
 		}
 	}
 	response := CreateResponseContract()
-	if _, ok := response["sandboxID"]; !ok {
-		t.Fatal("contract/create_response.json omits sandboxID")
+	for _, field := range []string{"sandboxID", "clientID", "envdAccessToken"} {
+		if _, ok := response[field]; !ok {
+			t.Fatalf("contract/create_response.json omits %q", field)
+		}
 	}
 	for _, absent := range []string{"metadata", "startedAt", "state"} {
 		if _, present := response[absent]; present {
@@ -263,10 +265,16 @@ func TestContractsAreValidAndNameTheFieldsTheDriverReads(t *testing.T) {
 		}
 	}
 	request := CreateRequestContract()
-	for _, field := range []string{"templateID", "timeout", "secure", "metadata", "envVars"} {
+	for _, field := range []string{"templateID", "timeout", "secure", "metadata"} {
 		if _, ok := request[field]; !ok {
 			t.Fatalf("contract/create_request.json omits %q", field)
 		}
+	}
+	// Bootstrap values never ride the create body: E2B resumes sandboxes from
+	// a post-start snapshot, so creation-time envVars would not reach the
+	// template's start command anyway.
+	if _, present := request["envVars"]; present {
+		t.Fatal("contract/create_request.json carries envVars; the bootstrap goes through the envd file route")
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -95,6 +96,11 @@ type entry struct {
 	metadata  map[string]string
 	createdAt time.Time
 	destroyed bool
+	// envdToken is the per-sandbox access token the create response carries
+	// and the envd file route requires.
+	envdToken string
+	// files records what the driver delivered through the envd file route.
+	files map[string]string
 	// lag counts down the list calls a destroyed sandbox stays visible for.
 	lag int
 }
@@ -164,7 +170,9 @@ func (s *Service) route(w http.ResponseWriter, r *http.Request) {
 	s.calls = append(s.calls, r.Method+" "+r.URL.Path)
 	s.mu.Unlock()
 
-	if s.opts.APIKey != "" && r.Header.Get("X-API-Key") != s.opts.APIKey {
+	// The envd file route is the sandbox's own agent, authenticated by the
+	// per-sandbox access token rather than the account API key.
+	if r.URL.Path != "/files" && s.opts.APIKey != "" && r.Header.Get("X-API-Key") != s.opts.APIKey {
 		http.Error(w, `{"message":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
@@ -175,6 +183,8 @@ func (s *Service) route(w http.ResponseWriter, r *http.Request) {
 		s.list(w, r)
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/sandboxes/"):
 		s.destroy(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/files":
+		s.writeFile(w, r)
 	default:
 		// A permissive fake would teach the driver habits the real API does not
 		// honor, so an unexpected route is a loud failure rather than a 200.
@@ -200,7 +210,7 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 	s.creates = append(s.creates, body)
 	s.next++
 	id := fmt.Sprintf("sbx_%04d", s.next)
-	created := &entry{id: id, metadata: metadata, createdAt: s.opts.Now()}
+	created := &entry{id: id, metadata: metadata, createdAt: s.opts.Now(), envdToken: "envd-token-" + id}
 	s.entries[id] = created
 	lose := s.opts.LoseCreateResponses > 0
 	if lose {
@@ -351,6 +361,70 @@ func createResponseJSON(e *entry) map[string]any {
 		out[key] = value
 	}
 	out["sandboxID"] = e.id
+	out["envdAccessToken"] = e.envdToken
+	return out
+}
+
+// writeFile is the envd POST /files route as the sandbox's agent serves it:
+// multipart body, path and username in the query, X-Access-Token required
+// because the driver creates secure sandboxes. Deliveries are recorded so a
+// test can assert the bootstrap reached the sandbox, and only the sandbox
+// whose token was presented.
+func (s *Service) writeFile(w http.ResponseWriter, r *http.Request) {
+	token := r.Header.Get("X-Access-Token")
+	s.mu.Lock()
+	var target *entry
+	for _, e := range s.entries {
+		if token != "" && e.envdToken == token && !e.destroyed {
+			target = e
+		}
+	}
+	s.mu.Unlock()
+	if target == nil {
+		http.Error(w, `{"code":401,"message":"unauthorized access, please provide a valid access token"}`, http.StatusUnauthorized)
+		return
+	}
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		http.Error(w, `{"message":"invalid multipart body"}`, http.StatusBadRequest)
+		return
+	}
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, `{"message":"missing file part"}`, http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, 1<<20))
+	if err != nil {
+		http.Error(w, `{"message":"read failed"}`, http.StatusBadRequest)
+		return
+	}
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" || !strings.HasPrefix(filePath, "/") {
+		http.Error(w, `{"message":"path must be absolute"}`, http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	if target.files == nil {
+		target.files = map[string]string{}
+	}
+	target.files[filePath] = string(content)
+	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode([]map[string]any{{"path": filePath, "name": filePath[strings.LastIndex(filePath, "/")+1:], "type": "file"}})
+}
+
+// Files returns what was written into a sandbox through the envd route, keyed
+// by path. A missing sandbox or one with no deliveries yields an empty map.
+func (s *Service) Files(id string) map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]string{}
+	if e, ok := s.entries[id]; ok {
+		for k, v := range e.files {
+			out[k] = v
+		}
+	}
 	return out
 }
 
