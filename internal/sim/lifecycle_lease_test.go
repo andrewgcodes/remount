@@ -58,7 +58,7 @@ func leaseEventTypes(t *testing.T, c *client.Client, id string) map[string]int {
 }
 
 // waitEvent waits for at least n events of typ on a workspace.
-func waitEvent(t *testing.T, c *client.Client, id, typ string, n int, within time.Duration) map[string]int {
+func waitLeaseEvent(t *testing.T, c *client.Client, id, typ string, n int, within time.Duration) map[string]int {
 	t.Helper()
 	var types map[string]int
 	for deadline := time.Now().Add(within); time.Now().Before(deadline); {
@@ -103,7 +103,7 @@ func TestWorkspaceLeaseAutoSleepsAfterDeadline(t *testing.T) {
 
 	observer := w.client("c2")
 	waitWorkspaceState(t, observer, ws.ID, proto.WSPaused, 45*time.Second)
-	types := waitEvent(t, observer, ws.ID, proto.EvWSLifecycleExpired, 1, 20*time.Second)
+	types := waitLeaseEvent(t, observer, ws.ID, proto.EvWSLifecycleExpired, 1, 20*time.Second)
 	if types[proto.EvWSLeaseHoldExpired] == 0 {
 		t.Fatalf("no ws.lease.expired event: %v", types)
 	}
@@ -231,7 +231,7 @@ func TestIdlePolicySleepsAfterMarkIdle(t *testing.T) {
 		t.Fatalf("mark idle deadline %+v", marked.LifecycleDeadline)
 	}
 	waitWorkspaceState(t, c, ws.ID, proto.WSPaused, 45*time.Second)
-	types := waitEvent(t, c, ws.ID, proto.EvWSLifecycleExpired, 1, 20*time.Second)
+	types := waitLeaseEvent(t, c, ws.ID, proto.EvWSLifecycleExpired, 1, 20*time.Second)
 	if types[proto.EvWSIdlePolicySet] == 0 || types[proto.EvWSIdleMarked] == 0 {
 		t.Fatalf("events: %v", types)
 	}
@@ -310,7 +310,7 @@ func TestLongCommandAutoSleptReplaysExplicitExitReason(t *testing.T) {
 	waitWorkspaceState(t, c, ws.ID, proto.WSPaused, 45*time.Second)
 
 	// The durable event log names the reason without anyone reattaching.
-	types := waitEvent(t, c, ws.ID, proto.EvSExited, 1, 30*time.Second)
+	types := waitLeaseEvent(t, c, ws.ID, proto.EvSExited, 1, 30*time.Second)
 	if types[proto.EvWSLifecycleExpired] == 0 {
 		t.Fatalf("events: %v", types)
 	}
