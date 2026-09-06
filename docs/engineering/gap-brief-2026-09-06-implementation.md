@@ -196,10 +196,22 @@ the filesystem survived. It found and fixed three defects: Chromium ignores
 `$HOME/.config` broke `ws.sleep` (the browser's home is now its profile
 directory), and a fresh handle restarted `iseq` at 1 so every CLI action
 after the first was dropped (`computer.get` now returns `last_iseq` and
-handles resume from it; ADR 0094). Open: Chromium never sends
-`Proxy-Authorization`, so brokered navigation to an allowed host is refused
-as unauthenticated; the fix is the CDP `Fetch.authRequired` handler, in
-progress.
+handles resume from it; ADR 0094).
+
+Brokered browsing (ADR [0095](../adr/0095-browser-proxy-auth-through-cdp.md)):
+Chromium never sends `Proxy-Authorization` on its own, so the node now arms
+CDP `Fetch` auth handling on the page and every auto-attached target and
+answers proxy challenges with the workspace's broker capability exactly once
+per request, cancels origin (site) challenges so a login prompt never sees
+the egress authority, and passes every other request through. Live in the
+Colima VM with a real public host: navigation to the allowed `example.com`
+loaded with status 200 and an `egress.allowed` audit; navigation to the
+unbound `example.org` was denied by host policy; the whole B34 lane passed
+three times and the CLI was driven by hand. Two facts an operator must know:
+the first CONNECT of each proxy connection is a `407` recorded as an
+`unauthenticated` denial beside the `allowed` retry, and Chromium's own
+component and metrics traffic runs outside any page target, so it stays
+denied (containment working).
 
 ## Gap 4 — durable lifecycle for running work
 
@@ -264,7 +276,7 @@ Delivered so far:
 
 | Builder | Scope | Status |
 |---|---|---|
-| Browser lane | `images/browser`, `remount computer` CLI, Python/TS `Computer`, real-Chromium conformance (B34) run live in the Colima VM, docs | merged (5a425b6); brokered browsing to an allowed host still needs CDP proxy auth (follow-up running) |
+| Browser lane | `images/browser`, `remount computer` CLI, Python/TS `Computer`, real-Chromium conformance (B34) run live in the Colima VM, docs | merged (5a425b6); brokered browsing fixed and verified live (9ba6f46) |
 | Conformance product | `cmd/conformance --profile`, markdown report, `remount conformance`, evidence E26/B33, gVisor drift lane script, operator docs | merged (ced0f00) |
 | Linux lanes | gVisor E4/E5/B28, E26 drift, a real `multi-tenant-isolated` gVisor node with `doctor` and `conformance --profile`, Firecracker B29 if its environment survived, all inside the Colima VM | merged (e55593d); gVisor verified, Firecracker unavailable |
 | Credentials | `remount binding`/`principal session` CLI, Python/TS helpers, keyless examples against a fake provider (B35), docs, live `.env` run with rotate and revoke | merged (29bae6b); `principal session` live test unavailable until a node can enroll in production mode from the CLI (follow-up running) |
