@@ -60,10 +60,32 @@ Live on macOS (process backend): `--profile dev` conformant at exit 0
 exit 1 with the seven profile obligations failing by name and the parked
 workspaces reported `profile_unschedulable`; `microvm` host-compat exit 2.
 
-Not proven on macOS: the gVisor and Firecracker `Reprobe` paths and the E26
-drift lane. A Linux-lane run inside the local Colima VM is in progress; until
-its ledger entry lands, E26 is `unavailable` and the `multi-tenant-isolated`
-profile has no live pass on a real isolated backend.
+Live on Linux (Colima Ubuntu aarch64 VM with `runsc release-20260831.0`,
+ledger entry "live gVisor isolation, profile and drift lanes in a Colima VM,
+2026-09-05"): the gVisor lanes E4, E5 and B28 passed; the E26 drift lane
+passed in 5 s; a real node started under `--profile multi-tenant-isolated`
+with the gVisor backend, `doctor --profile multi-tenant-isolated` exited 0
+with nine checks passing, a workspace with `requires.profile` scheduled and
+ran, `remount conformance --profile multi-tenant-isolated --backend gvisor`
+judged 78 checks with 64 passed, 0 failed, 14 unavailable and every required
+row green, and removing a host prerequisite out of band produced
+`node.profile.unschedulable` within a second, `doctor` exit 1, a parked
+workspace with `pending_reason profile_unschedulable` and a refused claim,
+with `node.profile.restored` after the prerequisite came back. gVisor's real
+descriptor satisfies every `multi-tenant-isolated` predicate exactly as ADR
+0089 states.
+
+The lane found and fixed two gVisor defects with unprivileged regression
+tests: a workspace whose sandbox never started could never be materialized
+again (Adopt/Create looped forever), and a symlinked rootfs path passed every
+probe but failed every materialization because `runsc` cannot serve a
+symlinked OCI root. Residual: a failed `runsc create` can leave an empty
+cgroup directory; recorded, not fixed.
+
+Firecracker B29 is `unavailable` on this host with the exact missing items
+recorded (pool permissions, a guest image whose init does not export `PATH`,
+1.3 GiB free in the pool); the 2026-09-04 x86_64 pass stands. `microvm` has
+no live pass on this branch.
 
 ## Gap 2 — brokered identity, credentials, egress, audit
 
@@ -223,7 +245,7 @@ Delivered so far:
 |---|---|---|
 | Browser lane | `images/browser`, `remount computer` CLI, Python/TS `Computer`, real-Chromium conformance (B34) run live in the Colima VM, docs | merged (5a425b6); brokered browsing to an allowed host still needs CDP proxy auth (follow-up running) |
 | Conformance product | `cmd/conformance --profile`, markdown report, `remount conformance`, evidence E26/B33, gVisor drift lane script, operator docs | merged (ced0f00) |
-| Linux lanes | gVisor E4/E5/B28, E26 drift, a real `multi-tenant-isolated` gVisor node with `doctor` and `conformance --profile`, Firecracker B29 if its environment survived, all inside the Colima VM | in progress |
+| Linux lanes | gVisor E4/E5/B28, E26 drift, a real `multi-tenant-isolated` gVisor node with `doctor` and `conformance --profile`, Firecracker B29 if its environment survived, all inside the Colima VM | merged (e55593d); gVisor verified, Firecracker unavailable |
 | Credentials | `remount binding`/`principal session` CLI, Python/TS helpers, keyless examples against a fake provider (B35), docs, live `.env` run with rotate and revoke | in progress |
 | Lifecycle | `remount ws lease`/idle CLI, Python/TS methods, auto-sleep example, docs, live timer run across a server restart | merged (39f951d) |
 | Typed errors and observability | typed error classes in three languages, support matrix, dependency-free OTLP tracing, log redaction, ADR 0093 | merged (b94530d); spans verified live against a local collector |
