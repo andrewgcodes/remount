@@ -211,7 +211,7 @@ func run(ctx context.Context, out io.Writer) error {
 	}
 	fmt.Fprintf(out, "filesystem survived: %s", data)
 
-	running, _, _, err := c.Run(ctx, ws.ID, "sh", "-c", "pgrep -f 'sleep 300' >/dev/null && echo still-running || echo processes-gone")
+	running, _, _, err := c.Run(ctx, ws.ID, "sh", "-c", "pgrep -f '[s]leep 300' >/dev/null && echo still-running || echo processes-gone")
 	if err != nil {
 		return err
 	}
