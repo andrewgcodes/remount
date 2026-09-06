@@ -969,6 +969,7 @@ export interface Finding {
   "subject"?: string;
   "detail": string;
   "hint"?: string;
+  "status"?: string;
 }
 
 export interface FleetGetReq {
@@ -1162,10 +1163,39 @@ export interface NodeInfo {
   "caps"?: Array<string>;
   "snapshots"?: string;
   "version"?: string;
+  "profile"?: string;
+  "runtime_checks"?: Array<Finding>;
 }
 
 export interface NodeListRes {
   "nodes": Array<NodeStatus>;
+}
+
+export interface NodeProfileEvent {
+  "node": string;
+  "profile": string;
+  "status": string;
+  "failed"?: Array<string>;
+}
+
+export interface NodeProfileGetReq {
+  "node"?: string;
+  "profile"?: string;
+}
+
+export interface NodeProfileGetRes {
+  "profile"?: string;
+  "nodes"?: Array<NodeProfileReport>;
+}
+
+export interface NodeProfileReport {
+  "node": string;
+  "profile": string;
+  "status": string;
+  "checks"?: Array<Finding>;
+  "evaluated_at": number;
+  "configured"?: string;
+  "online"?: boolean;
 }
 
 export interface NodeStatus {
@@ -1362,6 +1392,7 @@ export interface Requires {
   "caps"?: Array<string>;
   "os"?: string;
   "arch"?: string;
+  "profile"?: string;
 }
 
 export interface RunInfo {
@@ -1929,6 +1960,9 @@ export interface WSRenewReq {
   "gen"?: Record<string, number>;
   "controller_epoch"?: number;
   "authz"?: Record<string, number>;
+  "profile"?: string;
+  "runtime_checks"?: Array<Finding>;
+  "report_checks"?: boolean;
 }
 
 export interface WSRenewRes {
@@ -2006,6 +2040,7 @@ export interface Workspace {
   "release_operation"?: string;
   "quarantine_operation"?: string;
   "quarantined_at"?: number;
+  "pending_reason"?: string;
 }
 
 export interface WorkspaceACL {
@@ -2114,6 +2149,7 @@ export const OPERATIONS = {
   "grant": { constant: "OpGrant", request: "GrantReq", response: "Grant" },
   "node.diag": { constant: "OpNodeDiag", request: "NodeDiagReq", response: "NodeDiag" },
   "node.list": { constant: "OpNodeList", request: "", response: "NodeListRes" },
+  "node.profile.get": { constant: "OpNodeProfileGet", request: "NodeProfileGetReq", response: "NodeProfileGetRes" },
   "node.status": { constant: "OpNodeStatus", request: "", response: "NodeStatus" },
   "pool.create": { constant: "OpPoolCreate", request: "PoolCreateReq", response: "Pool" },
   "pool.get": { constant: "OpPoolGet", request: "PoolGetReq", response: "Pool" },
