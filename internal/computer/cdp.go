@@ -223,6 +223,47 @@ func (c *conn) call(ctx context.Context, sessionID, method string, params any, o
 	}
 }
 
+// send writes one CDP call and does not wait for its reply.
+//
+// It exists for the Fetch responses that unblock a paused request. Those are
+// issued from inside the read loop's own event handler, where waiting for a
+// reply would deadlock: the reply can only arrive on the loop that is waiting.
+// An unmatched reply is dropped by readLoop, which is exactly what should
+// happen to one nobody is waiting for. See ADR 0095.
+func (c *conn) send(ctx context.Context, sessionID, method string, params any) error {
+	var raw json.RawMessage
+	if params != nil {
+		encoded, err := json.Marshal(params)
+		if err != nil {
+			return err
+		}
+		raw = encoded
+	}
+	c.mu.Lock()
+	if c.err != nil {
+		terminal := c.err
+		c.mu.Unlock()
+		return closedErr(terminal)
+	}
+	c.nextID++
+	id := c.nextID
+	c.mu.Unlock()
+	frame, err := json.Marshal(message{ID: id, Method: method, Params: raw, SessionID: sessionID})
+	if err != nil {
+		return err
+	}
+	c.writeMu.Lock()
+	writeErr := c.ws.Write(ctx, websocket.MessageText, frame)
+	c.writeMu.Unlock()
+	if writeErr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return closedErr(writeErr)
+	}
+	return nil
+}
+
 func (c *conn) forget(id int64) {
 	c.mu.Lock()
 	delete(c.pending, id)
