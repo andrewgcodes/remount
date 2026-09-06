@@ -41,6 +41,7 @@ import (
 	"remount.dev/remount/internal/eventlog"
 	"remount.dev/remount/internal/ids"
 	"remount.dev/remount/internal/metrics"
+	"remount.dev/remount/internal/profile"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/session"
 	"remount.dev/remount/internal/transport"
@@ -141,7 +142,22 @@ type Options struct {
 	// VolumeCapability is for injected, already-probed implementations in
 	// tests or platform integrations. The built-in backend probes itself.
 	VolumeCapability bool
+	// Profile is the runtime profile this node claims (ADR 0089). Empty is
+	// profile.Dev, which claims nothing. The claim is reported to the control
+	// plane but is never evidence: the control plane re-derives what the node
+	// satisfies from its backend descriptors. What the claim does control
+	// locally is which workspaces this node will materialize.
+	Profile string
+	// ProfileHealthInterval is how often backends that can drift are
+	// re-probed. Zero selects DefaultProfileHealthInterval.
+	ProfileHealthInterval time.Duration
 }
+
+// DefaultProfileHealthInterval is the drift-detection cadence. It is short
+// enough that a lost isolation guarantee is observable within one lease
+// window on a production deployment, and long enough that re-probing costs
+// nothing measurable.
+const DefaultProfileHealthInterval = 30 * time.Second
 
 // Node is the supervisor.
 type Node struct {
@@ -217,6 +233,17 @@ type Node struct {
 	requestCtx     context.Context
 	requestCancel  context.CancelFunc
 	acceptRequests bool
+
+	// profileMu guards the runtime-profile health this node reports. It is
+	// deliberately separate from n.mu: reprobing a backend runs host I/O and
+	// must never hold the lock that serializes claims and materializations.
+	profileMu        sync.Mutex
+	profile          profile.Profile
+	profileChecks    []proto.Finding
+	profileDegraded  bool
+	profileReported  bool   // a check set has been observed at least once
+	profileVersion   uint64 // bumps on every probe
+	profileDelivered uint64 // highest version the control plane accepted
 
 	started  time.Time
 	stop     chan struct{}
@@ -408,6 +435,14 @@ func New(opts Options) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	runtimeProfile, err := profile.Parse(opts.Profile)
+	if err != nil {
+		return nil, err
+	}
+	opts.Profile = string(runtimeProfile)
+	if opts.ProfileHealthInterval <= 0 {
+		opts.ProfileHealthInterval = DefaultProfileHealthInterval
+	}
 	if opts.Backends == nil {
 		pb, err := workspace.NewProcess(filepath.Join(opts.DataDir, "ws"))
 		if err != nil {
@@ -522,6 +557,7 @@ func New(opts Options) (*Node, error) {
 		requestCtx: requestCtx, requestCancel: requestCancel, acceptRequests: true,
 		started: time.Now(), stop: make(chan struct{}), online: make(chan struct{}),
 		epochPath: epochPath, controllerEpoch: controllerEpoch,
+		profile: runtimeProfile,
 	}
 	for id, record := range releases {
 		if record.State != releaseCommitted {
@@ -1049,11 +1085,12 @@ func (n *Node) resequence(events []proto.Event) uint64 {
 
 // Run connects (and reconnects) to the relay until ctx ends.
 func (n *Node) Run(ctx context.Context) error {
-	n.wg.Add(4)
+	n.wg.Add(5)
 	go n.renewLoop(ctx)
 	go n.fenceLoop(ctx)
 	go n.eventLoop(ctx)
 	go n.artifactGCLoop(ctx)
+	go n.profileHealthLoop(ctx)
 	defer n.wg.Wait()
 	defer n.shutdown()
 	backoff := 100 * time.Millisecond
@@ -1425,6 +1462,11 @@ func (n *Node) connectOnce(ctx context.Context) error {
 	info.Version = n.opts.Version
 	info.Caps = n.opts.Caps
 	info.Connectors = []string{proto.EgressConnectorPackage, proto.EgressConnectorGit}
+	// The profile claim and the host checks travel with the descriptors so a
+	// reconnecting node's drift is visible before its first renewal. Neither
+	// is authority: the control plane re-evaluates from the descriptors.
+	info.Profile = string(n.Profile())
+	info.RuntimeChecks = n.profileHealthSnapshot()
 	hello.Node = &info
 	hello.IssuedAt = time.Now().UnixMilli()
 	hello.Nonce = make([]byte, 32)
@@ -1569,7 +1611,14 @@ func (n *Node) renew(ctx context.Context) {
 	if p == nil {
 		return
 	}
-	if len(req.IDs) > 0 {
+	// Runtime-profile health rides on renewal rather than on a channel of its
+	// own. A node holding nothing still renews when its checks changed, so
+	// drift on an idle node reaches the control plane at the same cadence.
+	checks, checkVersion, reportChecks := n.profileHealthForRenew()
+	if reportChecks {
+		req.Profile, req.RuntimeChecks, req.ReportChecks = string(n.Profile()), checks, true
+	}
+	if len(req.IDs) > 0 || req.ReportChecks {
 		var res proto.WSRenewRes
 		rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		if err := p.Call(rctx, proto.PeerControl, proto.OpWSRenew, req, &res); err != nil {
@@ -1577,6 +1626,9 @@ func (n *Node) renew(ctx context.Context) {
 		} else if req.ControllerEpoch != 0 && res.ControllerEpoch != req.ControllerEpoch {
 			n.logger.Warn("renew response refused", "epoch", res.ControllerEpoch, "expected_epoch", req.ControllerEpoch)
 		} else {
+			if reportChecks {
+				n.profileHealthDelivered(checkVersion)
+			}
 			n.applyRenewResults(req, &res)
 		}
 		cancel()
@@ -3700,6 +3752,13 @@ func (n *Node) materializeWithReady(ctx context.Context, w proto.Workspace, adop
 
 func (n *Node) materializeWithReadyHook(ctx context.Context, w proto.Workspace, adopt, notifyReady bool, beforePublish func(*ws) (bool, error)) error {
 	if err := n.requireUplinkCapabilities(w.Spec.Security.Profile); err != nil {
+		return err
+	}
+	// Runtime-profile health is checked here, after the claim, because it can
+	// change between the control plane's placement decision and this
+	// materialization. A drifted node refuses the work rather than serving it
+	// with the boundary the workspace asked for missing (ADR 0089).
+	if err := n.requireSchedulableProfile(w.Spec); err != nil {
 		return err
 	}
 	restoreFormat, err := proto.NormalizeArtifactFormat(w.Spec.RestoreFormat)

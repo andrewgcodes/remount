@@ -390,6 +390,12 @@ type Control struct {
 type nodeState struct {
 	Status proto.NodeStatus
 	PubKey []byte
+	// profileVerified is whether this node last satisfied the runtime profile
+	// it claims, and profileEvaluated whether that has been decided at all.
+	// Both are derived from Status.Info and are never persisted: a restored
+	// row is re-evaluated on the node's next hello (ADR 0089).
+	profileVerified  bool
+	profileEvaluated bool
 }
 
 // requireDeploymentCapabilities refuses a peer that negotiated fewer
@@ -1747,7 +1753,12 @@ func (c *Control) PeerConnected(ctx context.Context, id string, h *proto.Hello) 
 			events = append(events, c.newEvent(proto.EvNodeEnrolled, id, "", id, h.Labels))
 		}
 		events = append(events, c.newEvent(proto.EvNodeOnline, id, "", id, nil))
+		// The hello carried this node's backend descriptors and its latest
+		// host checks. Evaluating here is what makes a node that came back
+		// degraded ineligible before it is offered any pending work.
+		events = append(events, c.profileHealthLocked(id, n)...)
 		c.saveNode(id, n, events...)
+		c.refreshNodeGaugesLocked()
 		if c.RecoveryPending() {
 			c.mu.Unlock()
 			return
@@ -1836,6 +1847,9 @@ func (c *Control) PeerGone(_ context.Context, id string) {
 			}
 		}
 		c.saveNode(id, n, c.newEvent(proto.EvNodeOffline, id, "", id, map[string]any{"workspaces": demoted}))
+		// An offline node satisfies no profile, but it is not drift: the
+		// gauges count only online machines, so recompute rather than emit.
+		c.refreshNodeGaugesLocked()
 		c.mu.Unlock()
 		return
 	}
@@ -2732,6 +2746,19 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return c.nodeList(), nil
+	case proto.OpNodeProfileGet:
+		req, err := decode[proto.NodeProfileGetReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.check(ctx, subject, ActionAdmin, Resource{Kind: "fleet", Tenant: subject.Tenant}); err != nil {
+			return nil, err
+		}
+		return c.nodeProfileGet(req)
 	case proto.OpEventsTail:
 		req, err := decode[proto.EventsTailReq](f)
 		if err != nil {
@@ -3107,6 +3134,12 @@ func (c *Control) snapshotWS(id string) *proto.Workspace {
 	cp.Spec.Volumes = append([]proto.VolumeMount(nil), ws.Spec.Volumes...)
 	cp.Spec.RestoreObjects = append([]string(nil), ws.Spec.RestoreObjects...)
 	cp.LastSnapshotObjects = append([]string(nil), ws.LastSnapshotObjects...)
+	// PendingReason is derived here rather than stored: it is a statement
+	// about the current fleet, not about the workspace, so it changes without
+	// the workspace changing and must never masquerade as durable state.
+	if cp.State == proto.WSPending && cp.Spec.Requires.Profile != "" && !c.anyNodeSatisfiesProfileLocked(cp.Spec.Requires.Profile) {
+		cp.PendingReason = proto.ReasonProfileUnschedulable
+	}
 	return &cp
 }
 
@@ -4547,6 +4580,14 @@ func (c *Control) wsRenew(ctx context.Context, node string, req *proto.WSRenewRe
 	}
 	if n := c.nodes[node]; n != nil {
 		n.Status.LastSeen = c.now().UnixMilli()
+		// Renewal is the node→control channel drift rides on. Recording the
+		// checks changes the node's standing, so the transition events commit
+		// with the node row rather than after it.
+		if req.ReportChecks {
+			events := c.applyNodeRuntimeChecksLocked(node, n, req.Profile, req.RuntimeChecks)
+			c.saveNode(node, n, events...)
+			c.refreshNodeGaugesLocked()
+		}
 	}
 	return res, nil
 }
@@ -4738,6 +4779,13 @@ func (c *Control) eligibleBackendLocked(ws *proto.Workspace, n *nodeState) (stri
 		if !contains(n.Status.Info.Caps, cap) {
 			return "", false
 		}
+	}
+	// Requires.Profile is matched against evidence, not against a label or a
+	// node's own claim: a workspace requiring multi-tenant-isolated never
+	// lands on a node whose descriptors and host checks do not satisfy it,
+	// however the node is labelled (ADR 0089).
+	if r.Profile != "" && !c.nodeSatisfiesProfileLocked(n, r.Profile) {
+		return "", false
 	}
 	if len(proto.MissingCapabilities(n.Status.Protocol, proto.SecurityCapabilities(ws.Spec.Security.Profile))) > 0 {
 		return "", false

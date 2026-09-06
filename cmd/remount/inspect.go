@@ -347,9 +347,14 @@ func cmdDoctor(ctx context.Context, args []string) error {
 	var c common
 	c.flags(fs)
 	deep := fs.Bool("deep", false, "re-hash every artifact; reads every byte")
+	runtimeProfile := fs.String("profile", "", "instead of the general health pass, report per-node conformance to a runtime profile: dev, trusted-single-tenant, multi-tenant-isolated, microvm")
+	node := fs.String("node", "", "with --profile, report only this node")
 	parse(fs, args)
 	cl := c.client()
 	defer cl.Close()
+	if *runtimeProfile != "" {
+		return doctorProfile(ctx, cl, *runtimeProfile, *node, c.json)
+	}
 	rep := doctorReport{OK: true}
 
 	add := func(f ...proto.Finding) {
@@ -495,6 +500,109 @@ func cmdDoctor(ctx context.Context, args []string) error {
 			Detail: fmt.Sprintf("%g replay gaps were reported; that much output no client could retrieve", v)})
 	}
 	return finish(rep, c.json)
+}
+
+// ---------------------------------------------------------------------------
+// doctor --profile
+// ---------------------------------------------------------------------------
+
+// profileCheck is one named check in one node's runtime-profile report.
+type profileCheck struct {
+	Check  string `json:"check"`
+	Status string `json:"status"`
+	Detail string `json:"detail,omitempty"`
+	Hint   string `json:"hint,omitempty"`
+}
+
+type profileNodeReport struct {
+	Node   string         `json:"node"`
+	Status string         `json:"status"`
+	Checks []profileCheck `json:"checks"`
+}
+
+type profileDoctorReport struct {
+	Profile string              `json:"profile"`
+	Nodes   []profileNodeReport `json:"nodes"`
+}
+
+// doctorProfile reports per-node conformance to one runtime profile.
+//
+// The exit-code contract is the point of the command and is deliberately
+// three-valued: 0 only when every check on every node passed, 1 when some
+// check failed, and 2 when nothing failed but something could not be
+// checked. A run that cannot answer must never look like a healthy one, so
+// there is no path on which an unavailable check exits 0 (ADR 0089).
+func doctorProfile(ctx context.Context, cl *client.Client, runtimeProfile, node string, asJSON bool) error {
+	res, err := cl.NodeProfiles(ctx, node, runtimeProfile)
+	if err != nil {
+		return err
+	}
+	out := profileDoctorReport{Profile: runtimeProfile}
+	anyFail, anyUnavailable := false, false
+	for _, n := range res.Nodes {
+		row := profileNodeReport{Node: n.Node, Status: n.Status}
+		for _, c := range n.Checks {
+			status := c.Status
+			if status == "" {
+				status = proto.CheckUnavailable
+			}
+			row.Checks = append(row.Checks, profileCheck{Check: c.Check, Status: status, Detail: c.Detail, Hint: c.Hint})
+			switch status {
+			case proto.CheckFail:
+				anyFail = true
+			case proto.CheckUnavailable:
+				anyUnavailable = true
+			}
+		}
+		switch n.Status {
+		case proto.CheckFail:
+			anyFail = true
+		case proto.CheckUnavailable:
+			anyUnavailable = true
+		}
+		out.Nodes = append(out.Nodes, row)
+	}
+	if len(out.Nodes) == 0 {
+		// No node is not a passing fleet. Nothing was proved.
+		anyUnavailable = true
+	}
+	if asJSON {
+		printJSON(out)
+	} else {
+		fmt.Printf("profile: %s\n", runtimeProfile)
+		if len(out.Nodes) == 0 {
+			fmt.Println("no nodes are known to the control plane; nothing was checked")
+		}
+		for _, n := range out.Nodes {
+			fmt.Printf("\n%s: %s\n", n.Node, n.Status)
+			for _, c := range n.Checks {
+				fmt.Printf("  %-11s %s\n", c.Status, c.Check)
+				if c.Detail != "" {
+					fmt.Printf("              %s\n", c.Detail)
+				}
+				if c.Status != proto.CheckPass && c.Hint != "" {
+					fmt.Printf("              hint: %s\n", c.Hint)
+				}
+			}
+		}
+		fmt.Println()
+		switch {
+		case anyFail:
+			fmt.Println("PROFILE NOT SATISFIED")
+		case anyUnavailable:
+			fmt.Println("INCOMPLETE: some checks could not run; this is not a passing result")
+		default:
+			fmt.Println("profile satisfied")
+		}
+	}
+	switch {
+	case anyFail:
+		return exitError(1)
+	case anyUnavailable:
+		return exitError(2)
+	default:
+		return nil
+	}
 }
 
 func finish(rep doctorReport, asJSON bool) error {

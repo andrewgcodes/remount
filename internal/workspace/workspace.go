@@ -57,6 +57,62 @@ type Describer interface {
 	Caps() Caps
 }
 
+// Reprober is the optional contract a backend implements when the host
+// prerequisites its Caps depend on can drift after construction: a kernel
+// module unloaded, a binary replaced, a capability dropped, a cgroup parent
+// removed. Caps are static once a backend exists, so without this a node keeps
+// advertising a boundary that stopped existing (ADR 0089).
+//
+// Reprobe must be read-only and safe to run against a node that is serving
+// workspaces. It must never reclaim, reap or recover anything: the
+// constructor's cleanup steps are safe exactly because nothing was running
+// yet, and re-running them later would destroy live sandboxes.
+//
+// It returns one proto.Finding per named check, each carrying
+// proto.CheckPass, proto.CheckFail or proto.CheckUnavailable. A check that
+// could not run is unavailable, never a pass.
+type Reprober interface {
+	Reprobe(ctx context.Context) []proto.Finding
+}
+
+// ReprobeRegistry runs every registered backend that implements Reprober and
+// returns the union of their findings, in registration order. A node with no
+// reprobing backend returns nil, which is not the same as a failing check.
+func ReprobeRegistry(ctx context.Context, r *Registry) []proto.Finding {
+	if r == nil {
+		return nil
+	}
+	var out []proto.Finding
+	for _, name := range r.Names() {
+		b, err := r.Get(name)
+		if err != nil {
+			continue
+		}
+		if rp, ok := b.(Reprober); ok {
+			out = append(out, rp.Reprobe(ctx)...)
+		}
+	}
+	return out
+}
+
+// CheckFinding builds one Reprobe result from an error: nil is a pass, a
+// non-nil error is a fail. Use UnavailableFinding when the check itself could
+// not be attempted.
+func CheckFinding(check, subject, detail, hint string, err error) proto.Finding {
+	if err == nil {
+		return proto.Finding{Severity: "info", Status: proto.CheckPass, Check: check, Subject: subject, Detail: detail}
+	}
+	return proto.Finding{
+		Severity: "error", Status: proto.CheckFail, Check: check, Subject: subject,
+		Detail: detail + ": " + err.Error(), Hint: hint,
+	}
+}
+
+// UnavailableFinding records a check that could not run. It is never healthy.
+func UnavailableFinding(check, subject, detail, hint string) proto.Finding {
+	return proto.Finding{Severity: "warn", Status: proto.CheckUnavailable, Check: check, Subject: subject, Detail: detail, Hint: hint}
+}
+
 // Provisioner creates a fresh materialization.
 type Provisioner interface {
 	// Create materializes a workspace. If restore is non-nil it is a tar.gz

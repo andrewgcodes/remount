@@ -65,6 +65,18 @@ type NodeInfo struct {
 	Caps               []string            `cbor:"caps,omitempty" json:"caps,omitempty"` // display, browser, gpu …; never security evidence
 	Snapshots          string              `cbor:"snapshots,omitempty" json:"snapshots,omitempty"`
 	Version            string              `cbor:"version,omitempty" json:"version,omitempty"`
+	// Profile is the runtime profile this node was configured with. Like
+	// Caps it is a self-claim and is never security evidence: the control
+	// plane decides which profiles a node satisfies from BackendDescriptors.
+	// It is reported so an operator can see a node whose configuration and
+	// evidence disagree.
+	Profile string `cbor:"profile,omitempty" json:"profile,omitempty"`
+	// RuntimeChecks are host prerequisites only the node can observe (KVM,
+	// runsc, netlink capability, cgroup parent). The control plane trusts
+	// them only to DOWNGRADE a profile result: a failing or unavailable
+	// check makes the node unschedulable for the profiles that need it, and
+	// a passing check never satisfies a descriptor predicate by itself.
+	RuntimeChecks []Finding `cbor:"runtime_checks,omitempty" json:"runtime_checks,omitempty"`
 }
 
 // BackendDescriptor reports evidence-bearing capabilities for one backend.
@@ -121,6 +133,13 @@ type Requires struct {
 	Caps    []string `cbor:"caps,omitempty" json:"caps,omitempty"`       // required node caps
 	OS      string   `cbor:"os,omitempty" json:"os,omitempty"`
 	Arch    string   `cbor:"arch,omitempty" json:"arch,omitempty"`
+	// Profile is the runtime profile a node must currently satisfy to run
+	// this workspace ("dev", "trusted-single-tenant",
+	// "multi-tenant-isolated", "microvm"). Unlike Caps it is not matched
+	// against anything the node claims: the control plane evaluates the
+	// node's backend descriptors and its reported host checks. Empty means
+	// no runtime-profile constraint.
+	Profile string `cbor:"profile,omitempty" json:"profile,omitempty"`
 }
 
 // Placement restricts which nodes may claim.
@@ -381,6 +400,11 @@ type Workspace struct {
 	// incident response as an ordinary transient failure.
 	QuarantineOperation string `cbor:"quarantine_operation,omitempty" json:"quarantine_operation,omitempty"`
 	QuarantinedAt       int64  `cbor:"quarantined_at,omitempty" json:"quarantined_at,omitempty"`
+	// PendingReason explains why a pending workspace has not been placed. It
+	// is derived at read time from the current fleet, never persisted and
+	// never an input to a decision, so it emits no event of its own. It
+	// carries a Reason* constant, currently only ReasonProfileUnschedulable.
+	PendingReason string `cbor:"pending_reason,omitempty" json:"pending_reason,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +430,7 @@ const (
 	OpControllerState      = "controller.state"        // control -> node: authoritative promotion reconciliation state
 	OpWSSnapshotCommit     = "ws.snapshot.commit"      // node -> control: make an uploaded snapshot authoritative
 	OpNodeList             = "node.list"               // -> NodeListRes
+	OpNodeProfileGet       = "node.profile.get"        // NodeProfileGetReq -> NodeProfileGetRes
 	OpEventsTail           = "events.tail"             // EventsTailReq -> streams ev frames, then res
 	OpEventsStop           = "events.stop"             // EventsStopReq -> {}; stops one event subscription
 	OpEventsPost           = "events.post"             // EventPost -> {} (node -> control; also webhook wake)
@@ -507,6 +532,18 @@ type WSRenewReq struct {
 	// Authz is the authorization revision the node currently enforces for
 	// each workspace (authz-push). Control answers with what changed since.
 	Authz map[string]uint64 `cbor:"authz,omitempty" json:"authz,omitempty"`
+	// Profile and RuntimeChecks carry the node's latest runtime-profile
+	// health (ADR 0089). Renewal is the existing periodic node→control
+	// channel, so drift rides on it rather than opening a second one. A node
+	// with no workspaces still renews when its checks change, so IDs may be
+	// empty when RuntimeChecks is set. Control trusts these only to
+	// downgrade.
+	Profile       string    `cbor:"profile,omitempty" json:"profile,omitempty"`
+	RuntimeChecks []Finding `cbor:"runtime_checks,omitempty" json:"runtime_checks,omitempty"`
+	// ReportChecks distinguishes "no checks to report" from "this node has
+	// no reprobing backend", so an empty RuntimeChecks can still clear a
+	// previously failing set.
+	ReportChecks bool `cbor:"report_checks,omitempty" json:"report_checks,omitempty"`
 }
 
 // WSRenewResult is the control plane's affirmative ownership decision for
@@ -592,6 +629,49 @@ type WSSnapshotCommitReq struct {
 
 type NodeListRes struct {
 	Nodes []NodeStatus `cbor:"nodes" json:"nodes"`
+}
+
+// NodeProfileGetReq asks the control plane to evaluate one runtime profile
+// against the evidence it holds. Node empty means every known node; Profile
+// empty means each node's own configured profile.
+type NodeProfileGetReq struct {
+	Node    string `cbor:"node,omitempty" json:"node,omitempty"`
+	Profile string `cbor:"profile,omitempty" json:"profile,omitempty"`
+}
+
+// NodeProfileReport is one node's evaluation of one runtime profile. Status
+// is CheckPass, CheckFail or CheckUnavailable, and it is CheckPass only when
+// every entry in Checks passed.
+type NodeProfileReport struct {
+	Node        string    `cbor:"node" json:"node"`
+	Profile     string    `cbor:"profile" json:"profile"`
+	Status      string    `cbor:"status" json:"status"`
+	Checks      []Finding `cbor:"checks,omitempty" json:"checks,omitempty"`
+	EvaluatedAt int64     `cbor:"evaluated_at" json:"evaluated_at"`
+	// Configured is the profile the node says it was started with. It is a
+	// self-claim reported for comparison, never evidence.
+	Configured string `cbor:"configured,omitempty" json:"configured,omitempty"`
+	// Online reports whether the node was connected at evaluation time. An
+	// offline node's evidence is its last hello, which is stale by
+	// definition, so it is reported rather than silently trusted.
+	Online bool `cbor:"online,omitempty" json:"online,omitempty"`
+}
+
+// NodeProfileGetRes answers node.profile.get, one report per node, sorted by
+// node id.
+type NodeProfileGetRes struct {
+	Profile string              `cbor:"profile,omitempty" json:"profile,omitempty"`
+	Nodes   []NodeProfileReport `cbor:"nodes,omitempty" json:"nodes,omitempty"`
+}
+
+// NodeProfileEvent is the payload of node.profile.verified,
+// node.profile.unschedulable and node.profile.restored. Failed names the
+// checks that did not pass, so a reader never has to parse Detail text.
+type NodeProfileEvent struct {
+	Node    string   `cbor:"node" json:"node"`
+	Profile string   `cbor:"profile" json:"profile"`
+	Status  string   `cbor:"status" json:"status"`
+	Failed  []string `cbor:"failed,omitempty" json:"failed,omitempty"`
 }
 
 // WorkspaceSelector identifies incident-containment targets. Empty selectors
@@ -1648,7 +1728,20 @@ type Finding struct {
 	Subject  string `cbor:"subject,omitempty" json:"subject,omitempty"`
 	Detail   string `cbor:"detail" json:"detail"`
 	Hint     string `cbor:"hint,omitempty" json:"hint,omitempty"`
+	// Status is the check's verdict when the finding is one result in a
+	// conformance-style report: CheckPass, CheckFail or CheckUnavailable.
+	// It is empty on a finding that merely describes a problem, and an empty
+	// status is never read as a pass.
+	Status string `cbor:"status,omitempty" json:"status,omitempty"`
 }
+
+// Check verdicts. An unavailable check is never a passing check; a report
+// that contains one is not healthy (AGENTS.md, `doctor`).
+const (
+	CheckPass        = "pass"
+	CheckFail        = "fail"
+	CheckUnavailable = "unavailable"
+)
 
 // NodeDiagReq asks a node for its deep state. Diagnostics expose workspace
 // roots and session programs, so the caller must prove it is entitled to at
@@ -1736,24 +1829,32 @@ type WSDiag struct {
 // ---------------------------------------------------------------------------
 
 const (
-	EvNodeEnrolled      = "node.enrolled"
-	EvNodeOnline        = "node.online"
-	EvNodeOffline       = "node.offline"
-	EvWSCreated         = "ws.created"
-	EvWSOffered         = "ws.offered"
-	EvWSClaiming        = "ws.claiming"
-	EvWSClaimed         = "ws.claimed"
-	EvWSReleased        = "ws.released"
-	EvWSMoved           = "ws.moved"
-	EvWSPaused          = "ws.paused"
-	EvWSResumed         = "ws.resumed"
-	EvWSSnapshot        = "ws.snapshot"
-	EvWSRestored        = "ws.restored"
-	EvWSDestroyed       = "ws.destroyed"
-	EvWSLeaseExpired    = "ws.lease_expired"
-	EvWSFenced          = "ws.fenced"
-	EvWSStateChanged    = "ws.state_changed"
-	EvControlReconciled = "control.reconciled"
+	EvNodeEnrolled = "node.enrolled"
+	EvNodeOnline   = "node.online"
+	EvNodeOffline  = "node.offline"
+	// Runtime-profile transitions (ADR 0089). Payload is NodeProfileEvent.
+	// The control plane emits them when its own view of a node's satisfied
+	// profiles changes; a node also emits the unschedulable/restored pair
+	// for its local degraded state so the transition is recorded even while
+	// its uplink is down.
+	EvNodeProfileVerified      = "node.profile.verified"
+	EvNodeProfileUnschedulable = "node.profile.unschedulable"
+	EvNodeProfileRestored      = "node.profile.restored"
+	EvWSCreated                = "ws.created"
+	EvWSOffered                = "ws.offered"
+	EvWSClaiming               = "ws.claiming"
+	EvWSClaimed                = "ws.claimed"
+	EvWSReleased               = "ws.released"
+	EvWSMoved                  = "ws.moved"
+	EvWSPaused                 = "ws.paused"
+	EvWSResumed                = "ws.resumed"
+	EvWSSnapshot               = "ws.snapshot"
+	EvWSRestored               = "ws.restored"
+	EvWSDestroyed              = "ws.destroyed"
+	EvWSLeaseExpired           = "ws.lease_expired"
+	EvWSFenced                 = "ws.fenced"
+	EvWSStateChanged           = "ws.state_changed"
+	EvControlReconciled        = "control.reconciled"
 	// EvQuotaExceeded records an admission refusal. It is emitted by both the
 	// tenant-authority admission transaction and the legacy in-process limits,
 	// so a rejection is never only a counter.
