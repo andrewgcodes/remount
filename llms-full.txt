@@ -287,6 +287,7 @@ verdict. See [docs/observability.md](docs/observability.md).
 - [docs/operations.md](docs/operations.md) — deploying, hardening and running it for real.
 - [docs/images.md](docs/images.md) — the default workspace image and what any substitute image must provide.
 - [docs/observability.md](docs/observability.md) — inspecting a deployment at three depths, and detecting damage.
+- [docs/security-profiles.md](docs/security-profiles.md) — the generated support matrix: operating systems, per-backend features, and which profile each backend can satisfy.
 - [docs/engineering/hardening-lessons.md](docs/engineering/hardening-lessons.md) — the review method distilled from the audits, race failures and live cloud tests.
 - [docs/engineering/](docs/engineering/) — dated audits, implementation requests, dispositions and verification evidence.
 - [MISTAKES.md](MISTAKES.md) — every bug we hit building this, and what each one taught.
@@ -1040,6 +1041,103 @@ For a coding-agent task, verify at least:
 not evidence of health. Read individual findings even when the command exits
 zero or JSON says `ok: true`: warnings such as `tenant.residency_unavailable`
 mean that named policy was not checked.
+
+## Public API, errors and tracing
+
+Remount's public surface is the Go `api` and `client` packages, the `remount`
+Python package, the `@remount/sdk` npm package, the wire protocol, and the
+documented CLI flags and `--json` shapes. What each version number promises,
+and how a break is announced, is in
+[`compatibility-policy.md`](compatibility-policy.md).
+
+### Typed errors
+
+Every failure carries a stable `code`. When one code covers outcomes you must
+tell apart — a `denied` from egress policy is not a `denied` from a missing
+role — it also carries a stable `reason`. Match on the code first and narrow on
+the reason only when the distinction matters. Never match on the message: it is
+for humans and may change in any release.
+
+```go
+if _, _, _, err := c.Run(ctx, ws, "curl", "https://api.example.com"); err != nil {
+    if api.Is(err, api.CodeDenied, api.ReasonEgressDenied) {
+        // bind a credential for that host, or add an egress rule
+    }
+}
+```
+
+```python
+try:
+    await client.exec(workspace, ["curl", "https://api.example.com"])
+except remount.errors.EgressDenied as denied:
+    print(denied.code, denied.reason)
+```
+
+```ts
+try {
+  await client.exec(workspace, ["curl", "https://api.example.com"]);
+} catch (error) {
+  if (error instanceof EgressDeniedError) { /* ... */ }
+}
+```
+
+Python raises one exception class per reason, all subclassing `ProtocolError`;
+TypeScript exports one error class per reason, all extending `ProtocolError`.
+A reason a client has never heard of — a server newer than the package —
+degrades to the base class rather than to an unhandled case, so an old client
+never crashes on a new vocabulary. The vocabulary itself is generated from the
+protocol into `remount.types.REASONS` and `Reason` in `@remount/sdk`:
+
+| Reason | Refines | Means |
+|---|---|---|
+| `permission_denied` | `denied` | the principal lacks a role or tenant scope |
+| `egress_denied` | `denied` | the broker refused a destination or placeholder |
+| `approval_required` | `denied` | approve-mode egress awaits a durable approval |
+| `binding_missing` | `not_found`, `denied` | no binding covers the placeholder |
+| `grant_expired` | `unauthorized` | the grant or capability TTL passed |
+| `revoked` | `unauthorized` | the principal, binding or grant was revoked |
+| `quota_exceeded` | `resource_exhausted` | a tenant quota or hard budget is spent |
+| `workspace_not_ready` | `conflict` | the workspace has not reached `ws.ready` |
+| `workspace_moved` | `conflict` | the workspace now lives on another node |
+| `generation_mismatch` | `conflict`, `unauthorized` | the request names a stale generation |
+| `backend_unsupported` | `unsupported` | the backend cannot perform this |
+| `output_evicted` | `evicted` | the requested session range is no longer retained |
+| `lifecycle_deadline_expired` | `conflict` | a lease or idle deadline already fired |
+| `browser_crashed` | `closed` | the computer session's browser exited |
+| `display_unavailable` | `unsupported` | no display or CDP endpoint could be reached |
+| `input_rejected` | `bad_request` | a computer input action was malformed |
+| `navigation_denied` | `denied` | egress policy blocked a browser navigation |
+| `profile_corrupt` | `conflict` | a persisted browser profile could not be opened |
+| `download_blocked` | `denied` | policy refused a browser download |
+| `profile_unschedulable` | `denied`, `unsupported` | no node satisfies the runtime profile |
+
+### Support matrix
+
+Which operating system can host a client and which can host a node, which
+backends run where, and which features and runtime profiles each backend
+supports, are generated from the backends' own advertised capabilities into
+[`security-profiles.md`](security-profiles.md). A documented `pass` there means
+the capabilities satisfy the profile; `unavailable` means a host check has to
+run first, and is never a pass. `remount doctor --profile PROFILE` and
+`remount conformance --profile PROFILE` settle it against a live deployment.
+
+### Traces to your own collector
+
+Spans go to a collector you run, or nowhere:
+
+```sh
+remount standalone --otlp-endpoint http://collector.internal:4318
+```
+
+`REMOUNT_OTLP_ENDPOINT` sets the same thing, and `server` and `up` take the
+same flag. There is no Remount-operated collector and no default endpoint, so
+with the flag unset nothing is recorded and nothing leaves the process. The
+exporter posts OTLP/HTTP JSON, which the OpenTelemetry Collector's `otlp`
+receiver accepts on port 4318. One span per request, named by its `op`, with a
+node span appearing as a child of the control span that caused it; attributes
+are identifiers only, and every one is scrubbed for credential shapes before it
+is buffered. [`observability.md`](observability.md#traces) has the attribute and
+counter tables.
 
 ## Documentation map and maintenance
 

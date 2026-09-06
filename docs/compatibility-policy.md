@@ -104,8 +104,10 @@ explicitly and name what changed and why.
   `sdk/typescript/package.json` (currently `>=20`). Raising any of these three
   floors is a MINOR change announced in the changelog, not a silent one.
 - Which backend supports which feature, and which is fit for which trust level,
-  is a separate matter of fact rather than of policy; see
-  [using Remount](using-remount.md) and `remount conformance`.
+  is a separate matter of fact rather than of policy; the generated support
+  matrix in [security profiles](security-profiles.md) lists operating systems,
+  per-backend features and profile suitability, and `remount conformance` and
+  `remount doctor --profile` settle it against a live deployment.
 
 Because Remount is self-hosted, an operator chooses when to upgrade. Nothing in
 this policy is a promise that someone else will keep a service running.

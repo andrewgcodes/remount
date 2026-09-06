@@ -283,6 +283,7 @@ verdict. See [docs/observability.md](docs/observability.md).
 - [docs/operations.md](docs/operations.md) — deploying, hardening and running it for real.
 - [docs/images.md](docs/images.md) — the default workspace image and what any substitute image must provide.
 - [docs/observability.md](docs/observability.md) — inspecting a deployment at three depths, and detecting damage.
+- [docs/security-profiles.md](docs/security-profiles.md) — the generated support matrix: operating systems, per-backend features, and which profile each backend can satisfy.
 - [docs/engineering/hardening-lessons.md](docs/engineering/hardening-lessons.md) — the review method distilled from the audits, race failures and live cloud tests.
 - [docs/engineering/](docs/engineering/) — dated audits, implementation requests, dispositions and verification evidence.
 - [MISTAKES.md](MISTAKES.md) — every bug we hit building this, and what each one taught.

@@ -252,6 +252,27 @@ const (
 	ComputerDownloadBlocked    = proto.ComputerDownloadBlocked
 )
 
+// Stable error reasons. A reason refines a Code when the code alone covers
+// outcomes a caller must tell apart: a `denied` from egress policy is not a
+// `denied` from a missing role. Match on the Code first; narrow on the reason
+// only when the distinction matters, and treat an unrecognised reason as the
+// bare code rather than as an unhandled case.
+const (
+	ReasonPermissionDenied         = proto.ReasonPermissionDenied
+	ReasonEgressDenied             = proto.ReasonEgressDenied
+	ReasonApprovalRequired         = proto.ReasonApprovalRequired
+	ReasonBindingMissing           = proto.ReasonBindingMissing
+	ReasonGrantExpired             = proto.ReasonGrantExpired
+	ReasonRevoked                  = proto.ReasonRevoked
+	ReasonQuotaExceeded            = proto.ReasonQuotaExceeded
+	ReasonWorkspaceNotReady        = proto.ReasonWorkspaceNotReady
+	ReasonWorkspaceMoved           = proto.ReasonWorkspaceMoved
+	ReasonGenerationMismatch       = proto.ReasonGenerationMismatch
+	ReasonOutputEvicted            = proto.ReasonOutputEvicted
+	ReasonLifecycleDeadlineExpired = proto.ReasonLifecycleDeadlineExpired
+	ReasonProfileUnschedulable     = proto.ReasonProfileUnschedulable
+)
+
 // Stable error reasons a computer operation can carry alongside its code.
 const (
 	ReasonBrowserCrashed     = proto.ReasonBrowserCrashed
@@ -268,3 +289,17 @@ const (
 // first; a reason narrows it, and an unrecognised reason must degrade to the
 // code rather than to an unhandled case.
 func ErrorReason(err error) string { return proto.ErrorReason(err) }
+
+// Is reports whether err is a Remount error with this code and, when reason is
+// non-empty, this reason. It is the one-line form of the two-step match:
+//
+//	if api.Is(err, api.CodeDenied, api.ReasonEgressDenied) { ... }
+//
+// An empty reason matches any reason, so Is(err, code, "") is IsErrorCode.
+func Is(err error, code, reason string) bool {
+	var protocolError *proto.Error
+	if !errors.As(err, &protocolError) || protocolError.Code != code {
+		return false
+	}
+	return reason == "" || protocolError.Reason == reason
+}

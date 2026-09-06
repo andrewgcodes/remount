@@ -192,7 +192,20 @@ func (b *Backend) Caps() workspace.Caps {
 	if !b.verified {
 		return workspace.Caps{Isolation: "none", Snapshots: "fs", EgressMode: "open", BrokerIdentity: "none"}
 	}
-	return workspace.Caps{Isolation: "microvm", Snapshots: "fs+mem", EgressEnforced: true, MultiTenant: true, SiblingIsolation: true, EgressMode: "enforced_gateway", BrokerIdentity: "per_session_capability", FilesystemBoundary: "block_device", NetworkNamespace: true, DeviceIsolation: true, MountPath: true}
+	return VerifiedCaps()
+}
+
+// VerifiedCaps are the capabilities this backend advertises once New's KVM,
+// jailer, guest, volume and network probes have passed. Caps returns exactly
+// this value, so a documentation generator on a host without KVM can describe
+// a verified node without a second copy that could drift. Reading it grants
+// nothing: an unverified backend still advertises the fail-closed zero value.
+func VerifiedCaps() workspace.Caps {
+	return workspace.Caps{
+		Isolation: "microvm", Snapshots: "fs+mem", EgressEnforced: true, MultiTenant: true,
+		SiblingIsolation: true, EgressMode: "enforced_gateway", BrokerIdentity: "per_session_capability",
+		FilesystemBoundary: "block_device", NetworkNamespace: true, DeviceIsolation: true, MountPath: true,
+	}
 }
 
 func (b *Backend) Create(ctx context.Context, id string, spec proto.WorkspaceSpec, restore io.Reader) (workspace.Handle, error) {
