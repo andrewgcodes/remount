@@ -15,7 +15,7 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/an
 - [What it's for](https://github.com/andrewgcodes/remount/blob/main/README.md#what-its-for): on a refactor and need to leave.
 - [Quick start](https://github.com/andrewgcodes/remount/blob/main/README.md#quick-start): Everything below runs on your laptop with no account, token or API key.
 - [Harnesses](https://github.com/andrewgcodes/remount/blob/main/README.md#harnesses): A recipe is a small YAML file embedded in the binary; adding a harness is a YAML pull request, not Go.
-- [Why Remount](https://github.com/andrewgcodes/remount/blob/main/README.md#why-remount): Sandbox APIs give you a container in someone else's cloud for the length of a request.
+- [Why Remount](https://github.com/andrewgcodes/remount/blob/main/README.md#why-remount): Sandbox APIs give you a container in someone else's cloud for the length of a request, and they compete on how many milliseconds it takes to start one.
 - [How it fits together](https://github.com/andrewgcodes/remount/blob/main/README.md#how-it-fits-together): Every machine that runs workspaces is a node.
 - [SDKs](https://github.com/andrewgcodes/remount/blob/main/README.md#sdks): Go:
 - [Deploying it](https://github.com/andrewgcodes/remount/blob/main/README.md#deploying-it): `remount standalone` is for one machine.
