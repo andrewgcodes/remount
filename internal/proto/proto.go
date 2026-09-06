@@ -73,11 +73,19 @@ type Frame struct {
 }
 
 // Error is a machine-readable failure. Code is stable; Msg is for humans.
+// Reason, when set, is a stable sub-classification within Code that SDKs
+// map to typed errors. It exists because one code covers several distinct
+// outcomes a caller must tell apart (a `denied` from egress policy is not a
+// `denied` from a missing grant) and because matching on Msg text is
+// forbidden. A peer that predates Reason ignores it; Code alone stays
+// sufficient to act on.
 type Error struct {
 	Code string `cbor:"code" json:"code"`
 	Msg  string `cbor:"msg,omitempty" json:"msg,omitempty"`
 	// Oldest is set with CodeEvicted: the oldest seq still replayable.
 	Oldest uint64 `cbor:"oldest,omitempty" json:"oldest,omitempty"`
+	// Reason is one of the Reason* constants, or empty.
+	Reason string `cbor:"reason,omitempty" json:"reason,omitempty"`
 }
 
 func (e *Error) Error() string {
@@ -112,9 +120,40 @@ const (
 	CodeResourceExhausted = "resource_exhausted"
 )
 
+// Stable error reasons. Each refines one or more codes; the code named in
+// the comment is the one a compliant peer sends it with. SDKs expose one
+// typed error per reason and fall back to the code when Reason is empty.
+const (
+	ReasonPermissionDenied         = "permission_denied"          // denied: the principal lacks a role or tenant scope
+	ReasonEgressDenied             = "egress_denied"              // denied: the broker refused a destination or placeholder
+	ReasonApprovalRequired         = "approval_required"          // denied: approve-mode egress awaits a durable approval
+	ReasonBindingMissing           = "binding_missing"            // not_found or denied: no binding covers the placeholder
+	ReasonGrantExpired             = "grant_expired"              // unauthorized: the grant or capability TTL passed
+	ReasonRevoked                  = "revoked"                    // unauthorized: the principal, binding or grant was revoked
+	ReasonQuotaExceeded            = "quota_exceeded"             // resource_exhausted: a tenant quota or hard budget is spent
+	ReasonWorkspaceNotReady        = "workspace_not_ready"        // conflict: the workspace has not reached ws.ready
+	ReasonWorkspaceMoved           = "workspace_moved"            // conflict: the workspace now lives on another node
+	ReasonGenerationMismatch       = "generation_mismatch"        // conflict or unauthorized: the request names a stale generation
+	ReasonBackendUnsupported       = "backend_unsupported"        // unsupported: the workspace backend cannot perform this
+	ReasonOutputEvicted            = "output_evicted"             // evicted: the requested session range is no longer retained
+	ReasonLifecycleDeadlineExpired = "lifecycle_deadline_expired" // conflict: a lease or idle deadline already fired
+	ReasonBrowserCrashed           = "browser_crashed"            // closed: the computer session's browser exited
+	ReasonDisplayUnavailable       = "display_unavailable"        // unsupported: no display or CDP endpoint could be reached
+	ReasonInputRejected            = "input_rejected"             // bad_request: a computer input action was malformed
+	ReasonNavigationDenied         = "navigation_denied"          // denied: egress policy blocked a browser navigation
+	ReasonProfileCorrupt           = "profile_corrupt"            // conflict: a persisted browser profile could not be opened
+	ReasonDownloadBlocked          = "download_blocked"           // denied: policy refused a browser download
+	ReasonProfileUnschedulable     = "profile_unschedulable"      // unsupported: no node currently satisfies the runtime profile
+)
+
 // Err builds an *Error.
 func Err(code, format string, a ...any) *Error {
 	return &Error{Code: code, Msg: fmt.Sprintf(format, a...)}
+}
+
+// ErrReason builds an *Error carrying a stable Reason alongside its Code.
+func ErrReason(code, reason, format string, a ...any) *Error {
+	return &Error{Code: code, Reason: reason, Msg: fmt.Sprintf(format, a...)}
 }
 
 var encMode cbor.EncMode
