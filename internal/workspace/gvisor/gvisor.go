@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/netip"
 	"net/url"
 	"os"
@@ -37,10 +38,36 @@ type Options struct {
 }
 
 // Backend runs OCI bundles with runsc.
+//
+// rootfs is the resolved directory every OCI bundle names, and rootfsPath is
+// the path the operator configured. They differ when REMOUNT_GVISOR_ROOTFS
+// names a symlink, which is the ordinary way to swap an immutable image
+// atomically. runsc cannot serve a bundle whose root.path is a symlink — it
+// dies with "cannot read client sync file" and names nothing useful — while
+// the drift probe must keep watching the path the operator gave, because that
+// path disappearing is the rootfs going away no matter what survives at the
+// far end of it.
 type Backend struct {
-	dir, rootfs string
-	network     *netns.Manager
-	runtime     runtimeClient
+	dir, rootfs, rootfsPath string
+	network                 *netns.Manager
+	runtime                 runtimeClient
+}
+
+// resolveRootFS returns the configured path and the directory the sandbox is
+// actually started from. Both are absolute; the second follows symlinks.
+func resolveRootFS(path string) (configured, resolved string, err error) {
+	configured, err = filepath.Abs(path)
+	if err != nil {
+		return "", "", err
+	}
+	if st, err := os.Stat(configured); err != nil || !st.IsDir() {
+		return "", "", fmt.Errorf("gvisor: rootfs %q is unavailable", configured)
+	}
+	resolved, err = filepath.EvalSymlinks(configured)
+	if err != nil {
+		return "", "", fmt.Errorf("gvisor: rootfs %q could not be resolved: %w", configured, err)
+	}
+	return configured, resolved, nil
 }
 
 // New verifies runsc, the immutable rootfs, and the host's namespace
@@ -60,12 +87,9 @@ func New(ctx context.Context, opts Options) (*Backend, error) {
 	if err != nil {
 		return nil, err
 	}
-	rootfs, err := filepath.Abs(opts.RootFS)
+	rootfsPath, rootfs, err := resolveRootFS(opts.RootFS)
 	if err != nil {
 		return nil, err
-	}
-	if st, err := os.Stat(rootfs); err != nil || !st.IsDir() {
-		return nil, fmt.Errorf("gvisor: rootfs %q is unavailable", rootfs)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -103,7 +127,7 @@ func New(ctx context.Context, opts Options) (*Backend, error) {
 	if err := network.Probe(ctx); err != nil {
 		return nil, fmt.Errorf("gvisor: enforced network unavailable: %w", err)
 	}
-	return &Backend{dir: dir, rootfs: rootfs, network: network, runtime: runtime}, nil
+	return &Backend{dir: dir, rootfs: rootfs, rootfsPath: rootfsPath, network: network, runtime: runtime}, nil
 }
 
 func (b *Backend) Name() string { return "gvisor" }
@@ -141,6 +165,18 @@ func (b *Backend) Create(ctx context.Context, id string, spec proto.WorkspaceSpe
 			return nil, fmt.Errorf("restore: %w", err)
 		}
 	}
+	// Record the mount path before anything downstream can fail. A
+	// materialization that dies before ApplyNetworkPolicy commits leaves this
+	// tree on disk, and the node's recovery path adopts those bytes rather
+	// than destroying data nothing else holds. Generation 0 is the marker for
+	// "created, never started": there is no boundary to re-attach to, so the
+	// mount path is the only thing worth carrying across. Without this file
+	// the tree was adoptable by neither Create (conflict) nor Adopt
+	// (not_found) and the workspace was wedged forever.
+	if err := writeMetadata(bundle, metadata{Mount: mount}); err != nil {
+		_ = os.RemoveAll(bundle)
+		return nil, err
+	}
 	handle, err := b.handle(ctx, id, bundle, work, mount, 1)
 	if err != nil {
 		_ = os.RemoveAll(bundle)
@@ -155,19 +191,33 @@ func (b *Backend) Adopt(ctx context.Context, id string) (workspace.Handle, error
 	if st, err := os.Stat(work); err != nil || !st.IsDir() {
 		return nil, proto.Err(proto.CodeNotFound, "no workspace %s here", id)
 	}
-	var retained metadata
+	// A tree that is here is a workspace, and the only question adoption asks
+	// is whether it also has a boundary to re-attach to. Missing or
+	// generation-0 metadata answers "no": the sandbox never started, so the
+	// honest recovery is a fresh boundary over the retained bytes, exactly
+	// the one Create would have built. Refusing here instead — which is what
+	// this did until the 2026-09-05 Colima drift lane caught it — wedges the
+	// workspace permanently, because Create refuses the same tree with
+	// CodeConflict and the node retries the pair forever.
+	retained := metadata{Mount: proto.DefaultMountPath}
 	data, err := os.ReadFile(filepath.Join(bundle, metadataName))
-	if err != nil {
-		return nil, proto.Err(proto.CodeNotFound, "workspace %s has no retained network metadata", id)
+	switch {
+	case err == nil:
+		if err := json.Unmarshal(data, &retained); err != nil {
+			return nil, fmt.Errorf("decode retained gvisor metadata: %w", err)
+		}
+	case !errors.Is(err, fs.ErrNotExist):
+		return nil, fmt.Errorf("read retained gvisor metadata: %w", err)
 	}
-	if err := json.Unmarshal(data, &retained); err != nil {
-		return nil, fmt.Errorf("decode retained gvisor metadata: %w", err)
-	}
-	if retained.Generation == 0 {
-		return nil, errors.New("retained gvisor metadata has no generation")
+	if retained.Mount == "" {
+		retained.Mount = proto.DefaultMountPath
 	}
 	if err := proto.ValidateMountPath(retained.Mount); err != nil {
 		return nil, fmt.Errorf("retained gvisor mount: %w", err)
+	}
+	generation := retained.Generation
+	if generation == 0 {
+		generation = 1
 	}
 	// New reaps the previous runsc state and every uninhabited network
 	// namespace before the backend becomes available. Broker ports are
@@ -176,7 +226,19 @@ func (b *Backend) Adopt(ctx context.Context, id string) (workspace.Handle, error
 	if err := b.runtime.destroy(ctx, containerName(id)); err != nil {
 		return nil, fmt.Errorf("stop retained runsc sandbox: %w", err)
 	}
-	return b.handle(ctx, id, bundle, work, retained.Mount, retained.Generation)
+	return b.handle(ctx, id, bundle, work, retained.Mount, generation)
+}
+
+// writeMetadata persists what a later Adopt needs to rebuild this workspace.
+// It is written twice in a workspace's life: at Create with generation 0,
+// meaning the tree exists and was never started, and again once
+// ApplyNetworkPolicy has a live boundary to record.
+func writeMetadata(bundle string, m metadata) error {
+	body, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(bundle, metadataName), body, 0o600)
 }
 
 func (b *Backend) handle(ctx context.Context, id, bundle, work, mount string, generation uint64) (*handle, error) {
