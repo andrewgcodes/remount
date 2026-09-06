@@ -526,6 +526,12 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `principal.list` | C | `PrincipalListReq{tenant?}` → `PrincipalListRes{principals}`; exact tenant only |
 | `principal.revoke` | C | `PrincipalRevokeReq{tenant?, principal, idem}` → `PrincipalRevokeRes{revision}`; advances the durable revision |
 | `principal.token.issue` | C | `PrincipalTokenIssueReq{tenant?, principal, role, ttl_ms, idem}` → `PrincipalTokenIssueRes{access_token, expires_at}`; access-only, assigned role, 24h maximum |
+| `principal.session.create` | C | `PrincipalSessionCreateReq{tenant?, subject?, roles?, ws, ttl_sec?, idem}` → `PrincipalSessionCreateRes{principal, token, expires_at, ws, gen}`; creates an ephemeral principal and its workspace- and generation-bound capability in one call. `subject` is generated when empty; the workspace must be claimed; the bearer is returned once and never persisted; `principal.revoke` ends it (§9.1) |
+| `binding.create` | C | `BindingCreateReq{binding: BindingSpec, idem}` → `BindingSpec` without `secret`; tenant operator only. Exactly one of `secret` and `source` (§9.1) |
+| `binding.list` | C | `BindingListReq{tenant?, include_revoked?}` → `BindingListRes{bindings}`; no secrets, revoked rows only on request |
+| `binding.get` | C | `BindingGetReq{id, tenant?}` → `BindingSpec` without `secret` |
+| `binding.rotate` | C | `BindingRotateReq{id, tenant?, secret\|source, idem}` → `BindingSpec`; increments `revision`, so leases minted from the previous credential stop being honored within one renew |
+| `binding.revoke` | C | `BindingRevokeReq{id, tenant?, reason?, idem}` → `BindingSpec` with `revoked_at`; permanent, and not provider-side revocation |
 | `principal.invite` | C | `PrincipalInviteReq{tenant, principal, ttl_ms, idem}` → `PrincipalTokenIssueRes`; creates a tenant-bound operator and returns its initial short-lived access bearer |
 | `grant` | C | `GrantReq{ws}` → `Grant` |
 | `node.list` | C | → `NodeListRes{nodes}` |
@@ -539,7 +545,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `events.post` | C N | `EventPost{events}` → `{}` |
 | `ws.claim` | N | `WSClaimReq{id}` → `WSClaimRes{workspace, lease_sec}` |
 | `ws.ready` | N | `WSReadyReq{id, gen, restore_processes?}` → `{}` |
-| `ws.renew` | N | `WSRenewReq{ids, gen, authz, controller_epoch, profile?, runtime_checks?, report_checks?}` → `WSRenewRes{results, controller_epoch}`; each result repeats the epoch and explicitly says continue/fence/destroy/reconcile and, for a continued lease, carries `authz_revision`, `revoked`, `authz_reset` (§3.2, §4.1). When `report_checks` is set the request also carries this node's runtime-profile health; `ids` may then be empty, because an idle node still reports drift |
+| `ws.renew` | N | `WSRenewReq{ids, gen, authz, controller_epoch, profile?, runtime_checks?, report_checks?}` → `WSRenewRes{results, controller_epoch}`; each result repeats the epoch and explicitly says continue/fence/destroy/reconcile and, for a continued lease, carries `authz_revision`, `revoked`, `authz_reset` (§3.2, §4.1) and `binding_revision`, the fingerprint of the workspace's current binding set (§9.1). When `report_checks` is set the request also carries this node's runtime-profile health; `ids` may then be empty, because an idle node still reports drift |
 | `ws.released` | N | `WSReleasedReq{id, gen, snapshot, reason, failed?}` → `{}`; `failed:true` means materialization could not complete and control holds the workspace out of placement with a growing delay (1s doubling to 30s, reset by the next `ws.ready`) instead of re-offering it at once |
 | `ws.snapshot.commit` | N | `WSSnapshotCommitReq{id, gen, snapshot}` → `{}` |
 | `artifact.proof` | N | `ArtifactProofReq{ws, gen, method, artifact}` → `ArtifactProofRes{proof}`; issues a one-use, short-lived control signature only to the live assignment holder |
@@ -550,7 +556,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `session.log.get` | N | `SessionLogGetReq{session, ws, gen}` → `SessionLogRecord`; only the current holder of that exact workspace generation, and only for a record whose tenant matches the workspace |
 | `session.log.delete` | N | `SessionLogGetReq{session, ws, gen}` → `{}`; current holder only. A live record — one not yet marked `complete` — cannot be deleted |
 | `controller.state` | control only | `ControllerNodeState{node, epoch, workspaces[], releases[]}`; authenticated node-authoritative state used only while a promoted controller is reconciling |
-| `binding.lease` | N | `BindingLeaseReq{ws, gen}` → `BindingLeaseRes{leases}` |
+| `binding.lease` | N | `BindingLeaseReq{ws, gen}` → `BindingLeaseRes{leases, revision}`. A revoked binding is refused with `unauthorized`/`revoked` and a binding the control plane does not have with `not_found`/`binding_missing`; the whole set is refused rather than silently shortened (§9.1) |
 | `egress.approval` | N | `EgressApprovalReq{ws, gen, principal, rule, host, method, path_hash, body_hash, fingerprint, wait_ms?}` → `EgressApprovalRes{id, status, allowed?, expires_at?}`; only the current generation holder may create the durable approval |
 | `agent.report` | N | `AgentReport{agent, run, ws, gen, seq, kind, ...}` → `{}`; one observation about a run, fenced to the node, generation and run, deduplicated by `seq` (§6.1); `kind: transcript` carries `chunks[]` for the mirror (§6.2) |
 | `diag` | C | `DiagReq{verify}` → control diagnostics |
@@ -1123,7 +1129,9 @@ A binding leased to a node looks like:
 ```
 BindingLeaseReq { ws, gen } // gen fences a source resolution that crosses a move
 BindingLease { id, secret, destinations: [host patterns],
-               shape, principals, placeholder, expires_at }
+               shape, principals, placeholder, expires_at,
+               kind, methods, path_prefixes, revision, gen }
+BindingLeaseRes { leases, revision }  // revision fingerprints the binding set
 ```
 
 The broker's rules, in order, for every request:
@@ -1227,6 +1235,56 @@ readiness, and synchronously revoke it during fencing and shutdown.
 Placeholders should be **shape-preserving**: same prefix and length as the real
 secret, so client-side format validation in a harness does not reject the
 placeholder before it ever reaches the broker.
+
+### 9.1 Binding lifecycle and session-scoped principals
+
+A binding is a durable, tenant-scoped, mutable resource, not a line in a file
+the control plane read once. Its public shape is:
+
+```
+BindingSpec { id, tenant, kind, secret (write-only), source,
+              destinations, principals, workspaces, placeholder, ttl_sec,
+              methods, path_prefixes, retention{no_log, note},
+              revision, created_at, rotated_at, revoked_at, revoked_reason }
+```
+
+`secret` is accepted by `binding.create` and `binding.rotate` and MUST NOT
+appear in any response, event, or diagnostic. `kind` is one of `api_key`,
+`bearer`, `cookie`, `header`. A `cookie` is a separate kind on purpose:
+browser login state is scoped, rotated and revoked differently from an API
+key and MUST NOT share a binding with one.
+
+`methods` and `path_prefixes` narrow a binding beyond its destination hosts.
+They are recorded policy carried on the lease; the broker rule order in §9
+above is where a conforming implementation enforces them.
+
+`retention` records a provider data-retention requirement as metadata.
+Remount cannot enforce a provider's policy; it records what the operator
+asserted so an audit can answer the question.
+
+An implementation that configures bindings from a file seeds them into the
+durable store on the first start that does not already have them, with
+`revision` 1 and no tenant (global). A row that already exists wins: a
+rotation or revocation is a durable decision and MUST NOT be undone by
+restarting with the original file. Global bindings are visible to every
+tenant; a tenant-scoped binding with the same id shadows one.
+
+**Revocation reaches a live workspace within one renew.** `ws.renew` carries
+`binding_revision`, the fingerprint of the workspace's declared binding set.
+A node whose leases were minted from a different fingerprint MUST re-lease.
+`binding.lease` then refuses (`revoked` or `binding_missing`), and the node
+MUST drop the leases it holds rather than keeping them until `expires_at`. A
+transport failure is not a refusal: leases survive it and expire normally.
+
+**Broker TTL expiry is not provider-side revocation.** Revoking a binding
+stops Remount substituting the credential. The credential itself remains valid
+at the provider until it is rotated or deleted there.
+
+A session-scoped principal is the one-call form of the model in §4: an
+ephemeral principal plus the workspace- and generation-bound capability it
+acts with. The capability stops verifying when the workspace moves, when the
+TTL passes, or when the principal is revoked. Its bearer is returned exactly
+once and is never written to durable control state or to an event.
 
 ## 10. Artifacts and snapshots
 
@@ -1376,7 +1434,8 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `node.profile.v
 `cred.used`, `egress.allowed`, `egress.denied`, `egress.redacted`, `timer.set`, `timer.fired`,
 `peer.gone`, `ws.fenced`, `ws.state_changed`, `event.producer_gap`,
 `fleet.quarantine.requested`, `fleet.quarantine.target`,
-`fleet.quarantine.completed`, `base.created`, `base.removed`, `volume.created`,
+`fleet.quarantine.completed`, `binding.created`, `binding.rotated`,
+`binding.revoked`, `principal.session.created`, `base.created`, `base.removed`, `volume.created`,
 `volume.published`, `volume.attached`, `volume.detached`, `volume.removed`, `run.started`,
 `run.finished`, `auth.workspace_resident`, `queue.created`,
 `queue.advanced`, `pool.created`, `pool.removed`, `pool.scaled`,

@@ -112,7 +112,7 @@ func (c *Control) reauthenticateClient(ctx context.Context, peer string) error {
 	}
 	subject, err := c.opts.Authenticator.Authenticate(ctx, Credential{Token: hello.Token, Role: proto.RoleClient, Peer: peer})
 	if err != nil || subject.ID == "" || subject.Tenant == "" {
-		return proto.Err(proto.CodeDenied, "credential expired or was revoked")
+		return proto.ErrReason(proto.CodeDenied, proto.ReasonRevoked, "credential expired or was revoked")
 	}
 	c.mu.Lock()
 	current := c.clients[peer]
@@ -290,9 +290,17 @@ func (c *Control) verifySessionCapabilityForNode(ctx context.Context, node, work
 	}
 	c.mu.Lock()
 	workspace := c.workspaces[workspaceID]
-	if workspace == nil || workspace.State != proto.WSClaimed || workspace.Node != node || workspace.Generation != generation {
+	if workspace == nil || workspace.State != proto.WSClaimed || workspace.Node != node {
 		c.mu.Unlock()
 		return SessionCapability{}, 0, proto.Err(proto.CodeDenied, "workspace assignment is not live")
+	}
+	if workspace.Generation != generation {
+		// The workspace moved. Naming that separately lets an SDK tell a
+		// capability that is bound to a past generation from one whose
+		// workspace is simply gone.
+		c.mu.Unlock()
+		return SessionCapability{}, 0, proto.ErrReason(proto.CodeDenied, proto.ReasonGenerationMismatch,
+			"workspace assignment is not live")
 	}
 	tenantID := workspace.Tenant
 	authzRevision := workspace.AuthzRevision
@@ -300,7 +308,7 @@ func (c *Control) verifySessionCapabilityForNode(ctx context.Context, node, work
 	c.mu.Unlock()
 	capability, err := c.opts.SessionCapabilities.VerifyBrokerCapability(ctx, token, tenantID, workspaceID, generation)
 	if err != nil {
-		return SessionCapability{}, 0, proto.Err(proto.CodeDenied, "session capability is invalid or revoked")
+		return SessionCapability{}, 0, proto.ErrReason(proto.CodeDenied, proto.ReasonRevoked, "session capability is invalid or revoked")
 	}
 	if err := c.check(ctx, capability.Subject, ActionExecute, resource); err != nil {
 		return SessionCapability{}, 0, err

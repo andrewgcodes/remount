@@ -256,9 +256,14 @@ type Node struct {
 // ws is a claimed workspace on this node.
 type ws struct {
 	proto.Workspace
-	handle           workspace.Handle
-	broker           *broker.Broker
-	leases           []proto.BindingLease
+	handle workspace.Handle
+	broker *broker.Broker
+	leases []proto.BindingLease
+	// bindingRevision fingerprints the control-plane binding set these leases
+	// were minted from. Renew reports the authoritative fingerprint, so a
+	// rotation or revocation is picked up within one renew interval rather
+	// than at lease expiry.
+	bindingRevision  uint64
 	lastSnapshot     time.Time
 	restoreProcesses string
 	// treeMu serializes node filesystem mutations/session startup with archive
@@ -1599,6 +1604,7 @@ func (n *Node) renew(ctx context.Context) {
 	}
 	// Refresh broker leases that are within a minute of expiry.
 	var refresh []*ws
+	expected := map[string]uint64{}
 	for _, w := range n.workspaces {
 		for _, l := range w.leases {
 			if l.ExpiresAt-time.Now().UnixMilli() < 60_000 {
@@ -1630,11 +1636,20 @@ func (n *Node) renew(ctx context.Context) {
 				n.profileHealthDelivered(checkVersion)
 			}
 			n.applyRenewResults(req, &res)
+			for _, stale := range n.staleBindingWorkspaces(&res) {
+				refresh = append(refresh, stale.workspace)
+				expected[stale.workspace.ID] = stale.revision
+			}
 		}
 		cancel()
 	}
+	seen := make(map[string]struct{}, len(refresh))
 	for _, w := range refresh {
-		n.refreshLeases(ctx, w)
+		if _, done := seen[w.ID]; done {
+			continue
+		}
+		seen[w.ID] = struct{}{}
+		n.refreshLeases(ctx, w, expected[w.ID])
 	}
 }
 
@@ -1770,7 +1785,11 @@ func (n *Node) fenceExpired(ctx context.Context, now time.Time) {
 	}
 }
 
-func (n *Node) refreshLeases(ctx context.Context, w *ws) {
+// refreshLeases re-leases one workspace's bindings. expected is the binding-set
+// fingerprint control reported at renew, or zero when the refresh was driven by
+// lease expiry instead. A refusal records it so the node does not re-ask on
+// every renew for a binding the operator has already withdrawn.
+func (n *Node) refreshLeases(ctx context.Context, w *ws, expected uint64) {
 	n.mu.Lock()
 	p := n.peer
 	n.mu.Unlock()
@@ -1781,15 +1800,71 @@ func (n *Node) refreshLeases(ctx context.Context, w *ws) {
 	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := p.Call(rctx, proto.PeerControl, proto.OpBindingLease, proto.BindingLeaseReq{WS: w.ID, Gen: w.Generation}, &res); err != nil {
+		if bindingLeaseRefused(err) {
+			// Control has decided this workspace may no longer substitute:
+			// a binding it names was revoked or removed. Keeping the leases
+			// until TTL would keep substituting a credential the operator
+			// already withdrew, so drop them now and fail closed.
+			n.mu.Lock()
+			w.leases = nil
+			w.bindingRevision = expected
+			if w.broker != nil {
+				w.broker.SetLeases(nil)
+			}
+			n.mu.Unlock()
+			n.logger.Warn("binding lease refused; substitution disabled for this workspace", "ws", w.ID, "err", err)
+			return
+		}
 		n.logger.Warn("lease refresh failed; broker will fail closed at expiry", "ws", w.ID, "err", err)
 		return
 	}
 	n.mu.Lock()
 	w.leases = res.Leases
+	w.bindingRevision = res.Revision
 	if w.broker != nil {
 		w.broker.SetLeases(res.Leases)
 	}
 	n.mu.Unlock()
+}
+
+// bindingLeaseRefused reports whether control definitively refused to lease,
+// as opposed to being briefly unreachable. Only a refusal invalidates the
+// leases the node already holds; a transport failure leaves them to expire.
+func bindingLeaseRefused(err error) bool {
+	var pe *proto.Error
+	if !errors.As(err, &pe) {
+		return false
+	}
+	switch pe.Reason {
+	case proto.ReasonRevoked, proto.ReasonBindingMissing:
+		return true
+	}
+	return false
+}
+
+// staleBinding names one workspace whose control-plane binding set changed
+// since its leases were minted, and the fingerprint it changed to.
+type staleBinding struct {
+	workspace *ws
+	revision  uint64
+}
+
+// staleBindingWorkspaces names the workspaces whose control-plane binding set
+// changed since their leases were minted.
+func (n *Node) staleBindingWorkspaces(res *proto.WSRenewRes) []staleBinding {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var stale []staleBinding
+	for _, result := range res.Results {
+		if !result.Accepted || result.BindingRevision == 0 {
+			continue
+		}
+		w := n.workspaces[result.ID]
+		if w != nil && w.bindingRevision != result.BindingRevision {
+			stale = append(stale, staleBinding{workspace: w, revision: result.BindingRevision})
+		}
+	}
+	return stale
 }
 
 // resync re-declares the workspaces this node is already serving. A control
@@ -2495,10 +2570,15 @@ func (n *Node) authorizeClaims(client, wsID string, g *proto.Grant) (*ws, proto.
 		return nil, proto.GrantClaims{}, proto.Err(proto.CodeUnauthorized, "grant is for a different client, workspace or node")
 	}
 	if g.Claims.Gen != w.Generation {
-		return nil, proto.GrantClaims{}, proto.Err(proto.CodeConflict, "grant generation %d != workspace generation %d (workspace moved?)", g.Claims.Gen, w.Generation)
+		return nil, proto.GrantClaims{}, proto.ErrReason(proto.CodeConflict, proto.ReasonGenerationMismatch,
+			"grant generation %d != workspace generation %d (workspace moved?)", g.Claims.Gen, w.Generation)
 	}
 	if g.Claims.Tenant != w.Tenant || g.Claims.AuthzRevision < w.AuthzRevision {
-		return nil, proto.GrantClaims{}, proto.Err(proto.CodeUnauthorized, "grant authorization revision or tenant is stale")
+		// A grant behind the node's authorization revision is the shape a
+		// revoked principal presents: revocation is what advances that
+		// revision, and control refuses to mint a fresh grant for it.
+		return nil, proto.GrantClaims{}, proto.ErrReason(proto.CodeUnauthorized, proto.ReasonRevoked,
+			"grant authorization revision or tenant is stale")
 	}
 	if g.Claims.AuthzRevision > w.AuthzRevision {
 		return nil, proto.GrantClaims{}, proto.Err(proto.CodeConflict,
@@ -3853,6 +3933,7 @@ func (n *Node) materializeWithReadyHook(ctx context.Context, w proto.Workspace, 
 	}
 	// Broker: one per workspace, always on, so every session has an egress path.
 	var leases []proto.BindingLease
+	var bindingRevision uint64
 	if len(w.Spec.Bindings) > 0 {
 		var res proto.BindingLeaseRes
 		n.mu.Lock()
@@ -3868,8 +3949,10 @@ func (n *Node) materializeWithReadyHook(ctx context.Context, w proto.Workspace, 
 			return retainOnError(fmt.Errorf("binding lease: %w", err))
 		}
 		leases = res.Leases
+		bindingRevision = res.Revision
 	}
 	entry.leases = leases
+	entry.bindingRevision = bindingRevision
 	brokerOpts := broker.Options{
 		WS: w.ID, Generation: w.Generation, Principal: w.Spec.Principal, Tenant: w.Tenant, Leases: leases,
 		Network: w.Spec.Security.Network, Allow: n.opts.Allow, AllowPrivate: n.opts.AllowPrivate,

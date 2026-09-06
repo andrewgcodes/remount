@@ -422,6 +422,16 @@ export interface BaseRemoveReq {
   "idem"?: string;
 }
 
+export interface BindingCreateReq {
+  "binding": BindingSpec;
+  "idem": string;
+}
+
+export interface BindingGetReq {
+  "id": string;
+  "tenant"?: string;
+}
+
 export interface BindingLease {
   "id": string;
   "secret": string;
@@ -430,6 +440,11 @@ export interface BindingLease {
   "principals"?: Array<string>;
   "expires_at": number;
   "placeholder"?: string;
+  "kind"?: string;
+  "methods"?: Array<string>;
+  "path_prefixes"?: Array<string>;
+  "revision"?: number;
+  "gen"?: number;
 }
 
 export interface BindingLeaseReq {
@@ -439,6 +454,57 @@ export interface BindingLeaseReq {
 
 export interface BindingLeaseRes {
   "leases": Array<BindingLease>;
+  "revision"?: number;
+}
+
+export interface BindingListReq {
+  "tenant"?: string;
+  "include_revoked"?: boolean;
+}
+
+export interface BindingListRes {
+  "bindings": Array<BindingSpec>;
+}
+
+export interface BindingRetention {
+  "no_log"?: boolean;
+  "note"?: string;
+}
+
+export interface BindingRevokeReq {
+  "id": string;
+  "tenant"?: string;
+  "reason"?: string;
+  "idem": string;
+}
+
+export interface BindingRotateReq {
+  "id": string;
+  "tenant"?: string;
+  "secret"?: string;
+  "source"?: string;
+  "idem": string;
+}
+
+export interface BindingSpec {
+  "id": string;
+  "tenant"?: string;
+  "kind"?: string;
+  "secret"?: string;
+  "source"?: string;
+  "destinations"?: Array<string>;
+  "principals"?: Array<string>;
+  "workspaces"?: Array<string>;
+  "placeholder"?: string;
+  "ttl_sec"?: number;
+  "methods"?: Array<string>;
+  "path_prefixes"?: Array<string>;
+  "retention"?: BindingRetention;
+  "revision"?: number;
+  "created_at"?: number;
+  "rotated_at"?: number;
+  "revoked_at"?: number;
+  "revoked_reason"?: string;
 }
 
 export interface Budget {
@@ -1311,6 +1377,23 @@ export interface PrincipalRevokeRes {
   "revision": number;
 }
 
+export interface PrincipalSessionCreateReq {
+  "tenant"?: string;
+  "subject"?: string;
+  "roles"?: Array<string>;
+  "ws": string;
+  "ttl_sec"?: number;
+  "idem": string;
+}
+
+export interface PrincipalSessionCreateRes {
+  "principal": Principal;
+  "token": string;
+  "expires_at": number;
+  "ws": string;
+  "gen": number;
+}
+
 export interface PrincipalTokenIssueReq {
   "tenant"?: string;
   "principal": string;
@@ -1981,6 +2064,7 @@ export interface WSRenewResult {
   "authz_revision"?: number;
   "revoked"?: Array<string>;
   "authz_reset"?: boolean;
+  "binding_revision"?: number;
 }
 
 export interface WSSleepReq {
@@ -2111,7 +2195,12 @@ export const OPERATIONS = {
   "base.create": { constant: "OpBaseCreate", request: "BaseCreateReq", response: "Base" },
   "base.list": { constant: "OpBaseList", request: "", response: "BaseListRes" },
   "base.remove": { constant: "OpBaseRemove", request: "BaseRemoveReq", response: "" },
+  "binding.create": { constant: "OpBindingCreate", request: "BindingCreateReq", response: "BindingSpec" },
+  "binding.get": { constant: "OpBindingGet", request: "BindingGetReq", response: "BindingSpec" },
   "binding.lease": { constant: "OpBindingLease", request: "BindingLeaseReq", response: "BindingLeaseRes" },
+  "binding.list": { constant: "OpBindingList", request: "BindingListReq", response: "BindingListRes" },
+  "binding.revoke": { constant: "OpBindingRevoke", request: "BindingRevokeReq", response: "BindingSpec" },
+  "binding.rotate": { constant: "OpBindingRotate", request: "BindingRotateReq", response: "BindingSpec" },
   "budget.create": { constant: "OpBudgetCreate", request: "BudgetCreateReq", response: "Budget" },
   "budget.list": { constant: "OpBudgetList", request: "BudgetListReq", response: "BudgetListRes" },
   "budget.remove": { constant: "OpBudgetRemove", request: "BudgetRemoveReq", response: "" },
@@ -2160,6 +2249,7 @@ export const OPERATIONS = {
   "principal.invite": { constant: "OpPrincipalInvite", request: "PrincipalInviteReq", response: "" },
   "principal.list": { constant: "OpPrincipalList", request: "PrincipalListReq", response: "PrincipalListRes" },
   "principal.revoke": { constant: "OpPrincipalRevoke", request: "PrincipalRevokeReq", response: "PrincipalRevokeRes" },
+  "principal.session.create": { constant: "OpPrincipalSessionCreate", request: "PrincipalSessionCreateReq", response: "PrincipalSessionCreateRes" },
   "principal.token.issue": { constant: "OpPrincipalTokenIssue", request: "PrincipalTokenIssueReq", response: "PrincipalTokenIssueRes" },
   "queue.advance": { constant: "OpQueueAdvance", request: "QueueAdvanceReq", response: "Queue" },
   "queue.create": { constant: "OpQueueCreate", request: "QueueCreateReq", response: "Queue" },

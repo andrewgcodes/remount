@@ -562,7 +562,7 @@ func (c *Control) egressApproval(ctx context.Context, node string, req *proto.Eg
 			tenant := ws.Tenant
 			c.mu.Unlock()
 			metrics.ApprovalQuotaRejected.Inc()
-			return nil, proto.Err(proto.CodeResourceExhausted, "tenant %s has %d pending egress approvals", tenant, pending)
+			return nil, proto.ErrReason(proto.CodeResourceExhausted, proto.ReasonQuotaExceeded, "tenant %s has %d pending egress approvals", tenant, pending)
 		}
 		ap = &proto.Approval{
 			ID: ids.New("ap"), Tenant: ws.Tenant, Owner: ws.Owner, WS: ws.ID, Kind: proto.ApprovalEgress,
@@ -638,7 +638,7 @@ func (c *Control) approvalAuthorize(ctx context.Context, subject Subject, ap *pr
 	}
 	c.mu.Unlock()
 	if agentCopy == nil {
-		return proto.Err(proto.CodeDenied, "subject %s may not %s approval %s", subject.ID, action, ap.ID)
+		return proto.ErrReason(proto.CodeDenied, proto.ReasonPermissionDenied, "subject %s may not %s approval %s", subject.ID, action, ap.ID)
 	}
 	return c.agentAuthorize(ctx, subject, agentCopy, action)
 }

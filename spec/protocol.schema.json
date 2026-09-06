@@ -1432,6 +1432,37 @@
       ],
       "additionalProperties": true
     },
+    "BindingCreateReq": {
+      "type": "object",
+      "properties": {
+        "binding": {
+          "$ref": "#/$defs/BindingSpec"
+        },
+        "idem": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "binding",
+        "idem"
+      ],
+      "additionalProperties": true
+    },
+    "BindingGetReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
     "BindingLease": {
       "type": "object",
       "properties": {
@@ -1444,8 +1475,26 @@
         "expires_at": {
           "type": "integer"
         },
+        "gen": {
+          "type": "integer"
+        },
         "id": {
           "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "methods": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path_prefixes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "placeholder": {
           "type": "string"
@@ -1455,6 +1504,9 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "revision": {
+          "type": "integer"
         },
         "secret": {
           "type": "string"
@@ -1494,10 +1546,177 @@
             "$ref": "#/$defs/BindingLease"
           },
           "type": "array"
+        },
+        "revision": {
+          "type": "integer"
         }
       },
       "required": [
         "leases"
+      ],
+      "additionalProperties": true
+    },
+    "BindingListReq": {
+      "type": "object",
+      "properties": {
+        "include_revoked": {
+          "type": "boolean"
+        },
+        "tenant": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "BindingListRes": {
+      "type": "object",
+      "properties": {
+        "bindings": {
+          "items": {
+            "$ref": "#/$defs/BindingSpec"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "bindings"
+      ],
+      "additionalProperties": true
+    },
+    "BindingRetention": {
+      "type": "object",
+      "properties": {
+        "no_log": {
+          "type": "boolean"
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "BindingRevokeReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "idem"
+      ],
+      "additionalProperties": true
+    },
+    "BindingRotateReq": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "idem": {
+          "type": "string"
+        },
+        "secret": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "idem"
+      ],
+      "additionalProperties": true
+    },
+    "BindingSpec": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer"
+        },
+        "destinations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "methods": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path_prefixes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "placeholder": {
+          "type": "string"
+        },
+        "principals": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "retention": {
+          "$ref": "#/$defs/BindingRetention"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "revoked_at": {
+          "type": "integer"
+        },
+        "revoked_reason": {
+          "type": "string"
+        },
+        "rotated_at": {
+          "type": "integer"
+        },
+        "secret": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "ttl_sec": {
+          "type": "integer"
+        },
+        "workspaces": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id"
       ],
       "additionalProperties": true
     },
@@ -4556,6 +4775,65 @@
       ],
       "additionalProperties": true
     },
+    "PrincipalSessionCreateReq": {
+      "type": "object",
+      "properties": {
+        "idem": {
+          "type": "string"
+        },
+        "roles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "ttl_sec": {
+          "type": "integer"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "idem",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
+    "PrincipalSessionCreateRes": {
+      "type": "object",
+      "properties": {
+        "expires_at": {
+          "type": "integer"
+        },
+        "gen": {
+          "type": "integer"
+        },
+        "principal": {
+          "$ref": "#/$defs/Principal"
+        },
+        "token": {
+          "type": "string"
+        },
+        "ws": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expires_at",
+        "gen",
+        "principal",
+        "token",
+        "ws"
+      ],
+      "additionalProperties": true
+    },
     "PrincipalTokenIssueReq": {
       "type": "object",
       "properties": {
@@ -6915,6 +7193,9 @@
         "authz_revision": {
           "type": "integer"
         },
+        "binding_revision": {
+          "type": "integer"
+        },
         "controller_epoch": {
           "type": "integer"
         },
@@ -7441,10 +7722,40 @@
       "request": "BaseRemoveReq"
     },
     {
+      "constant": "OpBindingCreate",
+      "name": "binding.create",
+      "request": "BindingCreateReq",
+      "response": "BindingSpec"
+    },
+    {
+      "constant": "OpBindingGet",
+      "name": "binding.get",
+      "request": "BindingGetReq",
+      "response": "BindingSpec"
+    },
+    {
       "constant": "OpBindingLease",
       "name": "binding.lease",
       "request": "BindingLeaseReq",
       "response": "BindingLeaseRes"
+    },
+    {
+      "constant": "OpBindingList",
+      "name": "binding.list",
+      "request": "BindingListReq",
+      "response": "BindingListRes"
+    },
+    {
+      "constant": "OpBindingRevoke",
+      "name": "binding.revoke",
+      "request": "BindingRevokeReq",
+      "response": "BindingSpec"
+    },
+    {
+      "constant": "OpBindingRotate",
+      "name": "binding.rotate",
+      "request": "BindingRotateReq",
+      "response": "BindingSpec"
     },
     {
       "constant": "OpBudgetCreate",
@@ -7710,6 +8021,12 @@
       "name": "principal.revoke",
       "request": "PrincipalRevokeReq",
       "response": "PrincipalRevokeRes"
+    },
+    {
+      "constant": "OpPrincipalSessionCreate",
+      "name": "principal.session.create",
+      "request": "PrincipalSessionCreateReq",
+      "response": "PrincipalSessionCreateRes"
     },
     {
       "constant": "OpPrincipalTokenIssue",

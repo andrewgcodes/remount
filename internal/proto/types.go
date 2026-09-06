@@ -565,6 +565,12 @@ type WSRenewResult struct {
 	AuthzRevision uint64   `cbor:"authz_revision,omitempty" json:"authz_revision,omitempty"`
 	Revoked       []string `cbor:"revoked,omitempty" json:"revoked,omitempty"`
 	AuthzReset    bool     `cbor:"authz_reset,omitempty" json:"authz_reset,omitempty"`
+	// BindingRevision fingerprints the workspace's current binding set. It
+	// differs from the value the node received with its last lease whenever a
+	// binding was rotated or revoked, which is how a credential change reaches
+	// a running workspace within one renew rather than at lease expiry. Zero
+	// means the workspace declares no bindings.
+	BindingRevision uint64 `cbor:"binding_revision,omitempty" json:"binding_revision,omitempty"`
 }
 
 type WSRenewRes struct {
@@ -1144,10 +1150,28 @@ type BindingLease struct {
 	// means "ref:<id>". A shape-preserving value (same prefix/length as the
 	// real secret) keeps client-side format validation happy.
 	Placeholder string `cbor:"placeholder,omitempty" json:"placeholder,omitempty"`
+	// Kind is one of the BindingKind* constants: what the substituted value
+	// is, so a browser cookie is never treated as an API key.
+	Kind string `cbor:"kind,omitempty" json:"kind,omitempty"`
+	// Methods and PathPrefixes narrow the binding beyond its destinations.
+	// Empty means every method or every path.
+	Methods      []string `cbor:"methods,omitempty" json:"methods,omitempty"`
+	PathPrefixes []string `cbor:"path_prefixes,omitempty" json:"path_prefixes,omitempty"`
+	// Revision is the binding revision this lease was minted from. A rotation
+	// bumps it, so a node can tell a stale lease from a live one.
+	Revision uint64 `cbor:"revision,omitempty" json:"revision,omitempty"`
+	// Generation is the workspace generation the lease was issued for. A lease
+	// carried across a move is not valid for the new generation.
+	Generation uint64 `cbor:"gen,omitempty" json:"gen,omitempty"`
 }
 
 type BindingLeaseRes struct {
 	Leases []BindingLease `cbor:"leases" json:"leases"`
+	// Revision fingerprints the binding set this response was computed from.
+	// The node compares it with WSRenewResult.BindingRevision and re-leases
+	// when they differ, so a rotation or revocation reaches a live workspace
+	// within one renew interval instead of at lease TTL.
+	Revision uint64 `cbor:"revision,omitempty" json:"revision,omitempty"`
 }
 
 type GrantReq struct {

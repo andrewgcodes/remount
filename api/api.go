@@ -71,6 +71,15 @@ type (
 	FleetOperationResult   = proto.FleetOperationResult
 	FleetQuarantineRequest = proto.FleetQuarantineReq
 
+	// Brokered credentials. A BindingSpec's Secret is write-only: it is
+	// accepted on create and rotate and never appears in a response.
+	BindingSpec             = proto.BindingSpec
+	BindingRetention        = proto.BindingRetention
+	BindingRotateRequest    = proto.BindingRotateReq
+	Principal               = proto.Principal
+	SessionPrincipalRequest = proto.PrincipalSessionCreateReq
+	SessionPrincipal        = proto.PrincipalSessionCreateRes
+
 	NodeInfo             = proto.NodeInfo
 	NodeStatus           = proto.NodeStatus
 	BackendDescriptor    = proto.BackendDescriptor
@@ -174,6 +183,13 @@ const (
 
 	SnapshotConsistencyLive     = proto.SnapshotConsistencyLive
 	SnapshotConsistencyQuiesced = proto.SnapshotConsistencyQuiesced
+
+	// Binding kinds. A browser session cookie is deliberately a different
+	// kind from an API key and must never share a binding with one.
+	BindingKindAPIKey = proto.BindingKindAPIKey
+	BindingKindBearer = proto.BindingKindBearer
+	BindingKindCookie = proto.BindingKindCookie
+	BindingKindHeader = proto.BindingKindHeader
 )
 
 // Computer resources. A computer is a browser a node drives inside a

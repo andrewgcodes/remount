@@ -425,6 +425,16 @@ BaseRemoveReq = TypedDict("BaseRemoveReq", {
     "idem": NotRequired[str],
 }, total=False)
 
+BindingCreateReq = TypedDict("BindingCreateReq", {
+    "binding": Required["BindingSpec"],
+    "idem": Required[str],
+}, total=False)
+
+BindingGetReq = TypedDict("BindingGetReq", {
+    "id": Required[str],
+    "tenant": NotRequired[str],
+}, total=False)
+
 BindingLease = TypedDict("BindingLease", {
     "id": Required[str],
     "secret": Required[str],
@@ -433,6 +443,11 @@ BindingLease = TypedDict("BindingLease", {
     "principals": NotRequired[list[str]],
     "expires_at": Required[int],
     "placeholder": NotRequired[str],
+    "kind": NotRequired[str],
+    "methods": NotRequired[list[str]],
+    "path_prefixes": NotRequired[list[str]],
+    "revision": NotRequired[int],
+    "gen": NotRequired[int],
 }, total=False)
 
 BindingLeaseReq = TypedDict("BindingLeaseReq", {
@@ -442,6 +457,57 @@ BindingLeaseReq = TypedDict("BindingLeaseReq", {
 
 BindingLeaseRes = TypedDict("BindingLeaseRes", {
     "leases": Required[list["BindingLease"]],
+    "revision": NotRequired[int],
+}, total=False)
+
+BindingListReq = TypedDict("BindingListReq", {
+    "tenant": NotRequired[str],
+    "include_revoked": NotRequired[bool],
+}, total=False)
+
+BindingListRes = TypedDict("BindingListRes", {
+    "bindings": Required[list["BindingSpec"]],
+}, total=False)
+
+BindingRetention = TypedDict("BindingRetention", {
+    "no_log": NotRequired[bool],
+    "note": NotRequired[str],
+}, total=False)
+
+BindingRevokeReq = TypedDict("BindingRevokeReq", {
+    "id": Required[str],
+    "tenant": NotRequired[str],
+    "reason": NotRequired[str],
+    "idem": Required[str],
+}, total=False)
+
+BindingRotateReq = TypedDict("BindingRotateReq", {
+    "id": Required[str],
+    "tenant": NotRequired[str],
+    "secret": NotRequired[str],
+    "source": NotRequired[str],
+    "idem": Required[str],
+}, total=False)
+
+BindingSpec = TypedDict("BindingSpec", {
+    "id": Required[str],
+    "tenant": NotRequired[str],
+    "kind": NotRequired[str],
+    "secret": NotRequired[str],
+    "source": NotRequired[str],
+    "destinations": NotRequired[list[str]],
+    "principals": NotRequired[list[str]],
+    "workspaces": NotRequired[list[str]],
+    "placeholder": NotRequired[str],
+    "ttl_sec": NotRequired[int],
+    "methods": NotRequired[list[str]],
+    "path_prefixes": NotRequired[list[str]],
+    "retention": NotRequired["BindingRetention"],
+    "revision": NotRequired[int],
+    "created_at": NotRequired[int],
+    "rotated_at": NotRequired[int],
+    "revoked_at": NotRequired[int],
+    "revoked_reason": NotRequired[str],
 }, total=False)
 
 Budget = TypedDict("Budget", {
@@ -1314,6 +1380,23 @@ PrincipalRevokeRes = TypedDict("PrincipalRevokeRes", {
     "revision": Required[int],
 }, total=False)
 
+PrincipalSessionCreateReq = TypedDict("PrincipalSessionCreateReq", {
+    "tenant": NotRequired[str],
+    "subject": NotRequired[str],
+    "roles": NotRequired[list[str]],
+    "ws": Required[str],
+    "ttl_sec": NotRequired[int],
+    "idem": Required[str],
+}, total=False)
+
+PrincipalSessionCreateRes = TypedDict("PrincipalSessionCreateRes", {
+    "principal": Required["Principal"],
+    "token": Required[str],
+    "expires_at": Required[int],
+    "ws": Required[str],
+    "gen": Required[int],
+}, total=False)
+
 PrincipalTokenIssueReq = TypedDict("PrincipalTokenIssueReq", {
     "tenant": NotRequired[str],
     "principal": Required[str],
@@ -1984,6 +2067,7 @@ WSRenewResult = TypedDict("WSRenewResult", {
     "authz_revision": NotRequired[int],
     "revoked": NotRequired[list[str]],
     "authz_reset": NotRequired[bool],
+    "binding_revision": NotRequired[int],
 }, total=False)
 
 WSSleepReq = TypedDict("WSSleepReq", {
@@ -2114,7 +2198,12 @@ OPERATIONS: dict[str, dict[str, object]] = {
     "base.create": {"constant": "OpBaseCreate", "request": "BaseCreateReq", "response": "Base"},
     "base.list": {"constant": "OpBaseList", "request": "", "response": "BaseListRes"},
     "base.remove": {"constant": "OpBaseRemove", "request": "BaseRemoveReq", "response": ""},
+    "binding.create": {"constant": "OpBindingCreate", "request": "BindingCreateReq", "response": "BindingSpec"},
+    "binding.get": {"constant": "OpBindingGet", "request": "BindingGetReq", "response": "BindingSpec"},
     "binding.lease": {"constant": "OpBindingLease", "request": "BindingLeaseReq", "response": "BindingLeaseRes"},
+    "binding.list": {"constant": "OpBindingList", "request": "BindingListReq", "response": "BindingListRes"},
+    "binding.revoke": {"constant": "OpBindingRevoke", "request": "BindingRevokeReq", "response": "BindingSpec"},
+    "binding.rotate": {"constant": "OpBindingRotate", "request": "BindingRotateReq", "response": "BindingSpec"},
     "budget.create": {"constant": "OpBudgetCreate", "request": "BudgetCreateReq", "response": "Budget"},
     "budget.list": {"constant": "OpBudgetList", "request": "BudgetListReq", "response": "BudgetListRes"},
     "budget.remove": {"constant": "OpBudgetRemove", "request": "BudgetRemoveReq", "response": ""},
@@ -2163,6 +2252,7 @@ OPERATIONS: dict[str, dict[str, object]] = {
     "principal.invite": {"constant": "OpPrincipalInvite", "request": "PrincipalInviteReq", "response": ""},
     "principal.list": {"constant": "OpPrincipalList", "request": "PrincipalListReq", "response": "PrincipalListRes"},
     "principal.revoke": {"constant": "OpPrincipalRevoke", "request": "PrincipalRevokeReq", "response": "PrincipalRevokeRes"},
+    "principal.session.create": {"constant": "OpPrincipalSessionCreate", "request": "PrincipalSessionCreateReq", "response": "PrincipalSessionCreateRes"},
     "principal.token.issue": {"constant": "OpPrincipalTokenIssue", "request": "PrincipalTokenIssueReq", "response": "PrincipalTokenIssueRes"},
     "queue.advance": {"constant": "OpQueueAdvance", "request": "QueueAdvanceReq", "response": "Queue"},
     "queue.create": {"constant": "OpQueueCreate", "request": "QueueCreateReq", "response": "Queue"},
