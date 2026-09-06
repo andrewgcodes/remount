@@ -244,6 +244,16 @@ func cmdInspect(ctx context.Context, args []string) error {
 	if ws.LeaseUntil > 0 {
 		fmt.Printf("  lease       %s remaining\n", time.Until(time.UnixMilli(ws.LeaseUntil)).Round(time.Second))
 	}
+	// The claim lease above is the node's ownership renewal. This is the
+	// client's durable hold (ADR 0090), which is a different thing with an
+	// unfortunately similar name, so the label says which one it is.
+	if hold := ws.Lease; hold.Live() {
+		fmt.Printf("  hold        %s until %s (on_expiry %s)\n", hold.ID, millis(hold.MaxAliveUntil), hold.OnExpiry)
+	}
+	if d := ws.LifecycleDeadline; d != nil {
+		fmt.Print("  ")
+		printLifecycleDeadline(os.Stdout, d)
+	}
 	fmt.Printf("  snapshot    %s\n", orDash(ws.LastSnapshot))
 	fmt.Printf("  principal   %s\n", orDash(ws.Spec.Principal))
 	if len(ws.Spec.Bindings) > 0 {

@@ -37,6 +37,51 @@ tests and engineering notes do not.
 - `make protogen` and `make protogen-check` wrap `cmd/protogen`, which
   regenerates the JSON Schema, operation table and Python/TypeScript
   declarations from `internal/proto` and byte-compares them.
+- Durable workspace holds and idle policy (`spec/PROTOCOL.md` §5.5, ADR 0090).
+  `ws.lease`, `ws.lease.renew`, `ws.lease.cancel` and `ws.lease.get` keep a
+  claimed workspace awake until a control-plane deadline and then sleep or
+  destroy it; `ws.idle.policy` and `ws.idle.mark` are the no-work cleanup rule
+  and its clock. The deadline is durable, so it survives the client that asked
+  for it, node loss, and a control-plane restart. `Workspace` gains `lease`,
+  `idle_policy`, `idle_since`, `last_activity_at` and `lifecycle_deadline`, the
+  derived view a client polls instead of reading timers. Activity is explicit:
+  session traffic does not extend a deadline.
+- CLI: `remount ws lease`, `ws lease renew|cancel|get`, `ws idle-policy`,
+  `ws mark-idle` and `ws mark-active`, all with `--json` and Go-duration flags.
+  `ws get` and `ws lease get` also print the pending lifecycle deadline in
+  words when not in `--json` mode.
+- SDKs: `LeaseWorkspace`, `RenewLease`, `CancelLease`, `GetLease`,
+  `SetIdlePolicy`, `MarkIdle` and `MarkActive` on the Go client; the same seven
+  as `lease_workspace`/`renew_lease`/`cancel_lease`/`get_lease`/
+  `set_idle_policy`/`mark_idle`/`mark_active` in Python and
+  `leaseWorkspace`/`renewLease`/`cancelLease`/`getLease`/`setIdlePolicy`/
+  `markIdle`/`markActive` in TypeScript.
+- Events `ws.lease.granted`, `ws.lease.renewed`, `ws.lease.cancelled`,
+  `ws.lease.expired`, `ws.idle.policy_set`, `ws.idle.marked`,
+  `ws.lifecycle.expired`, `ws.lifecycle.expiry_failed` and
+  `ws.hold.max_reached`. Note that `ws.lease_expired` remains a different
+  event: it is the node's claim lease, not a client's hold.
+- `examples/long-running-autosleep`: take a hold, run a command that outlives
+  it, renew once, watch the control plane sleep the workspace on its own, read
+  the exit reason and the events, then wake it and confirm the filesystem
+  survived.
+
+### Changed
+
+- A session ended by a lifecycle deadline reports
+  `exit.reason = "lifecycle_deadline_expired"` rather than the generic
+  `"workspace released"`, and the node gives it `SIGTERM` plus a bounded grace
+  (five seconds by default) before `SIGKILL`. On Windows the grace degrades to
+  immediate termination; the recorded reason is the same.
+
+### Fixed
+
+- A client streaming a session is no longer cut off before the exit chunk when
+  its workspace is released. `releasePrepare` cancelled every output
+  subscription before terminating the sessions, so the exit chunk the stop
+  produced had no subscriber left to receive it and an attached reader hung
+  forever on a stream that went quiet and never closed. Subscribers now deliver
+  the exit chunk their joined sessions produced, bounded, before they are cut.
 
 ### In progress
 
@@ -46,9 +91,6 @@ the change it actually shipped, or deletes if it did not land.
 
 - Runtime profiles: a truthful production-isolation gate on node startup,
   scheduling, `doctor` and `conformance --profile`.
-- Durable workspace lifecycle deadlines: a public lifecycle API with
-  control-plane durable timers and generation-bound cancel/extend, surviving
-  client and node death.
 - Brokered credentials as the documented default: higher-level binding and
   principal APIs, provider-neutral schemas, revocation and audit.
 - Browser and computer-use sessions: screenshot, click, type, key, scroll,

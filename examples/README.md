@@ -4,13 +4,14 @@
 |---|---|---|
 | [minimal-shell](minimal-shell/README.md) | connect, create a workspace, stream a command, write and read a file, destroy | no |
 | [artifact-transfer](artifact-transfer/README.md) | upload a directory, snapshot, download and digest-check the artifact, restore into a second workspace, verify byte for byte | no |
+| [long-running-autosleep](long-running-autosleep/README.md) | hold a workspace for a background job with a durable control-plane deadline, let it expire, read the exit reason, wake it | no |
 | [agentloop](#agentloop) | a whole coding-agent loop whose model calls are brokered, so no key enters the workspace | a model key on the server |
 | [diy-devin](diy-devin/README.md) | reference clients for the Agent HTTP API in Python, TypeScript, a web page and a GitHub Action | depends on the harness |
 
 Every example expects a running server. The quickest one is standalone mode,
 which needs no token.
 
-The first two examples need nothing else — no key, no binding, no outbound
+The first three examples need nothing else — no key, no binding, no outbound
 network:
 
 ```sh
@@ -18,9 +19,10 @@ go run ./cmd/remount standalone --data ./data
 export REMOUNT_SERVER=http://127.0.0.1:7443
 go run ./examples/minimal-shell
 go run ./examples/artifact-transfer
+go run ./examples/long-running-autosleep
 ```
 
-Both are executed end to end against an in-process server by
+All three are executed end to end against an in-process server by
 `go test ./integration/examples/`, so an example that stops working fails CI
 rather than a reader's laptop.
 
@@ -51,6 +53,16 @@ A directory moved between two workspaces through the content-addressed
 artifact store, verified byte for byte, with the downloaded object checked
 against the digest that named it. See
 [artifact-transfer/](artifact-transfer/README.md).
+
+## long-running-autosleep
+
+A background job whose deadline lives in Remount rather than in the process
+that started it. The example takes a twenty-second hold with `ws.lease`, starts
+a `sleep 300` that will outlive it, renews once, then stops renewing and
+watches the control plane sleep the workspace on its own — the session ends
+with the exit reason `lifecycle_deadline_expired`, `ws.lifecycle.expired`
+explains it, and waking shows the filesystem survived and the processes did
+not. See [long-running-autosleep/](long-running-autosleep/README.md).
 
 ## diy-devin
 

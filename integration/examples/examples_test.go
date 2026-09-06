@@ -82,6 +82,48 @@ func TestArtifactTransferExample(t *testing.T) {
 	}
 }
 
+// TestLongRunningAutosleepExample runs examples/long-running-autosleep end to
+// end. The example takes a twenty-second hold, renews once, and then waits for
+// Remount's own control plane to act — so unlike the other two, most of its
+// runtime is a deadline nobody in this process is holding.
+//
+// The example fails itself if the exit reason or an expected event is missing,
+// so a green run is already the assertion. The checks below name the claims out
+// loud anyway: what would silently rot here is not the exit status but whether
+// the durable half still happens.
+func TestLongRunningAutosleepExample(t *testing.T) {
+	requirePOSIXShell(t)
+	endpoint := standalone(t)
+	stdout := runExample(t, "./examples/long-running-autosleep", endpoint, 5*time.Minute)
+
+	for _, want := range []string{
+		"background job started",
+		"(renewals 1)",
+		"pending deadline: sleep at ",
+		"is paused, checkpoint art_sha256:",
+		`reason "lifecycle_deadline_expired"`,
+		"event ws.lifecycle.expired action=sleep source=lease",
+		"event ws.lease.expired ",
+		"filesystem survived: written before the hold expired",
+		"processes after wake: processes-gone",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("long-running-autosleep output is missing %q:\n%s", want, stdout)
+		}
+	}
+	// The hold expired on its own schedule rather than being cancelled: the
+	// example never calls CancelLease, so a cancelled hold here would mean the
+	// deadline was retired by something else.
+	if strings.Contains(stdout, "reason=cancelled") {
+		t.Errorf("the hold was cancelled rather than expiring at its deadline:\n%s", stdout)
+	}
+	if matches := workspaceID.FindAllString(stdout, -1); len(matches) == 0 {
+		t.Errorf("long-running-autosleep never named a workspace:\n%s", stdout)
+	} else if !strings.Contains(stdout, "workspace "+matches[0]+" destroyed") {
+		t.Errorf("long-running-autosleep left workspace %s behind:\n%s", matches[0], stdout)
+	}
+}
+
 var (
 	workspaceID        = regexp.MustCompile(`ws_[a-z0-9]+`)
 	destroyedWorkspace = regexp.MustCompile(`workspace (ws_[a-z0-9]+) destroyed`)

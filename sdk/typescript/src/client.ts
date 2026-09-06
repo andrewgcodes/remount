@@ -1,4 +1,5 @@
 import { Decoder, Encoder } from "cbor-x";
+import type { Workspace, WorkspaceLease, WSLeaseRes } from "./types.js";
 
 const encoder = new Encoder({ useRecords: false, variableMapSize: true });
 const decoder = new Decoder({ mapsAsObjects: true });
@@ -87,6 +88,11 @@ export interface Chunk {
 
 function idem(): string {
   return `idem_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+// Lifecycle durations are wire seconds: reject locally what the control plane would reject.
+function seconds(name: string, value: number, positive: boolean): void {
+  if (!Number.isInteger(value) || value < 0 || (positive && value === 0)) throw new Error(`${name} must be a ${positive ? "positive" : "non-negative"} whole number of seconds`);
 }
 
 async function sha256(data: Uint8Array): Promise<string> {
@@ -549,6 +555,71 @@ export class Client {
 
   async destroyWorkspace(workspace: string, idempotencyKey = idem()): Promise<void> {
     await this.call("ws.destroy", { id: workspace, idem: idempotencyKey });
+  }
+
+  /**
+   * Hold a workspace alive for at most `maxAliveSec` seconds, then sleep it
+   * (or destroy it when `onExpiry` is "destroy"); `minAliveSec` keeps it awake
+   * that long regardless of idleness. The deadline is durable in the control
+   * plane, so it still fires if this process dies, is redeployed or loses the
+   * network — unlike a `setTimeout`, which dies with the process that set it.
+   * Activity is explicit: session traffic does not extend the deadline, so
+   * call `markActive` (or `renewLease`) on every turn the workspace is in use.
+   */
+  leaseWorkspace(workspace: string, options: { maxAliveSec: number; minAliveSec?: number; onExpiry?: "sleep" | "destroy"; reason?: string; idempotencyKey?: string }): Promise<WorkspaceLease> {
+    seconds("maxAliveSec", options.maxAliveSec, true);
+    if (options.minAliveSec !== undefined) seconds("minAliveSec", options.minAliveSec, false);
+    if (options.onExpiry !== undefined && options.onExpiry !== "sleep" && options.onExpiry !== "destroy") throw new Error('onExpiry must be "sleep" or "destroy"');
+    // The expiry action is sent explicitly so sleep-versus-destroy is never inferred from a default.
+    const body: Record<string, any> = { id: workspace, max_alive_sec: options.maxAliveSec, on_expiry: options.onExpiry ?? "sleep", idem: options.idempotencyKey ?? idem() };
+    if (options.minAliveSec !== undefined) body.min_alive_sec = options.minAliveSec;
+    if (options.reason !== undefined) body.reason = options.reason;
+    return this.call("ws.lease", body) as Promise<WorkspaceLease>;
+  }
+
+  /**
+   * Push a held lease `extendSec` seconds further out. Throws a `ProtocolError`
+   * with code "conflict" once the deadline already fired or the hold was
+   * cancelled (reason "lifecycle_deadline_expired"), or once the workspace
+   * moved (reason "generation_mismatch"); both mean take a fresh lease.
+   */
+  renewLease(workspace: string, lease: string, options: { extendSec: number; minAliveSec?: number; idempotencyKey?: string }): Promise<WorkspaceLease> {
+    seconds("extendSec", options.extendSec, true);
+    if (options.minAliveSec !== undefined) seconds("minAliveSec", options.minAliveSec, false);
+    const body: Record<string, any> = { id: workspace, lease, extend_sec: options.extendSec, idem: options.idempotencyKey ?? idem() };
+    if (options.minAliveSec !== undefined) body.min_alive_sec = options.minAliveSec;
+    return this.call("ws.lease.renew", body) as Promise<WorkspaceLease>;
+  }
+
+  /** Release a hold early; the workspace returns to its idle policy without waiting for the deadline. */
+  cancelLease(workspace: string, lease: string, idempotencyKey = idem()): Promise<Workspace> {
+    return this.call("ws.lease.cancel", { id: workspace, lease, idem: idempotencyKey }) as Promise<Workspace>;
+  }
+
+  /** Read the hold and the durable deadline the control plane will act on; a read, so it carries no idempotency key. */
+  getLease(workspace: string): Promise<WSLeaseRes> { return this.call("ws.lease.get", { id: workspace }) as Promise<WSLeaseRes>; }
+
+  /** Sleep or destroy the workspace after that many seconds idle; activity is what `markActive` reports, not session traffic. */
+  setIdlePolicy(workspace: string, options: { sleepAfterSec?: number; destroyAfterSec?: number; idempotencyKey?: string } = {}): Promise<Workspace> {
+    if (options.sleepAfterSec !== undefined) seconds("sleepAfterSec", options.sleepAfterSec, false);
+    if (options.destroyAfterSec !== undefined) seconds("destroyAfterSec", options.destroyAfterSec, false);
+    const body: Record<string, any> = { id: workspace, idem: options.idempotencyKey ?? idem() };
+    if (options.sleepAfterSec !== undefined) body.sleep_after_sec = options.sleepAfterSec;
+    if (options.destroyAfterSec !== undefined) body.destroy_after_sec = options.destroyAfterSec;
+    return this.call("ws.idle.policy", body) as Promise<Workspace>;
+  }
+
+  /** Report the workspace idle, starting the idle policy's clock. */
+  markIdle(workspace: string, reason?: string, idempotencyKey = idem()): Promise<Workspace> { return this.mark(workspace, true, reason, idempotencyKey); }
+
+  /** Report the workspace in use, resetting the idle clock; call it every turn, since session traffic alone does not. */
+  markActive(workspace: string, reason?: string, idempotencyKey = idem()): Promise<Workspace> { return this.mark(workspace, false, reason, idempotencyKey); }
+
+  private mark(workspace: string, idle: boolean, reason: string | undefined, idempotencyKey: string): Promise<Workspace> {
+    // `idle` is always on the wire: an absent flag would read as the false default and silently mark active.
+    const body: Record<string, any> = { id: workspace, idle, idem: idempotencyKey };
+    if (reason !== undefined) body.reason = reason;
+    return this.call("ws.idle.mark", body) as Promise<Workspace>;
   }
 
   async exec(workspace: string, program: string[], options: { kind?: string; cwd?: string; env?: Record<string, string>; stdin?: boolean; idempotencyKey?: string } = {}): Promise<Session> {

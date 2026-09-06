@@ -21,6 +21,8 @@ from .types import (
     SessionStatus,
     Timer,
     Workspace,
+    WorkspaceLease,
+    WSLeaseRes,
     WSSnapshotRes,
 )
 
@@ -599,6 +601,172 @@ class Client:
                 {"id": workspace, "idem": idempotency_key or _idempotency_key()},
             ),
         )
+
+    async def lease_workspace(
+        self,
+        workspace: str,
+        *,
+        max_alive_sec: int,
+        min_alive_sec: int = 0,
+        on_expiry: str = "",
+        reason: str = "",
+        idempotency_key: str | None = None,
+    ) -> WorkspaceLease:
+        """Take a durable hold that keeps a claimed workspace awake.
+
+        The deadline lives in Remount's control plane, not in this process, so
+        it survives this client dying, being redeployed, or losing the network
+        - which an ``asyncio.sleep`` timer holding the workspace open does not.
+        When the deadline passes with nobody renewing it, the control plane
+        performs ``on_expiry`` ("sleep" by default, or "destroy") on its own.
+
+        A workspace holds at most one lease; a later call replaces it. The
+        workspace must be ``claimed``, or the call is refused with
+        ``ProtocolError`` code ``conflict`` and reason ``workspace_not_ready``;
+        at the tenant held-workspace limit it is refused ``resource_exhausted``
+        with reason ``quota_exceeded``.
+        """
+        if max_alive_sec <= 0:
+            raise ValueError("workspace lease requires a positive max_alive_sec")
+        if min_alive_sec < 0:
+            raise ValueError("workspace lease times must not be negative")
+        if on_expiry not in ("", "sleep", "destroy"):
+            raise ValueError('workspace lease on_expiry must be "sleep" or "destroy"')
+        body: dict[str, object] = {
+            "id": workspace,
+            "max_alive_sec": max_alive_sec,
+            "idem": idempotency_key or _idempotency_key(),
+        }
+        if min_alive_sec:
+            body["min_alive_sec"] = min_alive_sec
+        if on_expiry:
+            body["on_expiry"] = on_expiry
+        if reason:
+            body["reason"] = reason
+        return cast(WorkspaceLease, await self.call("ws.lease", body))
+
+    async def renew_lease(
+        self,
+        workspace: str,
+        lease: str,
+        *,
+        extend_sec: int,
+        min_alive_sec: int = 0,
+        idempotency_key: str | None = None,
+    ) -> WorkspaceLease:
+        """Extend a hold by ``extend_sec`` seconds from now.
+
+        Renewal is refused with ``ProtocolError`` code ``conflict`` and reason
+        ``lifecycle_deadline_expired`` once the deadline has fired or the hold
+        was cancelled, and reason ``generation_mismatch`` once the workspace
+        has moved. Both mean this caller no longer holds the workspace and must
+        take a fresh lease rather than assume the old one still stands.
+        """
+        if extend_sec <= 0:
+            raise ValueError("lease renewal requires a positive extend_sec")
+        if min_alive_sec < 0:
+            raise ValueError("lease renewal times must not be negative")
+        body: dict[str, object] = {
+            "id": workspace,
+            "lease": lease,
+            "extend_sec": extend_sec,
+            "idem": idempotency_key or _idempotency_key(),
+        }
+        if min_alive_sec:
+            body["min_alive_sec"] = min_alive_sec
+        return cast(WorkspaceLease, await self.call("ws.lease.renew", body))
+
+    async def cancel_lease(
+        self, workspace: str, lease: str, idempotency_key: str | None = None
+    ) -> Workspace:
+        """Release a hold.
+
+        The workspace stays ``claimed`` and falls back to its idle policy, if
+        it has one. A later renew of the cancelled lease is refused
+        ``conflict`` / ``lifecycle_deadline_expired``.
+        """
+        return cast(
+            Workspace,
+            await self.call(
+                "ws.lease.cancel",
+                {
+                    "id": workspace,
+                    "lease": lease,
+                    "idem": idempotency_key or _idempotency_key(),
+                },
+            ),
+        )
+
+    async def get_lease(self, workspace: str) -> WSLeaseRes:
+        """Read a workspace's hold and the deadline the control plane will act
+        on next, which may come from the idle policy rather than from a lease.
+
+        This is a read: it carries no idempotency key and changes nothing.
+        """
+        return cast(WSLeaseRes, await self.call("ws.lease.get", {"id": workspace}))
+
+    async def set_idle_policy(
+        self,
+        workspace: str,
+        *,
+        sleep_after_sec: int = 0,
+        destroy_after_sec: int = 0,
+        idempotency_key: str | None = None,
+    ) -> Workspace:
+        """Install the durable no-work cleanup rule for a workspace.
+
+        Both durations zero removes the policy. The clock only runs while the
+        workspace is marked idle: session traffic does not start or stop it,
+        because only the caller knows whether a turn settled or merely paused.
+        """
+        if sleep_after_sec < 0 or destroy_after_sec < 0:
+            raise ValueError("idle policy times must not be negative")
+        body: dict[str, object] = {
+            "id": workspace,
+            "idem": idempotency_key or _idempotency_key(),
+        }
+        if sleep_after_sec:
+            body["sleep_after_sec"] = sleep_after_sec
+        if destroy_after_sec:
+            body["destroy_after_sec"] = destroy_after_sec
+        return cast(Workspace, await self.call("ws.idle.policy", body))
+
+    async def mark_idle(
+        self, workspace: str, reason: str = "", idempotency_key: str | None = None
+    ) -> Workspace:
+        """Start the workspace's idle clock.
+
+        Session traffic does not do this on its own; the caller marks the
+        workspace idle when a turn has settled rather than merely paused.
+        """
+        return await self._mark_idle(workspace, True, reason, idempotency_key)
+
+    async def mark_active(
+        self, workspace: str, reason: str = "", idempotency_key: str | None = None
+    ) -> Workspace:
+        """Stop the workspace's idle clock and clear any pending idle deadline.
+
+        This is the explicit activity signal: traffic through a session does
+        not extend a lifecycle deadline, so a caller that is still working must
+        say so here.
+        """
+        return await self._mark_idle(workspace, False, reason, idempotency_key)
+
+    async def _mark_idle(
+        self,
+        workspace: str,
+        idle: bool,
+        reason: str,
+        idempotency_key: str | None,
+    ) -> Workspace:
+        body: dict[str, object] = {
+            "id": workspace,
+            "idle": idle,
+            "idem": idempotency_key or _idempotency_key(),
+        }
+        if reason:
+            body["reason"] = reason
+        return cast(Workspace, await self.call("ws.idle.mark", body))
 
     async def read_file(
         self,
