@@ -12,26 +12,32 @@ redirect.
 
 ## Deploy on Vercel
 
-Deployed on 2026-09-05 as project `remount-vanity` under the Vercel scope
-`andrew-gaos-projects-7ae0e473`, with `remount.dev` and `get.remount.dev`
-attached and verified; `https://remount.dev/remount/cmd/remount?go-get=1`
-answers 200 with the meta tag. The domain is registered through Vercel
-Domains, so DNS is managed there. The `*.vercel.app` deployment URLs sit
-behind Vercel's deployment protection and redirect to a login; only the
-custom domains are public, which is what Go and `curl` use.
+The Vercel project `remount-vanity` (scope `andrew-gaos-projects-7ae0e473`)
+is connected to this GitHub repository with **Root Directory** set to
+`deploy/vanity` and Framework "Other". Every push to `main` that touches this
+directory redeploys it; nothing else in the repository is built. The domains
+`remount.dev` and `get.remount.dev` are attached to that project, and the
+domain is registered through Vercel Domains, so DNS lives there too.
 
-To redeploy after editing this directory:
+The root directory matters: without it Vercel treats the repository's `api/`
+package as Go serverless functions and the build fails with "Could not find
+an exported function in api/api.go". If a build ever fails that way, the
+setting has been lost.
+
+To deploy by hand instead of by push, link the checkout to the project once
+and deploy from the repository root (the root-directory setting is applied
+server-side):
 
 ```sh
 npm i -g vercel            # once
-cd deploy/vanity
 vercel login
 vercel link --yes --scope andrew-gaos-projects-7ae0e473 --project remount-vanity
 vercel deploy --prod --yes --scope andrew-gaos-projects-7ae0e473
 ```
 
-The first-time setup was `vercel domains add remount.dev remount-vanity` and
-the same for `get.remount.dev`; both are already assigned.
+The `*.vercel.app` deployment URLs sit behind Vercel's deployment protection
+and redirect to a login; only the custom domains are public, which is what
+Go and `curl` use.
 
 Then verify from any machine:
 
