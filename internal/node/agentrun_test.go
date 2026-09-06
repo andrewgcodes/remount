@@ -391,6 +391,9 @@ func TestAgentRunAppliesRecipeACPSandboxMode(t *testing.T) {
 		{name: "custom command", custom: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if runtime.GOOS == "windows" && !tc.custom {
+				t.Skip("unavailable: recipe ACP launcher scripts require a POSIX shell")
+			}
 			f := newAgentFixture(t)
 			req := f.request(t, "mode", "check mode")
 			if !tc.custom {

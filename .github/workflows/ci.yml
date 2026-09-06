@@ -68,8 +68,6 @@ jobs:
         with:
           go-version: '1.27.1'
           check-latest: false
-      - name: install race-detector C toolchain
-        run: choco install mingw --version=16.1.0 --no-progress -y
       - name: gofmt
         shell: pwsh
         run: |
@@ -83,6 +81,8 @@ jobs:
       - name: lock discipline
         shell: bash
         run: ./scripts/lint-locks.sh .
+      - name: Windows platform smoke
+        run: go test -count=1 -timeout 300s -run '^(TestWriteSecretFileIsExclusiveAndPrivate|TestReadSecretFileRefusesAReadableFile|TestReadSecretFileRefusesWorldReadableWindowsDACL|TestNodeCredentialPrecedence|TestCredentialFileIsPrivateAndServerScoped|TestStoredCredentialRefusesWorldReadableWindowsDACL|TestStoreCreatesPrivateScopeKey|TestStoreRefusesWorldReadableWindowsScopeKey|TestAgentRunAppliesRecipeACPSandboxMode|TestRecipeACPProgramRefusesWindowsProcessWorkspace|TestAgentOmittedSandboxAppliesWorkspaceWriteACPMode)$' ./cmd/remount ./internal/connector ./internal/node ./internal/sim
       - name: test
         run: |
           # Windows Server 2022 currently measures the 64 MiB incompressible
@@ -96,8 +96,11 @@ jobs:
           # Serialize packages so the sim timing lanes are not competing with
           # cross-compilation and artifact installation for host resources.
           go test -p 1 -count=1 -timeout 2400s -skip '^(TestExecRoundTripCostOfTheDurableSessionTier|TestPlanbPerfMoveIncompressible|TestPlanBOpenCodeAgentTranscriptApprovalAndResume|TestPlanBOpenCodeDeterministicModelLane|TestHandoffScaleAndControlFailover)$' ./...
-          Push-Location integration/publicsdk
-          go test -count=1 ./...
+      - name: public SDK
+        working-directory: integration/publicsdk
+        run: go test -count=1 ./...
+      - name: install race-detector C toolchain
+        run: choco install mingw --version=16.1.0 --no-progress -y
       - name: race
         run: |
           # Under the race detector the Docker OpenCode lane can fence the

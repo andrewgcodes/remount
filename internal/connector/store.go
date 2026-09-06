@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"remount.dev/remount/internal/metrics"
+	"remount.dev/remount/internal/privatefile"
 )
 
 const (
@@ -78,8 +79,9 @@ type reservation struct {
 	released bool
 }
 
-// NewStore opens a connector cache. Node-private metadata is mode 0700/0600;
-// immutable blobs are mode 0444 and named only by their SHA-256 digest.
+// NewStore opens a connector cache. Node-private metadata uses platform-native
+// private directory/file permissions; immutable blobs are named only by their
+// SHA-256 digest.
 func NewStore(root string, opts StoreOptions) (*Store, error) {
 	if root == "" {
 		return nil, errors.New("connector store: root is required")
@@ -178,6 +180,11 @@ func removeOwnedStaging(dir, prefix string, exclusive bool) error {
 func loadOrCreateKey(path string) ([]byte, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err == nil {
+		if err := privatefile.SecureFile(path); err != nil {
+			_ = f.Close()
+			_ = os.Remove(path)
+			return nil, fmt.Errorf("connector store: protect scope key: %w", err)
+		}
 		key := make([]byte, connectorKeyBytes)
 		if _, err := rand.Read(key); err != nil {
 			_ = f.Close()
@@ -202,15 +209,19 @@ func loadOrCreateKey(path string) ([]byte, error) {
 	if !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("connector store: create scope key: %w", err)
 	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("connector store: inspect scope key: %w", err)
+	}
+	if err := privatefile.ValidateFile(path, info); err != nil {
+		return nil, fmt.Errorf("connector store: unsafe scope key: %w", err)
+	}
 	key, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("connector store: read scope key: %w", err)
 	}
 	if len(key) != connectorKeyBytes {
 		return nil, errors.New("connector store: corrupt scope key")
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return nil, fmt.Errorf("connector store: protect scope key: %w", err)
 	}
 	return key, nil
 }
@@ -586,7 +597,7 @@ func ensurePrivateDir(path string) error {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return err
 	}
-	return os.Chmod(path, 0o700)
+	return privatefile.SecureDirectory(path)
 }
 
 func (s *Store) scopeUsageLocked(scope string) (int64, int64, error) {

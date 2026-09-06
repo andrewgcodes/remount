@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -276,6 +277,9 @@ func TestAgentEndToEndTurnsAndTranscript(t *testing.T) {
 }
 
 func TestAgentOmittedSandboxAppliesWorkspaceWriteACPMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: recipe ACP launcher scripts require a POSIX shell")
+	}
 	w := newWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")

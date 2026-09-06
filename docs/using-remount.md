@@ -68,6 +68,8 @@ Do not place a bearer on a command line on a shared host. Process arguments
 are visible to other local processes. Production identity, TLS, tokens, OIDC,
 backups, and node enrollment are covered in
 [`operations.md`](operations.md).
+Remount-created credential files use mode 0600 on Unix and protected NTFS
+DACLs on Windows; files readable by another local principal are refused.
 
 ## Run a coding agent on a checkout
 

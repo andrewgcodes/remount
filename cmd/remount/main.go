@@ -251,7 +251,7 @@ func usage() {
   remount principal session --ws WS [--roles agent] [--ttl 15m]   ephemeral principal + generation-bound capability, printed once
   remount node enroll --name NAME [--tenant T] [--labels k=v] [--ttl 10m] (--out FILE | --stdout)   one-time node credential
   remount token issue PRINCIPAL --role agent --ttl 1h [--tenant T]
-  remount login --tenant TENANT      OIDC device login; stores rotating credentials mode 0600
+  remount login --tenant TENANT      OIDC device login; stores rotating credentials privately
 
   remount ws create [--name N] [--dir PATH | --base NAME | --repo URL[@REF]] [--volume ID:PATH] [--backend B] [--image IMG] [--security PROFILE] [--requires-profile P] [--egress-rule JSON] [--binding ID]
                                       --requires-profile is the runtime profile a node must satisfy (dev, trusted-single-tenant, multi-tenant-isolated, microvm);
@@ -581,7 +581,7 @@ func cmdServer(ctx context.Context, args []string) error {
 	maxConcurrentRequests := fs.Int("max-concurrent-requests", 128, "maximum concurrent control-plane requests")
 	mode := fs.String("mode", envOr("REMOUNT_SECURITY_MODE", server.ModeStandalone), "security mode: standalone, production-single-tenant, production-multi-tenant")
 	bootstrapPrincipal := fs.String("bootstrap-principal", "", "create the first global operator (requires --bootstrap-token-file)")
-	bootstrapTokenFile := fs.String("bootstrap-token-file", "", "exclusive mode-0600 path for the initial short-lived operator bearer")
+	bootstrapTokenFile := fs.String("bootstrap-token-file", "", "exclusive private path for the initial short-lived operator bearer")
 	bootstrapTTL := fs.Duration("bootstrap-ttl", 15*time.Minute, "initial operator bearer lifetime")
 	publicURL := fs.String("public-url", envOr("REMOUNT_PUBLIC_URL", ""), "externally reachable base URL agent links are minted under (https://host)")
 	agentUI := fs.String("agent-ui", envOr("REMOUNT_AGENT_UI", ""), "operator UI URL that /a/{id} redirects to; {id} is replaced, else appended")
@@ -686,19 +686,15 @@ func cmdServer(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		file, err := os.OpenFile(bootstrapPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		file, err := reserveSecretFile(bootstrapPath)
 		if err != nil {
 			return fmt.Errorf("create bootstrap token file: %w", err)
 		}
 		token, expires, issueErr := srv.BootstrapOperator(ctx, *bootstrapPrincipal, *bootstrapTTL)
-		if issueErr == nil {
-			_, issueErr = fmt.Fprintf(file, "%s\n", token)
-		}
-		if syncErr := file.Sync(); issueErr == nil {
-			issueErr = syncErr
-		}
-		if closeErr := file.Close(); issueErr == nil {
-			issueErr = closeErr
+		if issueErr != nil {
+			_ = file.Close()
+		} else {
+			issueErr = commitSecretFile(file, token)
 		}
 		if issueErr != nil {
 			_ = os.Remove(bootstrapPath)
@@ -715,7 +711,7 @@ func cmdUp(ctx context.Context, args []string) error {
 	var c common
 	c.flags(fs)
 	data := fs.String("data", envOr("REMOUNT_NODE_DATA", defaultNodeData()), "node data directory")
-	enrollmentFile := fs.String("enrollment-file", os.Getenv("REMOUNT_ENROLLMENT_FILE"), "mode-0600 `file` holding the one-time credential from remount node enroll")
+	enrollmentFile := fs.String("enrollment-file", os.Getenv("REMOUNT_ENROLLMENT_FILE"), "private `file` holding the one-time credential from remount node enroll")
 	nodeID := fs.String("node-id", os.Getenv("REMOUNT_NODE_ID"), "fixed n_ identity for one-time provisioned nodes")
 	labels := kvFlag{}
 	fs.Var(labels, "label", "node label k=v (repeatable)")

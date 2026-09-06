@@ -340,7 +340,7 @@ func TestWorkspaceCreateRejectsClientSelectedPrincipalBeforeDial(t *testing.T) {
 	}
 }
 
-func TestCredentialFileIsMode0600AndServerScoped(t *testing.T) {
+func TestCredentialFileIsPrivateAndServerScoped(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "credentials.json")
 	value := credentialFile{Server: "https://one.example", Tenant: "tenant-a", AccessToken: "access-secret", RefreshToken: "refresh-secret"}
 	if err := writeCredentialFile(path, value); err != nil {
@@ -350,10 +350,11 @@ func TestCredentialFileIsMode0600AndServerScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runtime.GOOS == "windows" {
-		t.Log("unavailable: Go file modes do not expose Windows ACL confidentiality")
-	} else if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("credential mode=%o", info.Mode().Perm())
+	}
+	if err := validateSecretFilePermissions(path, info); err != nil {
+		t.Fatalf("credential file permissions: %v", err)
 	}
 	t.Setenv("REMOUNT_CREDENTIAL_FILE", path)
 	if got := storedAccessToken("https://one.example"); got != "access-secret" {
