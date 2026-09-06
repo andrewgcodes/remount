@@ -38,6 +38,12 @@ tests and engineering notes do not.
   Plan B §6 evidence record into `OUT` (default `dist/`, `PROFILE` default
   `dev`). It does not change `make conformance`, which still means the
   hostile-input suites under the race detector.
+- `remount ws create --requires-profile dev|trusted-single-tenant|multi-tenant-isolated|microvm`
+  sets `Requires.Profile`, the runtime profile a node must currently satisfy to
+  run the workspace. The value is validated before the client dials, so a
+  misspelled profile is a named local error rather than a workspace that parks
+  as `profile_unschedulable`. Omitting the flag states no requirement, which is
+  not the same as requiring `dev`.
 - `docs/security-profiles.md` gains a "Runtime profiles satisfied" column per
   backend, derived from `internal/profile` rather than hand-maintained.
 - `remount computer create|get|screenshot|click|type|key|scroll|navigate|eval|downloads|close`
@@ -162,12 +168,22 @@ These are the [2026-09-06 gap brief](docs/engineering/gap-brief-2026-09-06.md)
 implementation order. Each line is a placeholder a later editor replaces with
 the change it actually shipped, or deletes if it did not land.
 
-- Runtime profiles: a truthful production-isolation gate on node startup,
-  scheduling, `doctor` and `conformance --profile`.
 - Brokered credentials as the documented default: higher-level binding and
   principal APIs, provider-neutral schemas, revocation and audit.
-- Browser and computer-use sessions: screenshot, click, type, key, scroll,
-  navigation, downloads and reconnect, with broker-aware browser egress.
+- Runtime profiles have landed and are listed above: `remount up --profile`
+  (env `REMOUNT_PROFILE`) is a fail-closed startup gate that refuses `process`
+  or `docker` under a production profile, `ws create --requires-profile` and
+  `requires.profile` schedule against advertised backend capabilities and park
+  an unplaceable workspace as `profile_unschedulable`, a reprobe loop emits
+  `node.profile.{verified,unschedulable,restored}` on drift, and
+  `remount doctor --profile` joins `remount conformance --profile` on the
+  three-valued 0/1/2 contract.
+- Browser and computer-use sessions have landed and are listed above:
+  `remount computer` plus the Go, Python and TypeScript `Computer` handles cover
+  create, screenshot, click, type, key, scroll, navigate, eval, downloads and
+  close, with `iseq` deduplication across a reconnect. What broker-aware browser
+  egress does and does not currently reach is documented in
+  [docs/using-remount.md](docs/using-remount.md#computer-sessions-the-built-in-browser-api).
 - SDK, conformance and observability polish: attachable conformance evidence.
   Typed errors, the support matrix, tracing and log redaction have landed and
   are listed above.

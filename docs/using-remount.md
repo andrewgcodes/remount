@@ -23,7 +23,11 @@ the documentation drift. The wire-level authority is
 | Keep a structured agent alive across disconnects, sleep, or node loss | [Durable Agents](#operate-a-durable-agent) |
 | Read or bring back files an agent changed | [Retrieve modified files](#retrieve-modified-files) |
 | Use workspaces directly as remote filesystems and process hosts | [Workspace primitives](#use-workspace-primitives-directly) |
+| Drive a browser — screenshot, click, type, navigate, download | [Computer sessions](#computer-sessions-the-built-in-browser-api) |
 | Run Chromium on a virtual X11 desktop or through VNC | [Browser and desktop workloads](#run-browser-and-virtual-desktop-workloads) |
+| Keep a workspace claimed while background work runs, without leaking compute | [Hold a workspace](#hold-a-workspace-for-background-work) |
+| Prove what a node's isolation actually is before trusting it | [Choose a runtime profile](#choose-a-runtime-profile) |
+| Handle failures programmatically, or send traces to your own collector | [Public API, errors and tracing](#public-api-errors-and-tracing) |
 | Try the checked-in deployment on Modal | [Modal reference deployment](#deploy-the-modal-reference) |
 | Operate a production control plane or node fleet | [`operations.md`](operations.md) |
 | Integrate a custom harness or model provider | [`harness-integration.md`](harness-integration.md) |
@@ -80,7 +84,10 @@ Replace `codex` with `opencode`, `claude`, or another built-in recipe listed by
 bindings by environment-variable reference; their values are not written into
 the generated bindings file or workspace.
 
-For an explicit server-side binding:
+For an explicit server-side binding — a named credential the server holds and
+the workspace only ever sees as a placeholder; see
+[Broker provider credentials](#broker-provider-credentials) for how one is
+defined:
 
 ```sh
 ./remount run opencode \
@@ -232,6 +239,11 @@ The Go equivalent is `Client.ApplyTarAt`. An empty destination preserves the
 root-overlay behavior used by `remount push`; neither form deletes paths the
 archive does not name.
 
+This is Go and Python only today. The TypeScript SDK does not expose
+`fs.apply_tar`, so a TypeScript caller uses `remount push` or the Agent HTTP
+API for the same effect, or calls the operation directly through the client's
+generic `nodeCall`.
+
 ### Preserve or move the whole filesystem
 
 ```sh
@@ -321,6 +333,11 @@ to live where the workspace lives.
 ./remount ws lease cancel "$WS" "$LEASE"
 ```
 
+One naming note, because both words appear below: the CLI verb is `lease`, and
+this guide calls the deadline it grants a **hold**. They are the same thing.
+(`ws.lease_expired` is unrelated: that is the node's claim lease, not a client's
+hold.)
+
 `--max` is the hard deadline: when it passes with nobody renewing, Remount
 performs `--on-expiry`, which is `sleep` (the default) or `destroy`. `--min` is
 the earliest the idle policy below may act, so a hold and a policy do not fight
@@ -392,6 +409,10 @@ wake, ACLs, and moves between two machines, is
 [`tutorial.md`](tutorial.md).
 
 ## Run browser and virtual desktop workloads
+
+A browser is a protocol resource — a computer session, driven by the node. A
+whole desktop is not: X11, a window manager and VNC are ordinary workspace
+processes you compose yourself.
 
 ### Computer sessions: the built-in browser API
 
@@ -701,6 +722,30 @@ and backup constraints are detailed in
 
 ## Choose a runtime profile
 
+A runtime profile is a machine's isolation claim, enforced as a fail-closed
+startup gate on the node and as a scheduling constraint on the workspace, and
+answered three-valued by `doctor --profile` and `conformance --profile`.
+
+### Three unrelated things are called a profile
+
+The word is overloaded across three surfaces that never interact. Read this once
+and the rest of the section is unambiguous:
+
+| Where you see it | What it names | Values |
+|---|---|---|
+| `remount up --profile P`, `ws create --requires-profile P`, `doctor --profile P`, `conformance --profile P` | the **runtime profile**: what a whole node currently proves about its isolation, and what a workspace demands of the node that runs it | `dev`, `trusted-single-tenant`, `multi-tenant-isolated`, `microvm` |
+| `ws create --security P`, `run --security P`, the workspace's `security.profile` | the **workspace security profile**: the isolation one workspace asks its backend for, refused if the backend cannot enforce it | `local`, `isolated`, `multi_tenant` |
+| `computer create --profile NAME` | the **browser profile**: a named on-disk Chromium profile directory inside the workspace | any name; `default` if unset |
+
+The first two look alike and are not. A runtime profile is a property of a
+machine and is evaluated over **every** backend that node registered; a workspace
+security profile is a property of one workspace and is checked against the
+backend that would run it. A node can satisfy `multi-tenant-isolated` while a
+workspace on it asks only for `local`, and a workspace can ask for `isolated`
+without ever naming a runtime profile. The third shares nothing but the word.
+
+### The four runtime profiles
+
 A runtime profile is what a **machine** claims, as distinct from
 `security.profile`, which is what one **workspace** requires. There are four,
 weakest first:
@@ -726,11 +771,21 @@ Require one when you create a workspace, through `requires.profile` on the
 workspace spec. The control plane schedules against the backend capabilities a
 node actually advertised, never against operator labels:
 
+```sh
+./remount ws create --requires-profile multi-tenant-isolated
+```
+
 ```go
 ws, err := c.CreateWorkspace(ctx, proto.WorkspaceSpec{
     Requires: proto.Requires{Profile: "multi-tenant-isolated"},
 })
 ```
+
+`--requires-profile` is validated locally before the client dials, so a
+misspelled profile is a named error rather than a workspace that parks forever.
+Omitting the flag states no requirement at all, which is not the same as asking
+for `dev`: no requirement matches every node, while `dev` is still a constraint
+the control plane evaluates.
 
 A workspace nobody can place stays `pending` with
 `pending_reason: profile_unschedulable` instead of landing somewhere weaker.
@@ -906,15 +961,63 @@ counter tables.
 
 ## Documentation map and maintenance
 
-This guide owns the supported **user journeys** and links to their detailed
-contracts:
+This guide owns the supported **user journeys**. Everything else that exists is
+listed below, so there is one place to look rather than a partial list per
+document.
 
+**Start here**
+
+- [`README.md`](../README.md): what Remount is, the zero-credential quick start,
+  and the honest status of every claim.
+- This file: the maintained user and coding-agent entry point.
 - [`tutorial.md`](tutorial.md): exact first-use and workspace walkthrough.
+
+**Using a deployment**
+
 - [`harness-integration.md`](harness-integration.md): recipes, ACP/PTY behavior,
   provider bindings, handoff, queues, custom harnesses, and virtual desktops.
+- [`api.md`](api.md): the Agent HTTP API — agents, transcript streaming,
+  approvals, diff, terminal, files, previews.
+- [`console.md`](console.md): the embedded operator console at `/console/`.
+- [`mcp.md`](mcp.md): exposing Remount and wrapped servers over MCP.
+- [`images.md`](images.md): the default workspace image, the reference browser
+  image, and what any substitute image must provide.
+
+**Running it for real**
+
 - [`operations.md`](operations.md): production deployment and fleet operation.
-- [`api.md`](api.md): Agent HTTP API.
+- [`security-profiles.md`](security-profiles.md): the generated support matrix —
+  operating systems, per-backend features, and the runtime profile each backend
+  can satisfy.
+- [`observability.md`](observability.md): inspection at three depths, traces,
+  metrics, and detecting damage.
+- [`benchmarks.md`](benchmarks.md): dated measurements, never promoted into
+  guarantees.
+
+**Contracts and change management**
+
 - [`spec/PROTOCOL.md`](../spec/PROTOCOL.md): normative protocol.
+- [`compatibility-policy.md`](compatibility-policy.md): what is public, what a
+  version number promises for each surface, and how a break is announced.
+- [`releases.md`](releases.md): the release and installation workflow, and its
+  current disposition.
+- [`CHANGELOG.md`](../CHANGELOG.md): user-visible changes.
+- [`design.md`](design.md): the architecture in full — data model, failure
+  model, threat model, performance budget, and current limitations.
+- [`adr/`](adr/README.md): one file per decision, indexed by number in
+  [`adr/README.md`](adr/README.md). New decisions get a new ADR; an existing one
+  is never rewritten.
+
+**Evidence, not claims**
+
+- [`engineering/current-status.md`](engineering/current-status.md): the
+  maintained status index — what is implemented, what was verified when.
+- [`engineering/`](engineering/): dated audits, implementation requests,
+  dispositions, the monthly verification ledger, and
+  [`hardening-lessons.md`](engineering/hardening-lessons.md), the review method
+  distilled from them. A dated document describes its own candidate.
+- [`MISTAKES.md`](../MISTAKES.md): every bug hit while building this, and what
+  each one taught.
 
 Command, recipe, provider, deployment, security, filesystem-transfer, or
 lifecycle changes are incomplete until the corresponding user journey here

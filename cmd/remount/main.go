@@ -39,6 +39,7 @@ import (
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/control"
 	"remount.dev/remount/internal/localfs"
+	"remount.dev/remount/internal/profile"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/secretsource"
 	"remount.dev/remount/internal/server"
@@ -210,6 +211,24 @@ func splitGlobalFlags(argv []string) (globals, rest []string) {
 
 func isFlag(a string) bool { return len(a) > 1 && a[0] == '-' }
 
+// requiresProfile validates the `ws create --requires-profile` value before
+// the client dials, so an unknown profile is a named local error rather than a
+// workspace that parks as unschedulable. An empty value means the workspace
+// asserts no runtime profile at all, which is not the same as requiring "dev":
+// no requirement matches every node, while "dev" is still a stated constraint
+// the control plane evaluates.
+func requiresProfile(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", nil
+	}
+	p, err := profile.Parse(trimmed)
+	if err != nil {
+		return "", err
+	}
+	return string(p), nil
+}
+
 func isHelp(a string) bool { return a == "help" || a == "-h" || a == "--help" }
 
 type exitError int
@@ -228,7 +247,9 @@ func usage() {
   remount token issue PRINCIPAL --role agent --ttl 1h [--tenant T]
   remount login --tenant TENANT      OIDC device login; stores rotating credentials mode 0600
 
-  remount ws create [--name N] [--dir PATH | --base NAME | --repo URL[@REF]] [--volume ID:PATH] [--backend B] [--image IMG] [--security PROFILE] [--egress-rule JSON] [--binding ID]
+  remount ws create [--name N] [--dir PATH | --base NAME | --repo URL[@REF]] [--volume ID:PATH] [--backend B] [--image IMG] [--security PROFILE] [--requires-profile P] [--egress-rule JSON] [--binding ID]
+                                      --requires-profile is the runtime profile a node must satisfy (dev, trusted-single-tenant, multi-tenant-isolated, microvm);
+                                      --security is the workspace's own isolation profile (local, isolated, multi_tenant)
   remount ws ls | get WS | destroy WS | move WS [--node ID] [--cpu N] | sleep WS (--after 1h | --on EVENT) | wake WS | snapshot WS [--authoritative] [--as-base NAME] | acl WS [--reader P]... [--writer P]...
   remount exec WS -- cmd args...      run a command (stdout/stderr/exit streamed)
   remount sh WS [cmd]                 interactive shell (pty)
@@ -875,6 +896,7 @@ func cmdWS(ctx context.Context, args []string) error {
 		cpu := fs.Int("cpu", 0, "required cpus")
 		mem := fs.Int("mem", 0, "required memory MiB")
 		nodeID := fs.String("node", "", "pin to node id")
+		requiresProfileFlag := fs.String("requires-profile", "", "runtime profile a node must satisfy: dev, trusted-single-tenant, multi-tenant-isolated, microvm")
 		principal := fs.String("principal", "", "deprecated; identity is server-authoritative")
 		run := fs.String("run", "", "run identifier used by fleet selectors")
 		model := fs.String("model", "", "model identifier used by fleet selectors")
@@ -908,6 +930,10 @@ func cmdWS(ctx context.Context, args []string) error {
 		}
 		if *principal != "" {
 			return errors.New("--principal is not supported; authenticated caller identity is authoritative")
+		}
+		requiredProfile, err := requiresProfile(*requiresProfileFlag)
+		if err != nil {
+			return err
 		}
 		seeds := 0
 		for _, set := range []bool{*dir != "", *restoreFrom != "", *base != "", *repo != ""} {
@@ -951,7 +977,7 @@ func cmdWS(ctx context.Context, args []string) error {
 		}
 		spec := proto.WorkspaceSpec{
 			Name: *name, Run: *run, Model: *model, Labels: workspaceLabels, Image: *image, RestoreFrom: *restoreFrom, Base: *base, Repo: repoSpec,
-			Requires:  proto.Requires{Backend: *backend, CPU: *cpu, MemMiB: *mem},
+			Requires:  proto.Requires{Backend: *backend, CPU: *cpu, MemMiB: *mem, Profile: requiredProfile},
 			Placement: proto.Placement{Allow: labels, Node: *nodeID},
 			Bindings:  bindings, Env: env, Exclude: exclude, Volumes: volumeMounts,
 			Security: proto.SecuritySpec{

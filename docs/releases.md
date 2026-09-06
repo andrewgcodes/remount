@@ -27,9 +27,12 @@ bash -o pipefail -c \
    REMOUNT_REQUIRE_SIGNATURE=1 sh'
 ```
 
-Do not advertise this command as working until its TLS endpoint and the chosen
-release pass the maintainer proof below. Once a release exists, inspect
-`install.sh` in your accessible checkout and execute it locally:
+`get.remount.dev` resolves and serves over TLS, but the route proxies
+`install.sh` from the repository's `main` branch, so while the repository is
+private it answers 404 and this one-liner does not run. Do not advertise it as
+working until the repository is public and the chosen release passes the
+maintainer proof below. Meanwhile, inspect `install.sh` in your accessible
+checkout and execute it locally:
 
 ```sh
 REMOUNT_REQUIRE_SIGNATURE=1 ./install.sh
@@ -86,8 +89,9 @@ go install remount.dev/remount/cmd/remount@v0.1.0
 ```
 
 The module's declared path is `remount.dev/remount`, so substituting its GitHub
-URL is not a supported workaround. The vanity domain must publish Go import
-metadata before this path can pass.
+URL is not a supported workaround. The vanity domain publishes that Go import
+metadata today; what this path still waits on is a public repository, and for
+an `@TAG` form, a tag.
 
 The runtime image contains only the static binary:
 
@@ -121,29 +125,47 @@ directories and requires byte identity. Run it before the tag. It proves local
 reproducibility for that source/toolchain; the release's provenance attestation
 proves which workflow produced the published bytes.
 
-## Current E18 disposition (2026-09-03)
+## Current E18 disposition (2026-09-05)
 
-E18 has **not** been exercised. No `v0.1.0` release was created in this work,
-and no package, formula or tag was published. Two external publication
-prerequisites are still open:
+E18 has **not** been exercised. No `v0.1.0` release was created, and no tag,
+package, formula or container was published; tagging and publishing are deferred
+by owner decision. What has changed since the 2026-09-03 disposition is the
+vanity domain, so this is the state item by item:
 
-- the 2026-09-03 check found `remount.dev` and `get.remount.dev` did not resolve;
-  public Go import metadata and the short installer endpoint must be verified
-  again as part of publication;
-- the Homebrew tap repository/formula publication has not been created or
-  verified.
+- **Vanity import metadata: live and verified.** `remount.dev` and
+  `get.remount.dev` were deployed on 2026-09-05 and both resolve.
+  `https://remount.dev/remount/cmd/remount?go-get=1` answers 200 with the
+  `go-import` meta tag, so the module path `remount.dev/remount` resolves to the
+  repository. The site is static — two meta tags and a redirect — and is the
+  only hosted piece of Remount. See
+  [`deploy/vanity/README.md`](../deploy/vanity/README.md) for the deployment and
+  the re-verification commands.
+- **`go install`: correct, and gated only on the repository being public.**
+  `go install remount.dev/remount/cmd/remount@main` works as soon as the
+  repository is reachable over `https` without credentials, because Go needs the
+  source, not a release. A versioned `...@TAG` additionally needs a tag, and
+  none exists.
+- **`get.remount.dev/install.sh`: answers 404 until the repository is public.**
+  The route proxies the installer from the repository's `main` branch, and the
+  raw URL 404s while the repository is private, so the documented one-liner does
+  too. Once the repository is public the installer runs and — until a release is
+  tagged — truthfully reports that no release exists.
+- **No release artifacts.** The authenticated GitHub release inventory was empty
+  on 2026-09-05: no binaries, checksums, SBOM, provenance or signatures.
+- **Homebrew tap: not created.** The tap repository and formula have not been
+  published or verified.
 
-The binary now falls back to Go module build information when no release
-linker flag was supplied, so a versioned `go install ...@TAG` reports that tag.
-Local source builds remain `dev`, and an explicit release linker value still
-wins. The release workflow continues to test this against the public module
-path rather than treating the unit contract as E18 evidence.
+The binary falls back to Go module build information when no release linker
+flag was supplied, so a versioned `go install ...@TAG` reports that tag. Local
+source builds remain `dev`, and an explicit release linker value still wins. The
+release workflow tests this against the public module path rather than treating
+the unit contract as E18 evidence.
 
-The verification workflow is intentionally red at the Go-install step until
-the vanity metadata exists. Skipping that step would not make E18 pass.
-Container publish, keyless signing and release uploads happen only in the
-automatic `workflow_run` path after the tag workflow succeeds; a manual
-dispatch is verification-only. None were invoked while preparing these files.
+The verification workflow's Go-install step now depends only on the repository
+being public, not on missing vanity metadata. Skipping any step would not make
+E18 pass. Container publish, keyless signing and release uploads happen only in
+the automatic `workflow_run` path after the tag workflow succeeds; a manual
+dispatch is verification-only. None have been invoked.
 
 ## What a release promises, and what changed
 

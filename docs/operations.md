@@ -56,6 +56,19 @@ Standalone refuses to start without a token unless `--insecure` is set.
 Production modes refuse that shared token entirely and use signed principal
 identity plus one-time node enrollment.
 
+`--mode production-multi-tenant` and `--profile multi-tenant-isolated` are
+different settings on different processes and neither implies the other.
+`--mode` is the **server's** identity and encryption model: who may authenticate,
+whether tenants exist, and how artifacts and audit records are keyed.
+`--profile` is a **node's** runtime isolation claim and a fail-closed startup
+gate on what that machine may register; see
+[choosing a backend](#choosing-a-backend) and
+[choose a runtime profile](using-remount.md#choose-a-runtime-profile). A
+multi-tenant control plane whose nodes all run the `process` backend is a
+`dev` fleet with real tenant boundaries in the control plane and none in the
+workspaces, which is a legitimate configuration and must not be described as
+multi-tenant isolation.
+
 ### Production onboarding and OIDC
 
 Bootstrap exactly one short-lived global operator on the first production

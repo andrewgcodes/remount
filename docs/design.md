@@ -252,6 +252,11 @@ not substitute for backend-specific hostile-workspace conformance tests.
 | Live snapshots and authoritative checkpoints | built; consistency is explicit and control commit is required for authority |
 | Resource quotas and retention | built for workspaces, sessions, requests, snapshots, artifacts, connector cache, events, timers and mutation records; diagnostics and metrics expose limits and GC |
 | Release pipeline | pinned actions, cross-platform static binaries, SBOM, checksums, provenance attestation and keyless checksum signature |
+| Runtime profiles: fail-closed node startup gate, `requires.profile` scheduling, drift reprobe, `doctor --profile`, `conformance --profile` ([ADR 0089](adr/0089-runtime-profiles-and-drift.md)) | built, unit/sim tested; gVisor passed `multi-tenant-isolated` live in a Linux VM, `microvm` has no live pass on this branch ([implementation record](engineering/gap-brief-2026-09-06-implementation.md#gap-1--production-isolation-profile)) |
+| Dynamic binding lifecycle and session-scoped principals: create/rotate/revoke at runtime, revocation within one renew, substitution locations and redaction ([ADR 0091](adr/0091-dynamic-binding-lifecycle-and-session-principals.md), [0092](adr/0092-broker-substitution-locations-and-redaction.md)) | built, unit/sim tested; live real-provider substitution and leak-block evidence ([implementation record](engineering/gap-brief-2026-09-06-implementation.md#gap-2--brokered-identity-credentials-egress-audit)) |
+| Computer sessions: screenshot, input, navigation, downloads as artifacts, typed failures, `iseq` resume ([ADR 0088](adr/0088-computer-sessions-over-port-substrate.md), [0094](adr/0094-a-resumed-computer-handle-reads-the-input-sequence.md)) | built, unit/sim tested; live against real Chromium on the docker backend, profiles node-local by design ([implementation record](engineering/gap-brief-2026-09-06-implementation.md#gap-3--computerbrowser-sessions)) |
+| Durable workspace leases and idle policy: control-plane deadlines that survive the client, node loss and a control-plane restart ([ADR 0090](adr/0090-durable-workspace-leases-and-idle-policy.md)) | built, control/sim tested; live across a mid-deadline control-plane restart ([implementation record](engineering/gap-brief-2026-09-06-implementation.md#gap-4--durable-lifecycle-for-running-work)) |
+| Typed errors in three languages and dependency-free OTLP span export to an operator-run collector ([ADR 0093](adr/0093-typed-errors-support-matrix-and-dependency-free-tracing.md)) | built, tested; spans verified live against a local collector. There is no default endpoint and no Remount-operated collector ([implementation record](engineering/gap-brief-2026-09-06-implementation.md#gap-5--sdk-conformance-release-observability)) |
 
 ### Verified end to end with a real agent
 
@@ -270,9 +275,15 @@ Named honestly, because a roadmap presented as a feature list is a lie.
   not automatically available on every host. Registration probes and exact-host
   conformance must pass. Process and Docker remain cooperative, and Apple
   Virtualization is not implemented.
-- **Display and browser sessions.** The protocol has the session kind reserved
-  but no native implementation. External browser/X11/VNC stacks can run as
+- **A full desktop as a protocol resource.** Computer sessions
+  ([ADR 0088](adr/0088-computer-sessions-over-port-substrate.md)) are a native
+  browser: screenshot, input, navigation, downloads and typed crash reporting
+  over the port substrate. They are not X11, a window manager or VNC, and a
+  browser profile is node-local by design, so it does not survive a sleep or a
+  move. When a whole desktop is required, external browser/X11/VNC stacks run as
   ordinary exec workloads; see [virtual desktops](harness-integration.md#browser-and-virtual-desktop-workloads).
+  The current state of brokered browsing to an allowed host is in
+  [the computer-session section](using-remount.md#computer-sessions-the-built-in-browser-api).
 - **Stock relay-confidentiality integration.** `internal/e2ee` implements
   authenticated key exchange and sealed peer payloads, with mutation/replay/
   reconnect tests. The control-plane binding operation and stock client/node
@@ -339,6 +350,10 @@ internal/workspace     Backend interface, process, docker, gvisor and firecracke
 internal/artifact      content-addressed store, deterministic snapshots
 internal/eventlog      the canonical log, memory and SQLite, subscriptions
 internal/broker        the egress credential broker
+internal/redact        credential-shape scrubbing for refusals, audit and logs
+internal/profile       runtime profiles, their obligations and evaluation
+internal/computer      the node-side CDP client behind computer sessions
+internal/trace         optional OTLP/HTTP span export: no dependency, no default endpoint
 internal/relay         frame routing by destination
 internal/control       claim queue, leases, timers, bindings, grants
 internal/node          the supervisor

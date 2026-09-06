@@ -34,6 +34,23 @@ disk at `/workspace`. The manifest SHA-256, protocol version, vsock port, and
 workspace path are the image contract. The guest holds no reusable host
 credential; the host accepts only the well-known host vsock CID.
 
+Two host requirements that a 2026-09-05 Colima run found the hard way, because
+both fail late and look like something else:
+
+- **The guest image's `/sbin/init` must export `PATH` before it starts the guest
+  agent.** A minimal init often leaves `PATH` unset, and the agent then starts
+  but cannot resolve any program the workspace asks it to run. The symptom is a
+  workspace that reaches ready and fails every `exec` with a not-found error,
+  not a registration failure.
+- **The CoW pool needs several GiB free.** Checkpoint and restore stage a full
+  disk plus state and memory bundle, so a pool with only a gigabyte or so of
+  headroom fails partway through a checkpoint rather than refusing it up front.
+  Size the pool for the largest workspace times the number of concurrent
+  checkpoints, not for the steady-state footprint.
+
+Both were recorded as the reason the B29 lane was `unavailable` on that host,
+alongside pool permissions. Unavailable is not a pass.
+
 Firecracker must be registered explicitly with `remount up --backend
 firecracker` and the `--firecracker-*` flags (or matching
 `REMOUNT_FIRECRACKER_*` variables). Registration fails rather than advertising

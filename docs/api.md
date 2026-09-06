@@ -61,6 +61,25 @@ Errors are one shape with the protocol's stable code:
 | `timeout` | 504 |
 | anything else | 500, message replaced by `internal error` |
 
+The body carries an optional `reason` alongside `code` and `message` when the
+server set one: a stable sub-classification inside an existing code, for the
+cases where one code covers outcomes a caller must tell apart. A `denied` from
+egress policy is not a `denied` from a missing role.
+
+```json
+{"error": {"code": "denied", "reason": "egress_denied",
+           "message": "host api.example.com is not allowed"}}
+```
+
+The field is omitted when empty, and a code without a reason is complete on its
+own — never treat a missing `reason` as an error. Branch on `code` first and
+narrow on `reason` only where the distinction matters; never match on `message`,
+which is for humans and may change in any release. A `reason` a client has never
+seen is a server newer than the client: fall back to the code rather than
+failing. The vocabulary is the protocol's, shared with the frame API and the
+SDKs, and is listed in
+[typed errors](using-remount.md#typed-errors).
+
 JSON bodies are limited to 1 MiB and unknown fields are rejected. A mutation
 takes an `Idempotency-Key` header; a retry with the same key returns the
 original result and a reuse with different arguments is `409 conflict`,

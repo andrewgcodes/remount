@@ -1,6 +1,6 @@
 # Remount
 
-> Portable agent workspaces, brokered credentials, durable sessions.
+> A durable computer for an agent: portable workspaces, brokered credentials, and sessions that outlive the client, the connection and the machine.
 
 Remount is an open protocol and a single static Go binary that gives an AI
 agent a workspace it can run on from anywhere: snapshotted, moved between
@@ -11,16 +11,22 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/an
 
 ## README
 
-- [Quick start from source](https://github.com/andrewgcodes/remount/blob/main/README.md#quick-start-from-source): Use the Go version declared in `go.mod` (currently 1.27.1).
+- [What this gives you that a container does not](https://github.com/andrewgcodes/remount/blob/main/README.md#what-this-gives-you-that-a-container-does-not): Seven claims, each with the section or document that shows the mechanism and states its limits.
+- [Quick start, no credentials](https://github.com/andrewgcodes/remount/blob/main/README.md#quick-start-no-credentials): Use the Go version declared in `go.mod` (currently 1.27.1).
+- [The fast path, once you have a provider key](https://github.com/andrewgcodes/remount/blob/main/README.md#the-fast-path-once-you-have-a-provider-key): One command runs a coding harness in a fresh workspace against a key it never sees.
 - [Move a running workspace to another machine](https://github.com/andrewgcodes/remount/blob/main/README.md#move-a-running-workspace-to-another-machine): The filesystem is snapshotted, the workspace is re-queued, a node in that zone claims it, and your files are there.
 - [Sleep and wake](https://github.com/andrewgcodes/remount/blob/main/README.md#sleep-and-wake): A sleeping workspace has no assigned node; its retained artifacts still use storage.
+- [Hold a workspace for background work](https://github.com/andrewgcodes/remount/blob/main/README.md#hold-a-workspace-for-background-work): `ws sleep` means "sleep now".
 - [Brokered credentials without placing keys in the workspace](https://github.com/andrewgcodes/remount/blob/main/README.md#brokered-credentials-without-placing-keys-in-the-workspace): Define a binding once, on the server:
+- [Isolation you can verify](https://github.com/andrewgcodes/remount/blob/main/README.md#isolation-you-can-verify): A **runtime profile** is what a machine claims, and claiming one is a startup gate rather than a label.
+- [Drive a browser](https://github.com/andrewgcodes/remount/blob/main/README.md#drive-a-browser): A **computer** is a browser the node drives inside a workspace.
 - [Everything is an event](https://github.com/andrewgcodes/remount/blob/main/README.md#everything-is-an-event): SQLite resource rows are the transactional source of lifecycle state; the append-only event log is the durable audit and observation record.
-- [Commands](https://github.com/andrewgcodes/remount/blob/main/README.md#commands): Sessions belong to the node, not to the terminal that started them.
+- [Commands](https://github.com/andrewgcodes/remount/blob/main/README.md#commands): `doctor --profile` and `conformance --profile` exit `0` pass, `1` fail, `2` nothing failed but something could not be checked.
 - [Go SDK](https://github.com/andrewgcodes/remount/blob/main/README.md#go-sdk): Applications import the supported public packages, not `internal/`:
 - [Seeing what is happening](https://github.com/andrewgcodes/remount/blob/main/README.md#seeing-what-is-happening): All three take `--json`.
+- [Project layout](https://github.com/andrewgcodes/remount/blob/main/README.md#project-layout): `internal/` is not a supported import path; the compatibility policy covers `api`, `client`, the two SDK packages, the wire protocol, and the CLI's documented flags and `--json` shapes.
 - [Documentation](https://github.com/andrewgcodes/remount/blob/main/README.md#documentation)
-- [Status](https://github.com/andrewgcodes/remount/blob/main/README.md#status): Working and tested: exec and pty sessions with replayable reconnect, workspace filesystem with server-side search and atomic edits, snapshots and cross-node moves, sleep and wake with durable timers, the credential broker, the claim queue with leases, the event log, port forwarding, durable Agents with fork/child composition, Python/TypeScript/Go SDKs, and an embedded [operator console](docs/console.md).
+- [Status](https://github.com/andrewgcodes/remount/blob/main/README.md#status): **Working and tested.** Exec and pty sessions with replayable reconnect; workspace filesystem with server-side search and atomic edits; snapshots and cross-node moves; sleep and wake with durable timers; the credential broker with typed policy over host, port, HTTP method, path and request/response budgets; the claim queue with leases; the event log; port forwarding; durable Agents with fork/child composition; Python/TypeScript/Go SDKs; and an embedded [operator console](docs/console.md).
 - [License](https://github.com/andrewgcodes/remount/blob/main/README.md#license): Apache-2.0.
 
 ## Using Remount
@@ -31,14 +37,14 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/an
 - [Operate a durable Agent](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#operate-a-durable-agent): An Agent owns a workspace and a durable transcript.
 - [Retrieve modified files](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#retrieve-modified-files): Agent changes live in the workspace, not automatically in the original host checkout.
 - [Use workspace primitives directly](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#use-workspace-primitives-directly): Start a manual local deployment:
-- [Run browser and virtual desktop workloads](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#run-browser-and-virtual-desktop-workloads)
+- [Run browser and virtual desktop workloads](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#run-browser-and-virtual-desktop-workloads): A browser is a protocol resource — a computer session, driven by the node.
 - [Broker provider credentials](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#broker-provider-credentials): Provider keys belong in the server or node environment, never in a workspace or committed bindings file.
 - [Deploy the Modal reference](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#deploy-the-modal-reference): `deploy/modal_app.py` is a reference deployment of one control plane and one process-backend node in one Modal container.
-- [Choose a runtime profile](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#choose-a-runtime-profile): A runtime profile is what a **machine** claims, as distinct from `security.profile`, which is what one **workspace** requires.
+- [Choose a runtime profile](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#choose-a-runtime-profile): A runtime profile is a machine's isolation claim, enforced as a fail-closed startup gate on the node and as a scheduling constraint on the workspace, and answered three-valued by `doctor --profile` and `conformance --profile`.
 - [Provider-backed nodes are not credential checks](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#provider-backed-nodes-are-not-credential-checks): Fly, E2B, Modal, ix.dev, and SSH pool drivers create whole Remount nodes.
 - [Verify outcomes and clean up](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#verify-outcomes-and-clean-up): Use the resource state and durable evidence, not a successful client call alone:
 - [Public API, errors and tracing](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#public-api-errors-and-tracing): Remount's public surface is the Go `api` and `client` packages, the `remount` Python package, the `@remount/sdk` npm package, the wire protocol, and the documented CLI flags and `--json` shapes.
-- [Documentation map and maintenance](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#documentation-map-and-maintenance): This guide owns the supported **user journeys** and links to their detailed contracts:
+- [Documentation map and maintenance](https://github.com/andrewgcodes/remount/blob/main/docs/using-remount.md#documentation-map-and-maintenance): This guide owns the supported **user journeys**.
 
 ## Tutorial
 
