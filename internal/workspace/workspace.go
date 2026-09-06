@@ -922,26 +922,34 @@ func (r *Registry) Names() []string { return append([]string(nil), r.order...) }
 func (r *Registry) Descriptors() []proto.BackendDescriptor {
 	out := make([]proto.BackendDescriptor, 0, len(r.order))
 	for _, name := range r.order {
-		caps := r.backends[name].Caps()
-		egress := caps.EgressMode
-		if egress == "" {
-			egress = "open"
-		}
-		if caps.EgressEnforced {
-			egress = "enforced_gateway"
-		}
-		out = append(out, proto.BackendDescriptor{
-			Name: name,
-			Security: proto.BackendSecurityCaps{
-				Isolation: caps.Isolation, MultiTenant: caps.MultiTenant,
-				SiblingIsolation: caps.SiblingIsolation, EgressMode: egress,
-				BrokerIdentity: caps.BrokerIdentity, FilesystemBoundary: caps.FilesystemBoundary,
-				NetworkNamespace: caps.NetworkNamespace, DeviceIsolation: caps.DeviceIsolation,
-			},
-			Runtime: proto.RuntimeCaps{Snapshots: caps.Snapshots, Display: caps.Display, MountPath: caps.MountPath},
-		})
+		out = append(out, DescriptorFor(name, r.backends[name].Caps()))
 	}
 	return out
+}
+
+// DescriptorFor normalizes one backend's Caps into the descriptor the control
+// plane schedules against. It is exported so documentation generators can
+// describe capabilities a host cannot construct here — a verified Firecracker
+// backend on a machine without KVM — through the same normalization a live
+// node uses, rather than through a second copy that could drift.
+func DescriptorFor(name string, caps Caps) proto.BackendDescriptor {
+	egress := caps.EgressMode
+	if egress == "" {
+		egress = "open"
+	}
+	if caps.EgressEnforced {
+		egress = "enforced_gateway"
+	}
+	return proto.BackendDescriptor{
+		Name: name,
+		Security: proto.BackendSecurityCaps{
+			Isolation: caps.Isolation, MultiTenant: caps.MultiTenant,
+			SiblingIsolation: caps.SiblingIsolation, EgressMode: egress,
+			BrokerIdentity: caps.BrokerIdentity, FilesystemBoundary: caps.FilesystemBoundary,
+			NetworkNamespace: caps.NetworkNamespace, DeviceIsolation: caps.DeviceIsolation,
+		},
+		Runtime: proto.RuntimeCaps{Snapshots: caps.Snapshots, Display: caps.Display, MountPath: caps.MountPath},
+	}
 }
 
 // Descriptor reports one registered backend's capabilities.

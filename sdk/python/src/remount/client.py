@@ -14,6 +14,7 @@ import cbor2
 import httpx
 from websockets.asyncio.client import connect as websocket_connect
 
+from .errors import ProtocolError, raise_for
 from .types import (
     FSApplyTarRes,
     FSEntry,
@@ -40,16 +41,6 @@ STREAM_GAP = 5
 # Node-owned enforcement stays on the node; clients fence frames, verify
 # artifact bytes and preserve explicit gaps in replayed session output.
 PEER_CAPABILITIES = ["v1", "authz-push", "controller-epoch", "session-cap", "chunked-artifacts", "tiered-session-logs", "release-epoch", "identity-admin"]
-
-
-class ProtocolError(Exception):
-    """A stable Remount protocol error."""
-
-    def __init__(self, code: str, message: str = "", oldest: int = 0):
-        self.code = code
-        self.message = message
-        self.oldest = oldest
-        super().__init__(f"{code}: {message}" if message else code)
 
 
 class ConnectionClosed(Exception):
@@ -449,7 +440,7 @@ class Client:
         error = response.get("err")
         if error:
             message = str(error.get("msg", "")).replace(self.token, "[redacted]") if self.token else str(error.get("msg", ""))
-            raise ProtocolError(error.get("code", "internal"), message, int(error.get("oldest", 0)))
+            raise_for(str(error.get("code", "internal")), str(error.get("reason", "")), message, int(error.get("oldest", 0)))
         return response
 
     async def call(self, op: str, body: dict[str, Any] | None = None, *, to: str = CONTROL) -> dict[str, Any]:

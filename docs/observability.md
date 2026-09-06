@@ -180,3 +180,54 @@ Event retention never punches a hole in the middle of history. A reader below
 the retained prefix receives the stable `evicted` error and current oldest
 sequence, and node producer high-water marks survive pruning so retries do not
 manufacture duplicate events or gaps.
+
+## Traces
+
+Every control-plane and node request can be recorded as a span and shipped to a
+collector you run. Tracing is off until you name one:
+
+```sh
+remount server     --otlp-endpoint http://collector.internal:4318
+remount up         --otlp-endpoint http://collector.internal:4318
+remount standalone --otlp-endpoint http://collector.internal:4318
+```
+
+`REMOUNT_OTLP_ENDPOINT` sets the same thing. There is no Remount-operated
+collector and no default endpoint: with the flag unset nothing is recorded and
+nothing leaves the process. A URL with no path gets `/v1/traces` appended, which
+is the OTLP/HTTP path for the trace signal; give a full path to override it.
+
+The exporter speaks OTLP/HTTP with a JSON payload and no OpenTelemetry
+dependency — the same reason `internal/metrics` renders Prometheus text by
+hand. Any collector that accepts OTLP/HTTP JSON works; the OpenTelemetry
+Collector's `otlp` receiver does, on port 4318.
+
+One span is recorded per dispatched request, named by its `op`. Control stamps
+the trace context onto requests it sends to nodes, so a node span appears as a
+child of the control span that caused it. Attributes are identifiers only:
+
+| Attribute | Means |
+|---|---|
+| `remount.peer` | the connected peer that sent the request |
+| `remount.principal` | the principal the control plane resolved for that peer |
+| `remount.ws` | the workspace the request names |
+| `remount.session` | the session the request names, on node spans |
+| `remount.code` / `remount.reason` | the stable error classification when the request failed |
+
+No token, secret, request body or free text is recorded, and every attribute is
+scrubbed through the same credential-shape redaction the broker and the agent
+transcript use before it is buffered. Structured logs pass through that
+redaction too, so a credential-shaped value that reached a log argument by
+accident does not reach the log.
+
+Two counters make the exporter itself observable:
+
+| Metric | Means |
+|---|---|
+| `remount_trace_spans_exported_total` | spans the collector accepted |
+| `remount_trace_export_failures_total` | spans that never arrived — dropped at a full queue, or lost to a failed batch |
+
+Telemetry never applies back pressure to a request: a full export queue drops
+the span and counts it here rather than stalling the operation that produced
+it. A rising failure counter means the collector is unreachable or refusing
+batches, not that the deployment is unhealthy.

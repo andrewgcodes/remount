@@ -1,4 +1,5 @@
-import { ConnectionClosed, ProtocolError } from "./client.js";
+import { ConnectionClosed } from "./client.js";
+import { ProtocolError } from "./errors.js";
 import type { Agent, AgentCreateReq, AgentMessageRes, Approval, ApprovalDecideReq } from "./types.js";
 
 function idem(): string { return `idem_${globalThis.crypto.randomUUID().replaceAll("-", "")}`; }
