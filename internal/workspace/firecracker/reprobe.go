@@ -170,7 +170,7 @@ func (f *JailerFactory) Reprobe(ctx context.Context) error {
 		return err
 	}
 	if compat != expected {
-		return fmt.Errorf("Firecracker host compatibility changed since start-up (was %+v, now %+v)", expected, compat)
+		return fmt.Errorf("firecracker host compatibility changed since start-up (was %+v, now %+v)", expected, compat)
 	}
 	return nil
 }
