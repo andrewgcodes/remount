@@ -39,6 +39,21 @@
   "directories": {
     "test": "test"
   },
-  "keywords": [],
-  "author": ""
+  "keywords": [
+    "agents",
+    "sandbox",
+    "workspace",
+    "runtime",
+    "remount"
+  ],
+  "author": "Andrew Kean Gao",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andrewgcodes/remount.git",
+    "directory": "sdk/typescript"
+  },
+  "homepage": "https://github.com/andrewgcodes/remount",
+  "bugs": {
+    "url": "https://github.com/andrewgcodes/remount/issues"
+  }
 }

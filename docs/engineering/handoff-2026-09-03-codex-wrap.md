@@ -16,7 +16,7 @@ Read this document together with, in order:
 5. `.agents/skills/remount-hardening-review/SKILL.md` when using Codex.
 
 Do not resume in the original checkout at
-`/Users/andrewgao/Documents/remount`: another agent was working there during
+`/Users/you/Documents/remount`: another agent was working there during
 this implementation. The integration checkout used here was
 `/private/tmp/remount-codex-handoff-2026-09-03` on branch
 `codex/handoff-2026-09-03`. Fetch first and create a fresh worktree from the PR

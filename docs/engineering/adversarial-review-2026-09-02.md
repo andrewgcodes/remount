@@ -1446,7 +1446,7 @@ earlier secret.
 **Verification**
 
 Confirmed by execution, not just reading. At
-/Users/andrewgao/Documents/remount/internal/broker/broker.go:224 the middle
+/Users/you/Documents/remount/internal/broker/broker.go:224 the middle
 loop is `for i, v := range vals`, so `v` is a copy taken once per header
 value; the inner `for _, l := range leases` loop writes `vals[i] =
 substitute(v, ph, l.Secret)` (line 242) from that stale `v` and never breaks.
