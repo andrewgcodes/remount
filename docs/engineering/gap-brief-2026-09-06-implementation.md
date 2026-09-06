@@ -46,10 +46,24 @@ control test that a self-reported pass cannot upgrade a failing descriptor;
 `cmd/remount` gate tests; a live standalone smoke of every `doctor --profile`
 exit path.
 
-Not proven here: the gVisor and Firecracker `Reprobe` paths compile under
-`GOOS=linux` but were not executed on this macOS host; the exact-host drift
-lane (E26) and profile conformance (B33) are the conformance builder's, run on
-Linux. See the follow-up section below.
+Conformance product (no new ADR; it implements ADR 0089's contract):
+`cmd/conformance --profile` and `remount conformance --profile` add one
+required row per profile obligation plus a scheduling row that proves
+`requires.profile` is honored, `--markdown` writes the review document, exit
+codes are 0/1/2, `make conformance-report` wraps a fresh standalone, and
+evidence gates B33 (profile conformance) and E26 (exact-host drift, gVisor)
+are registered. `docs/operations.md` and `docs/security-profiles.md` carry the
+profile column.
+
+Live on macOS (process backend): `--profile dev` conformant at exit 0
+(70 checks, 62 passed, 8 unavailable); `--profile multi-tenant-isolated`
+exit 1 with the seven profile obligations failing by name and the parked
+workspaces reported `profile_unschedulable`; `microvm` host-compat exit 2.
+
+Not proven on macOS: the gVisor and Firecracker `Reprobe` paths and the E26
+drift lane. A Linux-lane run inside the local Colima VM is in progress; until
+its ledger entry lands, E26 is `unavailable` and the `multi-tenant-isolated`
+profile has no live pass on a real isolated backend.
 
 ## Gap 2 — brokered identity, credentials, egress, audit
 
@@ -175,7 +189,8 @@ Delivered so far:
 | Builder | Scope | Status |
 |---|---|---|
 | Browser lane | `images/browser`, `remount computer` CLI, Python/TS `Computer`, real-Chromium conformance (B34) run live in Docker, docs | in progress |
-| Conformance product | `cmd/conformance --profile`, markdown report, `remount conformance`, evidence E26/B33, gVisor drift lane script, operator docs | in progress |
+| Conformance product | `cmd/conformance --profile`, markdown report, `remount conformance`, evidence E26/B33, gVisor drift lane script, operator docs | merged (ced0f00) |
+| Linux lanes | gVisor E4/E5/B28, E26 drift, a real `multi-tenant-isolated` gVisor node with `doctor` and `conformance --profile`, Firecracker B29 if its environment survived, all inside the Colima VM | in progress |
 | Credentials | `remount binding`/`principal session` CLI, Python/TS helpers, keyless examples against a fake provider (B35), docs, live `.env` run with rotate and revoke | in progress |
 | Lifecycle | `remount ws lease`/idle CLI, Python/TS methods, auto-sleep example, docs, live timer run across a server restart | in progress |
 | Typed errors and observability | typed error classes in three languages, support matrix, dependency-free OTLP tracing, log redaction, ADR 0093 | in progress |
