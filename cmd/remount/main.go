@@ -225,6 +225,7 @@ func usage() {
   remount tenant create TENANT [--oidc FILE] | ls
   remount invite PRINCIPAL --tenant TENANT [--ttl 15m]
   remount principal create PRINCIPAL [--tenant T] [--roles agent] | ls | revoke PRINCIPAL
+  remount principal session --ws WS [--roles agent] [--ttl 15m]   ephemeral principal + generation-bound capability, printed once
   remount token issue PRINCIPAL --role agent --ttl 1h [--tenant T]
   remount login --tenant TENANT      OIDC device login; stores rotating credentials mode 0600
 
@@ -253,7 +254,10 @@ func usage() {
   remount run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM]   run the file's tasks in order in one workspace, checkpointing or sleeping between them
   remount handoff [--recipe R] [--task T] [--dir .]                      move this checkout and the harness's conversation into a workspace and keep it going
   remount resume WS [--task T]        rejoin a running harness, or wake the workspace and continue the conversation
+  remount binding create ID --destination HOST --secret-env NAME [--kind api_key] [--placeholder S] [--ttl 15m] [--method M]... [--path-prefix P]... [--substitution query:key] [--retention-no-log]
+  remount binding ls [--include-revoked] | get ID | rotate ID --secret-env NAME | revoke ID [--reason TEXT]
   remount binding preset ls           provider presets a --binding may name
+  remount binding preset apply PRESET [--secret-env NAME] [--id b_openai] [--host H]   the same create in one command
   remount agent create RECIPE [seed flags] [--sleep-after DUR] [--max-turns N] [--approve M] [--detach] -- TASK
                                       a durable ACP agent: survives disconnects, node loss and sleep; run does this for acp recipes
   remount agent ls | get ID | open ID [--ui] | message ID [--steer] -- TEXT | cancel ID | fork ID | sleep ID | wake ID | destroy ID

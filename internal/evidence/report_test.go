@@ -2,6 +2,7 @@ package evidence
 
 import (
 	"encoding/xml"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -131,7 +132,11 @@ func TestADirtyCandidateIsMarkedInTheSummary(t *testing.T) {
 
 func TestListNamesTheOpenRowsAndTheirTickets(t *testing.T) {
 	text := RenderList(View(fakeEnv(nil)))
-	if !strings.Contains(text, "60 of 60 registered acceptance scenarios shown") {
+	// The count comes from the registry rather than a literal, so adding a
+	// scenario does not turn every branch that adds one into a conflict on
+	// this line. What is asserted is that the list shows every registered row.
+	total := len(Scenarios())
+	if !strings.Contains(text, fmt.Sprintf("%d of %d registered acceptance scenarios shown", total, total)) {
 		t.Fatalf("the list must lead with the counts:\n%s", strings.SplitN(text, "\n", 2)[0])
 	}
 	for _, want := range []string{"OPEN: Plan B phase B1", "E1", "B32", "missing env: REMOUNT_INTEGRATION_OPENAI_KEY"} {

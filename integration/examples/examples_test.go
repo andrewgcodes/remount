@@ -151,7 +151,7 @@ func repoRoot(t *testing.T) string {
 // runExample builds one example package and runs the binary against endpoint,
 // returning its stdout. Building first rather than `go run` keeps the go
 // tool's own output out of the program's.
-func runExample(t *testing.T, pkg, endpoint string, timeout time.Duration) string {
+func runExample(t *testing.T, pkg, endpoint string, timeout time.Duration, env ...string) string {
 	t.Helper()
 	root := repoRoot(t)
 	binary := filepath.Join(t.TempDir(), "example")
@@ -168,8 +168,10 @@ func runExample(t *testing.T, pkg, endpoint string, timeout time.Duration) strin
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binary)
 	cmd.Dir = t.TempDir()
-	// Only the server address. No token, no provider key, no proxy.
+	// Only the server address, plus whatever the caller names. No token, no
+	// real provider key, no proxy.
 	cmd.Env = append(os.Environ(), "REMOUNT_SERVER="+endpoint, "REMOUNT_TOKEN=")
+	cmd.Env = append(cmd.Env, env...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -185,7 +187,7 @@ func runExample(t *testing.T, pkg, endpoint string, timeout time.Duration) strin
 
 // standalone runs a control plane and a process-backend node in this process,
 // the way `remount standalone` does, and returns the server's base URL.
-func standalone(t *testing.T) string {
+func standalone(t *testing.T, adjust ...func(*node.Options)) string {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	data := t.TempDir()
@@ -219,13 +221,17 @@ func standalone(t *testing.T) string {
 		t.Fatal(err)
 	}
 	link := strings.Replace(endpoint, "http://", "ws://", 1) + "/v1/link"
-	n, err := node.New(node.Options{
+	options := node.Options{
 		DataDir: nodeDir, Dialer: transport.DialFunc(func(ctx context.Context) (transport.Conn, error) {
 			return transport.DialWS(ctx, link, nil)
 		}),
 		Labels: map[string]string{"standalone": "true"}, Backends: workspace.NewRegistry(process),
 		ArtifactURL: endpoint + "/v1/artifacts", Logger: quiet, Version: "test",
-	})
+	}
+	for _, apply := range adjust {
+		apply(&options)
+	}
+	n, err := node.New(options)
 	if err != nil {
 		cancel()
 		srv.Close()
