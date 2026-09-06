@@ -19,18 +19,19 @@
 
 </div>
 
-Remount is self-hosted infrastructure for cloud agents, and for local agents
-that move to the cloud and back. An agent's computer is a **workspace**. It
-can run on your laptop, a VM, a GPU box, Kubernetes, Modal or Fly, and it
-moves between them with its files, its policy and its saved state. Any
-harness works: [Claude Code](https://github.com/anthropics/claude-code),
+Remount is the open-source infrastructure for cloud agents. You bring the
+harness, whether that is [Claude Code](https://github.com/anthropics/claude-code),
 [Codex](https://github.com/openai/codex), [OpenCode](https://github.com/sst/opencode),
 [Pi](https://github.com/earendil-works/pi), [Gemini CLI](https://github.com/google-gemini/gemini-cli),
 [Aider](https://github.com/Aider-AI/aider), [Goose](https://github.com/block/goose),
 [Cline](https://github.com/cline/cline), [OpenHands](https://github.com/All-Hands-AI/OpenHands),
-or the agent loop you wrote in Go, Python or TypeScript. Workspaces snapshot,
-move, sleep, wake on events, replay their sessions, and never hold an API
-key. One static Go binary, one open protocol, Apache-2.0, nothing hosted.
+or the loop your product runs in Go, Python or TypeScript. Remount gives it a
+computer: a **workspace** that runs on your laptop, a VM, a GPU box,
+Kubernetes, Modal or Fly, moves between them with its files, policy and saved
+state, replays its sessions, sleeps and wakes on events, and never holds an
+API key. It is the same runtime whether the agent writes code, reviews
+contracts, reconciles expenses, browses the web or answers customers. One
+static Go binary, one open protocol, Apache-2.0, nothing hosted.
 
 - **Move between local and cloud.** Start an agent on your laptop and hand it
   to a cloud node with `remount handoff`; pull it back with `remount resume`
