@@ -22,7 +22,7 @@ full-suite Docker OpenCode lanes remain known failing and are visible CI
 debt.**
 
 Host: Windows Server 2022 amd64. Go: 1.27.1. Race C toolchain: MinGW-w64
-16.1.0. Final verification integrated `origin/main` at `7d1bc8d`.
+16.1.0. Final post-merge verification used `origin/main` at `51185dd`.
 
 ### Final command results
 
@@ -259,12 +259,30 @@ test remain unchanged in developer package targets.
 
 ## Current-main compatibility recheck
 
-The final branch contains `origin/main` at
-`7d1bc8ddbc055be9f57e157bac1915c0cadbe876`; no mainline commit was missing.
-On that combined history, native Windows passed build, vet, the complete
+After the Windows pull request merged, `origin/main` was
+`51185ddeda5c4451c024a1fd7c660e4cc271a52b`. That history includes the Windows
+work and four commits that landed concurrently: the Helm document comparator,
+safe retry of an S3 request the transport never wrote, host-sized simulation
+loads with container-user catalog writes, and the September 4 session handoff.
+
+The merged Helm test retains both document-level semantic comparison and
+CRLF/LF normalization. The S3 suite retains both the conditional-write
+connection-closing regression and the rewindable unused-connection retry
+regression. The OpenCode lane retains the assertion that transient state does
+not enter the workspace while writing its model catalog as the container user.
+Focused policy and S3 package tests passed, and the deterministic OpenCode model
+lane passed in 46.128 seconds.
+
+The first post-merge CI run exposed one integration defect in the composed S3
+test: `staticcheck` reported `U1000` for an unused `bodies` field left on
+`staleOnceTransport`. The field was test scaffolding with no behavior and was
+removed; the focused S3 package and its static analysis were rerun afterward.
+
+On the merged history, native Windows passed build, vet, the complete
 serialized ordinary package lane with the five documented Windows exclusions,
 the nested public-SDK module, and the complete serialized race package lane
-with its four documented exclusions. Built-binary conformance remained:
+with its four documented exclusions. Formatting, lock-discipline lint, and
+diff checks also passed. Built-binary conformance remained:
 
 ```text
 60 passed, 0 failed, 8 unavailable of 68 requirements
@@ -2215,3 +2233,202 @@ This was not a new comprehensive security audit, a dependency upgrade, or a
 production qualification. No `.env` credentials were loaded, cloud resources
 deployed, browser/host-isolation lanes rerun, or new race/full-verify result
 claimed. Prior live and race evidence remains dated in its original entries.
+
+## Historical PR #13 evidence integrated on 2026-09-05
+
+The following entries retain the original Linux candidate results. Their
+integration does not claim a new Linux/runsc host pass on current main.
+
+### 2026-09-04 — release-matrix node inventory propagation
+
+The Ubuntu test job failed `TestReleaseMatrixUnderLocalProfile` because the
+test queried control-plane node inventory immediately after both node-local
+`Online` signals. One node had completed its local handshake but had not yet
+become visible to the subsequent client list request. The test now waits,
+within its existing 30-second context, until both exact node identities are
+listed before asserting their negotiated protocols. The protocol and placement
+assertions are unchanged.
+
+Verification:
+
+```sh
+go test -race -count=20 \
+  -run '^TestReleaseMatrixUnderLocalProfile$' \
+  -timeout 300s ./internal/sim
+go test -count=1 -timeout 1200s ./internal/sim
+staticcheck ./internal/sim
+go vet ./internal/sim
+```
+
+All commands passed. The repeated race proof completed in 19.219 seconds and
+the complete simulation package completed in 251.767 seconds.
+
+### 2026-09-04 — Windows-main integration after the Ubuntu CI fix
+
+The Linux branch merged `origin/main` at
+`51185ddeda5c4451c024a1fd7c660e4cc271a52b`, retaining the upstream
+cross-platform split files, serialized heavy test gates, bounded concurrent
+cursor detach, and local workspace cleanup. The merge also retained the Linux
+branch's durable session completion ordering, exact stale-grant handling,
+durable event polling, filesystem-access preparation, and deny-first gVisor
+proof.
+
+Verification:
+
+```sh
+make lint
+make test
+make race
+make conformance
+go test -race -count=20 \
+  -run '^TestReleaseMatrixUnderLocalProfile$' \
+  -timeout 300s ./internal/sim
+staticcheck ./internal/sim
+go vet ./internal/sim
+go test -count=1 -timeout 1200s ./internal/sim
+go run ./cmd/conformance --build .
+sudo -n env \
+  REMOUNT_GVISOR_ROOTFS=/home/ubuntu/firecracker-artifacts/gvisor-rootfs-alpine-3.22 \
+  scripts/gvisor-spike.sh
+```
+
+All commands passed. The repeated release-matrix race proof completed in
+19.063 seconds and the complete simulation package completed in 254.963
+seconds. The complete race suite and serialized conformance suite passed. The
+built-binary conformance run reported 60 passed, 0 failed, and 8 unavailable;
+all 53 required requirements passed and cleanup was verified.
+
+Linux 5.15 rejected the upstream netdev egress hook with `Operation not
+supported`; the spike installed its deny-first host-ingress fallback and
+passed broker reachability, IPv4 TCP, IPv6, UDP, DNS, ICMP, raw-socket, unlisted
+CONNECT, and post-revoke denial checks. Its exit trap deleted the runsc
+sandbox, veth, nftables table, network namespace, bind mount, and temporary
+directory. **Status: verified.**
+
+### 2026-09-04 — B32 aggregate correction and merged-main follow-up
+
+The first aggregate run on committed candidate
+`a48d046132ba01976fb799424607654bb33c32b9` correctly failed:
+
+```text
+evidence: verdict failed: 1 required rows failed, 20 unavailable, 0 leaks
+B32: owning proof skipped without an unavailable reason
+```
+
+The B32 registry command ran the entire `integration/installs` package even
+though its owner is `integration/installs.TestB32*`. The package also contains
+the unrelated `TestCleanEnvKeepsWindowsPackageManagerRoots`, whose
+Windows-contract skip is not a B32 proof. The evidence parser remains strict;
+the registry command was narrowed to its owning tests and a regression fixes
+that exact command:
+
+```sh
+go test -count=1 -timeout=20m -run '^TestB32' ./integration/installs/
+```
+
+On committed candidate `ed84f259c17043b81391ae758df2048faa950014`,
+the command passed in 45.813 seconds. The clean committed-candidate aggregate
+then completed:
+
+```sh
+go run ./cmd/evidence run
+```
+
+```text
+Rows: 35 passed, 0 failed, 32 unavailable
+Required rows: 35 of 55 passed, 0 failed, 20 unavailable
+External resources created: 1; cleanup verified 1, failed 0
+```
+
+This result is deliberately **incomplete**, not passed: all 20 required rows
+that did not execute remain unavailable with named missing prerequisites or
+unwired owning proofs. B32 passed and no required row failed.
+
+After `main` advanced to `069a17d3acf63bcd6050acf4bbadd4ef3d90ad61`
+with four Windows-lane test corrections, that commit was merged without
+overwriting the follow-up changes. On committed candidate
+`ff23e7e29c3c96dd676de4e516b9d317da93f380`, the direct B32 proof passed again
+in 49.368 seconds, the affected workspace packages passed under the race
+detector, and the aggregate repeated the same 35 passed, 0 failed, 32
+unavailable result with verified cleanup.
+
+Built-binary conformance on the same candidate:
+
+```sh
+go run ./cmd/conformance --build .
+```
+
+```text
+60 passed, 0 failed, 8 unavailable of 68 requirements
+required: 53 passed, 0 failed, 0 unavailable
+cleanup: verified
+```
+
+After the original pull request merged, the unmerged work was moved to a
+follow-up branch based on current `main`. The exact Linux host proof was
+re-run:
+
+```sh
+sudo -n env \
+  REMOUNT_GVISOR_ROOTFS=/home/ubuntu/firecracker-artifacts/gvisor-rootfs-alpine-3.22 \
+  scripts/gvisor-spike.sh
+```
+
+Linux 5.15 again rejected the guest netdev egress hook with `Operation not
+supported`. The host-veth ingress fallback installed; the positive control,
+all denial probes, and post-revoke denial passed; the script reported
+`gVisor E4 spike passed`. Its exit trap removed the runsc sandbox, nftables
+tables, namespace, veth pair, bind mount, bundle, and state root. B32 removed
+its temporary install and build directories. **Status: verified.**
+
+## Reviewed PR integration and real-provider check — 2026-09-05
+
+Candidate `0da858a539d6ace30784a01cf6aea70ce50216db` integrates PRs #1–#4,
+#7, #12, and #13 onto `3620140691c2f5b70652da7c10d1b1af097e4c0d`.
+The control, node, workspace, client, CLI, and public SDK runtime code is
+unchanged from that base. Historical host results above remain evidence for
+their named candidates, not fresh host qualification of this integration.
+
+Focused checks passed: the evidence package under race, 20 race-enabled
+release-matrix repetitions, and 10 race-enabled repetitions of the new
+gVisor script contract. The script contract fails against the previous
+script, proving that its fallback regression is observable. It stubs
+privileged commands and does not qualify Linux kernel enforcement.
+Actionlint 1.7.12 passed with ShellCheck and Pyflakes disabled; shell syntax,
+`make lint`, generated-document tests, and `make docs` also passed.
+
+The exact candidate also passed a real OpenCode/OpenAI integration on local
+Docker, using only the authorized OpenAI key loaded in memory from `.env`:
+
+```sh
+go test -race -count=1 -v -timeout=12m ./internal/sim \
+  -run '^TestRunOpenCodeDockerIntegration$'
+```
+
+The test passed in 292.31 seconds (package: 293.858 seconds), using
+`openai/gpt-4o-mini` and
+`node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5`.
+The real agent wrote `GREETING.txt` containing `hello`, also independently
+read from its container. Assertions covered run lifecycle and broker
+credential-use events, workspace and snapshot leak scans with planted
+canaries, event and deep-diagnostic checks, and workspace/container cleanup.
+After completion, Docker inventory for the exact workspace label was empty.
+The key was not placed in the workspace, command arguments, or this ledger.
+
+This exercises candidate Go components with in-process simulation transport
+and a real Docker harness/provider, not a deployed cloud service or a frozen
+standalone CLI binary. Docker remains cooperative isolation; unavailable
+read-only mounts are not an enforced-profile pass. No cloud resources were
+created. GitHub jobs on the pre-integration main were refused before startup
+by account billing/spending limits. Native Windows, Linux/runsc, KVM, cloud
+deployment, and release-signing qualification remain unavailable here.
+
+`PATH=/Users/andrewgao/go/bin:$PATH make verify` completed with all 17
+portable local gates passing: formatting; host/Linux/Windows/Darwin vet;
+lock discipline; the main suite (556 seconds) and external public SDK suite;
+distribution builds; module verification/tidy; staticcheck; govulncheck;
+seeded fuzz corpus; the full race suite (763 seconds); conformance (379
+seconds); and nine bounded fuzz targets (110 seconds total). This is the
+complete local gate set, not a hosted CI or native multi-platform pass.
+Only this ledger entry was added after the tested code commit; documentation
+generation, lint, generated-document tests, and diff checks were rechecked.
