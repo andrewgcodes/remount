@@ -819,13 +819,22 @@ What the API promises, and what it does not:
 - **Egress policy is per host, never per URL.** The broker tunnels CONNECT
   opaquely and terminates no TLS, so it can see the host a browser asked for
   and nothing else. Read no per-path guarantee into this.
-- **A browser cannot currently reach a host the broker allows.** Chromium honors
-  `http_proxy`/`https_proxy` and does route through the workspace's broker, but
-  it does not present the workspace capability as proxy authentication, so the
-  broker refuses every destination as unauthenticated and the navigation
-  surfaces as `denied`/`navigation_denied`. Browser traffic is therefore
-  contained but not yet usable against allowed hosts; a workspace that must
-  browse the network needs a node whose broker is not in the path.
+- **A browser reaches the hosts the broker allows, and only those.** Chromium
+  routes through the workspace's broker but discards the capability in the proxy
+  URL and never volunteers `Proxy-Authorization`; it waits to be challenged, and
+  a headless browser has nobody to ask. The node answers that challenge itself
+  over CDP, with the same capability the browser's own `HTTPS_PROXY` carries, so
+  an allowed host loads normally and an unbound one is refused by host policy as
+  `denied`/`navigation_denied`
+  ([ADR 0095](adr/0095-browser-proxy-auth-through-cdp.md)). Two consequences are
+  worth knowing before you read an audit trail. A site that asks for a password
+  itself gets `CancelAuth` — the workspace capability is never handed to an
+  origin — so an HTTP-authenticated page fails rather than logging in. And the
+  first `CONNECT` of a proxy connection is recorded as an `unauthenticated`
+  `egress.denied`: that is the `407` challenge, and the retry that carries the
+  credential is the `allowed` record beside it. Chromium's own component and
+  metrics traffic is issued outside any page and cannot be authenticated at all,
+  so it stays denied.
 - **Profiles do not survive a move, a sleep or a `remount pull`.** A profile
   lives in `.remount/browser/<profile>`, which every snapshot excludes on
   purpose: a live browser profile contains singleton symlinks and lock files

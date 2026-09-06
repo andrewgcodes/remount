@@ -40,6 +40,10 @@ type Options struct {
 	Viewport proto.ComputerViewport
 	// DownloadPath is the workspace-side directory the browser saves into.
 	DownloadPath string
+	// ProxyAuth is the credential this conversation answers a proxy
+	// authentication challenge with. Leave it unset and no request is
+	// intercepted at all. See ADR 0095.
+	ProxyAuth    ProxyCredentials
 	ReadyTimeout time.Duration
 	CallTimeout  time.Duration
 	LoadTimeout  time.Duration
@@ -73,6 +77,9 @@ type Client struct {
 	downloads map[string]*Download
 	order     []string
 	reason    string
+	// challenged names the requests already given the proxy credential, so
+	// one request is never answered with it twice.
+	challenged map[string]bool
 
 	watchers sync.WaitGroup
 	stopped  chan struct{}
@@ -175,10 +182,19 @@ func (c *Client) setup(ctx context.Context) error {
 	if err := c.conn.call(call, c.page, "Runtime.enable", nil, nil); err != nil {
 		return err
 	}
-	return c.conn.call(call, c.page, "Emulation.setDeviceMetricsOverride", map[string]any{
+	if err := c.conn.call(call, c.page, "Emulation.setDeviceMetricsOverride", map[string]any{
 		"width": c.opts.Viewport.Width, "height": c.opts.Viewport.Height,
 		"deviceScaleFactor": 1, "mobile": false,
-	}, nil)
+	}, nil); err != nil {
+		return err
+	}
+	if !c.opts.ProxyAuth.Set() {
+		return nil
+	}
+	// Request interception is armed last: everything above it is what a
+	// computer is with or without a broker in its path, and a browser that
+	// meets no proxy challenge should pay nothing for one.
+	return c.armSession(call, c.page)
 }
 
 func (c *Client) resolveTarget(ctx context.Context) (string, error) {
@@ -384,6 +400,22 @@ func (c *Client) Eval(ctx context.Context, expression string) (json.RawMessage, 
 
 func (c *Client) handleEvent(m message) {
 	switch m.Method {
+	case "Fetch.authRequired", "Fetch.requestPaused", "Target.attachedToTarget":
+		// These three only exist while request interception is armed, and
+		// answering them from the read loop is deliberate: the answers are
+		// fire-and-forget writes, so nothing here waits for a reply that
+		// could only arrive on this same loop. See ADR 0095.
+		if !c.opts.ProxyAuth.Set() {
+			return
+		}
+		switch m.Method {
+		case "Fetch.authRequired":
+			c.answerAuthChallenge(m)
+		case "Fetch.requestPaused":
+			c.continuePaused(m)
+		case "Target.attachedToTarget":
+			c.armAttachedTarget(m)
+		}
 	case "Browser.downloadWillBegin", "Page.downloadWillBegin":
 		var p struct {
 			GUID              string `json:"guid"`
