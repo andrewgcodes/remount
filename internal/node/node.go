@@ -1910,7 +1910,9 @@ func (n *Node) fenceWorkspace(ctx context.Context, id, reason string) {
 	}
 	if w != nil {
 		if w.broker != nil {
-			_ = w.broker.Close()
+			// Fencing revokes rather than closes: a stream already in flight
+			// is gateway access this workspace no longer has.
+			_ = w.broker.Revoke()
 		}
 		detachErr := n.detachWorkspaceVolumes(context.WithoutCancel(ctx), w, w.Spec.Volumes)
 		if detachErr != nil {
@@ -2055,7 +2057,10 @@ func (n *Node) quarantine(ctx context.Context, req *proto.WSQuarantineReq) (*pro
 		}
 		networkErr := n.revokeWorkspaceNetwork(ctx, retainedWorkspace)
 		if retainedWorkspace.broker != nil {
-			_ = retainedWorkspace.broker.Close()
+			// Containment cuts the gateway synchronously. A graceful close
+			// would let an allowed transfer keep running after the operator
+			// was told the workspace was contained.
+			_ = retainedWorkspace.broker.Revoke()
 		}
 		sessionErr := n.stopWorkspaceSessions(retainedWorkspace)
 		if networkErr != nil || sessionErr != nil {
