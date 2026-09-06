@@ -160,8 +160,8 @@ func TestListJSONEnumeratesEveryScenario(t *testing.T) {
 	if err := json.Unmarshal([]byte(buf.String()), &views); err != nil {
 		t.Fatal(err)
 	}
-	if len(views) != 57 {
-		t.Fatalf("got %d rows, want E1-E25 plus B1-B32", len(views))
+	if want := len(evidence.Scenarios()); len(views) != want {
+		t.Fatalf("got %d rows, want every registered scenario (%d)", len(views), want)
 	}
 	for _, v := range views {
 		if v.Evidence == evidence.StatusPassed {
