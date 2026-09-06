@@ -2380,3 +2380,55 @@ all denial probes, and post-revoke denial passed; the script reported
 `gVisor E4 spike passed`. Its exit trap removed the runsc sandbox, nftables
 tables, namespace, veth pair, bind mount, bundle, and state root. B32 removed
 its temporary install and build directories. **Status: verified.**
+
+## Reviewed PR integration and real-provider check — 2026-09-05
+
+Candidate `0da858a539d6ace30784a01cf6aea70ce50216db` integrates PRs #1–#4,
+#7, #12, and #13 onto `3620140691c2f5b70652da7c10d1b1af097e4c0d`.
+The control, node, workspace, client, CLI, and public SDK runtime code is
+unchanged from that base. Historical host results above remain evidence for
+their named candidates, not fresh host qualification of this integration.
+
+Focused checks passed: the evidence package under race, 20 race-enabled
+release-matrix repetitions, and 10 race-enabled repetitions of the new
+gVisor script contract. The script contract fails against the previous
+script, proving that its fallback regression is observable. It stubs
+privileged commands and does not qualify Linux kernel enforcement.
+Actionlint 1.7.12 passed with ShellCheck and Pyflakes disabled; shell syntax,
+`make lint`, generated-document tests, and `make docs` also passed.
+
+The exact candidate also passed a real OpenCode/OpenAI integration on local
+Docker, using only the authorized OpenAI key loaded in memory from `.env`:
+
+```sh
+go test -race -count=1 -v -timeout=12m ./internal/sim \
+  -run '^TestRunOpenCodeDockerIntegration$'
+```
+
+The test passed in 292.31 seconds (package: 293.858 seconds), using
+`openai/gpt-4o-mini` and
+`node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5`.
+The real agent wrote `GREETING.txt` containing `hello`, also independently
+read from its container. Assertions covered run lifecycle and broker
+credential-use events, workspace and snapshot leak scans with planted
+canaries, event and deep-diagnostic checks, and workspace/container cleanup.
+After completion, Docker inventory for the exact workspace label was empty.
+The key was not placed in the workspace, command arguments, or this ledger.
+
+This exercises candidate Go components with in-process simulation transport
+and a real Docker harness/provider, not a deployed cloud service or a frozen
+standalone CLI binary. Docker remains cooperative isolation; unavailable
+read-only mounts are not an enforced-profile pass. No cloud resources were
+created. GitHub jobs on the pre-integration main were refused before startup
+by account billing/spending limits. Native Windows, Linux/runsc, KVM, cloud
+deployment, and release-signing qualification remain unavailable here.
+
+`PATH=/Users/andrewgao/go/bin:$PATH make verify` completed with all 17
+portable local gates passing: formatting; host/Linux/Windows/Darwin vet;
+lock discipline; the main suite (556 seconds) and external public SDK suite;
+distribution builds; module verification/tidy; staticcheck; govulncheck;
+seeded fuzz corpus; the full race suite (763 seconds); conformance (379
+seconds); and nine bounded fuzz targets (110 seconds total). This is the
+complete local gate set, not a hosted CI or native multi-platform pass.
+Only this ledger entry was added after the tested code commit; documentation
+generation, lint, generated-document tests, and diff checks were rechecked.
