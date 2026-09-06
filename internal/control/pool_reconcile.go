@@ -63,8 +63,12 @@ func (c *Control) reconcilePoolsAsync() {
 	sort.Strings(keys)
 	demand := c.poolDemandLocked(keys)
 	work := make([]poolWork, 0, len(keys))
+	now := c.opts.Now()
 	for _, key := range keys {
 		if c.poolBusy[key] {
+			continue
+		}
+		if retryAt := c.poolInventoryRetryAt[key]; retryAt.After(now) {
 			continue
 		}
 		source := c.pools[key]
@@ -143,13 +147,17 @@ func (c *Control) reconcilePool(work poolWork) {
 		c.commitPoolFailure(work, "inventory", err)
 		return
 	}
+	c.mu.Lock()
+	delete(c.poolInventoryFailures, work.key)
+	delete(c.poolInventoryRetryAt, work.key)
+	c.mu.Unlock()
 	nodes := c.enrichPoolInventory(work, machines)
 	actions, reconcileErr := c.opts.PoolReconciler.Reconcile(ctx, work.spec, nodes, work.demand)
 	c.commitPoolResult(work, len(machines), actions, reconcileErr)
 }
 
 func (c *Control) enrichPoolInventory(work poolWork, machines []provision.Machine) []nodepool.Node {
-	now := c.now()
+	now := c.opts.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := make([]nodepool.Node, 0, len(machines))
@@ -254,7 +262,7 @@ func (f *poolRetireFence) Retire(context.Context) (bool, error) {
 	fence := poolRetirement{Pool: f.work.key, Machine: f.machine, Node: f.node}
 	if err := c.transact(func(tx *eventlog.Tx) error {
 		_, err := tx.Exec(`INSERT INTO pool_retirements(node, tenant, pool, machine, created_at) VALUES(?,?,?,?,?)`,
-			f.node, f.work.pool.Tenant, f.work.pool.Spec.Name, f.machine, c.now().UnixMilli())
+			f.node, f.work.pool.Tenant, f.work.pool.Spec.Name, f.machine, c.opts.Now().UnixMilli())
 		return err
 	}, []*proto.Event{c.poolEvent(proto.EvPoolRetiring, f.work.pool, "", f.payload())}); err != nil {
 		return false, err
@@ -318,9 +326,29 @@ func (c *Control) prunePoolRetirementsLocked(work poolWork, visible map[string]s
 	}
 }
 
+// poolInventoryBackoff bounds how often a failing inventory call is retried.
+// Without it a broken helper or a provider outage was polled, and recorded as
+// a pool.provision_failed event, on every reconcile tick.
+const (
+	poolInventoryBackoffMin = 2 * time.Second
+	poolInventoryBackoffMax = 2 * time.Minute
+)
+
 func (c *Control) commitPoolFailure(work poolWork, reason string, cause error) {
+	var retryAt time.Time
+	if reason == "inventory" {
+		c.mu.Lock()
+		c.poolInventoryFailures[work.key]++
+		delay := poolInventoryBackoffMin
+		for i := 1; i < c.poolInventoryFailures[work.key] && delay < poolInventoryBackoffMax; i++ {
+			delay = min(delay*2, poolInventoryBackoffMax)
+		}
+		retryAt = c.opts.Now().Add(delay)
+		c.poolInventoryRetryAt[work.key] = retryAt
+		c.mu.Unlock()
+	}
 	c.commitPoolResult(work, work.pool.Current, []nodepool.Action{{Kind: nodepool.ActionCreateFailed,
-		From: work.pool.Current, To: work.pool.Current, Reason: reason, Error: cause.Error()}}, cause)
+		From: work.pool.Current, To: work.pool.Current, Reason: reason, Error: cause.Error(), RetryAt: retryAt}}, cause)
 }
 
 func (c *Control) commitPoolResult(work poolWork, observed int, actions []nodepool.Action, reconcileErr error) {
@@ -361,7 +389,7 @@ func (c *Control) commitPoolResult(work poolWork, observed int, actions []nodepo
 		}
 		return
 	}
-	next.UpdatedAt = c.now().UnixMilli()
+	next.UpdatedAt = c.opts.Now().UnixMilli()
 	if err := c.transact(func(tx *eventlog.Tx) error {
 		_, err := tx.Exec(`UPDATE pools SET data=? WHERE tenant=? AND name=?`, proto.MustMarshal(next), next.Tenant, next.Spec.Name)
 		return err

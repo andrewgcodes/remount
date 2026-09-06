@@ -996,34 +996,50 @@ cannot satisfy isolated`. So the machine image has to carry `runsc` and an
 unpacked rootfs, and the pool is created with `--backend gvisor`:
 
 ```sh
-remount pool create e2b --vendor e2b --backend gvisor --min 1 --max 4 --label zone=e2b
-remount pool create ix  --vendor ix  --backend gvisor --min 1 --max 4 --region us-east-1 --label zone=ix
+remount pool create ix --vendor ix --backend gvisor --min 0 --max 4 --region us-east-1 --label zone=ix
 ```
+
+A pool belongs to the tenant of the operator who created it, and its nodes
+serve that tenant's workspaces, so create pools as a tenant operator rather
+than the global bootstrap principal. `pool rm` refuses while the pool holds
+machines; a pool created with `--min 0` drains itself after
+`--idle-scale-down`.
 
 ### E2B
 
-The `e2b` entry names a template built from [`images/e2b/`](../images/e2b/):
-the node binary, a pinned `runsc`, an Alpine minirootfs at
-`/opt/remount/rootfs`, and a start command that runs the node as root.
+E2B sandboxes cannot host pool nodes today. The driver and the template in
+[`images/e2b/`](../images/e2b/) take a sandbox all the way to an enrolled
+`gvisor` node, but E2B's kernel (6.1, checked 2026-09-06) is built without
+`CONFIG_NF_TABLES_NETDEV`, `CONFIG_NET_CLS_FLOWER` and `CONFIG_NET_ACT_GACT`,
+and the enforced egress gateway installs its deny-all policy as a
+netdev-family nftables table. Every workspace materialization on such a node
+failed with `install deny-all policy: create host ingress table: operation
+not supported`. The network probe now creates and deletes a netdev table at
+node startup, so the node refuses to start there with `enforced network
+unavailable: nf_tables netdev family is unsupported by this kernel` rather
+than enrolling and holding workspaces `pending`.
+
+What the driver does, for the day the kernel changes or for a self-hosted
+E2B with a different one: E2B snapshots a template after its start command
+has run and resumes every sandbox from that snapshot, so nothing passed at
+sandbox creation reaches the start command as an environment variable. The
+driver creates the sandbox with `secure: true`, then writes the `REMOUNT_*`
+bootstrap values, enrollment credential included, to
+`/home/user/remount-bootstrap.env` through the sandbox's envd file API,
+authenticating with the one-time access token the create response carries.
+That token is used for that request and never logged or stored. The start
+command waits for the file, imports it, deletes it, and execs `remount up`
+as root, logging to `/var/lib/remount/node.log`. A sandbox whose bootstrap
+cannot be delivered is killed immediately so the retry starts clean.
+Optional entry fields: `sandbox_domain` (default: the API endpoint host
+without its `api.` label), `bootstrap_path`, `bootstrap_user`. Build the
+template with:
 
 ```sh
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o remount-linux-amd64 ./cmd/remount
 pip install e2b && export E2B_API_KEY=...
 python3 images/e2b/build.py remount-linux-amd64 remount-node
 ```
-
-E2B snapshots a template after its start command has run and resumes every
-sandbox from that snapshot, so nothing passed at sandbox creation reaches the
-start command as an environment variable. The driver therefore creates the
-sandbox with `secure: true`, then writes the `REMOUNT_*` bootstrap values,
-enrollment credential included, to `/home/user/remount-bootstrap.env` through
-the sandbox's envd file API, authenticating with the one-time access token the
-create response carries. That token is used for that request and never logged
-or stored. The start command waits for the file, imports it, deletes it, and
-execs `remount up`, logging to `/var/lib/remount/node.log`. A sandbox whose
-bootstrap cannot be delivered is killed immediately so the retry starts clean.
-Optional entry fields: `sandbox_domain` (default: the API endpoint host
-without its `api.` label), `bootstrap_path`, `bootstrap_user`.
 
 ### ix.dev
 
