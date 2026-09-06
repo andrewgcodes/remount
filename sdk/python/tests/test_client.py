@@ -450,6 +450,142 @@ async def test_sleep_workspace_requires_wake_trigger():
 
 
 @pytest.mark.asyncio
+async def test_lease_workspace_takes_durable_hold():
+    lease = {
+        "id": "lease_1",
+        "ws": "ws_1",
+        "gen": 3,
+        "max_alive_until": 1_700_000_900_000,
+        "on_expiry": "destroy",
+        "reason": "agent turn",
+        "created_at": 1_700_000_000_000,
+    }
+    socket = FakeSocket({"ws.lease": lease})
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client("https://cp.example", "token", connector=connector)
+    taken = await client.lease_workspace(
+        "ws_1", max_alive_sec=900, on_expiry="destroy", reason="agent turn"
+    )
+    assert taken == lease
+    frame = next(sent for sent in socket.sent if sent.get("op") == "ws.lease")
+    body = cbor2.loads(frame["body"])
+    assert frame["to"] == "control"
+    assert body["id"] == "ws_1"
+    assert body["max_alive_sec"] == 900
+    assert body["on_expiry"] == "destroy"
+    assert body["reason"] == "agent turn"
+    assert body["idem"].startswith("idem_")
+    assert "min_alive_sec" not in body
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_renew_lease_extends_the_control_plane_deadline():
+    lease = {
+        "id": "lease_1",
+        "ws": "ws_1",
+        "gen": 3,
+        "max_alive_until": 1_700_000_600_000,
+        "on_expiry": "sleep",
+        "created_at": 1_700_000_000_000,
+        "renewals": 1,
+    }
+    socket = FakeSocket({"ws.lease.renew": lease})
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client("https://cp.example", "token", connector=connector)
+    renewed = await client.renew_lease(
+        "ws_1", "lease_1", extend_sec=600, idempotency_key="idem_renew"
+    )
+    assert renewed == lease
+    frame = next(sent for sent in socket.sent if sent.get("op") == "ws.lease.renew")
+    assert cbor2.loads(frame["body"]) == {
+        "id": "ws_1",
+        "lease": "lease_1",
+        "extend_sec": 600,
+        "idem": "idem_renew",
+    }
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_marks_carry_the_explicit_activity_signal():
+    socket = FakeSocket({"ws.idle.mark": {"id": "ws_1", "state": "claimed"}})
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client("https://cp.example", "token", connector=connector)
+    await client.mark_idle("ws_1", reason="turn settled")
+    await client.mark_active("ws_1")
+    bodies = [
+        cbor2.loads(sent["body"])
+        for sent in socket.sent
+        if sent.get("op") == "ws.idle.mark"
+    ]
+    assert bodies[0]["id"] == "ws_1"
+    assert bodies[0]["idle"] is True
+    assert bodies[0]["reason"] == "turn settled"
+    # Activity is explicit and must reach the control plane as a decoded false,
+    # not as an absent key that a caller could confuse with "unchanged".
+    assert bodies[1]["idle"] is False
+    assert "reason" not in bodies[1]
+    assert all(body["idem"].startswith("idem_") for body in bodies)
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_lease_and_idle_policy_validate_inputs():
+    client = Client("https://cp.example", "token", connector=FakeSocket)
+    with pytest.raises(ValueError, match="positive max_alive_sec"):
+        await client.lease_workspace("ws_1", max_alive_sec=0)
+    with pytest.raises(ValueError, match="positive max_alive_sec"):
+        await client.lease_workspace("ws_1", max_alive_sec=-30)
+    with pytest.raises(ValueError, match="must not be negative"):
+        await client.lease_workspace("ws_1", max_alive_sec=60, min_alive_sec=-1)
+    with pytest.raises(ValueError, match="on_expiry"):
+        await client.lease_workspace("ws_1", max_alive_sec=60, on_expiry="explode")
+    with pytest.raises(ValueError, match="positive extend_sec"):
+        await client.renew_lease("ws_1", "lease_1", extend_sec=0)
+    with pytest.raises(ValueError, match="must not be negative"):
+        await client.renew_lease("ws_1", "lease_1", extend_sec=60, min_alive_sec=-1)
+    with pytest.raises(ValueError, match="must not be negative"):
+        await client.set_idle_policy("ws_1", sleep_after_sec=-1)
+    with pytest.raises(ValueError, match="must not be negative"):
+        await client.set_idle_policy("ws_1", destroy_after_sec=-1)
+
+
+@pytest.mark.asyncio
+async def test_get_lease_reads_deadline_without_an_idempotency_key():
+    status = {
+        "lease": {
+            "id": "lease_1",
+            "ws": "ws_1",
+            "gen": 3,
+            "max_alive_until": 1_700_000_900_000,
+            "on_expiry": "sleep",
+            "created_at": 1_700_000_000_000,
+        },
+        "deadline": {"at": 1_700_000_900_000, "action": "sleep", "source": "lease"},
+    }
+    socket = FakeSocket({"ws.lease.get": status})
+
+    async def connector(*_args, **_kwargs):
+        return socket
+
+    client = Client("https://cp.example", "token", connector=connector)
+    assert await client.get_lease("ws_1") == status
+    frame = next(sent for sent in socket.sent if sent.get("op") == "ws.lease.get")
+    assert cbor2.loads(frame["body"]) == {"id": "ws_1"}
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_file_helpers_chunk_reads_and_idempotent_writes():
     reads = iter(
         [

@@ -1537,3 +1537,30 @@ Tests preserve the same writer across partial-write and EOF errors. This state
 belongs to the live session; pipe writes are not a durable transaction.
 
 **Lesson.** Retry tests must preserve the side effects of the failed attempt.
+
+## 60. A release cut the output subscription before writing the exit chunk
+
+`Node.releasePrepare` cancelled every output subscription for a workspace in
+the same critical section that removed it from the serving map, and only then
+terminated its sessions. The exit chunk that stop produced therefore had no
+subscriber left to receive it. The reason still reached the durable log, so
+`s.exited` was correct and a reattached replay read it correctly — but a client
+that never went away saw its stream go silent and never close.
+
+The behaviour was invisible to the tests because every test that cared
+reattached and replayed. Running `examples/long-running-autosleep` against a
+real standalone server found it in one run: the workspace reached `paused`, the
+event log said `lifecycle_deadline_expired`, and the example hung in
+`client.Copy` until it was killed.
+
+Removing the workspace from the serving map is the fence, and it still happens
+first. The subscriptions are now drained after every session has been joined
+and its log closed, bounded, and cancelled after that; a failed quiesce still
+cuts immediately. `TestLiveSessionReceivesLifecycleExitChunk` keeps a client
+attached across the expiry and fails if the stream does not end.
+
+**Lesson.** A stream that goes quiet and never closes is worse than an error.
+Terminating a producer and cutting its consumers are two decisions with an
+order, and the honest order is producer first. Test the client that stays, not
+only the client that comes back.
+

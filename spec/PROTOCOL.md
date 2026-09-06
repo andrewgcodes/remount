@@ -1069,6 +1069,15 @@ Guarantees:
    naming the lost range and then continue from the oldest chunk it has. It MUST
    NOT silently skip, and it MUST NOT kill the session. The harness can then tell
    the model that output was elided, which is the only honest option.
+5. When a node releases a workspace — an explicit `ws.sleep`, a `ws.move`, or a
+   lifecycle deadline expiring (§5.5) — it MUST let attached subscribers deliver
+   the resulting `exit` chunk before it stops serving them, bounded by an
+   implementation deadline. A subscription cut before the exit chunk leaves the
+   reader with a stream that goes quiet and never closes, which is
+   indistinguishable from work still in progress and is therefore worse than
+   either an exit or an explicit `gap`. Fencing a workspace for an authority
+   reason — a quarantine, a lost claim — is the exception: there the cut is the
+   point, and the reader learns the outcome from the event log instead.
 
 Retention is a bounded in-memory ring plus a spill file. The reference node uses
 2 MiB of memory and 128 MiB of spill per session, and evicts on both a byte cap

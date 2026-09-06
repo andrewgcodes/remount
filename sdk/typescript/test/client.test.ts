@@ -221,6 +221,88 @@ describe("protocol authority", () => {
   });
 });
 
+describe("workspace lifecycle", () => {
+  const lease = { id: "lease_1", ws: "ws_1", gen: 3, max_alive_until: 1800, on_expiry: "sleep", created_at: 0 };
+
+  // Answers every control op with one fixed body so a request body can be read back off the wire.
+  function replySocket(body: Record<string, any>): FakeSocket {
+    const socket = new FakeSocket();
+    const hello = socket.send.bind(socket);
+    socket.send = (wire: Uint8Array) => {
+      const frame: any = decoder.decode(wire);
+      if (frame.t === "hello") { hello(wire); return; }
+      socket.sent.push(frame);
+      socket.emit("message", { data: encoder.encode({ v: 1, t: "res", controller_epoch: socket.epoch, id: frame.id, op: frame.op ?? "", from: frame.to ?? "", body: encoder.encode(body) }) });
+    };
+    return socket;
+  }
+
+  function sentBody(socket: FakeSocket, op: string, index = 0): any {
+    return decoder.decode(socket.sent.filter((frame) => frame.op === op)[index].body);
+  }
+
+  it("takes a durable lease and states the expiry action on the wire", async () => {
+    const socket = replySocket(lease);
+    const client = new Client("https://cp.example", "token", { websocketFactory: async () => socket });
+    expect(await client.leaseWorkspace("ws_1", { maxAliveSec: 1800, onExpiry: "destroy", reason: "batch" })).toEqual(lease);
+    const request = sentBody(socket, "ws.lease");
+    expect(request.idem).toMatch(/^idem_[0-9a-f]{32}$/);
+    delete request.idem;
+    expect(request).toEqual({ id: "ws_1", max_alive_sec: 1800, on_expiry: "destroy", reason: "batch" });
+    await client.leaseWorkspace("ws_1", { maxAliveSec: 60, minAliveSec: 30, idempotencyKey: "stable" });
+    expect(sentBody(socket, "ws.lease", 1)).toEqual({ id: "ws_1", max_alive_sec: 60, min_alive_sec: 30, on_expiry: "sleep", idem: "stable" });
+    await client.close();
+  });
+
+  it("renews a held lease against its lease id", async () => {
+    const socket = replySocket(lease);
+    const client = new Client("https://cp.example", "token", { websocketFactory: async () => socket });
+    expect(await client.renewLease("ws_1", "lease_1", { extendSec: 600 })).toEqual(lease);
+    const request = sentBody(socket, "ws.lease.renew");
+    expect(request.idem).toMatch(/^idem_[0-9a-f]{32}$/);
+    delete request.idem;
+    expect(request).toEqual({ id: "ws_1", lease: "lease_1", extend_sec: 600 });
+    await client.close();
+  });
+
+  it("marks activity explicitly in both directions", async () => {
+    const socket = replySocket({ id: "ws_1" });
+    const client = new Client("https://cp.example", "token", { websocketFactory: async () => socket });
+    await client.markIdle("ws_1", "turn ended");
+    await client.markActive("ws_1");
+    const idled = sentBody(socket, "ws.idle.mark");
+    expect(idled.idle).toBe(true); expect(idled.reason).toBe("turn ended");
+    const active = sentBody(socket, "ws.idle.mark", 1);
+    // An absent flag would decode as the false default, so activity must be on the wire, not implied.
+    expect("idle" in active).toBe(true);
+    expect(active.idle).toBe(false); expect(active.reason).toBeUndefined();
+    await client.close();
+  });
+
+  it("refuses lifecycle durations the control plane would reject", () => {
+    const client = new Client("https://cp.example", "token");
+    expect(() => client.leaseWorkspace("ws_1", { maxAliveSec: 0 })).toThrow("maxAliveSec must be a positive whole number of seconds");
+    expect(() => client.leaseWorkspace("ws_1", { maxAliveSec: 60, minAliveSec: -1 })).toThrow("minAliveSec must be a non-negative whole number of seconds");
+    expect(() => client.leaseWorkspace("ws_1", { maxAliveSec: 60, onExpiry: "terminate" as any })).toThrow('onExpiry must be "sleep" or "destroy"');
+    expect(() => client.renewLease("ws_1", "lease_1", { extendSec: 0 })).toThrow("extendSec must be a positive whole number of seconds");
+    expect(() => client.setIdlePolicy("ws_1", { destroyAfterSec: -30 })).toThrow("destroyAfterSec must be a non-negative whole number of seconds");
+    // A fractional duration would encode as a CBOR float and the control
+    // plane's int64 decode would reject it with a message about a field the
+    // caller never typed, so it is refused here instead.
+    expect(() => client.leaseWorkspace("ws_1", { maxAliveSec: 1.5 })).toThrow("maxAliveSec must be a positive whole number of seconds");
+  });
+
+  it("reads the lease and its durable deadline without an idempotency key", async () => {
+    const socket = replySocket({ lease, deadline: { at: 1800, action: "sleep", source: "lease" } });
+    const client = new Client("https://cp.example", "token", { websocketFactory: async () => socket });
+    const held = await client.getLease("ws_1");
+    expect(held.lease!.id).toBe("lease_1");
+    expect(held.deadline!.action).toBe("sleep");
+    expect(sentBody(socket, "ws.lease.get")).toEqual({ id: "ws_1" });
+    await client.close();
+  });
+});
+
 describe("artifact transfer", () => {
   const payload = new TextEncoder().encode("nonempty artifact");
   const id = `art_sha256:${createHash("sha256").update(payload).digest("hex")}`;

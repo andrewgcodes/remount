@@ -2023,6 +2023,52 @@ func (n *Node) stopWorkspaceSessionsGraceful(w *ws, reason string, grace time.Du
 	return err
 }
 
+// subscriberDrainTimeout bounds how long a release waits for a workspace's
+// live output subscribers to deliver the exit chunks their sessions just
+// produced. Every session has already been joined and its log closed by that
+// point, so each pump is a finite read from EOF and the drain normally costs
+// microseconds. The bound exists because a peer that has stopped reading must
+// delay a checkpoint by a known amount rather than indefinitely.
+const subscriberDrainTimeout = 5 * time.Second
+
+// drainWorkspaceSubscribers waits for every output subscription on a workspace
+// to finish and retire itself, then cuts whatever is left.
+//
+// A subscription pump ends on its own once the session log is closed and it
+// has read past the last chunk, so this is a wait for delivery, not a nudge.
+// Cancelling instead of waiting is what loses the exit chunk.
+func (n *Node) drainWorkspaceSubscribers(ws string, within time.Duration) {
+	for deadline := time.Now().Add(within); ; {
+		n.mu.Lock()
+		remaining := 0
+		for _, s := range n.subs {
+			if s.ws == ws {
+				remaining++
+			}
+		}
+		n.mu.Unlock()
+		if remaining == 0 || !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	n.cancelWorkspaceSubscribers(ws)
+}
+
+// cancelWorkspaceSubscribers cuts every output subscription on a workspace.
+// It is the fence for output this node must stop producing now, used where
+// waiting for delivery would be wrong (a failed quiesce) or unsafe.
+func (n *Node) cancelWorkspaceSubscribers(ws string) {
+	n.mu.Lock()
+	for k, s := range n.subs {
+		if s.ws == ws {
+			s.cancel()
+			delete(n.subs, k)
+		}
+	}
+	n.mu.Unlock()
+}
+
 // releaseSessionStop chooses how a release ends the workspace's sessions. A
 // lifecycle deadline expiry is the only release that is both expected and
 // scheduled, so it is the only one that both names itself in the exit chunk
@@ -5143,19 +5189,26 @@ func (n *Node) release(ctx context.Context, req *proto.WSReleaseReq) (any, error
 	n.prepared[req.WS] = prepared
 	delete(n.workspaces, req.WS)
 	delete(n.deadlines, req.WS)
-	for k, s := range n.subs {
-		if s.ws == req.WS {
-			s.cancel()
-			delete(n.subs, k)
-		}
-	}
 	n.mu.Unlock()
 	// Drain any session startup already inside the tree boundary, then stop all
 	// resulting processes so the snapshot (or destroy) is quiescent.
+	//
+	// Removing the workspace above is the fence: a queued starter now fails
+	// its post-lock serviceability check. Cutting the output subscriptions in
+	// the same breath is not part of that fence, and doing it here used to
+	// throw away the very chunk the stop below produces. A client streaming
+	// `sleep 300` when a lifecycle deadline fired saw its stream go quiet and
+	// never close, which is worse than an exit and worse than a gap: it is
+	// indistinguishable from work still in progress.
 	stopReason, stopGrace := n.releaseSessionStop(req.Reason)
 	if err := n.stopWorkspaceSessionsGraceful(w, stopReason, stopGrace); err != nil {
+		n.cancelWorkspaceSubscribers(req.WS)
 		return nil, n.rollbackRelease(ctx, w, prepared, fmt.Errorf("quiesce workspace sessions: %w", err))
 	}
+	// Every session is joined and its log closed, so each subscriber is a
+	// bounded read away from the exit chunk it must deliver. Wait for that,
+	// then cut whatever is left.
+	n.drainWorkspaceSubscribers(req.WS, subscriberDrainTimeout)
 	if err := n.updateRelease(req.WS, releasePreparing, releaseQuiesced, proto.WSReleasedReq{}); err != nil {
 		return nil, n.rollbackRelease(ctx, w, prepared, err)
 	}

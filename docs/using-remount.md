@@ -304,6 +304,89 @@ control-plane release epoch. Exact retries remain idempotent, while a delayed
 request from an older aborted cycle cannot fence or stop work in the restored
 workspace.
 
+### Hold a workspace for background work
+
+`ws sleep` means "sleep now". The opposite — "keep this workspace claimed
+because work is still running, then sleep it if nobody extends the deadline" —
+is `ws lease`, and the reason it is a Remount operation rather than a timer in
+your own process is that your process is not durable. A deploy, a scale-down,
+an OOM kill or a partition takes an `asyncio.sleep` or a `setTimeout` with it,
+and the workspace then runs until somebody notices the bill. The deadline has
+to live where the workspace lives.
+
+```sh
+./remount ws lease "$WS" --max 20m --min 30s --reason background_job
+./remount ws lease renew "$WS" "$LEASE" --extend 10m
+./remount ws lease get "$WS"
+./remount ws lease cancel "$WS" "$LEASE"
+```
+
+`--max` is the hard deadline: when it passes with nobody renewing, Remount
+performs `--on-expiry`, which is `sleep` (the default) or `destroy`. `--min` is
+the earliest the idle policy below may act, so a hold and a policy do not fight
+each other. A workspace has at most one hold; a second `ws lease` replaces it.
+`--extend` is measured from now, not from the original grant.
+
+The idle policy is the other half: a no-work cleanup rule rather than a job
+deadline.
+
+```sh
+./remount ws idle-policy "$WS" --sleep-after 10m --destroy-after 2h
+./remount ws mark-idle "$WS" --reason turn_settled
+./remount ws mark-active "$WS" --reason new_turn
+```
+
+**Activity is explicit.** `ws mark-active`, `ws lease` and `ws lease renew`
+reset the clock. Session traffic does not, in either direction: a workspace
+with a running `sleep 300` and no renewal still sleeps at its deadline, and a
+workspace with an idle shell attached and nothing to do is still idle. Only the
+caller can tell a settled turn from a pause, so mark activity every turn rather
+than expecting Remount to infer it.
+
+Read the schedule from the workspace, not from a timer of your own.
+`ws get` and `ws lease get` publish `lifecycle_deadline` — what happens next,
+when, and whether it came from the hold or the idle policy — and the CLI prints
+it in words:
+
+```
+lifecycle deadline: sleep at 2026-09-06T02:27:34Z (in 4m12s, source=lease)
+```
+
+When the deadline passes, Remount releases the workspace through the same path
+`ws sleep` uses: the node sends `SIGTERM`, waits five seconds, then `SIGKILL`,
+and joins every session before the checkpoint is taken. Sessions ended this way
+carry `exit.reason = "lifecycle_deadline_expired"`, so a replayed log says a
+policy decision ended the work rather than leaving you to infer it. The
+workspace publishes `paused` and the event log carries `ws.lifecycle.expired`
+with the action, the source and the timer. A hold is a filesystem checkpoint,
+not a memory checkpoint: the files come back on `ws wake`, the processes do
+not. Expiry never schedules a resume — use `ws sleep --after` or `--on` for
+that.
+
+Failure is loud. If the release underneath an expiry fails, Remount retries
+with backoff and then emits `ws.lifecycle.expiry_failed` with the attempt count
+and the error, leaving the workspace degraded and operator-actionable rather
+than quietly still running.
+
+Holds are bounded. `--max` (and every idle-policy duration) may not exceed the
+deployment's maximum hold, 24 hours by default, and a tenant may pin only so
+many workspaces awake at once, 256 by default; the refusal is
+`resource_exhausted` with reason `quota_exceeded` alongside a
+`ws.hold.max_reached` event. Renewing after the deadline fired or the hold was
+cancelled is refused with `conflict` and reason `lifecycle_deadline_expired`;
+renewing after a `ws move` is refused with reason `generation_mismatch`. Both
+mean take a fresh hold rather than assume you still hold one.
+
+The built-in Agent resource keeps its own idle policy, which additionally
+cancels the harness run so the transcript flushes and wakes the agent on an
+inbox message. Neither is expressible for a raw workspace, which has no harness
+and no inbox. What a raw workspace gets is the durable half: a control-plane
+deadline, an idle clock, generation-aware refusals, and an expiry that survives
+every process involved in asking for it.
+
+`examples/long-running-autosleep` runs the whole cycle against a local server,
+and §8 of [`tutorial.md`](tutorial.md) is the full reference.
+
 The complete walkthrough, including bases, repository seeding, event-triggered
 wake, ACLs, and moves between two machines, is
 [`tutorial.md`](tutorial.md).
