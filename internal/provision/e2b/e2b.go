@@ -227,12 +227,10 @@ func (d *Driver) deliverBootstrap(ctx context.Context, s sandbox, bootstrap prov
 		return fmt.Errorf("e2b: build bootstrap upload: %w", err)
 	}
 	query := url.Values{"path": {d.bootstrapPath}, "username": {d.bootstrapUser}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/files?"+query.Encode(), &body)
-	if err != nil {
-		return fmt.Errorf("e2b: build bootstrap upload: %w", err)
-	}
-	req.Header.Set("Content-Type", form.FormDataContentType())
-	req.Header.Set("X-Access-Token", s.EnvdAccessToken)
+	target := base + "/files?" + query.Encode()
+	// The buffer is consumed by the first attempt, so every attempt reads the
+	// captured bytes rather than whatever the buffer has left.
+	payload := body.Bytes()
 	var last error
 	for attempt := 0; attempt < 5; attempt++ {
 		if attempt > 0 {
@@ -241,8 +239,13 @@ func (d *Driver) deliverBootstrap(ctx context.Context, s sandbox, bootstrap prov
 				return fmt.Errorf("e2b: deliver bootstrap: %w", ctx.Err())
 			case <-time.After(time.Duration(attempt) * 2 * time.Second):
 			}
-			req.Body = io.NopCloser(bytes.NewReader(body.Bytes()))
 		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(payload))
+		if err != nil {
+			return fmt.Errorf("e2b: build bootstrap upload: %w", err)
+		}
+		req.Header.Set("Content-Type", form.FormDataContentType())
+		req.Header.Set("X-Access-Token", s.EnvdAccessToken)
 		resp, err := d.envd.Do(req)
 		if err != nil {
 			// The transport error may quote the URL, never the token.

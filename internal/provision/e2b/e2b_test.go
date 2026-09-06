@@ -241,6 +241,57 @@ func TestConcurrentCreateIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestBootstrapDeliveryRetriesWithTheFullBody(t *testing.T) {
+	var mu sync.Mutex
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.URL.Path == "/files":
+			attempts++
+			if attempts == 1 {
+				http.Error(w, `{"message":"envd not ready"}`, http.StatusServiceUnavailable)
+				return
+			}
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				t.Error(err)
+			}
+			file, _, err := r.FormFile("file")
+			if err != nil {
+				t.Errorf("retry lost the multipart body: %v", err)
+				http.Error(w, "no file", http.StatusBadRequest)
+				return
+			}
+			content, _ := io.ReadAll(file)
+			if !strings.Contains(string(content), "REMOUNT_ENROLL_TOKEN='retry-secret'") {
+				t.Errorf("retry body=%q", content)
+			}
+			_, _ = w.Write([]byte(`[{"path":"/home/user/remount-bootstrap.env","type":"file"}]`))
+		case r.Method == http.MethodGet:
+			_, _ = w.Write([]byte("[]"))
+		case r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(sandbox{SandboxID: "retry", EnvdAccessToken: "envd-token"})
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	driver, err := New(Config{Endpoint: server.URL, EnvdEndpoint: server.URL, APIKey: "api-key", Template: "template"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := driver.Create(context.Background(), testRequest("retry-secret")); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if attempts != 2 {
+		t.Fatalf("attempts=%d, want 2", attempts)
+	}
+}
+
 func TestCreateReleasesSandboxWhenBootstrapDeliveryFails(t *testing.T) {
 	var mu sync.Mutex
 	deleted := false
