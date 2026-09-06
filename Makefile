@@ -67,6 +67,19 @@ lint: vet
 acpgen:
 	@go run ./cmd/acpgen
 
+# Regenerate spec/protocol.schema.json, sdk/python/src/remount/types.py and
+# sdk/typescript/src/types.ts from the Go syntax trees in internal/proto
+# (ADR 0078: internal/proto is the sole authority). protogen-check is the gate
+# .github/workflows/sdks.yml runs; it byte-compares rather than regenerating,
+# so a hand-edited generated file fails instead of being quietly overwritten.
+.PHONY: protogen protogen-check
+
+protogen:
+	@go run ./cmd/protogen
+
+protogen-check:
+	@go run ./cmd/protogen --check
+
 # Regenerate llms.txt and llms-full.txt from README.md and docs/.
 docs:
 	@./scripts/gen-llms.sh

@@ -661,6 +661,7 @@ Error = TypedDict("Error", {
     "code": Required[str],
     "msg": NotRequired[str],
     "oldest": NotRequired[int],
+    "reason": NotRequired[str],
 }, total=False)
 
 Event = TypedDict("Event", {
