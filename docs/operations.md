@@ -95,6 +95,95 @@ JWKS through the server, and stores the access/refresh pair in
 rotation is single-use. Provider, refresh, device, enrollment and bootstrap
 bearers never appear in canonical events.
 
+### Enroll a node
+
+Production modes refuse a shared node token, so a machine joins by presenting a
+**one-time enrollment credential** an operator minted for it. The credential is
+consumed by the machine's first hello and bound to that machine's key; every
+later reconnect proves possession of the key instead. Presenting a consumed one
+again is `unauthorized` with reason `revoked`.
+
+From an empty directory to a claimed workspace:
+
+```sh
+# 1. Start the control plane and bootstrap one operator. REMOUNT_MASTER_KEY is
+#    the artifact encryption key production modes require: base64 of 32 random
+#    bytes, held in the server's environment and backed up out of band.
+export REMOUNT_MASTER_KEY="$(head -c 32 /dev/urandom | base64)"
+remount server --listen 127.0.0.1:7443 --data /var/lib/remount \
+  --mode production-single-tenant \
+  --bootstrap-principal root --bootstrap-token-file /run/remount/op.token &
+
+# 2. Act as that operator. It is a global operator (tenant "*"), so every
+#    tenant-scoped command below must name the tenant explicitly.
+export REMOUNT_SERVER=http://127.0.0.1:7443
+export REMOUNT_TOKEN="$(tr -d '\n' </run/remount/op.token)"
+
+# 3. Mint the machine's credential. --out is exclusive and mode 0600; the
+#    command refuses to overwrite a path that already exists.
+remount node enroll --name web-1 --tenant acme --labels zone=eu-west \
+  --ttl 10m --out /run/remount/web-1.enroll
+
+# 4. Start the node with it, on the machine that will run workloads. The
+#    credential never appears in argv. The backend must satisfy the
+#    deployment's security floor; see the note below. gvisor also needs
+#    REMOUNT_GVISOR_ROOTFS to name an unpacked rootfs.
+remount up --server http://127.0.0.1:7443 --backend gvisor \
+  --data /var/lib/remount-node --enrollment-file /run/remount/web-1.enroll &
+
+# 5. Confirm it joined, then give an agent principal a workspace on it.
+remount node ls          # or: remount nodes
+remount principal create builder --tenant acme --roles agent
+remount token issue builder --tenant acme --role agent --ttl 1h > /run/remount/builder.token
+
+# 6. As that principal, create a workspace. It reaches `claimed` on the node.
+REMOUNT_TOKEN="$(tr -d '\n' </run/remount/builder.token)" \
+  remount ws create --name first --json
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--name` | required | pool or machine name the enrollment is recorded under; also accepted positionally |
+| `--tenant` | caller's tenant | exact tenant. A global operator (tenant `*`) must name one |
+| `--labels k=v` | none | trusted placement labels, repeatable. A node can neither expand nor replace them in its hello, and `tenant` is stamped by the control plane regardless |
+| `--ttl` | `10m` | credential lifetime, 1s to 10m. The window is short on purpose: it only has to cover handing the file to one machine |
+| `--out FILE` | none | exclusive mode-0600 destination. Exactly one of `--out` and `--stdout` |
+| `--stdout` | off | print the credential once on stdout, for a pipe into a provisioning system |
+
+**The backend has to satisfy the deployment's security floor, or the hello is
+refused whatever the credential says.** Every production mode floors workspaces
+at `isolated`, which requires container-or-better isolation *and* an enforced
+egress gateway. Of the four backends only `gvisor` and `firecracker` advertise
+`enforced_gateway`; `process` and `docker` advertise `cooperative_proxy` and
+are refused with `unauthorized: enrolled node backend <name> cannot satisfy
+isolated`. Both qualifying backends need a Linux host, so a macOS laptop cannot
+contribute a node to a production-mode control plane at all — use `remount
+standalone` there. The floor is checked before the credential is consumed, so a
+refused node can be reconfigured and restarted with the same file.
+
+`remount up` resolves its credential in this order: `--enrollment-file` (or
+`REMOUNT_ENROLLMENT_FILE`), then `--token`/`REMOUNT_TOKEN`, then
+`REMOUNT_ENROLL_TOKEN`, which is the variable the provider drivers in
+`--provisioners` set inside a machine they created. The file wins over the
+ambient bearer deliberately: `REMOUNT_TOKEN` is usually exported for the client
+CLI, and a node that quietly enrolled with an operator bearer instead of the
+credential you just named would fail confusingly. The node refuses an
+enrollment file any other local user can read, and logs which source it used —
+never the value.
+
+Each credential is for exactly one machine. To add a second node, mint a
+second credential; reusing the first is refused. `remount node enroll` is not
+replay-safe by design: replaying an idempotency key mints a *new* credential
+rather than returning the previous one, because a bearer must never be stored
+where it could be handed out twice. The paired
+`identity.node_enrollment_issued` event names the issuing operator and carries
+no bearer, so `remount events` shows who enrolled what and when.
+
+For fleets, `--provisioners` and `remount pool` do all of this automatically:
+the pool reconciler mints a credential per machine and hands it to the provider
+in a protected channel. `remount node enroll` is the hand path for a machine
+you own or a first node.
+
 The data directory contains two things:
 
 | Path | Contents |
@@ -137,6 +226,7 @@ remount up --server https://remount.example \
 | Flag | Default | Meaning |
 |---|---|---|
 | `--data` | `~/.remount/node` | identity, workspaces, spill, artifact cache; also `REMOUNT_NODE_DATA` |
+| `--enrollment-file` | none | mode-0600 file holding the one-time credential from `remount node enroll`; also `REMOUNT_ENROLLMENT_FILE`. Required to join a production-mode control plane; see "Enroll a node" above |
 | `--label k=v` | none | placement labels, repeatable |
 | `--backend` | `process` | comma-separated: `process`, `docker`, `gvisor`, `firecracker`; hardened backends require host prerequisites |
 | `--image` | `ghcr.io/andrewgcodes/remount-workspace:<version>` | default image for docker workspaces; see `docs/images.md`; `ubuntu:24.04` still works |

@@ -1252,6 +1252,21 @@ export interface NodeDiagReq {
   "verify"?: boolean;
 }
 
+export interface NodeEnrollReq {
+  "tenant"?: string;
+  "name": string;
+  "labels"?: Record<string, string>;
+  "ttl_ms": number;
+  "idem": string;
+}
+
+export interface NodeEnrollRes {
+  "enrollment_token": string;
+  "tenant": string;
+  "name": string;
+  "expires_at": number;
+}
+
 export interface NodeInfo {
   "backends": Array<string>;
   "backend_descriptors"?: Array<BackendDescriptor>;
@@ -2389,6 +2404,7 @@ export const OPERATIONS = {
   "fs.write": { constant: "OpFSWrite", request: "FSWriteReq", response: "" },
   "grant": { constant: "OpGrant", request: "GrantReq", response: "Grant" },
   "node.diag": { constant: "OpNodeDiag", request: "NodeDiagReq", response: "NodeDiag" },
+  "node.enroll": { constant: "OpNodeEnroll", request: "NodeEnrollReq", response: "NodeEnrollRes" },
   "node.list": { constant: "OpNodeList", request: "", response: "NodeListRes" },
   "node.profile.get": { constant: "OpNodeProfileGet", request: "NodeProfileGetReq", response: "NodeProfileGetRes" },
   "node.status": { constant: "OpNodeStatus", request: "", response: "NodeStatus" },

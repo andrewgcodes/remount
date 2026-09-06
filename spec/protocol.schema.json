@@ -4322,6 +4322,59 @@
       },
       "additionalProperties": true
     },
+    "NodeEnrollReq": {
+      "type": "object",
+      "properties": {
+        "idem": {
+          "type": "string"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "name": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "ttl_ms": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "idem",
+        "name",
+        "ttl_ms"
+      ],
+      "additionalProperties": true
+    },
+    "NodeEnrollRes": {
+      "type": "object",
+      "properties": {
+        "enrollment_token": {
+          "type": "string"
+        },
+        "expires_at": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "enrollment_token",
+        "expires_at",
+        "name",
+        "tenant"
+      ],
+      "additionalProperties": true
+    },
     "NodeInfo": {
       "type": "object",
       "properties": {
@@ -8319,6 +8372,12 @@
       "name": "node.diag",
       "request": "NodeDiagReq",
       "response": "NodeDiag"
+    },
+    {
+      "constant": "OpNodeEnroll",
+      "name": "node.enroll",
+      "request": "NodeEnrollReq",
+      "response": "NodeEnrollRes"
     },
     {
       "constant": "OpNodeList",

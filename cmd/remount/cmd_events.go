@@ -60,6 +60,13 @@ func eventJSON(e proto.Event) map[string]any {
 	if e.Origin != "" {
 		out["origin"] = e.Origin
 	}
+	// Who did it, when the actor is not the same string as the principal the
+	// event is about. An operator minting a node enrollment is exactly that
+	// case: the event has no principal and the operator is the only
+	// attribution it carries.
+	if e.Actor != "" {
+		out["actor"] = e.Actor
+	}
 	if e.Cause != 0 {
 		out["cause"] = e.Cause
 	}

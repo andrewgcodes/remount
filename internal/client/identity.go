@@ -28,6 +28,19 @@ func (c *Client) IssuePrincipalToken(ctx context.Context, tenant, principal, rol
 	return &result, err
 }
 
+// EnrollNode mints one one-time node enrollment credential for an exact
+// tenant and returns it once. The bearer is never persisted by the control
+// plane, so a caller that loses it mints another rather than re-reading it;
+// replaying idempotencyKey issues a second credential for the same reason.
+// Labels become placement authority the node cannot alter in its hello.
+func (c *Client) EnrollNode(ctx context.Context, tenant, name string, labels map[string]string, ttl time.Duration, idempotencyKey string) (*proto.NodeEnrollRes, error) {
+	var result proto.NodeEnrollRes
+	err := c.call(ctx, proto.PeerControl, proto.OpNodeEnroll, proto.NodeEnrollReq{
+		Tenant: tenant, Name: name, Labels: labels, TTLMS: ttl.Milliseconds(), IdempotencyKey: idempotencyKey,
+	}, &result)
+	return &result, err
+}
+
 // InvitePrincipal creates a tenant operator and returns a short-lived bearer.
 func (c *Client) InvitePrincipal(ctx context.Context, tenant, principal string, ttl time.Duration, idempotencyKey string) (*proto.PrincipalTokenIssueRes, error) {
 	var result proto.PrincipalTokenIssueRes

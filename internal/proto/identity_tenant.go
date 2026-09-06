@@ -22,6 +22,36 @@ const (
 	EvIdentityRolesChanged     = "identity.roles_changed"
 )
 
+// Node enrollment is the operator half of §3's one-time enrollment: an
+// operator mints a single-use credential, hands it to exactly one machine,
+// and that machine's first hello consumes it. The credential is returned once
+// and never enters durable control state or any canonical event payload.
+const (
+	OpNodeEnroll                   = "node.enroll"
+	EvIdentityNodeEnrollmentIssued = "identity.node_enrollment_issued"
+)
+
+// NodeEnrollReq asks for one one-time node enrollment credential. Name is the
+// pool or machine name the enrollment is recorded under; Labels are trusted
+// placement labels a node can neither expand nor replace in its hello. TTLMS
+// is bounded by the issuer at ten minutes.
+type NodeEnrollReq struct {
+	Tenant         string            `cbor:"tenant,omitempty" json:"tenant,omitempty"`
+	Name           string            `cbor:"name" json:"name"`
+	Labels         map[string]string `cbor:"labels,omitempty" json:"labels,omitempty"`
+	TTLMS          int64             `cbor:"ttl_ms" json:"ttl_ms"`
+	IdempotencyKey string            `cbor:"idem" json:"idem"`
+}
+
+// NodeEnrollRes carries the one-time bearer exactly once. It must never be
+// written to durable state, a log line, or an event payload.
+type NodeEnrollRes struct {
+	EnrollmentToken string `cbor:"enrollment_token" json:"enrollment_token"`
+	Tenant          string `cbor:"tenant" json:"tenant"`
+	Name            string `cbor:"name" json:"name"`
+	ExpiresAt       int64  `cbor:"expires_at" json:"expires_at"`
+}
+
 const (
 	TenantActive    = "active"
 	TenantSuspended = "suspended"

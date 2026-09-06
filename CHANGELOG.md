@@ -20,6 +20,21 @@ tests and engineering notes do not.
 
 ### Added
 
+- `remount node enroll --name NAME [--tenant T] [--labels k=v] [--ttl 10m]
+  (--out FILE | --stdout)` mints the one-time credential a machine presents to
+  join a production-mode control plane, over the new `node.enroll` control
+  operation (`Client.EnrollNode`). `--out` is exclusive and mode 0600.
+  `remount up` accepts it as `--enrollment-file FILE` /
+  `REMOUNT_ENROLLMENT_FILE` and, for a provider-created machine, honours the
+  `REMOUNT_ENROLL_TOKEN` the provisioner drivers already set; the file wins
+  over an ambient `REMOUNT_TOKEN`. `remount node ls` is `remount nodes` under
+  the other name. Before this there was no command between "a production
+  control plane is running" and "a node is attached to it", so a
+  production-mode deployment could not acquire its first node from the CLI.
+  Issuing one emits `identity.node_enrollment_issued`, which names the
+  operator and carries no bearer, and a second use of the same credential is
+  refused `unauthorized` with reason `revoked`. See "Enroll a node" in
+  `docs/operations.md`.
 - `remount conformance [--profile dev|trusted-single-tenant|multi-tenant-isolated|microvm]`
   judges a deployment black-box against the protocol manifest and, when a
   profile is named, against that profile: one required row per obligation read
@@ -202,6 +217,18 @@ tests and engineering notes do not.
   the operations.
 
 ### Fixed
+
+- A node hello refused for its backend no longer spends the one-time
+  enrollment credential it presented. The control plane consumed the
+  credential and only then checked the node's backend descriptors against the
+  deployment security floor, so a node whose backend can never satisfy the
+  floor burned a credential per connection attempt and the operator had to
+  mint a new one to retry. The floor is decided entirely from the hello's own
+  descriptors, so it is now decided first. A hello with no descriptors at all
+  is refused the same way.
+- `remount events --json` now includes `actor`, so an event whose only
+  attribution is the operator who caused it — `identity.node_enrollment_issued`
+  is the first — is no longer rendered with no actor at all.
 
 - A client streaming a session is no longer cut off before the exit chunk when
   its workspace is released. `releasePrepare` cancelled every output

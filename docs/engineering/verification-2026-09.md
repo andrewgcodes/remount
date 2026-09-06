@@ -3296,6 +3296,11 @@ end live. It is covered by `internal/sim` (2A) instead. **The missing
 node-enrollment CLI is a separate product gap and is recorded here as a
 finding, not as a pass.**
 
+> Followed up on 2026-09-05 in "gap: node enrollment from the CLI, and how far
+> `principal session` gets live" below. The enrollment command now exists and
+> was exercised against a live production-single-tenant control plane; the
+> remaining blocker on this host turned out to be a different one.
+
 ### Cleanup
 
 The workspace was destroyed, `b_anthropic` was revoked, both servers were
@@ -3414,3 +3419,218 @@ one public destination. gVisor and firecracker computer sessions remain
 untested. Nothing here proves per-URL policy, which the opaque CONNECT tunnel
 makes impossible (ADR 0088), and nothing here proves a site that authenticates
 its *own* users works: an origin challenge is deliberately cancelled.
+
+## 2026-09-05 — gap: node enrollment from the CLI, and how far `principal session` gets live
+
+Host: darwin/arm64 (Apple Silicon), Go 1.27.1, worktree
+`claude/gap-brief-2026-09-06` + this change. One control plane on
+`127.0.0.1:7749`, data under a scratchpad directory, everything removed at the
+end. `REMOUNT_MASTER_KEY` was generated inside the launcher script with
+`head -c 32 /dev/urandom | base64`, existed only in that process's environment,
+was never printed and never written to disk.
+
+The previous entry ("The session-principal step, and why it is unavailable")
+recorded that a production-mode server comes up but no CLI in that build mints
+the one-time node enrollment credential a node needs, so `remount up` was
+refused `unauthorized: node enrollment failed` and no local deployment could
+have both a principal authority and a claimed workspace. This run closes the
+enrollment half and reports exactly where the other half now stops.
+
+### What the run did, in order
+
+```sh
+# 1. Production control plane, no shared token, one bootstrapped operator.
+export REMOUNT_MASTER_KEY="$(head -c 32 /dev/urandom | base64)"   # inside the launcher only
+remount server --listen 127.0.0.1:7749 --data ./data-srv \
+  --mode production-single-tenant \
+  --bootstrap-principal root --bootstrap-token-file ./op.token --bootstrap-ttl 60m
+```
+
+`/readyz` → `{"ok":true,"peers":0,"security_mode":"production-single-tenant","security_ready":true,"serving":true}`,
+and `op.token` was created mode `-rw-------`.
+
+```sh
+# 2. The command that did not exist.
+remount node enroll --name live-1 --tenant acme --labels zone=local \
+  --ttl 10m --out ./live-1.enroll --json
+```
+
+```json
+{"expires_at": "2026-09-06T04:03:17Z", "name": "live-1", "path": ".../live-1.enroll", "tenant": "acme"}
+```
+
+`live-1.enroll` was `-rw-------`, 51 bytes, holding one `enroll_…` bearer. The
+bearer is not in the JSON when `--out` is used; `--stdout` prints it once
+instead and was exercised separately (`live-3`).
+
+```sh
+# 3. The node presents it. No REMOUNT_TOKEN is exported in this shell.
+remount up --server http://127.0.0.1:7749 --backend process \
+  --data ./data-node --enrollment-file ./live-1.enroll
+```
+
+```
+msg="remount node starting" id=n_… server=http://127.0.0.1:7749 data=… credential=enrollment-file
+msg="uplink lost; reconnecting" err="unauthorized: enrolled node backend process cannot satisfy isolated" reason="" backoff=100ms
+```
+
+The node read the file, presented it, got past enrollment, and was refused by
+the **deployment security floor**, not by enrollment.
+
+### Finding 1: the floor, not the credential, is what blocks a node here
+
+`server.validateSecurityMode` gives every production mode a floor of at least
+`isolated`, which `proto.NormalizeSecurity` expands to
+`MinIsolation=container` **and** `RequireEnforcedEgress=true`. On this host the
+only constructible backends are `process`
+(`Isolation:"none", EgressMode:"cooperative_proxy"`) and `docker`
+(`Isolation:"container", EgressMode:"cooperative_proxy"` — Colima was running,
+so docker was genuinely available). Neither advertises `enforced_gateway`, so
+neither can join *any* production-mode control plane. Only `gvisor` and
+`firecracker` can, and both need a Linux host.
+
+So the reason a local production deployment still cannot reach a claimed
+workspace has changed: it is no longer a missing command, it is that macOS has
+no backend that satisfies the production floor. That is a host limitation, and
+it is correct behaviour — the floor is doing its job.
+
+### Finding 2, fixed in this change: a refused hello was spending the credential
+
+`control.Authenticate` consumed the one-time enrollment (`AuthenticateNode`)
+and only then evaluated the backend floor (`validateDynamicNode`). The live
+run made that visible: after the very first refused hello the server's event
+log already contained
+
+```
+identity.node_enrollment_issued   (seq 2, tenant acme, pool live-1)
+node.enrolled                     (seq 3, node n_…, pool live-1)
+```
+
+— the credential was spent and the node durably bound, even though the node
+was refused and never came online. Every retry after that reconnected under
+the same key and was refused again, so the operator's only recovery was to
+mint another credential.
+
+A second machine (a different data directory, so a different id and key)
+presenting the same file confirmed the credential really was gone:
+
+```
+msg="uplink lost; reconnecting" err="unauthorized: node enrollment failed" reason=revoked backoff=100ms
+```
+
+That is the live proof of one-time semantics, with the reason a caller can
+match on.
+
+The floor is decided entirely from the hello's own backend descriptors, so it
+does not need the credential. `validateDynamicNode` now runs **before**
+`AuthenticateNode`. Re-running the same scenario on the fixed build, after
+seven refused hellos:
+
+```
+identity.node_enrollment_issued   (seq 2, tenant acme, pool live-1)
+identity.principal_created        (seq 3)
+```
+
+No `node.enrolled`. The credential survived every refusal.
+`internal/control/auth_test.go` now asserts `auth.called == 0` for both a
+below-floor backend and a hello with no descriptors.
+
+### Finding 3, fixed in this change: `--out` minted before it checked the path
+
+The first `--out` onto an existing path was refused *after* the round trip:
+
+```
+remount: create …/live-1.enroll: open …/live-1.enroll: file exists
+```
+
+The credential had already been minted and was then discarded — a live
+one-time credential nobody holds, counting against the deployment's enrollment
+capacity until it expired. `remount node enroll` now reserves the destination
+`O_EXCL|0600` before it calls the control plane. The event log records both
+halves of that A/B in one place:
+
+| enrollment event | name | when |
+|---|---|---|
+| 1 | `live-1` | the run's node credential |
+| 2 | `live-2` | minted then thrown away by the **pre-fix** collision |
+| 3 | `live-3` | the `--stdout` form |
+
+and the **post-fix** collision attempt minted nothing at all.
+
+### How far `principal session` gets now
+
+Against the standalone, the previous entry recorded
+`unsupported: principal authority is not configured`. Against this production
+control plane the operation is reachable and typed on its actual arguments:
+
+| Command | Result |
+|---|---|
+| `principal session --ws ws_does_not_exist --tenant acme --ttl 2m` | `not_found: workspace ws_does_not_exist` |
+| `principal session --ws <pending ws> --tenant acme --ttl 2m` | `conflict: workspace … is pending, not claimed` (reason `workspace_not_ready`) |
+
+The workspace stays `pending` because no node can join (finding 1), so the
+capability itself still cannot be minted live on this host. That last step is
+covered by `internal/sim`
+(`TestNodeEnrollmentFromOperatorClaimsAWorkspace` boots a production-mode
+control plane in process, mints the credential through the new CLI path,
+claims a workspace on the enrolled node, and refuses the second use; the 2A
+tests cover `principal.session.create` itself). **Recorded as a partial pass:
+the enrollment path is proven live end to end, the session capability is
+not.**
+
+What did work live, and is the closest available evidence for the revocation
+half:
+
+```sh
+remount principal create auditor --tenant acme --roles agent   # acme auditor agent
+remount token issue auditor --tenant acme --role agent --ttl 30m > auditor.token
+REMOUNT_TOKEN=$(cat auditor.token) remount ws ls                # lists the workspace
+remount principal revoke auditor --tenant acme                  # revision 1
+REMOUNT_TOKEN=$(cat auditor.token) remount ws ls                # unauthorized: authentication failed
+```
+
+The same bearer went from working to refused at hello, and the log recorded
+`identity.principal_revoked` plus `identity.workspace_revoked` for the live
+workspace.
+
+### The rest of the CLI surface, live
+
+| Command | Result |
+|---|---|
+| `remount node ls` | header row, no online nodes (the enrolled node never came online) |
+| `remount node enroll --name live-2 --out <existing path>` | refused locally, nothing minted |
+| `remount node enroll --name live-3 --stdout` | bearer on stdout, `expires 2026-09-06T03:57:27Z` on stderr |
+| `remount up --enrollment-file <mode 0644 file>` | `… is mode 0644: a credential file must not be group- or world-accessible` |
+| `remount events --json` | now carries `actor`, so `identity.node_enrollment_issued` shows `"actor": "root"` |
+
+### Credential scan
+
+Exact-value `grep -c -F` for the enrollment bearer and the operator bearer,
+with a canary file that deliberately contained both so the comparison is known
+to work. Counts only; no value was printed.
+
+| Subject | enrollment | operator |
+|---|---|---|
+| `canary.txt` (positive control) | 1 | 1 |
+| `live-1.enroll` | 1 | 0 |
+| `op.token` | 0 | 1 |
+| `server.log` | 0 | 0 |
+| `node.log` | 0 | 0 |
+| `remount events --json` capture | 0 | 0 |
+| `data-srv/` recursive (SQLite, WAL, artifacts) | 0 | 0 |
+| `data-node/` recursive | 0 | 0 |
+
+Each credential exists only in its own mode-0600 file. The control plane's
+SQLite holds the enrollment's SHA-256 digest and nothing else, which is what
+the digest-only invariant claims.
+
+### Cleanup
+
+Both nodes and the server were killed, `lsof -i :7749` reported the port free
+and `pgrep` showed no process from this run. `data-srv/`, all three node data
+directories, `op.token`, `live-1.enroll`, the canary, the loose-mode copy, the
+principal bearers and the event capture were removed, and then the whole
+scratchpad directory holding the launcher scripts, the built binary and the
+logs was removed too. The `remount` processes still visible in `pgrep` at
+cleanup belong to an unrelated concurrent session under a different scratchpad
+directory.

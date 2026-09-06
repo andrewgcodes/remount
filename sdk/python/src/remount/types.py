@@ -1255,6 +1255,21 @@ NodeDiagReq = TypedDict("NodeDiagReq", {
     "verify": NotRequired[bool],
 }, total=False)
 
+NodeEnrollReq = TypedDict("NodeEnrollReq", {
+    "tenant": NotRequired[str],
+    "name": Required[str],
+    "labels": NotRequired[dict[str, str]],
+    "ttl_ms": Required[int],
+    "idem": Required[str],
+}, total=False)
+
+NodeEnrollRes = TypedDict("NodeEnrollRes", {
+    "enrollment_token": Required[str],
+    "tenant": Required[str],
+    "name": Required[str],
+    "expires_at": Required[int],
+}, total=False)
+
 NodeInfo = TypedDict("NodeInfo", {
     "backends": Required[list[str]],
     "backend_descriptors": NotRequired[list["BackendDescriptor"]],
@@ -2393,6 +2408,7 @@ OPERATIONS: dict[str, dict[str, object]] = {
     "fs.write": {"constant": "OpFSWrite", "request": "FSWriteReq", "response": ""},
     "grant": {"constant": "OpGrant", "request": "GrantReq", "response": "Grant"},
     "node.diag": {"constant": "OpNodeDiag", "request": "NodeDiagReq", "response": "NodeDiag"},
+    "node.enroll": {"constant": "OpNodeEnroll", "request": "NodeEnrollReq", "response": "NodeEnrollRes"},
     "node.list": {"constant": "OpNodeList", "request": "", "response": "NodeListRes"},
     "node.profile.get": {"constant": "OpNodeProfileGet", "request": "NodeProfileGetReq", "response": "NodeProfileGetRes"},
     "node.status": {"constant": "OpNodeStatus", "request": "", "response": "NodeStatus"},

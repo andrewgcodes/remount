@@ -1138,7 +1138,11 @@ func (n *Node) Run(ctx context.Context) error {
 			}
 		}
 		n.mu.Unlock()
-		n.logger.Warn("uplink lost; reconnecting", "err", err, "backoff", delay)
+		// The Reason is logged beside the error because Error() deliberately
+		// omits it: a refused hello is where an operator most needs to tell
+		// "this one-time enrollment was already consumed" (`revoked`) from
+		// every other unauthorized.
+		n.logger.Warn("uplink lost; reconnecting", "err", err, "reason", proto.ErrorReason(err), "backoff", delay)
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():

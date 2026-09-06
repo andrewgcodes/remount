@@ -33,9 +33,22 @@ func (c *Control) Authenticate(ctx context.Context, h *proto.Hello) (string, *pr
 			return "", nil, err
 		}
 		if c.opts.NodeAuthenticator != nil {
+			// The deployment floor is decided entirely from this hello's own
+			// backend descriptors, so it is decided before the one-time
+			// enrollment is spent. Consuming first would burn a credential on
+			// every attempt by a node whose backend can never satisfy the
+			// floor, forcing the operator to mint a new one just to retry.
+			if err := c.validateDynamicNode(h); err != nil {
+				return "", nil, err
+			}
 			identity, err := c.opts.NodeAuthenticator.AuthenticateNode(ctx, h.Peer, h.Token, append([]byte(nil), h.PubKey...))
 			if err != nil || identity.Tenant == "" {
-				return "", nil, proto.Err(proto.CodeUnauthorized, "node enrollment failed")
+				// The code and message are deliberately unchanged: a hello
+				// refusal must not tell an unauthenticated caller which of
+				// the several ways it failed. The authority's Reason, when it
+				// set one, does travel, because the holder of the credential
+				// needs to tell "already consumed" from "wrong key".
+				return "", nil, proto.ErrReason(proto.CodeUnauthorized, proto.ErrorReason(err), "node enrollment failed")
 			}
 			h.Labels = cloneMap(identity.Labels)
 			if h.Labels == nil {
@@ -45,9 +58,6 @@ func (c *Control) Authenticate(ctx context.Context, h *proto.Hello) (string, *pr
 			if identity.Pool != "" {
 				h.Labels["pool"] = identity.Pool // compatibility with bindings issued before ADR 0064
 				h.Labels["remount.pool"] = identity.Pool
-			}
-			if err := c.validateDynamicNode(h); err != nil {
-				return "", nil, err
 			}
 			ok.NodeToken = identity.Token
 		} else if c.opts.Token != "" && subtle.ConstantTimeCompare([]byte(h.Token), []byte(c.opts.Token)) != 1 {

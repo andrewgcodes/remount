@@ -72,6 +72,34 @@ func TestDynamicNodeEnrollmentRejectsUnenforcedBackend(t *testing.T) {
 	if _, _, err := f.c.Authenticate(context.Background(), &h); err == nil {
 		t.Fatal("dynamic enrollment accepted a backend below the deployment floor")
 	}
+	// The floor is decided entirely from the hello's own descriptors, so it
+	// must be decided BEFORE the one-time credential is spent. Otherwise an
+	// operator who starts a node with the wrong backend burns a credential
+	// per attempt and has to mint a new one to try again — which is exactly
+	// what a live production-single-tenant run on a host with only the
+	// process backend did.
+	if auth.called != 0 {
+		t.Fatalf("a hello refused for its backend consumed the one-time enrollment (%d calls)", auth.called)
+	}
+}
+
+// A hello with no NodeInfo at all is the same class of refusal: it can be
+// decided without the credential, so it must not spend it.
+func TestDynamicNodeEnrollmentWithoutDescriptorsKeepsTheCredential(t *testing.T) {
+	auth := &fakeNodeAuthenticator{wantNode: "n_bare", wantToken: "enroll_secret", identity: NodeIdentity{Tenant: "tenant-a"}}
+	f := newControlFixture(t, "", func(opts *Options) {
+		opts.NodeAuthenticator = auth
+		opts.SecurityProfileFloor = proto.SecurityIsolated
+	})
+	h, key := signedNodeHello(t, "n_bare", "enroll_secret", processNodeInfo(1024))
+	h.Node = nil
+	h.Proof = ed25519.Sign(key, proto.HelloProofBytes(h))
+	if _, _, err := f.c.Authenticate(context.Background(), &h); err == nil {
+		t.Fatal("a hello with no backend descriptors was accepted")
+	}
+	if auth.called != 0 {
+		t.Fatalf("a hello with no backend descriptors consumed the enrollment (%d calls)", auth.called)
+	}
 }
 
 // tokenSubjects authenticates each token as a distinct subject, so a test can

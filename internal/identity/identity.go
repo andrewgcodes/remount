@@ -444,20 +444,57 @@ func (m *Manager) IssueWithLabels(ctx context.Context, pool, tenant string, labe
 	return m.issueEnrollment(ctx, pool, tenant, labels, ttl)
 }
 
-func (m *Manager) issueEnrollment(ctx context.Context, pool, tenant string, labels map[string]string, ttl time.Duration) (string, error) {
+// IssueNodeEnrollment is the operator-attributed path behind the `node.enroll`
+// control operation. It differs from the scheduler's IssueEnrollment only in
+// its audit shape: the event names the operator who asked and is typed
+// identity.node_enrollment_issued, so a hand-minted credential is
+// distinguishable in the log from one a pool reconciler minted. Like every
+// other enrollment, only the SHA-256 digest is committed; the bearer is
+// returned once and the expiry lets a caller print a deadline without
+// re-deriving it.
+func (m *Manager) IssueNodeEnrollment(ctx context.Context, pool, tenant string, labels map[string]string, ttl time.Duration, actor string) (string, time.Time, error) {
+	// The same predicate the shared path uses, evaluated here so an operator
+	// request gets a typed bad_request rather than the plain error the
+	// scheduler path returns, which control could only map to `unreachable`.
+	// One rule, two error shapes, rather than a second rule in control that
+	// could drift from this one.
 	if !validText(pool, 256) || !validText(tenant, 253) || ttl < time.Second || ttl > 10*time.Minute || !validLabels(labels) {
-		return "", errors.New("identity: enrollment needs pool, tenant and ttl <= 10m")
+		return "", time.Time{}, proto.Err(proto.CodeBadRequest,
+			"node enrollment needs a printable name and tenant, a ttl of at most 10m, and at most 64 printable labels")
+	}
+	token, expires, err := m.issueEnrollmentAs(ctx, pool, tenant, labels, ttl, proto.EvIdentityNodeEnrollmentIssued, actor)
+	if errors.Is(err, ErrEnrollmentCapacity) {
+		// A typed refusal for the operator path: being at the deployment's
+		// live-enrollment ceiling is a quota, not an unreachable authority,
+		// and control would otherwise flatten it to `unreachable`.
+		return "", time.Time{}, proto.ErrReason(proto.CodeResourceExhausted, proto.ReasonQuotaExceeded,
+			"live node enrollment capacity reached")
+	}
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return token, expires, nil
+}
+
+func (m *Manager) issueEnrollment(ctx context.Context, pool, tenant string, labels map[string]string, ttl time.Duration) (string, error) {
+	token, _, err := m.issueEnrollmentAs(ctx, pool, tenant, labels, ttl, "identity.enrollment_issued", "")
+	return token, err
+}
+
+func (m *Manager) issueEnrollmentAs(ctx context.Context, pool, tenant string, labels map[string]string, ttl time.Duration, eventType, actor string) (string, time.Time, error) {
+	if !validText(pool, 256) || !validText(tenant, 253) || ttl < time.Second || ttl > 10*time.Minute || !validLabels(labels) {
+		return "", time.Time{}, errors.New("identity: enrollment needs pool, tenant and ttl <= 10m")
 	}
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	token := "enroll_" + base64.RawURLEncoding.EncodeToString(raw)
 	hash := sha256.Sum256([]byte(token))
 	now := m.now()
 	enrollment := Enrollment{ID: ids.New("enr"), Pool: pool, Tenant: tenant, IssuedAt: now, ExpiresAt: now.Add(ttl), Labels: cloneLabels(labels)}
 	event := Event{
-		Type: "identity.enrollment_issued", ID: enrollment.ID, Pool: pool, Tenant: tenant,
+		Type: eventType, ID: enrollment.ID, Pool: pool, Tenant: tenant, Actor: actor,
 	}
 	var storeErr error
 	if bounded, ok := m.store.(BoundedEnrollmentStore); ok {
@@ -466,9 +503,9 @@ func (m *Manager) issueEnrollment(ctx context.Context, pool, tenant string, labe
 		storeErr = m.store.PutEnrollment(ctx, hash, enrollment, event)
 	}
 	if storeErr != nil {
-		return "", storeErr
+		return "", time.Time{}, storeErr
 	}
-	return token, nil
+	return token, enrollment.ExpiresAt, nil
 }
 
 // Issue implements the enrollment-source interface used by node pools.
@@ -496,7 +533,14 @@ func (m *Manager) AuthenticateNode(ctx context.Context, nodeID, token string, pu
 		return control.NodeIdentity{}, err
 	}
 	if !ok || subtle.ConstantTimeCompare(binding.PubKey, pubKey) != 1 {
-		return control.NodeIdentity{}, proto.Err(proto.CodeUnauthorized, "invalid or expired node enrollment")
+		// A one-time enrollment that was already consumed is deleted, so an
+		// unknown digest and an expired one are indistinguishable here on
+		// purpose. Both mean the same thing to the operator holding it: this
+		// credential no longer grants anything. The code is unchanged; the
+		// reason exists so a second `remount up` with the same file is
+		// diagnosable without matching on message text.
+		return control.NodeIdentity{}, proto.ErrReason(proto.CodeUnauthorized, proto.ReasonRevoked,
+			"invalid or expired node enrollment")
 	}
 	now := m.now()
 	accessToken, err := m.sign(Claims{ID: ids.New("tok"), Subject: nodeID, Tenant: binding.Tenant, Roles: []string{RoleNode},

@@ -135,6 +135,13 @@ reconnects, or leave it empty to be assigned one. Client-selected `principal`,
 workspace principal, labels, and capabilities are never authorization input;
 the control plane derives subject and tenant from the presented credential.
 
+A node's `token` in production is a one-time enrollment credential minted by
+`node.enroll` (§6). It is consumed by the first successful hello and bound to
+that node's key; every later hello from the same node proves possession of the
+key instead, and the spent credential is never consulted again. Presenting a
+consumed, expired or unknown credential is `unauthorized`; the refusal carries
+reason `revoked` and never distinguishes those cases to the caller.
+
 `NodeInfo.profile` is the runtime profile the node was configured with
 (`dev`, `trusted-single-tenant`, `multi-tenant-isolated`, `microvm`) and
 `NodeInfo.runtime_checks` is a list of `Finding{severity, check, subject,
@@ -596,6 +603,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `binding.rotate` | C | `BindingRotateReq{id, tenant?, secret\|source, idem}` → `BindingSpec`; increments `revision`, so leases minted from the previous credential stop being honored within one renew |
 | `binding.revoke` | C | `BindingRevokeReq{id, tenant?, reason?, idem}` → `BindingSpec` with `revoked_at`; permanent, and not provider-side revocation |
 | `principal.invite` | C | `PrincipalInviteReq{tenant, principal, ttl_ms, idem}` → `PrincipalTokenIssueRes`; creates a tenant-bound operator and returns its initial short-lived access bearer |
+| `node.enroll` | C | `NodeEnrollReq{tenant?, name, labels?, ttl_ms, idem}` → `NodeEnrollRes{enrollment_token, tenant, name, expires_at}`; tenant operator only. Mints one one-time enrollment credential for the machine that will present it in its `hello` (§3). `ttl_ms` is 1s to 10m, `labels` become placement authority the node cannot expand or replace, and the tenant must be exact. The bearer is returned once and, like `principal.token.issue`, is deliberately not recorded for idempotent replay: replaying `idem` mints a second credential rather than returning a stored one, because a credential must never enter durable state. The paired `identity.node_enrollment_issued` event names the issuing operator and carries no bearer |
 | `grant` | C | `GrantReq{ws}` → `Grant` |
 | `node.list` | C | → `NodeListRes{nodes}` |
 | `node.profile.get` | C | `NodeProfileGetReq{node?, profile?}` → `NodeProfileGetRes{profile, nodes}`; admin only. Empty `node` reports every node, empty `profile` evaluates each node against the profile it claims. Each `NodeProfileReport{node, profile, status, checks, evaluated_at, configured, online}` carries one `Finding` per named check with `status` `pass`/`fail`/`unavailable`; the report's `status` is `pass` only when every check passed, and an offline node is `unavailable`, never `pass` |

@@ -88,6 +88,51 @@ func (c *Control) principalTokenIssue(ctx context.Context, actor Subject, req *p
 	return &proto.PrincipalTokenIssueRes{AccessToken: token, ExpiresAt: expires.UnixMilli()}, nil
 }
 
+// maxNodeEnrollmentTTL bounds a one-time credential's window. It matches the
+// identity authority's own ceiling: a credential that outlives the operator's
+// attention is the thing enrollment exists to avoid.
+const maxNodeEnrollmentTTL = 10 * time.Minute
+
+// nodeEnroll mints the one-time credential a machine presents in its first
+// hello. It is the missing operator step between "a production control plane
+// is running" and "a node is attached to it": without it a production-mode
+// deployment has a principal authority and no way to acquire a node.
+//
+// The idempotency key is required, like every other mutating request, but the
+// result is deliberately NOT recorded for replay: the response is a bearer,
+// and a bearer must never enter durable state. Replaying the key therefore
+// mints a second credential rather than returning the first, which is the
+// same trade `principal.token.issue` and `principal.session.create` make.
+func (c *Control) nodeEnroll(ctx context.Context, actor Subject, req *proto.NodeEnrollReq) (*proto.NodeEnrollRes, error) {
+	if c.opts.NodeEnrollments == nil {
+		return nil, proto.Err(proto.CodeUnsupported, "node enrollment authority is not configured")
+	}
+	tenantID, err := exactPrincipalTenant(actor, req.Tenant)
+	if err != nil {
+		return nil, err
+	}
+	// Shape only. Label and name validity belong to the authority that binds
+	// them rather than to a second rule here that could drift from it; it
+	// answers bad_request for those.
+	if req.Name == "" || req.IdempotencyKey == "" || req.TTLMS < 1000 || req.TTLMS > maxNodeEnrollmentTTL.Milliseconds() {
+		return nil, proto.Err(proto.CodeBadRequest, "name, a ttl between 1s and 10m, and an idempotency key are required")
+	}
+	if c.opts.Tenants != nil {
+		if _, err := c.opts.Tenants.Get(ctx, tenantID); err != nil {
+			return nil, mapTenantError(err)
+		}
+	}
+	if err := c.check(ctx, actor, ActionAdmin, Resource{Kind: "node-enrollment", ID: req.Name, Tenant: tenantID}); err != nil {
+		return nil, err
+	}
+	token, expires, err := c.opts.NodeEnrollments.IssueNodeEnrollment(ctx, req.Name, tenantID,
+		req.Labels, time.Duration(req.TTLMS)*time.Millisecond, actor.ID)
+	if err != nil {
+		return nil, mapIdentityError(err)
+	}
+	return &proto.NodeEnrollRes{EnrollmentToken: token, Tenant: tenantID, Name: req.Name, ExpiresAt: expires.UnixMilli()}, nil
+}
+
 func (c *Control) principalInvite(ctx context.Context, actor Subject, req *proto.PrincipalInviteReq) (*proto.PrincipalTokenIssueRes, error) {
 	if req.Tenant == "" || req.TTLMS < 1000 || req.TTLMS > (24*time.Hour).Milliseconds() {
 		return nil, proto.Err(proto.CodeBadRequest, "invite requires an exact tenant")

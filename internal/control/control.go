@@ -158,6 +158,15 @@ type PrincipalRevocationAuthority interface {
 	RevokePrincipalWith(context.Context, string, string, func(*eventlog.Tx, uint64) error) (uint64, error)
 }
 
+// NodeEnrollmentAuthority mints the one-time credential a machine presents in
+// its first hello (§3). It is the operator-facing half of NodeAuthenticator:
+// one mints, the other consumes. The returned bearer is ephemeral and, like
+// every other credential in this file, must never enter control persistence,
+// a log line or an event payload.
+type NodeEnrollmentAuthority interface {
+	IssueNodeEnrollment(ctx context.Context, name, tenant string, labels map[string]string, ttl time.Duration, actor string) (string, time.Time, error)
+}
+
 // PrincipalAuthority owns tenant-scoped roles and access-token issuance.
 // Returned bearers are ephemeral and must never enter control persistence.
 type PrincipalAuthority interface {
@@ -239,7 +248,11 @@ type Options struct {
 	// NodeAuthenticator replaces the legacy shared node token and static
 	// approval map with one-time enrollment plus durable key bindings.
 	NodeAuthenticator NodeAuthenticator
-	ApprovedNodes     map[string]NodeApproval
+	// NodeEnrollments mints those one-time credentials for an operator. Nil
+	// makes `node.enroll` report `unsupported` rather than silently
+	// succeeding without an identity authority behind it.
+	NodeEnrollments NodeEnrollmentAuthority
+	ApprovedNodes   map[string]NodeApproval
 	// SharedSubject is used by the legacy single-token/standalone profile.
 	// Client-selected Hello.Principal is always ignored.
 	SharedSubject Subject
@@ -2297,6 +2310,16 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return c.principalTokenIssue(ctx, subject, req)
+	case proto.OpNodeEnroll:
+		req, err := decode[proto.NodeEnrollReq](f)
+		if err != nil {
+			return nil, err
+		}
+		subject, err := c.subjectOf(f.From)
+		if err != nil {
+			return nil, err
+		}
+		return c.nodeEnroll(ctx, subject, req)
 	case proto.OpPrincipalInvite:
 		req, err := decode[proto.PrincipalInviteReq](f)
 		if err != nil {

@@ -472,11 +472,20 @@ func New(opts Options) (*Server, error) {
 	}
 	var sessionCapabilities control.SessionCapabilityAuthority
 	var principalRevocations control.PrincipalRevocationAuthority
+	var nodeEnrollments control.NodeEnrollmentAuthority
 	principalAuthority := opts.PrincipalAuthority
 	if identityManager != nil {
 		sessionCapabilities = identityManager
 		principalRevocations = identityManager
 		principalAuthority = identityManager
+		nodeEnrollments = identityManager
+	}
+	if nodeEnrollments == nil && opts.NodeAuthenticator != nil {
+		// A deployment that supplied its own identity authority gets the
+		// operator enrollment path too, but only if that authority can
+		// actually mint one. Absent the capability the op stays `unsupported`
+		// rather than pretending to have an authority it does not have.
+		nodeEnrollments, _ = opts.NodeAuthenticator.(control.NodeEnrollmentAuthority)
 	}
 	var authority control.ControllerAuthority
 	controllerRole := "active"
@@ -496,6 +505,7 @@ func New(opts Options) (*Server, error) {
 		Bindings: opts.Bindings, SecretResolver: opts.SecretResolver, LeaseSec: opts.LeaseSec, Logger: opts.Logger,
 		Artifacts: legacyControlArtifacts, TenantArtifacts: opts.TenantArtifacts,
 		Authenticator: opts.Authenticator, Authorizer: opts.Authorizer, NodeAuthenticator: opts.NodeAuthenticator, ApprovedNodes: opts.ApprovedNodes,
+		NodeEnrollments:     nodeEnrollments,
 		SessionCapabilities: sessionCapabilities, PrincipalRevocations: principalRevocations,
 		Principals:           principalAuthority,
 		SessionCapabilityTTL: opts.SessionCapabilityTTL,

@@ -2,6 +2,8 @@
 //
 //	remount server   --listen :7443 --data ./data --token T [--bindings bindings.json]
 //	remount up       --server https://host:7443 --token T [--label k=v] [--backend process|docker]
+//	remount up       --server https://host:7443 --enrollment-file FILE   (production: one-time enrollment)
+//	remount node     enroll --name N (--out FILE | --stdout) | ls
 //	remount ws       create|ls|get|destroy|move|sleep|wake|snapshot
 //	remount exec     WS -- cmd args...
 //	remount sh       WS            (interactive pty)
@@ -78,7 +80,7 @@ func run(ctx context.Context, argv []string) error {
 	}
 	cmd, args := argv[0], argv[1:]
 	switch cmd {
-	case "ws", "fs", "fleet", "pool", "volume", "budget", "run", "agent", "mcp", "tenant", "principal", "token", "audit", "computer":
+	case "ws", "fs", "fleet", "pool", "volume", "budget", "run", "agent", "mcp", "tenant", "principal", "token", "audit", "computer", "node":
 		if len(args) > 0 && !isFlag(args[0]) {
 			args = append(append([]string{args[0]}, globals...), args[1:]...)
 		} else {
@@ -172,6 +174,8 @@ func run(ctx context.Context, argv []string) error {
 		return cmdMetrics(ctx, args)
 	case "nodes":
 		return cmdNodes(ctx, args)
+	case "node":
+		return cmdNode(ctx, args)
 	case "events":
 		return cmdEvents(ctx, args)
 	case "timers":
@@ -245,6 +249,7 @@ func usage() {
   remount invite PRINCIPAL --tenant TENANT [--ttl 15m]
   remount principal create PRINCIPAL [--tenant T] [--roles agent] | ls | revoke PRINCIPAL
   remount principal session --ws WS [--roles agent] [--ttl 15m]   ephemeral principal + generation-bound capability, printed once
+  remount node enroll --name NAME [--tenant T] [--labels k=v] [--ttl 10m] (--out FILE | --stdout)   one-time node credential
   remount token issue PRINCIPAL --role agent --ttl 1h [--tenant T]
   remount login --tenant TENANT      OIDC device login; stores rotating credentials mode 0600
 
@@ -289,7 +294,7 @@ func usage() {
   remount approvals deny ID                                               deny a pending request
   remount approve ID [--option X | --deny | --content JSON]              compatibility shorthand
   remount mcp serve | config HOST | wrap -- SERVER                      expose Remount and wrapped servers over MCP
-  remount nodes | events [--follow] [--ws WS] | timers
+  remount nodes | node ls | events [--follow] [--ws WS] | timers
   remount audit export --tenant T --range FROM..TO [--out FILE]          a signed, tenant-scoped bundle of the event log; FROM..TO includes both ends
   remount audit verify BUNDLE [--key BASE64] [--tenant T] | audit key    check a bundle, offline when given the key
 
@@ -710,6 +715,7 @@ func cmdUp(ctx context.Context, args []string) error {
 	var c common
 	c.flags(fs)
 	data := fs.String("data", envOr("REMOUNT_NODE_DATA", defaultNodeData()), "node data directory")
+	enrollmentFile := fs.String("enrollment-file", os.Getenv("REMOUNT_ENROLLMENT_FILE"), "mode-0600 `file` holding the one-time credential from remount node enroll")
 	nodeID := fs.String("node-id", os.Getenv("REMOUNT_NODE_ID"), "fixed n_ identity for one-time provisioned nodes")
 	labels := kvFlag{}
 	fs.Var(labels, "label", "node label k=v (repeatable)")
@@ -769,6 +775,11 @@ func cmdUp(ctx context.Context, args []string) error {
 		return err
 	}
 	*data = dataDir
+	credential, credentialSource, err := nodeCredential(c.token, *enrollmentFile)
+	if err != nil {
+		return err
+	}
+	c.token = credential
 	n, err := buildNode(*data, *nodeID, c, labels, *backends, *image, allow, allowPrivate, nodeResourceOptions{
 		artifactBytes: *artifactBytes, artifactStoreBytes: *artifactStoreBytes, artifactObjects: *artifactObjects,
 		artifactRetention: *artifactRetention, artifactGCInterval: *artifactGCInterval,
@@ -792,7 +803,10 @@ func cmdUp(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	slog.Info("remount node starting", "id", n.ID(), "server", c.server, "data", *data)
+	// The source, never the credential. An operator who mistyped
+	// --enrollment-file needs to know the node fell back to the ambient
+	// bearer before it spends a minute failing to enroll.
+	slog.Info("remount node starting", "id", n.ID(), "server", c.server, "data", *data, "credential", credentialSource)
 	return n.Run(ctx)
 }
 
@@ -1853,6 +1867,12 @@ func cmdNodes(ctx context.Context, args []string) error {
 	if err := arity(fs, 0, 0, "nodes"); err != nil {
 		return err
 	}
+	return listNodes(ctx, c)
+}
+
+// listNodes is shared by `remount nodes` and `remount node ls`, which are the
+// same query under the two names people reach for.
+func listNodes(ctx context.Context, c common) error {
 	cl := c.client()
 	defer cl.Close()
 	nodes, err := cl.ListNodes(ctx)
