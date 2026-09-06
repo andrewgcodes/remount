@@ -25,9 +25,7 @@ or the loop your product runs in Go, Python or TypeScript. Remount gives it a
 computer: a **workspace** that runs on your laptop, a VM, a GPU box,
 Kubernetes, Modal or Fly, moves between them with its files, policy and saved
 state, replays its sessions, sleeps and wakes on events, and never holds an
-API key. It is the same runtime whether the agent writes code, reviews
-contracts, reconciles expenses, browses the web or answers customers. One
-static Go binary, one open protocol, Apache-2.0, nothing hosted.
+API key. One static Go binary, one open protocol, Apache-2.0, nothing hosted.
 
 - **Move between local and cloud.** Start an agent on your laptop and hand it
   to a cloud node with `remount handoff`; pull it back with `remount resume`
