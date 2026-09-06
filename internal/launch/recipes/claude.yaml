@@ -3,6 +3,17 @@ name: claude
 description: Claude Code CLI
 auth: either
 providers: [anthropic]
+subscription:
+  login: ["claude", "auth", "login", "--claudeai"]
+  status: ["claude", "auth", "status"]
+  logout: ["claude", "auth", "logout"]
+  unset_env: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]
+  verify: |
+    status="$(claude auth status --json 2>/dev/null)" || exit 1
+    compact="$(printf '%s' "$status" | tr -d '[:space:]')"
+    case "$compact" in *'"loggedIn":true'*) ;; *) exit 1;; esac
+    case "$compact" in *'"authMethod":"oauth_token"'*) ;; *) exit 1;; esac
+    case "$compact" in *'"apiProvider":"firstParty"'*) ;; *) exit 1;; esac
 hosts:
   - registry.npmjs.org
   - statsig.anthropic.com

@@ -374,6 +374,11 @@ AuditPolicy = TypedDict("AuditPolicy", {
     "required": NotRequired[bool],
 }, total=False)
 
+AuthOperation = TypedDict("AuthOperation", {
+    "recipe": Required[str],
+    "action": Required[str],
+}, total=False)
+
 AuthzRevocation = TypedDict("AuthzRevocation", {
     "rev": Required[int],
     "principal": Required[str],
@@ -1594,6 +1599,8 @@ SOpenReq = TypedDict("SOpenReq", {
     "grant": NotRequired[Optional["Grant"]],
     "no_sub": NotRequired[bool],
     "run": NotRequired[Optional["RunInfo"]],
+    "sensitive": NotRequired[bool],
+    "auth_operation": NotRequired[Optional["AuthOperation"]],
 }, total=False)
 
 SOpenRes = TypedDict("SOpenRes", {
@@ -1677,6 +1684,8 @@ SessionInfo = TypedDict("SessionInfo", {
     "pid": NotRequired[int],
     "opened_at": Required[int],
     "run": NotRequired[Optional["RunInfo"]],
+    "sensitive": NotRequired[bool],
+    "auth_operation": NotRequired[Optional["AuthOperation"]],
 }, total=False)
 
 SessionLogCommitReq = TypedDict("SessionLogCommitReq", {
@@ -2028,6 +2037,12 @@ WSInfoRes = TypedDict("WSInfoRes", {
     "root": NotRequired[str],
     "sessions": NotRequired[list[str]],
     "broker": NotRequired[str],
+}, total=False)
+
+WSLaunchRecordReq = TypedDict("WSLaunchRecordReq", {
+    "id": Required[str],
+    "labels": Required[dict[str, str]],
+    "idem": NotRequired[str],
 }, total=False)
 
 WSLeaseCancelReq = TypedDict("WSLeaseCancelReq", {
@@ -2468,6 +2483,7 @@ OPERATIONS: dict[str, dict[str, object]] = {
     "ws.idle.mark": {"constant": "OpWSIdleMark", "request": "WSIdleMarkReq", "response": "Workspace"},
     "ws.idle.policy": {"constant": "OpWSIdlePolicy", "request": "WSIdlePolicyReq", "response": "Workspace"},
     "ws.info": {"constant": "OpWSInfo", "request": "WSGetReq", "response": "WSInfoRes"},
+    "ws.launch.record": {"constant": "OpWSLaunchRecord", "request": "WSLaunchRecordReq", "response": "Workspace"},
     "ws.lease": {"constant": "OpWSLease", "request": "WSLeaseReq", "response": "WorkspaceLease"},
     "ws.lease.cancel": {"constant": "OpWSLeaseCancel", "request": "WSLeaseCancelReq", "response": "Workspace"},
     "ws.lease.get": {"constant": "OpWSLeaseGet", "request": "WSLeaseGetReq", "response": "WSLeaseRes"},

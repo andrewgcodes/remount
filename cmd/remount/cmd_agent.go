@@ -26,7 +26,7 @@ import (
 // agent: durable agents (ADR 0043)
 // ---------------------------------------------------------------------------
 
-const agentUsage = `agent create RECIPE [--dir PATH | --base NAME | --repo URL[@REF] | --ws WS] [--binding ID[:PRESET]]... [--sleep-after DUR] [--max-turns N] [--approve M] [--parent ID] [--at TIME] [--acp-cmd ARG]... [--detach] -- TASK…
+const agentUsage = `agent create RECIPE [--auth subscription|api-key] [--dir PATH | --base NAME | --repo URL[@REF] | --ws WS] [--binding ID[:PRESET]]... [--sleep-after DUR] [--max-turns N] [--approve M] [--parent ID] [--at TIME] [--acp-cmd ARG]... [--detach] -- TASK…
     agent ls [--status S] [--ws WS] [--parent ID]
     agent get ID
     agent open ID [--ui]
@@ -72,12 +72,12 @@ func cmdAgent(ctx context.Context, args []string) error {
 
 // agentSeedFlags are the launch flags `agent create` shares with `run`.
 type agentSeedFlags struct {
-	dir, repo, base, ws, image, backend, name, model, security, sandbox, approve, mountPath, recipeFile, parent, at string
-	includeGit                                                                                                      bool
-	repoDepth                                                                                                       int
-	bindings, exclude, acpCmd                                                                                       listFlag
-	sleepAfter                                                                                                      time.Duration
-	maxTurns                                                                                                        int
+	dir, repo, base, ws, image, backend, name, model, auth, security, sandbox, approve, mountPath, recipeFile, parent, at string
+	includeGit                                                                                                            bool
+	repoDepth                                                                                                             int
+	bindings, exclude, acpCmd                                                                                             listFlag
+	sleepAfter                                                                                                            time.Duration
+	maxTurns                                                                                                              int
 }
 
 func (f *agentSeedFlags) register(fs *flag.FlagSet) {
@@ -91,6 +91,7 @@ func (f *agentSeedFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.backend, "backend", "", "require a node backend (docker, process)")
 	fs.StringVar(&f.name, "name", "", "agent (and workspace) name")
 	fs.StringVar(&f.model, "model", "", "model id passed to the harness")
+	fs.StringVar(&f.auth, "auth", "", "subscription | api-key (required by recipes that support both explicitly)")
 	fs.StringVar(&f.security, "security", "", "local | isolated | multi_tenant (default local)")
 	fs.StringVar(&f.sandbox, "sandbox", launch.SandboxWorkspaceWrite, "read-only | workspace-write | full")
 	fs.StringVar(&f.approve, "approve", launch.ApproveNever, "never | auto | on-request: what happens when the harness asks permission")
@@ -149,6 +150,9 @@ func planAgent(ctx context.Context, c *common, f *agentSeedFlags, recipe *launch
 	if recipe.CommandFromArgs && len(f.acpCmd) == 0 {
 		return nil, fmt.Errorf("recipe %s needs --acp-cmd", recipe.Name)
 	}
+	if f.auth == launch.AuthSubscription && len(f.acpCmd) != 0 {
+		return nil, errors.New("--auth subscription cannot be combined with --acp-cmd because the recipe's subscription preflight would be bypassed")
+	}
 	if strings.TrimSpace(task) == "" {
 		return nil, fmt.Errorf("recipe %s needs a task after --", recipe.Name)
 	}
@@ -165,7 +169,7 @@ func planAgent(ctx context.Context, c *common, f *agentSeedFlags, recipe *launch
 	}
 	o := launch.Options{
 		Recipe: recipe, Task: task, WS: f.ws, Base: f.base, Name: f.name, Image: f.image, Backend: f.backend,
-		Security: f.security, Sandbox: f.sandbox, Model: f.model, Exclude: f.exclude, MountPath: f.mountPath,
+		Auth: normalizeAuthFlag(f.auth), Security: f.security, Sandbox: f.sandbox, Model: f.model, Exclude: f.exclude, MountPath: f.mountPath,
 		// launch.Options validates the harness's own approve modes; the
 		// Agent policy carries the real value.
 		Approve: launch.ApproveNever,
@@ -199,8 +203,10 @@ func planAgent(ctx context.Context, c *common, f *agentSeedFlags, recipe *launch
 		return nil, errors.New("--repo-depth needs --repo")
 	}
 	var err error
-	if o.Bindings, err = defaultBindings(recipe, o.Bindings, c.localBindings(ctx)); err != nil {
-		return nil, err
+	if o.Auth == "" {
+		if o.Bindings, err = defaultBindings(recipe, o.Bindings, c.localBindings(ctx)); err != nil {
+			return nil, err
+		}
 	}
 	// Validate wants a seed it can name; a --dir is uploaded afterwards.
 	probe := o
@@ -319,7 +325,7 @@ func cmdAgentCreate(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if p.plan.Auth == launch.AuthWorkspaceResident {
+	if p.plan.Auth == launch.AuthWorkspaceResident || p.plan.Auth == launch.AuthSubscription {
 		fmt.Fprintf(os.Stderr, "note: %s will use its own login kept inside workspace %s (no provider binding given)\n", recipe.Name, a.WS)
 	}
 	if *detach || c.json {

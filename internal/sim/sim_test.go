@@ -31,9 +31,11 @@ import (
 	"remount.dev/remount/internal/budget"
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/control"
+	"remount.dev/remount/internal/launch"
 	"remount.dev/remount/internal/node"
 	"remount.dev/remount/internal/notifier"
 	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/providerauth"
 	"remount.dev/remount/internal/server"
 	"remount.dev/remount/internal/transport"
 	"remount.dev/remount/internal/workspace"
@@ -677,6 +679,348 @@ func TestNodeUplinkFlapKeepsSessionRunning(t *testing.T) {
 	got, _ := c.GetWorkspace(ctx, ws.ID)
 	if got.Generation != ws.Generation || got.State != proto.WSClaimed {
 		t.Fatalf("%+v", got)
+	}
+}
+
+func TestSensitiveAuthSessionIsActiveClientOnlyAndSanitized(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: provider auth commands use the recipe's Unix shell contract")
+	}
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("sensitive-auth")
+	ws := mustWS(t, c, proto.WorkspaceSpec{})
+	ctx := ctxT(t, 60*time.Second)
+	if err := c.WriteFile(ctx, ws.ID, ".local/bin/claude", []byte("#!/bin/sh\nprintf confidential-auth-canary\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	auth := &proto.AuthOperation{Recipe: "claude", Action: proto.AuthActionStatus}
+	if _, err := c.Exec(ctx, proto.SOpenReq{
+		WS: ws.ID, Program: []string{"sh", "-c", "printf hidden-command"},
+		Sensitive: true, AuthOperation: auth,
+	}); err == nil || !strings.Contains(err.Error(), "node-approved") {
+		t.Fatalf("arbitrary sensitive command = %v", err)
+	}
+	program, err := providerauth.Program(auth.Recipe, auth.Action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*proto.SOpenReq)
+		wantErr string
+	}{
+		{"missing metadata", func(req *proto.SOpenReq) { req.AuthOperation = nil }, "require auth operation metadata"},
+		{"custom cwd", func(req *proto.SOpenReq) { req.Cwd = "/tmp" }, "node-approved"},
+		{"custom environment", func(req *proto.SOpenReq) { req.Env = map[string]string{"OPENAI_API_KEY": "canary"} }, "node-approved"},
+		{"detached", func(req *proto.SOpenReq) { req.NoSubscribe = true }, "must stream"},
+		{"harness run", func(req *proto.SOpenReq) { req.Run = &proto.RunInfo{Recipe: "claude"} }, "cannot also be harness runs"},
+	} {
+		req := proto.SOpenReq{WS: ws.ID, Program: program, Sensitive: true, AuthOperation: auth}
+		tc.mutate(&req)
+		if _, err := c.Exec(ctx, req); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Errorf("%s request = %v, want error containing %q", tc.name, err, tc.wantErr)
+		}
+	}
+	open := proto.SOpenReq{
+		WS: ws.ID, Kind: proto.SessionExec,
+		Program: program, Sensitive: true, AuthOperation: auth,
+		IdempotencyKey: "sensitive-auth-open",
+	}
+	s, err := c.Exec(ctx, open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := <-s.Chunks()
+	if first.Stream != proto.StreamInfo {
+		t.Fatalf("first stream = %d", first.Stream)
+	}
+	var info proto.SessionInfo
+	if err := proto.Unmarshal(first.Data, &info); err != nil {
+		t.Fatal(err)
+	}
+	if !info.Sensitive || info.AuthOperation == nil || len(info.Program) != 0 {
+		t.Fatalf("sensitive info = %+v", info)
+	}
+	var out bytes.Buffer
+	if exit := client.Copy(s, &out, nil); exit == nil || exit.Code != 0 {
+		t.Fatalf("exit = %+v", exit)
+	}
+	if out.String() != "confidential-auth-canary" {
+		t.Fatalf("active client output = %q", out.String())
+	}
+	if _, err := c.Attach(ctx, ws.ID, s.ID, 0); err == nil || !strings.Contains(err.Error(), "sensitive") {
+		t.Fatalf("later attach = %v", err)
+	}
+	if _, err := c.Exec(ctx, open); err == nil || !strings.Contains(err.Error(), "cannot be reopened") {
+		t.Fatalf("idempotent reopen = %v", err)
+	}
+	var events []proto.Event
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		events, err = c.ReadEvents(ctx, 1, ws.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var started, finished bool
+		for _, event := range events {
+			started = started || event.Type == proto.EvAuthOperationStarted
+			finished = finished || event.Type == proto.EvAuthOperationFinished
+		}
+		if started && finished {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	var started, finished bool
+	for _, event := range events {
+		started = started || event.Type == proto.EvAuthOperationStarted
+		finished = finished || event.Type == proto.EvAuthOperationFinished
+		if strings.Contains(string(event.Payload), "confidential-auth-canary") || strings.Contains(string(event.Payload), `"sh"`) {
+			t.Fatalf("event %s leaked sensitive program/output: %q", event.Type, event.Payload)
+		}
+	}
+	if !started || !finished {
+		t.Fatalf("auth lifecycle events missing: started=%t finished=%t events=%v", started, finished, events)
+	}
+}
+
+func TestSensitiveAuthSessionStaysOnOpeningConnection(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: provider auth commands use the recipe's Unix shell contract")
+	}
+	w := newWorld(t)
+	var attachAttempts atomic.Int64
+	w.peerHooks["sensitive-long"] = func(frame *proto.Frame) bool {
+		if frame.Op == proto.OpSAttach {
+			attachAttempts.Add(1)
+		}
+		return true
+	}
+	w.node("n1", nil)
+	c := w.client("sensitive-long")
+	ws := mustWS(t, c, proto.WorkspaceSpec{})
+	ctx := ctxT(t, 75*time.Second)
+	script := "#!/bin/sh\n" +
+		"printf 'ready\\n'\n" +
+		"IFS= read -r first\n" +
+		"printf 'first:%s\\n' \"$first\"\n" +
+		"sleep 31\n" +
+		"IFS= read -r second\n" +
+		"printf 'second:%s\\n' \"$second\"\n" +
+		"sleep 120\n"
+	if err := c.WriteFile(ctx, ws.ID, ".local/bin/claude", []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	auth := &proto.AuthOperation{Recipe: "claude", Action: proto.AuthActionLogin}
+	program, err := providerauth.Program(auth.Recipe, auth.Action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := c.Exec(ctx, proto.SOpenReq{
+		WS: ws.ID, Kind: proto.SessionPTY, Program: program, Stdin: true,
+		Rows: 24, Cols: 80, TimeoutSec: 180, Sensitive: true, AuthOperation: auth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output strings.Builder
+	readUntil := func(want string, timeout time.Duration) {
+		t.Helper()
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		for !strings.Contains(output.String(), want) {
+			select {
+			case chunk, ok := <-s.Chunks():
+				if !ok {
+					t.Fatalf("session ended before %q: output=%q err=%v", want, output.String(), s.Err())
+				}
+				if chunk.Stream == proto.StreamStdout {
+					output.Write(chunk.Data)
+				}
+			case <-timer.C:
+				t.Fatalf("timed out waiting for %q in %q", want, output.String())
+			}
+		}
+	}
+	readUntil("ready", 5*time.Second)
+	if err := s.Input(ctx, []byte("one\n"), false); err != nil {
+		t.Fatal(err)
+	}
+	readUntil("first:one", 5*time.Second)
+	time.Sleep(31 * time.Second)
+	select {
+	case <-s.Done():
+		t.Fatalf("sensitive session ended during long-lived operation: %v", s.Err())
+	default:
+	}
+	if got := attachAttempts.Load(); got != 0 {
+		t.Fatalf("sensitive session attempted %d ordinary attaches", got)
+	}
+	if err := s.Input(ctx, []byte("two\n"), false); err != nil {
+		t.Fatal(err)
+	}
+	readUntil("second:two", 5*time.Second)
+	if w.cut("sensitive-long") == 0 {
+		t.Fatal("client connection was not cut")
+	}
+	select {
+	case <-s.Done():
+		if err := s.Err(); err == nil || !strings.Contains(err.Error(), "opening connection") {
+			t.Fatalf("disconnect error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sensitive session delivery did not end promptly after disconnect")
+	}
+}
+
+func TestSensitiveAuthOpenDoesNotRetryAcrossConnections(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: provider auth commands use the recipe's Unix shell contract")
+	}
+	w := newWorld(t)
+	const peer = "sensitive-open-cut"
+	var opens atomic.Int64
+	w.peerHooks[peer] = func(frame *proto.Frame) bool {
+		if frame.Op == proto.OpSOpen {
+			opens.Add(1)
+		}
+		return true
+	}
+	var cut sync.Once
+	w.serverHooks[peer] = func(frame *proto.Frame) bool {
+		if frame.T == proto.KindRes && frame.Op == proto.OpSOpen {
+			cut.Do(func() { go w.cut(peer) })
+			return false
+		}
+		return true
+	}
+	w.node("n1", nil)
+	c := w.client(peer)
+	ws := mustWS(t, c, proto.WorkspaceSpec{})
+	ctx := ctxT(t, 10*time.Second)
+	if err := c.WriteFile(ctx, ws.ID, ".local/bin/claude", []byte("#!/bin/sh\nsleep 120\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	auth := &proto.AuthOperation{Recipe: "claude", Action: proto.AuthActionLogin}
+	program, err := providerauth.Program(auth.Recipe, auth.Action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if _, err := c.Exec(ctx, proto.SOpenReq{
+		WS: ws.ID, Kind: proto.SessionPTY, Program: program, Stdin: true,
+		Rows: 24, Cols: 80, TimeoutSec: 180, Sensitive: true, AuthOperation: auth,
+	}); err == nil {
+		t.Fatal("sensitive open survived loss of its opening connection")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("sensitive open returned after %s", elapsed)
+	}
+	if got := opens.Load(); got != 1 {
+		t.Fatalf("sensitive open crossed connections: attempts=%d", got)
+	}
+}
+
+func TestExistingWorkspaceLaunchPersistsAuthForResume(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unavailable: built-in harness launchers use the Unix shell contract")
+	}
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("existing-workspace-auth")
+	ws := mustWS(t, c, proto.WorkspaceSpec{Labels: map[string]string{
+		"user.label":             "preserved",
+		launch.LabelBindings:     "stale",
+		launch.LabelModel:        "stale",
+		launch.LabelConversation: "stale",
+	}})
+	ctx := ctxT(t, 60*time.Second)
+	recipe := &launch.Recipe{
+		Name:          "auth-test",
+		Auth:          launch.AuthEither,
+		Command:       []string{"sh", "-c", "printf initial"},
+		ResumeCommand: []string{"sh", "-c", "printf resumed"},
+		Subscription: &launch.SubscriptionSpec{
+			Login: []string{"auth-test", "login"}, Status: []string{"auth-test", "status"},
+			Logout: []string{"auth-test", "logout"}, Verify: "true",
+		},
+	}
+	started, err := launch.Start(ctx, c, launch.Options{
+		Recipe: recipe, WS: ws.ID, Auth: launch.AuthSubscription, Task: "work",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if exit := client.Copy(started.Session, &out, nil); exit == nil || exit.Code != 0 || out.String() != "initial" {
+		t.Fatalf("initial launch output = %q exit=%+v", out.String(), exit)
+	}
+	recorded, err := c.GetWorkspace(ctx, ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := recorded.Spec.Labels[launch.LabelAuth]; got != launch.AuthSubscription {
+		t.Fatalf("recorded auth = %q, want %q; labels=%v", got, launch.AuthSubscription, recorded.Spec.Labels)
+	}
+	if got := recorded.Spec.Labels[launch.LabelRecipe]; got != recipe.Name {
+		t.Fatalf("recorded recipe = %q, want %q; labels=%v", got, recipe.Name, recorded.Spec.Labels)
+	}
+	if recorded.Spec.Labels["user.label"] != "preserved" ||
+		recorded.Spec.Labels[launch.LabelBindings] != "" ||
+		recorded.Spec.Labels[launch.LabelModel] != "" ||
+		recorded.Spec.Labels[launch.LabelConversation] != "" {
+		t.Fatalf("launch metadata replacement labels = %v", recorded.Spec.Labels)
+	}
+	events, err := c.ReadEvents(ctx, 1, ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recordedEvent bool
+	for _, event := range events {
+		recordedEvent = recordedEvent || event.Type == proto.EvWSLaunchRecorded
+	}
+	if !recordedEvent {
+		t.Fatalf("missing %s event in %+v", proto.EvWSLaunchRecorded, events)
+	}
+	key := client.WithIdempotencyKey("existing-workspace-launch")
+	firstRecord, err := c.RecordWorkspaceLaunch(ctx, ws.ID, map[string]string{
+		launch.LabelRecipe: recipe.Name,
+		launch.LabelAuth:   launch.AuthSubscription,
+	}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayedRecord, err := c.RecordWorkspaceLaunch(ctx, ws.ID, map[string]string{
+		launch.LabelRecipe: recipe.Name,
+		launch.LabelAuth:   launch.AuthSubscription,
+	}, key)
+	if err != nil || replayedRecord.UpdatedAt != firstRecord.UpdatedAt {
+		t.Fatalf("launch metadata replay = %+v, %v; first=%+v", replayedRecord, err, firstRecord)
+	}
+	if _, err := c.RecordWorkspaceLaunch(ctx, ws.ID, map[string]string{
+		launch.LabelRecipe: recipe.Name,
+		launch.LabelAuth:   launch.AuthAPIKey,
+	}, key); err == nil {
+		t.Fatal("changed launch metadata reused an idempotency key")
+	}
+	resumed, err := launch.Resume(ctx, c, launch.ResumeOptions{
+		WS: ws.ID, Recipe: recipe, Task: "continue",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if resumed.Run == nil || resumed.Run.Auth != launch.AuthSubscription {
+		t.Fatalf("resume without auth = %+v", resumed.Run)
+	}
+	if exit := client.Copy(resumed.Session, &out, nil); exit == nil || exit.Code != 0 || out.String() != "resumed" {
+		t.Fatalf("resumed launch output = %q exit=%+v", out.String(), exit)
+	}
+	if _, err := launch.Resume(ctx, c, launch.ResumeOptions{
+		WS: ws.ID, Recipe: recipe, Auth: launch.AuthAPIKey, Task: "continue",
+	}); err == nil || !strings.Contains(err.Error(), "refusing resume") {
+		t.Fatalf("conflicting auth resume = %v", err)
 	}
 }
 

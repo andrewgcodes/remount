@@ -15,7 +15,7 @@ func TestConversationOptionsValidate(t *testing.T) {
 	const id = "11111111-1111-4111-8111-111111111111"
 	transcript := ".codex/sessions/2026/09/04/rollout-2026-09-04T12-00-00-" + id + ".jsonl"
 	for _, conversation := range []string{id, "../session", "latest", "--last", strings.Repeat("z", 36)} {
-		o := Options{Recipe: r, Resume: true, Task: "continue", Conversation: conversation, ConversationPath: transcript}
+		o := Options{Recipe: r, Auth: AuthSubscription, Resume: true, Task: "continue", Conversation: conversation, ConversationPath: transcript}
 		plan, err := o.Validate()
 		if conversation == id {
 			if err != nil {
@@ -29,9 +29,55 @@ func TestConversationOptionsValidate(t *testing.T) {
 		}
 	}
 	for _, badPath := range []string{"", "../" + transcript, ".codex/auth.json", strings.ReplaceAll(transcript, id, "22222222-2222-4222-8222-222222222222")} {
-		o := Options{Recipe: r, Resume: true, Task: "continue", Conversation: id, ConversationPath: badPath}
+		o := Options{Recipe: r, Auth: AuthSubscription, Resume: true, Task: "continue", Conversation: id, ConversationPath: badPath}
 		if _, err := o.Validate(); err == nil {
 			t.Errorf("invalid conversation transcript %q accepted", badPath)
+		}
+	}
+}
+
+func TestExplicitAuthPlans(t *testing.T) {
+	claude, err := Load("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscription, err := (&Options{Recipe: claude, Auth: AuthSubscription, Task: "work"}).Validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if subscription.Auth != AuthSubscription || subscription.Run.Auth != proto.RunAuthSubscription || subscription.Spec.Labels[LabelAuth] != AuthSubscription || len(subscription.Spec.Bindings) != 0 {
+		t.Fatalf("subscription plan = %+v", subscription)
+	}
+	binding, err := ParseBinding("b_anthropic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiKey, err := (&Options{Recipe: claude, Auth: AuthAPIKey, Task: "work", Bindings: []Binding{binding}}).Validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if apiKey.Auth != AuthAPIKey || apiKey.Run.Auth != proto.RunAuthAPIKey || apiKey.Spec.Labels[LabelAuth] != AuthAPIKey || len(apiKey.Spec.Bindings) != 1 {
+		t.Fatalf("api-key plan = %+v", apiKey)
+	}
+}
+
+func TestResumeAuthPreservesBillingMode(t *testing.T) {
+	for _, tc := range []struct {
+		recorded  string
+		requested string
+		want      string
+		wantErr   bool
+	}{
+		{AuthSubscription, "", AuthSubscription, false},
+		{AuthAPIKey, "", AuthAPIKey, false},
+		{"", AuthSubscription, AuthSubscription, false},
+		{AuthSubscription, AuthSubscription, AuthSubscription, false},
+		{AuthSubscription, AuthAPIKey, "", true},
+		{AuthAPIKey, AuthSubscription, "", true},
+	} {
+		got, err := resumeAuth("ws_auth", tc.recorded, tc.requested)
+		if (err != nil) != tc.wantErr || got != tc.want {
+			t.Errorf("recorded=%q requested=%q: got=%q err=%v", tc.recorded, tc.requested, got, err)
 		}
 	}
 }

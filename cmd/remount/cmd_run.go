@@ -22,7 +22,7 @@ import (
 // run: seed a workspace, install a harness, launch it against brokered keys
 // ---------------------------------------------------------------------------
 
-const runUsage = "run RECIPE [--dir PATH | --base NAME | --repo URL[@REF] | --ws WS] [--binding ID[:PRESET]]... [--security P] [--sandbox M] [--approve M] [--mount-path /abs] [--detach] [--pty] [--sleep-after DUR] [--max-turns N] [--parent ID] [--at TIME | --sleep-until HH:MM] -- TASK…\n    run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM] | --queue-continue QUEUE"
+const runUsage = "run RECIPE [--auth subscription|api-key] [--dir PATH | --base NAME | --repo URL[@REF] | --ws WS] [--binding ID[:PRESET]]... [--security P] [--sandbox M] [--approve M] [--mount-path /abs] [--detach] [--pty] [--sleep-after DUR] [--max-turns N] [--parent ID] [--at TIME | --sleep-until HH:MM] -- TASK…\n    run RECIPE --queue FILE [--sleep-after DUR | --sleep-until HH:MM] | --queue-continue QUEUE"
 
 func cmdRun(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
@@ -40,6 +40,7 @@ func cmdRun(ctx context.Context, args []string) error {
 	backend := fs.String("backend", "", "require a node backend (docker, process)")
 	name := fs.String("name", "", "workspace name")
 	model := fs.String("model", "", "model id passed to the harness")
+	auth := fs.String("auth", "", "subscription | api-key (required by recipes that support both explicitly)")
 	security := fs.String("security", "", "local | isolated | multi_tenant (default local)")
 	sandbox := fs.String("sandbox", launch.SandboxWorkspaceWrite, "read-only | workspace-write | full")
 	approve := fs.String("approve", launch.ApproveNever, "never | on-request")
@@ -120,6 +121,7 @@ func cmdRun(ctx context.Context, args []string) error {
 		seed := agentSeedFlags{
 			dir: *dir, repo: *repo, base: *base, ws: *wsID, image: *image, backend: *backend, name: *name, model: *model,
 			security: *security, sandbox: *sandbox, approve: *approve, mountPath: *mountPath, recipeFile: *recipeFile,
+			auth:       normalizeAuthFlag(*auth),
 			includeGit: *includeGit, repoDepth: *repoDepth, bindings: bindings, exclude: exclude,
 			sleepAfter: *sleepAfter, maxTurns: *maxTurns, parent: *parent, at: startAt,
 		}
@@ -139,7 +141,7 @@ func cmdRun(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		if p.plan.Auth == launch.AuthWorkspaceResident {
+		if p.plan.Auth == launch.AuthWorkspaceResident || p.plan.Auth == launch.AuthSubscription {
 			fmt.Fprintf(os.Stderr, "note: %s will use its own login kept inside workspace %s (no provider binding given)\n", recipe.Name, a.WS)
 		}
 		if *detach {
@@ -162,7 +164,7 @@ func cmdRun(ctx context.Context, args []string) error {
 	}
 	o := launch.Options{
 		Recipe: recipe, WS: *wsID, Base: *base, Name: *name, Image: *image, Backend: *backend,
-		Security: *security, Sandbox: *sandbox, Approve: *approve, Model: *model, Exclude: exclude, Resume: *resume,
+		Auth: normalizeAuthFlag(*auth), Security: *security, Sandbox: *sandbox, Approve: *approve, Model: *model, Exclude: exclude, Resume: *resume,
 		Timeout: *timeout, Stderr: os.Stderr, MountPath: *mountPath,
 	}
 	if queued {
@@ -217,8 +219,10 @@ func cmdRun(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	if o.Bindings, err = defaultBindings(recipe, o.Bindings, c.localBindings(ctx)); err != nil {
-		return err
+	if o.Auth == "" {
+		if o.Bindings, err = defaultBindings(recipe, o.Bindings, c.localBindings(ctx)); err != nil {
+			return err
+		}
 	}
 	// Fail on flag errors before uploading anything.
 	probe := o
@@ -254,7 +258,7 @@ func cmdRun(ctx context.Context, args []string) error {
 		return err
 	}
 	ws, s := res.Workspace, res.Session
-	if res.Auth == launch.AuthWorkspaceResident {
+	if res.Auth == launch.AuthWorkspaceResident || res.Auth == launch.AuthSubscription {
 		fmt.Fprintf(os.Stderr, "note: %s will use its own login kept inside workspace %s (no provider binding given)\n", recipe.Name, ws.ID)
 	}
 	if *detach {

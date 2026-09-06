@@ -371,6 +371,11 @@ export interface AuditPolicy {
   "required"?: boolean;
 }
 
+export interface AuthOperation {
+  "recipe": string;
+  "action": string;
+}
+
 export interface AuthzRevocation {
   "rev": number;
   "principal": string;
@@ -1591,6 +1596,8 @@ export interface SOpenReq {
   "grant"?: Grant | null;
   "no_sub"?: boolean;
   "run"?: RunInfo | null;
+  "sensitive"?: boolean;
+  "auth_operation"?: AuthOperation | null;
 }
 
 export interface SOpenRes {
@@ -1674,6 +1681,8 @@ export interface SessionInfo {
   "pid"?: number;
   "opened_at": number;
   "run"?: RunInfo | null;
+  "sensitive"?: boolean;
+  "auth_operation"?: AuthOperation | null;
 }
 
 export interface SessionLogCommitReq {
@@ -2025,6 +2034,12 @@ export interface WSInfoRes {
   "root"?: string;
   "sessions"?: Array<string>;
   "broker"?: string;
+}
+
+export interface WSLaunchRecordReq {
+  "id": string;
+  "labels": Record<string, string>;
+  "idem"?: string;
 }
 
 export interface WSLeaseCancelReq {
@@ -2464,6 +2479,7 @@ export const OPERATIONS = {
   "ws.idle.mark": { constant: "OpWSIdleMark", request: "WSIdleMarkReq", response: "Workspace" },
   "ws.idle.policy": { constant: "OpWSIdlePolicy", request: "WSIdlePolicyReq", response: "Workspace" },
   "ws.info": { constant: "OpWSInfo", request: "WSGetReq", response: "WSInfoRes" },
+  "ws.launch.record": { constant: "OpWSLaunchRecord", request: "WSLaunchRecordReq", response: "Workspace" },
   "ws.lease": { constant: "OpWSLease", request: "WSLeaseReq", response: "WorkspaceLease" },
   "ws.lease.cancel": { constant: "OpWSLeaseCancel", request: "WSLeaseCancelReq", response: "Workspace" },
   "ws.lease.get": { constant: "OpWSLeaseGet", request: "WSLeaseGetReq", response: "WSLeaseRes" },

@@ -89,6 +89,8 @@ carries 0020-0038, 0042 or 0046.
 | [0094](0094-a-resumed-computer-handle-reads-the-input-sequence.md) | A resumed computer handle reads the node's input sequence |
 | [0095](0095-browser-proxy-auth-through-cdp.md) | Browser proxy auth through CDP |
 | [0096](0096-the-credential-surface-is-the-cli-the-sdks-and-runnable-examples.md) | The credential surface is the CLI, the SDKs and runnable examples |
+| [0097](0097-node-enrollment-is-an-operator-command.md) | Node enrollment is an operator command, and the floor is checked before the credential is spent |
+| [0098](0098-provider-subscription-auth-is-explicit-and-confidential.md) | Provider subscription auth is explicit and confidential |
 
 ## Where to start
 

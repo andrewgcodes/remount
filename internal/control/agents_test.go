@@ -317,6 +317,43 @@ func TestAgentCreateIsIdempotentAndValidates(t *testing.T) {
 	}); codeOf(err) != proto.CodeBadRequest {
 		t.Fatalf("bad sandbox = %v", err)
 	}
+	for _, recipe := range []string{"claude", "codex"} {
+		if _, err := af.c.agentCreate(context.Background(), localSubject(), &proto.AgentCreateReq{
+			Spec: proto.AgentSpec{Recipe: recipe},
+		}); codeOf(err) != proto.CodeBadRequest || !strings.Contains(err.Error(), "spec.auth is required") {
+			t.Fatalf("%s without explicit auth = %v", recipe, err)
+		}
+	}
+	customSubscription := `name: custom-subscription
+auth: either
+providers: [anthropic]
+subscription:
+  login: ["custom", "login"]
+  status: ["custom", "status"]
+  logout: ["custom", "logout"]
+  verify: "true"
+command: ["custom", "{{.Task}}"]
+`
+	if err := validateAgentSpec(&proto.AgentSpec{
+		Recipe: "custom-subscription", RecipeYAML: customSubscription,
+	}); codeOf(err) != proto.CodeBadRequest || !strings.Contains(err.Error(), "spec.auth is required") {
+		t.Fatalf("custom subscription recipe without explicit auth = %v", err)
+	}
+	if err := validateAgentSpec(&proto.AgentSpec{
+		Recipe: "legacy-custom", RecipeYAML: "name: legacy-custom\nauth: workspace_resident\ncommand: [legacy]\n",
+	}); err != nil {
+		t.Fatalf("legacy recipe without subscription metadata = %v", err)
+	}
+	if err := validateAgentSpec(&proto.AgentSpec{
+		Recipe: "legacy-custom", RecipeYAML: "not: [valid",
+	}); err != nil {
+		t.Fatalf("malformed legacy recipe should retain deferred validation: %v", err)
+	}
+	if _, err := af.c.agentCreate(context.Background(), localSubject(), &proto.AgentCreateReq{
+		Spec: proto.AgentSpec{Recipe: "claude", Auth: proto.RunAuthSubscription, ACPCommand: []string{"custom-acp"}},
+	}); codeOf(err) != proto.CodeBadRequest {
+		t.Fatalf("subscription with custom acp command = %v", err)
+	}
 	if _, err := af.c.agentCreate(context.Background(), localSubject(), &proto.AgentCreateReq{
 		Spec: agentSpec(""), Policy: proto.AgentPolicy{Approve: proto.ApproveAuto},
 	}); codeOf(err) != proto.CodeDenied {

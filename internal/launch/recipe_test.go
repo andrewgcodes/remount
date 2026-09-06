@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"remount.dev/remount/internal/providerauth"
 )
 
 func TestEveryBuiltinRecipeLoadsAndRenders(t *testing.T) {
@@ -648,15 +650,62 @@ func assertRecipeLaunchCommands(t *testing.T, r *Recipe, d Data, command, resume
 
 func TestAuthMode(t *testing.T) {
 	custom, _ := Load("custom")
-	if m, err := custom.AuthMode(nil); err != nil || m != AuthWorkspaceResident {
+	if m, err := custom.AuthMode("", nil); err != nil || m != AuthWorkspaceResident {
 		t.Fatalf("custom without bindings: %s %v", m, err)
 	}
-	if m, err := custom.AuthMode([]string{"openai"}); err != nil || m != AuthAPIKey {
+	if m, err := custom.AuthMode("", []string{"openai"}); err != nil || m != AuthAPIKey {
 		t.Fatalf("custom with binding: %s %v", m, err)
 	}
 	aider, _ := Load("aider")
-	if _, err := aider.AuthMode(nil); err == nil {
+	if _, err := aider.AuthMode("", nil); err == nil {
 		t.Fatal("api_key recipe without a binding must be refused")
+	}
+	claude, _ := Load("claude")
+	if _, err := claude.AuthMode("", nil); err == nil || !strings.Contains(err.Error(), "requires --auth") {
+		t.Fatalf("ambiguous Claude auth accepted: %v", err)
+	}
+	if mode, err := claude.AuthMode(AuthSubscription, nil); err != nil || mode != AuthSubscription {
+		t.Fatalf("subscription mode = %q, %v", mode, err)
+	}
+	if _, err := claude.AuthMode(AuthSubscription, []string{"anthropic"}); err == nil || !strings.Contains(err.Error(), "cannot use provider bindings") {
+		t.Fatalf("subscription binding accepted: %v", err)
+	}
+	if _, err := claude.AuthMode(AuthAPIKey, nil); err == nil || !strings.Contains(err.Error(), "explicit provider binding") {
+		t.Fatalf("api-key mode without binding accepted: %v", err)
+	}
+	if mode, err := claude.AuthMode(AuthAPIKey, []string{"anthropic"}); err != nil || mode != AuthAPIKey {
+		t.Fatalf("api-key mode = %q, %v", mode, err)
+	}
+}
+
+func TestSubscriptionLaunchersStripAPIKeysAndVerifyStatus(t *testing.T) {
+	for _, name := range []string{"claude", "codex"} {
+		r, err := Load(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Subscription == nil || len(r.Subscription.Login) == 0 || len(r.Subscription.Status) == 0 || len(r.Subscription.Logout) == 0 {
+			t.Fatalf("%s subscription metadata = %+v", name, r.Subscription)
+		}
+		approved, ok := providerauth.Lookup(name)
+		if !ok || !slices.Equal(r.Subscription.Login, approved.Login) || !slices.Equal(r.Subscription.Status, approved.Status) || !slices.Equal(r.Subscription.Logout, approved.Logout) || !slices.Equal(r.Subscription.UnsetEnv, approved.UnsetEnv) {
+			t.Fatalf("%s recipe and node auth contracts differ: recipe=%+v node=%+v", name, r.Subscription, approved)
+		}
+		script, err := r.Launcher(Data{Recipe: name, Workspace: "ws_auth", Auth: AuthSubscription}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range r.Subscription.UnsetEnv {
+			if !strings.Contains(script, "unset "+key+"\n") {
+				t.Errorf("%s launcher did not unset %s:\n%s", name, key, script)
+			}
+			if strings.Contains(script, "export "+key+"=") {
+				t.Errorf("%s launcher re-exported %s:\n%s", name, key, script)
+			}
+		}
+		if !strings.Contains(script, ") >/dev/null 2>&1") || !strings.Contains(script, "subscription login is unavailable") {
+			t.Errorf("%s launcher does not fail closed with sanitized status output:\n%s", name, script)
+		}
 	}
 }
 

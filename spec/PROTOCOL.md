@@ -547,6 +547,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `ws.move` | C | `WSMoveReq{id, requires?, placement?, idem}` → `Workspace` |
 | `ws.sleep` | C | `WSSleepReq{id, after_sec\|at\|on, match?, idem}` → `Timer`; `match` is a bounded exact payload-field predicate used only with `on` |
 | `ws.wake` | C | `WSGetReq{id, idem}` → `Workspace` |
+| `ws.launch.record` | C | `WSLaunchRecordReq{id, labels, idem}` → `Workspace`; replaces only the bounded `remount.recipe`, `remount.auth`, `remount.bindings`, `remount.model`, `remount.conversation`, and `remount.conversation.path` labels used to reconstruct the latest launch |
 | `ws.lease` | C | `WSLeaseReq{id, min_alive_sec?, max_alive_sec, on_expiry?, reason?, idem}` → `WorkspaceLease`; a durable hold on a `claimed` workspace. `on_expiry` is `sleep` (default) or `destroy`; `max_alive_sec` may not exceed the deployment's maximum hold. One hold per workspace: a new key replaces the previous one. Refused `conflict`/`workspace_not_ready` unless the workspace is `claimed`, and `resource_exhausted`/`quota_exceeded` at the tenant held-workspace limit |
 | `ws.lease.renew` | C | `WSLeaseRenewReq{id, lease, extend_sec, min_alive_sec?, idem}` → `WorkspaceLease`; extends both bounds from now. Refused `conflict`/`lifecycle_deadline_expired` once the deadline fired or the hold was cancelled, and `conflict`/`generation_mismatch` once the workspace was moved or re-placed |
 | `ws.lease.cancel` | C | `WSLeaseCancelReq{id, lease, idem}` → `Workspace`; removes the hold. The workspace stays `claimed` under its idle policy, if any |
@@ -872,7 +873,7 @@ Sent to a node id, and every one carries a `Grant` on first use per connection.
 
 | op | Body → Response |
 |---|---|
-| `s.open` | `SOpenReq{ws, kind, program, cwd, env, rows, cols, stdin, timeout_sec, idem, run?}` → `SOpenRes{s, next, kind?}` |
+| `s.open` | `SOpenReq{ws, kind, program, cwd, env, rows, cols, stdin, timeout_sec, idem, run?, sensitive?, auth_operation?}` → `SOpenRes{s, next, kind?}` |
 | `s.attach` | `SAttachReq{s, from, subscription?}` → `SOpenRes{s, next, kind?}` |
 | `s.input` | `SInputReq{s, iseq, d, eof}` → `{}` |
 | `s.resize` | `SResizeReq{s, rows, cols}` → `{}` |
@@ -1102,6 +1103,17 @@ Guarantees:
    either an exit or an explicit `gap`. Fencing a workspace for an authority
    reason — a quarantine, a lost claim — is the exception: there the cut is the
    point, and the reader learns the outcome from the event log instead.
+6. A provider auth open sets `sensitive: true` and carries
+   `auth_operation: AuthOperation{recipe, action}` where action is `login`,
+   `status` or `logout`. The node MUST accept only its exact built-in provider
+   command, with no caller-supplied `cwd` or `env`, under the `local` security
+   profile. It MUST stream to the opening client, refuse later `s.attach`,
+   disable spill and durable session-log publication, omit raw `program` from
+   `SessionInfo` and `s.opened`, and retain the completed in-memory session only
+   for a bounded interval (five minutes in the reference node). The opening
+   client MUST NOT issue `s.attach` for that session; if its connection is lost,
+   local delivery ends immediately rather than entering the ordinary reattach
+   retry loop. A sensitive session cannot also carry `run` or set `no_sub`.
 
 Retention is a bounded in-memory ring plus a spill file. The reference node uses
 2 MiB of memory and 128 MiB of spill per session, and evicts on both a byte cap
@@ -1132,14 +1144,27 @@ transaction with the child process, and it does not survive loss of that process
 the session as a harness launch (`remount run`). `recipe` is the recipe name
 (`^[a-z0-9][a-z0-9_-]{0,63}$`); `task_hash` is a short digest of the task text,
 never the text; `sandbox` is `read-only`, `workspace-write` or `full`; `auth`
-is `api_key` (the harness reads a brokered placeholder from its environment)
-or `workspace_resident` (the harness keeps its own login token in the
-workspace, outside the broker's view). The node validates `run` fail-closed
-(`bad_request`), copies it into `SessionInfo.run`, and emits `run.started`
+is `api_key` (the harness reads a brokered placeholder from its environment),
+`workspace_resident` (the harness keeps its own login token in the workspace,
+outside the broker's view), or `subscription` (a verified provider-native
+subscription login in a trusted-local workspace). The node validates `run`
+fail-closed (`bad_request`), copies it into `SessionInfo.run`, and emits
+`run.started`
 once when the session is created — an idempotent replay of the open emits
 nothing — and `run.finished` from the session's exit path, so a client that
-detached still gets both records. When `auth` is `workspace_resident` the node
-also emits `auth.workspace_resident`.
+detached still gets both records. `subscription` and `workspace_resident` are
+refused outside the local security profile. When `auth` is
+`workspace_resident` or `subscription` the node also emits
+`auth.workspace_resident`, recording that provider authorization state resides
+inside the trusted workspace.
+
+Claude and Codex recipes require the client to select `subscription` or
+`api_key`; omission is not a billing-mode default. Subscription launchers
+remove provider API-key and base-URL variables, run a provider-specific
+fail-closed status check with its output discarded, and then execute the
+harness. API-key mode requires a provider binding. The workspace label
+`remount.auth` records the mode for resume; a conflicting explicit override is
+refused.
 
 ### 8.2 Tiered durable session logs (`tiered-session-logs`)
 
@@ -1597,7 +1622,7 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `node.profile.v
 `node.profile.unschedulable`, `node.profile.restored`, `ws.created`,
 `ws.claiming`, `ws.claimed`, `ws.released`, `ws.moved`, `ws.paused`,
 `ws.resumed`, `ws.snapshot`, `ws.restored`, `ws.destroyed`,
-`ws.lease_expired`, `ws.acl`, `authz.revoked`, `s.opened`, `s.exited`,
+`ws.launch_recorded`, `ws.lease_expired`, `ws.acl`, `authz.revoked`, `s.opened`, `s.exited`,
 `fs.write`, `fs.edit`, `fs.remove`, `fs.apply_tar`,
 `cred.used`, `egress.allowed`, `egress.denied`, `egress.redacted`, `timer.set`, `timer.fired`,
 `peer.gone`, `ws.fenced`, `ws.state_changed`, `event.producer_gap`,
@@ -1605,7 +1630,8 @@ Canonical types: `node.enrolled`, `node.online`, `node.offline`, `node.profile.v
 `fleet.quarantine.completed`, `binding.created`, `binding.rotated`,
 `binding.revoked`, `principal.session.created`, `base.created`, `base.removed`, `volume.created`,
 `volume.published`, `volume.attached`, `volume.detached`, `volume.removed`, `run.started`,
-`run.finished`, `auth.workspace_resident`, `queue.created`,
+`run.finished`, `auth.workspace_resident`, `auth.operation.started`,
+`auth.operation.finished`, `queue.created`,
 `queue.advanced`, `pool.created`, `pool.removed`, `pool.scaled`,
 `pool.provision_failed`, `pool.retiring`, `pool.retire_aborted`, `pool.retired`, `repo.cloned`, `agent.created`, `agent.message`,
 `agent.run.started`, `agent.run.finished`, `agent.session`, `agent.turn`,
@@ -1674,8 +1700,14 @@ content, a permission request's detail or a provider key.
 
 `run.started` carries `s`, `recipe`, `task_hash`, `sandbox` and `auth`;
 `run.finished` carries `s`, `recipe`, `exit` and `signal`;
-`auth.workspace_resident` carries `s` and `recipe`. All three set `session`.
+`auth.workspace_resident` carries `s` and `recipe` for
+`workspace_resident` and `subscription` launches. All three set `session`.
 None carries the task text, the harness argv or a provider key.
+
+`auth.operation.started` carries `s`, `recipe` and `action`;
+`auth.operation.finished` adds `exit` and `signal`. Both set `session`. Neither
+carries provider output, the provider argv, an authorization URL, a device
+code, a callback, a token or a key.
 
 `queue.created` carries `queue`, `ws` and `items` (a count); `queue.advanced`
 carries `queue`, `index`, `exit`, `signal`, `status` and `cursor`. Both are on

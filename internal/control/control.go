@@ -33,6 +33,7 @@ import (
 	"remount.dev/remount/internal/budget"
 	"remount.dev/remount/internal/eventlog"
 	"remount.dev/remount/internal/ids"
+	"remount.dev/remount/internal/launch"
 	"remount.dev/remount/internal/metrics"
 	"remount.dev/remount/internal/proto"
 	"remount.dev/remount/internal/relay"
@@ -2442,6 +2443,15 @@ func (c *Control) dispatch(ctx context.Context, f *proto.Frame) (any, error) {
 			return nil, err
 		}
 		return c.wsWake(ctx, c.principalOf(f.From), req.ID, "", req.IdempotencyKey)
+	case proto.OpWSLaunchRecord:
+		req, err := decode[proto.WSLaunchRecordReq](f)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := c.authorizeWorkspace(ctx, f.From, req.ID, ActionWrite); err != nil {
+			return nil, err
+		}
+		return c.wsLaunchRecord(ctx, c.principalOf(f.From), req)
 	case proto.OpWSLease:
 		req, err := decode[proto.WSLeaseReq](f)
 		if err != nil {
@@ -4474,6 +4484,96 @@ func (c *Control) wsSleep(ctx context.Context, principal string, req *proto.WSSl
 	c.timers[t.ID] = t
 	c.mu.Unlock()
 	return &tcp, nil
+}
+
+var workspaceLaunchLabels = []string{
+	launch.LabelRecipe,
+	launch.LabelBindings,
+	launch.LabelAuth,
+	launch.LabelModel,
+	launch.LabelConversation,
+	launch.LabelConversationPath,
+}
+
+func validateWorkspaceLaunchLabels(labels map[string]string) error {
+	if labels[launch.LabelRecipe] == "" || len(labels[launch.LabelRecipe]) > 64 {
+		return proto.Err(proto.CodeBadRequest, "%s is required and at most 64 bytes", launch.LabelRecipe)
+	}
+	switch labels[launch.LabelAuth] {
+	case launch.AuthAPIKey, launch.AuthSubscription, launch.AuthWorkspaceResident:
+	default:
+		return proto.Err(proto.CodeBadRequest, "%s must be api_key, subscription or workspace_resident", launch.LabelAuth)
+	}
+	if len(labels) > len(workspaceLaunchLabels) {
+		return proto.Err(proto.CodeBadRequest, "workspace launch metadata has too many labels")
+	}
+	total := 0
+	for key, value := range labels {
+		if !contains(workspaceLaunchLabels, key) {
+			return proto.Err(proto.CodeBadRequest, "workspace launch label %q is unsupported", key)
+		}
+		if strings.ContainsRune(value, '\x00') || len(value) > 4096 {
+			return proto.Err(proto.CodeBadRequest, "workspace launch label %q is invalid", key)
+		}
+		total += len(key) + len(value)
+	}
+	if total > 8192 {
+		return proto.Err(proto.CodeBadRequest, "workspace launch metadata is too large")
+	}
+	return nil
+}
+
+// wsLaunchRecord replaces only Remount's resumable launch metadata. Other workspace
+// labels remain caller-owned, and the committed row is visible before a
+// harness process can start.
+func (c *Control) wsLaunchRecord(ctx context.Context, principal string, req *proto.WSLaunchRecordReq) (*proto.Workspace, error) {
+	if err := validateWorkspaceLaunchLabels(req.Labels); err != nil {
+		return nil, err
+	}
+	scope := principal + "|" + req.ID + "|workspace.launch-record"
+	unlockMutation := c.lockMutation(scope, req.IdempotencyKey)
+	defer unlockMutation()
+	var prior proto.Workspace
+	if hit, err := c.mutationLookup(scope, req.IdempotencyKey, proto.OpWSLaunchRecord, req, &prior); err != nil {
+		return nil, err
+	} else if hit {
+		return &prior, nil
+	}
+	c.mu.Lock()
+	ws := c.workspaces[req.ID]
+	if ws == nil {
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeNotFound, "workspace %s", req.ID)
+	}
+	if ws.State == proto.WSDestroyed || ws.State == proto.WSDestroying {
+		state := ws.State
+		c.mu.Unlock()
+		return nil, proto.Err(proto.CodeConflict, "workspace %s is %s", req.ID, state)
+	}
+	next := *ws
+	next.Spec.Labels = make(map[string]string, len(ws.Spec.Labels)+len(req.Labels))
+	for key, value := range ws.Spec.Labels {
+		next.Spec.Labels[key] = value
+	}
+	for _, key := range workspaceLaunchLabels {
+		delete(next.Spec.Labels, key)
+	}
+	for key, value := range req.Labels {
+		if value != "" {
+			next.Spec.Labels[key] = value
+		}
+	}
+	payload := map[string]any{"labels": req.Labels}
+	if err := c.persistWSAndMutation(&next, scope, req.IdempotencyKey, proto.OpWSLaunchRecord, req, &next,
+		c.wsEvent(&next, proto.EvWSLaunchRecorded, principal, "", payload)); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	*ws = next
+	result := next
+	result.Spec.Labels = cloneMap(next.Spec.Labels)
+	c.mu.Unlock()
+	return &result, nil
 }
 
 // wsACL replaces the ACL and advances the authorization revision so every
