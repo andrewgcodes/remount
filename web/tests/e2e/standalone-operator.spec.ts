@@ -13,6 +13,7 @@ const AUTH = { authorization: 'Bearer e15-standalone' };
 test.describe.configure({ mode: 'serial' });
 
 test('the fleet the browser renders is the real fleet, and creating a workspace is a real mutation', async ({ page }) => {
+  await page.emulateMedia({ colorScheme: 'light' });
   await signIn(page, 'e15-standalone');
   await expect(page.getByRole('heading', { name: 'Fleet' })).toBeVisible();
 
@@ -48,9 +49,9 @@ test('the terminal streams real PTY bytes over the real terminal WebSocket, and 
 
   const marker = `e15-real-pty-${Date.now()}`;
   await page.getByRole('tab', { name: 'terminal' }).click();
-  await page.getByLabel('Run command').fill(`printf ${marker}`);
+  await page.getByLabel('Run command').fill(`printf "%s\\n" "${marker} with spaces"`);
   await page.getByRole('button', { name: 'Run' }).click();
-  await expect(page.locator('.xterm')).toContainText(marker);
+  await expect(page.locator('.xterm')).toContainText(`${marker} with spaces`);
 
   // The socket really went to the server's terminal endpoint for this
   // workspace, and the bytes arrived as base64 chunk frames from the node.

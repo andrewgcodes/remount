@@ -84,9 +84,9 @@ old “not built” or “unavailable” statements are not a current feature in
 - The `microvm` runtime profile has no live pass on this branch. The
   Firecracker backend's dated 2026-09-04 x86_64 KVM evidence stands on its own
   terms; the profile lane is recorded as `unavailable`, which is not a pass.
-- The standalone doctor can return `ok: true` with a warning such as
-  `tenant.residency_unavailable`. Inspect findings and named checks; a zero
-  exit alone is not evidence that every policy was checked.
+- The standalone doctor reports unavailable checks such as
+  `tenant.residency_unavailable` as incomplete: exit 2, `ok: false`, and
+  `incomplete: true`. Exit 0 is reserved for a fully healthy result.
 - Public release, package and Homebrew-tap readiness and independent security
   review remain separate from local builds and tests. The authenticated GitHub
   release inventory was empty on 2026-09-05 and tagging is deferred by owner

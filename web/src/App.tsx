@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
 import type { APIClient } from './api';
 import { Badge, bytes, ConfirmButton, Empty, ErrorNotice, formatDate, Loading, PageHeader, StateBadge } from './components';
 import { usePolling } from './hooks';
+import { parseCommand } from './command';
 import { Terminal } from './Terminal';
 import type { Approval, EventRecord, RuntimeConfig, WorkspaceDetail } from './types';
 
@@ -96,9 +97,12 @@ function Workspace({ api, id, refreshMs }: { api: APIClient; id: string; refresh
   };
   const run = async (event: Event) => {
     event.preventDefault();
-    const argv = command.trim().split(/\s+/).filter(Boolean);
-    if (!argv.length) return;
-    try { const result = await api.exec(id, argv); setSession(result.session); setTab('terminal'); setCommand(''); state.reload(); }
+    setMutationError(undefined);
+    try {
+      const argv = parseCommand(command);
+      if (!argv.length) return;
+      const result = await api.exec(id, argv); setSession(result.session); setTab('terminal'); setCommand(''); state.reload();
+    }
     catch (error) { setMutationError(error as Error); }
   };
   if (state.loading && !detail) return <Loading />;

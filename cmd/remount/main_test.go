@@ -283,6 +283,48 @@ func TestDriveKillOnInterruptForwardsSIGINTThenDetaches(t *testing.T) {
 	}
 }
 
+func TestAttachUsesRawTerminalOnlyForPTYSession(t *testing.T) {
+	sessions := []proto.SessionStatus{
+		{Info: proto.SessionInfo{ID: "exec", Kind: proto.SessionExec}},
+		{Info: proto.SessionInfo{ID: "pty", Kind: proto.SessionPTY}},
+	}
+	if attachUsesRawTerminal(sessions, "exec") {
+		t.Fatal("exec attach enabled raw terminal mode")
+	}
+	if !attachUsesRawTerminal(sessions, "pty") {
+		t.Fatal("PTY attach did not enable raw terminal mode")
+	}
+	if attachUsesRawTerminal(sessions, "missing") {
+		t.Fatal("unknown session enabled raw terminal mode")
+	}
+}
+
+func TestDoctorUnavailableIsIncompleteNotHealthy(t *testing.T) {
+	rep := doctorReport{OK: true}
+	rep.add(proto.Finding{
+		Severity: "warn",
+		Check:    "tenant.residency_unavailable",
+		Detail:   "residency policy could not be checked",
+	})
+	output := captureStdout(t, func() {
+		err := finish(rep, false)
+		var code exitError
+		if !errors.As(err, &code) || code != 2 {
+			t.Fatalf("exit=%v", err)
+		}
+	})
+	if strings.Contains(output, "\nhealthy\n") || !strings.Contains(output, "INCOMPLETE") {
+		t.Fatalf("output=%q", output)
+	}
+
+	jsonOutput := captureStdout(t, func() {
+		_ = finish(rep, true)
+	})
+	if !strings.Contains(jsonOutput, `"ok": false`) || !strings.Contains(jsonOutput, `"incomplete": true`) {
+		t.Fatalf("json=%s", jsonOutput)
+	}
+}
+
 func TestExecTimeoutIsNotClamped(t *testing.T) {
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	timeout := fs.Duration("timeout", 0, "")
