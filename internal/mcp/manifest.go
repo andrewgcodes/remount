@@ -79,15 +79,16 @@ var composites = []Operation{
 var protocolOperations = []string{
 	"agent.approval.decided", "agent.cancel", "agent.create", "agent.deliver", "agent.destroy", "agent.fork", "agent.get", "agent.list", "agent.message", "agent.report", "agent.run", "agent.run.cancel", "agent.sleep", "agent.transcript", "agent.wake",
 	"approval.decide", "approval.get", "approval.list", "artifact.proof", "audit.export", "audit.key", "base.create", "base.list", "base.remove", "binding.lease",
+	"binding.create", "binding.get", "binding.list", "binding.revoke", "binding.rotate",
 	"budget.create", "budget.list", "budget.remove", "budget.reserve", "budget.settle",
 	"computer.close", "computer.create", "computer.downloads", "computer.eval", "computer.get", "computer.input", "computer.navigate", "computer.screenshot",
 	"controller.state", "diag", "egress.approval",
 	"events.post", "events.stop", "events.tail", "fleet.get", "fleet.list", "fleet.quarantine",
 	"fs.apply_tar", "fs.edit", "fs.list", "fs.mkdir", "fs.read", "fs.remove", "fs.rename", "fs.search", "fs.stat", "fs.write", "grant",
-	"node.diag", "node.list", "node.status", "pool.create", "pool.get", "pool.list", "pool.remove", "port.open", "principal.create", "principal.invite", "principal.list", "principal.revoke", "principal.token.issue",
+	"node.diag", "node.list", "node.profile.get", "node.status", "pool.create", "pool.get", "pool.list", "pool.remove", "port.open", "principal.create", "principal.invite", "principal.list", "principal.revoke", "principal.session.create", "principal.token.issue",
 	"queue.advance", "queue.create", "queue.get", "queue.list", "s.ack", "s.attach", "s.close", "s.input", "s.list", "s.open", "s.resize", "s.signal", "s.wait",
 	"session.cap.check", "session.cap.issue", "session.cap.renew", "session.log.commit", "session.log.delete", "session.log.get", "tenant.create", "tenant.get", "tenant.list", "tenant.state", "tenant.update", "tenant.usage",
-	"timer.list", "usage.get", "volume.archive", "volume.attach", "volume.create", "volume.detach", "volume.get", "volume.list", "volume.publish", "volume.publish.commit", "volume.remove", "ws.acl", "ws.claim", "ws.create", "ws.destroy", "ws.get", "ws.info", "ws.list", "ws.move", "ws.quarantine", "ws.quarantine.commit", "ws.ready", "ws.release", "ws.release.abort", "ws.release.abort.commit", "ws.release.commit", "ws.released", "ws.renew", "ws.sleep", "ws.snapshot", "ws.snapshot.commit", "ws.wake",
+	"timer.list", "usage.get", "volume.archive", "volume.attach", "volume.create", "volume.detach", "volume.get", "volume.list", "volume.publish", "volume.publish.commit", "volume.remove", "ws.acl", "ws.claim", "ws.create", "ws.destroy", "ws.get", "ws.idle.mark", "ws.idle.policy", "ws.info", "ws.lease", "ws.lease.cancel", "ws.lease.get", "ws.lease.renew", "ws.list", "ws.move", "ws.quarantine", "ws.quarantine.commit", "ws.ready", "ws.release", "ws.release.abort", "ws.release.abort.commit", "ws.release.commit", "ws.released", "ws.renew", "ws.sleep", "ws.snapshot", "ws.snapshot.commit", "ws.wake",
 }
 
 // protocolToolName is the tool name advertised for a protocol operation.
