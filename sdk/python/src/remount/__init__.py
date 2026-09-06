@@ -3,6 +3,7 @@
 from . import errors
 from .agent import AgentClient, ApprovalDecisionInput, Terminal
 from .client import Chunk, Client, ConnectionClosed, Session
+from .computer import Computer
 from .errors import ProtocolError
 
 __all__ = [
@@ -10,6 +11,7 @@ __all__ = [
     "ApprovalDecisionInput",
     "Chunk",
     "Client",
+    "Computer",
     "ConnectionClosed",
     "ProtocolError",
     "Session",

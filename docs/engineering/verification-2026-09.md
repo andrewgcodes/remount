@@ -2678,3 +2678,140 @@ rather than tidying up on the way out. `remount ws ls` afterwards was empty.
 The standalone process was stopped and the scratch data directory removed.
 Nothing was created outside the session scratchpad and no cloud or provider
 resource was involved.
+
+## Browser computer-session conformance — 2026-09-05
+
+**Status: verified on a Linux docker host (a Colima VM on this machine);
+unavailable on the macOS Docker Desktop host itself, and the lane says so
+rather than failing.**
+
+Candidate: `claude/gap-brief-2026-09-06` at `a8da2ee` plus the change this
+entry lands with. Go 1.27.1. macOS 26.3 arm64; Docker Desktop 29.4.1;
+Colima 6.8.0-117 Ubuntu aarch64 with its own docker daemon.
+
+### Image
+
+```sh
+docker build -t remount-browser:local images/browser
+```
+
+`remount-browser:local` is
+`sha256:cc31ada10723450af1b53d89496118e3c5854661634c46711fa1d3165b85534f`,
+1.13 GB, `linux/arm64`, carrying Chromium 152.0.7977.82. `linux/amd64` was not
+built here. `remount-browser-health` returned `Chrome/152.0.7977.82` against a
+browser started by hand in the image.
+
+### Commands
+
+On the macOS host, where the daemon runs in a VM the host does not route to:
+
+```sh
+./scripts/browser-conformance.sh build
+./scripts/browser-conformance.sh run
+```
+
+reported `SKIP ... unavailable: this host does not route to container addresses
+(172.17.0.2: dial tcp 172.17.0.2:9345: i/o timeout)`. A computer session
+reaches the browser at the container's own address, so that is a genuine
+absence of a prerequisite, not a browser defect, and the gate never renders it
+as a pass.
+
+The same lane, cross-compiled and run inside the Colima Linux VM against that
+VM's docker daemon:
+
+```sh
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -o browser.test ./integration/browser/
+colima ssh -- <worktree>/browser.test \
+  -test.run '^TestB34BrowserComputerConformance$' -test.v -test.timeout=20m
+```
+
+`--- PASS: TestB34BrowserComputerConformance (3.23s)`.
+
+### Per-step result
+
+| Step | Result |
+|---|---|
+| `computer.create`, default launch | verified: `Chrome/152.0.7977.82`, viewport 1280x720, `computer.created` names the computer |
+| `computer.navigate` to `file:///work/page.html` | verified: status `loaded`, title `Remount browser conformance` |
+| click changes the DOM | verified: `#banner` became `clicked 1` and `window.__clicks` became 1 |
+| screenshot changes with the DOM | verified: 7,655-byte PNG before, 8,093-byte PNG after, digests differ |
+| typing into an ordinary input | verified: exact text |
+| typing into a contenteditable | verified: exact text |
+| typing into an iframe field | verified: exact text, reported out of the frame by `postMessage` |
+| download becomes an artifact | verified: `remount-conformance.txt` published as `art_sha256:e4adcffc…`, 37 bytes, `computer.download` names the same id, and the archive's bytes were compared to the page's blob |
+| navigation to an unbound host | verified with a caveat, below |
+| killing the browser | verified: `computer.get` returned `closed`/`browser_crashed`, a later `computer.screenshot` failed with the same code and reason, and both `computer.degraded` and `computer.closed` were emitted |
+| sleep/wake | verified: `computer.get` returned `not_found`, `.remount/browser/default` was absent, and `page.html` survived |
+
+### The egress caveat, stated exactly
+
+Navigating to `https://example.com/` failed with `denied`/`navigation_denied`
+and the broker recorded an `egress.denied` event naming `example.com:443`, so
+the browser's traffic did travel through the workspace's broker. The recorded
+decision was **`unauthenticated`**, reason `workspace broker capability missing
+or invalid` — not a host-policy denial. Chromium honors `http_proxy`/
+`https_proxy` but does not send the workspace capability as
+`Proxy-Authorization`, which was confirmed directly: a Chromium in this image
+pointed at a logging listener with credentials in the proxy URL sent
+`CONNECT host:443` with no `Proxy-Authorization` header. The consequence is
+that a browser is contained but cannot reach a host the broker *allows*
+either. Closing that needs the node to answer the browser's proxy auth
+challenge over CDP (`Fetch.authRequired` + `Fetch.continueWithAuth`); it is not
+done here and no claim of usable brokered browsing is made.
+
+### The CLI, driven live
+
+A `remount` binary cross-compiled for `linux/arm64` was run inside the same VM
+as `remount standalone --backend docker`, and the `remount computer`
+subcommands were driven against a real browser in the reference image. `create`
+(with `--viewport 800x600`), `get`, `navigate` to a `file://` page,
+`screenshot --out` (an 800x600, 3,372-byte file whose first bytes are the PNG
+magic), `click` (the page's title became `clicked`), `type`, `key`, `scroll`,
+`eval --json` (which read back `typed from the cli`), `downloads`, `close`
+twice with the same `--idem` (both succeeded), and `get` afterwards
+(`not_found`) all behaved. The node's own filesystem probe pulls its default
+image, which is not published, so `remount-browser:local` was tagged as that
+name inside the VM for this smoke; the workspace itself was created with
+`--image remount-browser:local`.
+
+### Three defects this lane found, and their fixes
+
+- **Chromium ignores `--remote-debugging-address`.** Verified from
+  `/proc/net/tcp` inside the container: with `--remote-debugging-address=0.0.0.0`
+  under both `--headless=new` and old headless, the DevTools listener stayed on
+  `127.0.0.1`. The node dials a workspace port at the address the backend
+  resolves — the container IP for docker, the sandbox IP for gVisor — so
+  `computer.create` timed out with `display_unavailable` on every container
+  backend. `node.DefaultBrowserProgram` now starts a `socat` forwarder
+  alongside the browser whenever the node will dial a non-loopback address,
+  keeping the browser as the foreground process so its exit is still the
+  session's exit, and the reference image ships `socat`.
+- **A browser's `$HOME` broke `ws.sleep`.** Chromium writes `$HOME/.config`
+  regardless of `--user-data-dir`; with `HOME=/work` those files landed in the
+  workspace payload as root and the checkpoint failed with
+  `openat .config: permission denied`. The browser session's `HOME` now
+  defaults to its own profile directory under the snapshot-excluded
+  `.remount` tree. An explicit `HOME` in the request still wins.
+- **Every CLI action after the first was silently dropped.** Each
+  `remount computer …` invocation builds a fresh handle whose input sequence
+  starts at one, which is a sequence the node had already applied, so the click
+  landed and the `type` and `key` that followed were deduplicated away with no
+  error anywhere. `ComputerGetRes` now carries `last_iseq` and a handle
+  addressed by id adopts it before its first action, in Go, Python and
+  TypeScript. Node-level dedup is unchanged and still proved directly. The
+  refinement is [ADR 0094](../adr/0094-a-resumed-computer-handle-reads-the-input-sequence.md).
+
+### Cleanup
+
+The workspace was destroyed by the test's own cleanup, which then asserted that
+`docker ps -aq --filter label=remount.workspace=<id>` was empty. A separate
+`docker ps -aq --filter label=remount.workspace` inside the VM after the run
+returned nothing. No credential was used, printed or recorded; the lane needs
+none.
+
+### What this does not prove
+
+One host, one architecture, one Chromium build, and the docker backend only.
+gVisor and firecracker computer sessions are untested here. Docker remains
+cooperative isolation. `linux/amd64`, a published browser image, and any CI
+lane for this gate are absent.

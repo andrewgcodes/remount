@@ -2490,4 +2490,9 @@ type ComputerGetRes struct {
 	Reason   string           `cbor:"reason,omitempty" json:"reason,omitempty"`
 	Viewport ComputerViewport `cbor:"viewport,omitempty" json:"viewport,omitempty"`
 	Session  string           `cbor:"s,omitempty" json:"s,omitempty"`
+	// LastInputSeq is the highest input sequence the node has applied. A
+	// caller that did not create this computer needs it before its first
+	// action: a fresh handle counting from one would send a sequence the node
+	// has already applied, and the batch would be dropped as a duplicate.
+	LastInputSeq uint64 `cbor:"last_iseq,omitempty" json:"last_iseq,omitempty"`
 }

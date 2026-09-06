@@ -232,6 +232,17 @@ the place to argue with that.
 
 ## Browser and virtual desktop workloads
 
+For a browser, reach for the built-in computer session first: `remount
+computer` and the SDK `Computer` handles drive screenshots, input, navigation
+and downloads as protocol operations, against the reference image in
+[`images/browser`](../images/browser/Dockerfile). The user-facing walkthrough,
+including the coordinate system, the typed failures, the per-host egress
+ceiling and the profile-persistence limit, is in
+[using-remount.md](using-remount.md#run-browser-and-virtual-desktop-workloads);
+the design is [ADR 0088](adr/0088-computer-sessions-over-port-substrate.md).
+The recipe below is what you compose when you need a whole desktop - X11, a
+window manager, a VNC client - rather than a browser.
+
 Remount supervises filesystem and process sessions; it does not implement a
 display server or VNC protocol. A node can nevertheless host a desktop stack,
 and the session log remains available when the initiating client disconnects.

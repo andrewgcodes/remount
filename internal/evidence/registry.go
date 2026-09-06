@@ -59,6 +59,7 @@ const (
 	sourcePlanB   = "docs/engineering/plan-b-repository-executable-2026-09-03.md"
 	sourceLinux   = "docs/engineering/verification-2026-09.md (Linux host verification 2026-09-04)"
 	sourceProfile = "docs/engineering/verification-2026-09.md (runtime-profile conformance 2026-09-05)"
+	sourceBrowser = "docs/engineering/verification-2026-09.md (browser computer-session conformance 2026-09-05)"
 )
 
 // notLanded is the only honest thing to say about a Plan B row whose ticket
@@ -505,6 +506,15 @@ var scenarios = []Scenario{
 			"REMOUNT_GVISOR_ROOTFS pointing at an unpacked rootfs, because it constructs a real gvisor backend, removes a host " +
 			"prerequisite out of band and waits for node.profile.unschedulable. The scripted-backend half of the same loop " +
 			"(internal/sim.TestProfileDriftMakesNodeUnschedulable) does run here and passes; it proves the control loop, not the host mechanism.",
+	},
+	{
+		ID: "B34", Title: "a real browser answers every computer operation on a real backend",
+		Layer: LayerHostCI, Required: true, Source: sourceBrowser,
+		Owner:    "integration/browser.TestB34BrowserComputerConformance, scripts/browser-conformance.sh",
+		Env:      []string{"REMOUNT_BROWSER_IMAGE", "REMOUNT_BROWSER_BROKER_HOST"},
+		Argv:     []string{"./scripts/browser-conformance.sh"},
+		Recorded: StatusPassed,
+		Note:     "Chromium 152 in the reference image passed create, navigate, click, typing into an input, a contenteditable and an iframe, a screenshot that changed with the DOM, a download published and byte-verified as an artifact, a refused navigation to an unbound host with its broker egress event, a killed browser reported as closed/browser_crashed, and a sleep/wake that left no computer and no profile. The refusal was recorded as unauthenticated rather than by host policy: Chromium does not present the workspace capability as proxy authentication, so the broker refuses every destination for a browser, allowed or not",
 	},
 }
 

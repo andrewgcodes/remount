@@ -1,0 +1,28 @@
+#!/bin/sh
+# remount-browser-health: report whether a DevTools endpoint is listening.
+#
+# Usage: remount-browser-health [port]
+#
+# The default port is 9222, which is the port a computer session uses when
+# computer.create names none. It prints the browser identification string and
+# exits 0 on success. A port that does not answer, or answers without a
+# Browser field, is a failure and never a silent pass: the point of the probe
+# is that an unreachable browser is visible before anything is built on it.
+set -eu
+
+port="${1:-${REMOUNT_BROWSER_PORT:-9222}}"
+url="http://127.0.0.1:${port}/json/version"
+
+if ! body=$(curl -fsS --max-time 5 "$url" 2>&1); then
+  echo "remount-browser-health: no DevTools endpoint on 127.0.0.1:${port}: ${body}" >&2
+  exit 1
+fi
+
+# Keep the parse dependency-free: the image ships curl, not jq.
+browser=$(printf '%s' "$body" | tr ',' '\n' |
+  sed -n 's/.*"Browser"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+if [ -z "$browser" ]; then
+  echo "remount-browser-health: ${url} answered without a Browser field" >&2
+  exit 1
+fi
+echo "$browser"
