@@ -11,6 +11,8 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/an
 
 ## README
 
+- [Introduction](https://github.com/andrewgcodes/remount/blob/main/README.md#introduction): An agent runtime is the machine an agent works on, plus whatever keeps that work alive when you are not looking.
+- [What it's for](https://github.com/andrewgcodes/remount/blob/main/README.md#what-its-for): on a refactor and need to leave.
 - [Quick start](https://github.com/andrewgcodes/remount/blob/main/README.md#quick-start): Everything below runs on your laptop with no account, token or API key.
 - [Harnesses](https://github.com/andrewgcodes/remount/blob/main/README.md#harnesses): A recipe is a small YAML file embedded in the binary; adding a harness is a YAML pull request, not Go.
 - [Why Remount](https://github.com/andrewgcodes/remount/blob/main/README.md#why-remount): Sandbox APIs give you a container in someone else's cloud for the length of a request.
@@ -19,7 +21,7 @@ command. The normative wire protocol is [spec/PROTOCOL.md](https://github.com/an
 - [Deploying it](https://github.com/andrewgcodes/remount/blob/main/README.md#deploying-it): `remount standalone` is for one machine.
 - [Documentation](https://github.com/andrewgcodes/remount/blob/main/README.md#documentation)
 - [Repository layout](https://github.com/andrewgcodes/remount/blob/main/README.md#repository-layout)
-- [Status and limits](https://github.com/andrewgcodes/remount/blob/main/README.md#status-and-limits): Everything in this README is implemented and tested, including under the race detector and in a one-process simulator with fault injection.
+- [Status](https://github.com/andrewgcodes/remount/blob/main/README.md#status): Everything in this README is implemented and tested, including under the race detector and in a one-process simulator with fault injection.
 - [Contributing and security](https://github.com/andrewgcodes/remount/blob/main/README.md#contributing-and-security): Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) before a change; `make verify` runs every CI gate locally.
 - [License](https://github.com/andrewgcodes/remount/blob/main/README.md#license): Apache-2.0.
 
