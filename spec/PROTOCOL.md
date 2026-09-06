@@ -107,7 +107,7 @@ HelloOK { peer, caps, server, now: int64, pubkey: bytes, lease_sec: int64,
           subject: string, tenant: string, node_token: string }
 
 NodeInfo { backends, backend_descriptors, connectors, os, arch, cpu, mem_mib,
-           caps, snapshots, version }
+           caps, snapshots, version, profile, runtime_checks }
 ```
 
 A peer MUST offer `caps:["v1"]`; the server returns the actual ordered
@@ -120,6 +120,19 @@ record. A client MAY present a previously assigned `c_` id to keep it across
 reconnects, or leave it empty to be assigned one. Client-selected `principal`,
 workspace principal, labels, and capabilities are never authorization input;
 the control plane derives subject and tenant from the presented credential.
+
+`NodeInfo.profile` is the runtime profile the node was configured with
+(`dev`, `trusted-single-tenant`, `multi-tenant-isolated`, `microvm`) and
+`NodeInfo.runtime_checks` is a list of `Finding{severity, check, subject,
+detail, hint, status}` describing host prerequisites only the node can
+observe. Like `caps`, neither is security evidence. A control plane decides
+which runtime profiles a node satisfies from `backend_descriptors`, and reads
+`runtime_checks` only to **downgrade** that decision: a failing or
+`unavailable` check makes the node unschedulable for the profiles that depend
+on it, and a `pass` never satisfies a descriptor predicate on its own. A
+`status` is `pass`, `fail` or `unavailable`; an absent status is treated as
+`unavailable`, never as a pass. A node re-probes its own prerequisites
+periodically and reports drift on `ws.renew`.
 
 `HelloOK.pubkey` is the control plane's grant-signing key. Nodes verify grants
 with it. `lease_sec` tells a node how often it must renew claims. A node MUST
@@ -341,6 +354,18 @@ the network policy before reporting `ws.ready`; advertising
 `enforced_gateway` without implementing the network-controller contract is an
 error, not evidence of enforcement.
 
+`WorkspaceSpec.requires.profile` is a separate, node-level constraint: the
+named **runtime profile** (`dev`, `trusted-single-tenant`,
+`multi-tenant-isolated`, `microvm`) a node must currently satisfy before it may
+claim this workspace. It is not matched against a label or a node's own claim;
+the control plane evaluates the node's `backend_descriptors` and, only to
+downgrade, its `runtime_checks` (§3). A workspace whose profile no online node
+satisfies stays `pending`, and `ws.get`/`ws.create` return
+`Workspace.pending_reason: "profile_unschedulable"` while that is why. A node
+that has drifted refuses the materialization with `denied` and
+`reason: "profile_unschedulable"` rather than serving the workspace with the
+boundary missing.
+
 `redact` is a bounded list of RE2 expressions applied to an HTTP response
 before any response byte enters the workspace. It is unavailable for CONNECT
 and managed connectors. A redacted response is buffered up to 16 MiB (or the
@@ -504,6 +529,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `principal.invite` | C | `PrincipalInviteReq{tenant, principal, ttl_ms, idem}` → `PrincipalTokenIssueRes`; creates a tenant-bound operator and returns its initial short-lived access bearer |
 | `grant` | C | `GrantReq{ws}` → `Grant` |
 | `node.list` | C | → `NodeListRes{nodes}` |
+| `node.profile.get` | C | `NodeProfileGetReq{node?, profile?}` → `NodeProfileGetRes{profile, nodes}`; admin only. Empty `node` reports every node, empty `profile` evaluates each node against the profile it claims. Each `NodeProfileReport{node, profile, status, checks, evaluated_at, configured, online}` carries one `Finding` per named check with `status` `pass`/`fail`/`unavailable`; the report's `status` is `pass` only when every check passed, and an offline node is `unavailable`, never `pass` |
 | `timer.list` | C | → `TimerListRes{timers}` |
 | `fleet.quarantine` | C | `FleetQuarantineReq{selector, action, deadline?\|timeout_ms?, idem}` → `FleetOperation` |
 | `fleet.get` | C | `FleetGetReq{id}` → `FleetOperation` |
@@ -513,7 +539,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `events.post` | C N | `EventPost{events}` → `{}` |
 | `ws.claim` | N | `WSClaimReq{id}` → `WSClaimRes{workspace, lease_sec}` |
 | `ws.ready` | N | `WSReadyReq{id, gen, restore_processes?}` → `{}` |
-| `ws.renew` | N | `WSRenewReq{ids, gen, authz, controller_epoch}` → `WSRenewRes{results, controller_epoch}`; each result repeats the epoch and explicitly says continue/fence/destroy/reconcile and, for a continued lease, carries `authz_revision`, `revoked`, `authz_reset` (§3.2, §4.1) |
+| `ws.renew` | N | `WSRenewReq{ids, gen, authz, controller_epoch, profile?, runtime_checks?, report_checks?}` → `WSRenewRes{results, controller_epoch}`; each result repeats the epoch and explicitly says continue/fence/destroy/reconcile and, for a continued lease, carries `authz_revision`, `revoked`, `authz_reset` (§3.2, §4.1). When `report_checks` is set the request also carries this node's runtime-profile health; `ids` may then be empty, because an idle node still reports drift |
 | `ws.released` | N | `WSReleasedReq{id, gen, snapshot, reason, failed?}` → `{}`; `failed:true` means materialization could not complete and control holds the workspace out of placement with a growing delay (1s doubling to 30s, reset by the next `ws.ready`) instead of re-offering it at once |
 | `ws.snapshot.commit` | N | `WSSnapshotCommitReq{id, gen, snapshot}` → `{}` |
 | `artifact.proof` | N | `ArtifactProofReq{ws, gen, method, artifact}` → `ArtifactProofRes{proof}`; issues a one-use, short-lived control signature only to the live assignment holder |
@@ -1309,7 +1335,8 @@ clock and is not authoritative. Nodes post an ordered outbox with a monotonic
 derived from control-plane ownership; sender-supplied principal metadata is
 discarded. A reader that cares about causality should use `cause` rather than
 infer it from timestamps.
-Canonical types: `node.enrolled`, `node.online`, `node.offline`, `ws.created`,
+Canonical types: `node.enrolled`, `node.online`, `node.offline`, `node.profile.verified`,
+`node.profile.unschedulable`, `node.profile.restored`, `ws.created`,
 `ws.claiming`, `ws.claimed`, `ws.released`, `ws.moved`, `ws.paused`,
 `ws.resumed`, `ws.snapshot`, `ws.restored`, `ws.destroyed`,
 `ws.lease_expired`, `ws.acl`, `authz.revoked`, `s.opened`, `s.exited`,
