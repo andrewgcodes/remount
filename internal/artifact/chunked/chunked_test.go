@@ -488,3 +488,57 @@ func (s *lyingStore) Open(id string) (io.ReadCloser, int64, error) {
 	}
 	return s.BlobStore.Open(id)
 }
+
+// A Docker workspace sees its tree at /work, so a tool inside it writes
+// absolute links under /work: Claude Code's .claude/debug/latest is one. The
+// node knows the tree by its host path, and measured against that the link
+// looks external. Found live on 2026-09-07, when it refused every sleep and
+// snapshot of a workspace Claude Code had run in.
+func TestSnapshotRewritesAbsoluteSymlinkUnderTheMountPath(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	target := filepath.Join(root, ".claude", "debug", "session.txt")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("debug"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, ".claude", "debug", "latest")
+	if err := os.Symlink("/work/.claude/debug/session.txt", link); err != nil {
+		t.Fatal(err)
+	}
+	store := newBlobStore(t)
+	if _, err := Snapshot(ctx, store, root, SnapshotOptions{}); err == nil {
+		t.Fatal("without the mount path the link is indistinguishable from an external one and must be refused")
+	}
+	result, err := Snapshot(ctx, store, root, SnapshotOptions{MountPath: "/work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := filepath.Join(t.TempDir(), "restored")
+	if err := os.Mkdir(restored, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Restore(ctx, store, result.ManifestID, restored, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	restoredLink := filepath.Join(restored, ".claude", "debug", "latest")
+	got, err := os.Readlink(restoredLink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "session.txt" {
+		t.Fatalf("restored link = %q, want the portable relative target", got)
+	}
+	if body, err := os.ReadFile(restoredLink); err != nil || string(body) != "debug" {
+		t.Fatalf("restored link body = %q, %v", body, err)
+	}
+	// A link under a different absolute prefix is still external.
+	if err := os.Symlink("/etc/passwd", filepath.Join(root, ".claude", "escape")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Snapshot(ctx, store, root, SnapshotOptions{MountPath: "/work"}); err == nil {
+		t.Fatal("mount path alias must not admit a link outside the tree")
+	}
+}

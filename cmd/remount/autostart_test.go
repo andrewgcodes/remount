@@ -133,3 +133,15 @@ func TestEnsureLocalServerReusesARunningServer(t *testing.T) {
 		t.Fatalf("bindings for a dead pid: %+v", got)
 	}
 }
+
+func TestAutostartAllowsTheHostsASubscriptionLaunchReaches(t *testing.T) {
+	seen := map[string]bool{}
+	for _, h := range recipeHosts() {
+		seen[h] = true
+	}
+	for _, want := range []string{"api.anthropic.com", "chatgpt.com", "auth.openai.com"} {
+		if !seen[want] {
+			t.Fatalf("recipeHosts() lacks %s; a subscription launch under the autostarted standalone would be refused at egress", want)
+		}
+	}
+}

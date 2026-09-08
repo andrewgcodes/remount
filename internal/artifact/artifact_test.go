@@ -3,6 +3,7 @@ package artifact
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -811,5 +812,71 @@ func TestACachedPutIsTheSameObjectAsADurableOne(t *testing.T) {
 	}
 	if err := cached.Verify(gotID); err != nil {
 		t.Fatalf("a cached object failed its own digest verification: %v", err)
+	}
+}
+
+func TestSymlinkSourceRootPrefersTheMountPathForLinksUnderIt(t *testing.T) {
+	cases := []struct{ target, root, mount, want string }{
+		{"/work/.claude/debug/x.txt", "/data/ws/root", "/work", "/work"},
+		{"/work", "/data/ws/root", "/work", "/work"},
+		{"/workspace/x", "/data/ws/root", "/work", "/data/ws/root"},
+		{"/data/ws/root/x", "/data/ws/root", "/work", "/data/ws/root"},
+		{"/etc/passwd", "/data/ws/root", "", "/data/ws/root"},
+		{"../x", "/data/ws/root", "/work", "/data/ws/root"},
+	}
+	for _, c := range cases {
+		if got := SymlinkSourceRoot(c.target, c.root, c.mount); got != c.want {
+			t.Errorf("SymlinkSourceRoot(%q, %q, %q) = %q, want %q", c.target, c.root, c.mount, got, c.want)
+		}
+	}
+}
+
+func TestSnapshotMountedRewritesAbsoluteSymlinkUnderTheMountPath(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".claude", "debug"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".claude", "debug", "s.txt"), []byte("debug"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/work/.claude/debug/s.txt", filepath.Join(root, ".claude", "debug", "latest")); err != nil {
+		t.Fatal(err)
+	}
+	var sink bytes.Buffer
+	if err := Snapshot(root, nil, &sink); err == nil {
+		t.Fatal("without the mount path the link must be refused as external")
+	}
+	var buf bytes.Buffer
+	if err := SnapshotMounted(root, "/work", nil, &buf); err != nil {
+		t.Fatal(err)
+	}
+	gz, err := gzip.NewReader(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(gz)
+	for {
+		h, err := tr.Next()
+		if err != nil {
+			t.Fatalf("symlink entry not found in archive: %v", err)
+		}
+		if h.Name == ".claude/debug/latest" {
+			if h.Typeflag != tar.TypeSymlink || h.Linkname != "s.txt" {
+				t.Fatalf("archived link = %q (type %v), want relative s.txt", h.Linkname, h.Typeflag)
+			}
+			break
+		}
+	}
+}
+
+// Windows hands back a rooted container path in its own separators; the
+// link is still internal to the mount and must come out relative.
+func TestPortableSymlinkTargetAcceptsAnOSNormalizedRootedLink(t *testing.T) {
+	got, err := PortableSymlinkTarget(".claude/debug/latest", filepath.FromSlash("/work/.claude/debug/s.txt"), "/work", "")
+	if err != nil || got != "s.txt" {
+		t.Fatalf("portable target = %q, %v; want s.txt", got, err)
+	}
+	if _, err := PortableSymlinkTarget(".claude/escape", filepath.FromSlash("/etc/passwd"), "/work", ""); err == nil {
+		t.Fatal("a rooted link outside the mount must still be refused")
 	}
 }

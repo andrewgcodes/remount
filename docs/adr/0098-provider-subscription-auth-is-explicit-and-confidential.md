@@ -78,3 +78,15 @@ account state is authoritative beyond that boundary.
   code change and review.
 - Tmux, if added later, may improve same-host process reattachment but does not
   become auth, lifecycle, replay or migration authority.
+- A subscription launch reaches the provider directly, so the recipe declares
+  those hosts under `subscription.hosts`; the autostarted standalone allows
+  them and an explicitly started node must `--allow` them. Found live on
+  2026-09-07, when every CONNECT to `api.anthropic.com` was refused. The same
+  run showed Claude Code 2.1.263 reporting `authMethod` as `claude.ai`, which
+  the verifier now accepts.
+- A Claude subscription launch drops `HTTP(S)_PROXY` (`subscription.bypass_proxy`
+  in the recipe): Bun's fetch hangs on the API's chunked keep-alive responses
+  through an HTTPS CONNECT proxy (oven-sh/bun#30381), and only an API-key
+  launch has the broker's plain-HTTP `/d/` path to use instead. The proxy is
+  cooperative under `local`, so enforcement does not change, but that
+  harness's provider traffic is not in the broker's audit.

@@ -845,7 +845,7 @@ func (h *dockerHandle) Snapshot(ctx context.Context, excludes []string, w io.Wri
 	if err := h.reown(ctx); err != nil {
 		return err
 	}
-	return artifact.Snapshot(h.root, excludes, w)
+	return artifact.SnapshotMounted(h.root, h.mount, excludes, w)
 }
 
 func (h *dockerHandle) Checkpoint(ctx context.Context, excludes []string, w io.Writer) (err error) {
@@ -865,7 +865,7 @@ func (h *dockerHandle) Checkpoint(ctx context.Context, excludes []string, w io.W
 			err = errors.Join(err, resumeErr)
 		}
 	}()
-	return artifact.Snapshot(h.root, excludes, w)
+	return artifact.SnapshotMounted(h.root, h.mount, excludes, w)
 }
 
 func (h *dockerHandle) Destroy(ctx context.Context) error {

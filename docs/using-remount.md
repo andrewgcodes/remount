@@ -135,6 +135,20 @@ WS=$(./remount ws create --name claude-subscription --security local)
   'Continue the implementation and run the focused tests.'
 ```
 
+A subscription launch has no broker in its path: the harness carries its own
+login and talks to the provider directly, so the node must allow that host
+without a credential. Claude needs `api.anthropic.com`; Codex needs
+`chatgpt.com` and `auth.openai.com`. The standalone that `remount run` starts
+for you allows them; an explicitly started server or node takes them through
+`--allow`, and a launch refused for this reason shows as `egress.denied` for
+that host in `remount events`. A Claude subscription launch additionally drops
+the `HTTP(S)_PROXY` variables: Claude Code's runtime hangs when it reaches the
+Anthropic API through an HTTPS CONNECT proxy
+([oven-sh/bun#30381](https://github.com/oven-sh/bun/issues/30381)), and unlike
+an API-key launch it has no brokered `/d/` path to use instead. Under the
+`local` profile the proxy is cooperative anyway; the consequence is that this
+harness's provider traffic does not appear in the broker's audit events.
+
 Codex uses the same flow with `codex`. Remount invokes
 `claude auth login --claudeai` or `codex login --device-auth`; the provider
 owns the browser/device authorization, token format, refresh, and logout.

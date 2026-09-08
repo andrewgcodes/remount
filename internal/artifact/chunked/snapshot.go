@@ -18,9 +18,13 @@ import (
 
 // SnapshotOptions controls one chunked snapshot.
 type SnapshotOptions struct {
-	Excludes []string
-	HotPaths []string
-	Limits   Limits
+	// MountPath is where processes inside the workspace see root (a Docker
+	// workspace's /work). An absolute symlink under it is an internal link
+	// and is rewritten to a portable relative one, as a link under root is.
+	MountPath string
+	Excludes  []string
+	HotPaths  []string
+	Limits    Limits
 	// Skip drops a path, and a skipped directory's whole subtree, in addition
 	// to Excludes. A local push passes localfs's selector here so the chunked
 	// and tar representations of one directory hold the same files; the
@@ -148,7 +152,7 @@ func Snapshot(ctx context.Context, store artifact.BlobStore, root string, opts S
 			entry.Type = "symlink"
 			entry.Link, err = rr.Readlink(name)
 			if err == nil {
-				entry.Link, err = artifact.PortableSymlinkTarget(rel, entry.Link, root, "")
+				entry.Link, err = artifact.PortableSymlinkTarget(rel, entry.Link, artifact.SymlinkSourceRoot(entry.Link, root, opts.MountPath), "")
 			}
 			if err != nil || !safeLink(rel, entry.Link) {
 				return result, errors.New("chunked artifact: unsafe symlink")

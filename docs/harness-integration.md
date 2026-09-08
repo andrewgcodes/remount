@@ -153,7 +153,10 @@ match, `--home` for an isolated state directory). Claude Code and Codex
 handoffs require `--auth api-key` and a brokered provider binding: they do not
 transfer Keychain credentials, subscription logins, provider configuration or
 unrelated conversations. Subscription handoff is refused; create the remote
-workspace and run `remount auth login` there. The CLI does not automatically
+workspace and run `remount auth login` there. That node must allow the
+provider hosts the recipe declares under `subscription.hosts`
+(`api.anthropic.com` for Claude; `chatgpt.com` and `auth.openai.com` for
+Codex), because a subscription launch bypasses the broker. The CLI does not automatically
 read `.env` files.
 
 For Claude/Codex, the newest valid saved transcript whose metadata matches the

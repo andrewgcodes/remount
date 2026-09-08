@@ -23,8 +23,11 @@ test:
 	go test -p 1 -count=1 -timeout 900s ./...
 	$(MAKE) public-api
 
+# 1800s matches scripts/verify-local.sh and the hosted lanes; the sim package
+# alone takes 8 minutes under the race detector on a 4-vCPU runner and the
+# plan-b gate runs every package concurrently with it.
 race:
-	go test -race -count=1 -timeout 900s ./...
+	go test -race -count=1 -timeout 1800s ./...
 
 fuzz:
 	go test ./internal/proto -run='^$$' -fuzz=FuzzDecodeFrame -fuzztime=$(FUZZTIME)

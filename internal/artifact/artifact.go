@@ -857,7 +857,14 @@ func Excluded(rel string, excludes []string) bool {
 // Snapshot writes a tar.gz of root to w. Entries are written in sorted
 // order so identical trees produce identical bytes (and thus ids).
 func Snapshot(root string, excludes []string, w io.Writer) error {
-	_, err := SnapshotFiltered(root, func(rel string, _ bool) bool { return Excluded(rel, excludes) }, w)
+	return SnapshotMounted(root, "", excludes, w)
+}
+
+// SnapshotMounted is Snapshot for a tree whose processes see it at mountPath
+// rather than at root (a Docker workspace's /work), so an absolute symlink
+// they wrote under mountPath is an internal link (see SymlinkSourceRoot).
+func SnapshotMounted(root, mountPath string, excludes []string, w io.Writer) error {
+	_, err := SnapshotTrees([]Tree{{Root: root, MountPath: mountPath, Skip: func(rel string, _ bool) bool { return Excluded(rel, excludes) }}}, w)
 	return err
 }
 
@@ -892,6 +899,9 @@ type Tree struct {
 	// Skip filters entries by their path relative to Root (see
 	// SnapshotFiltered); nil keeps everything.
 	Skip func(rel string, isDir bool) bool
+	// MountPath is where processes inside the workspace see Root, so an
+	// absolute link under it is an internal link (see SymlinkSourceRoot).
+	MountPath string
 }
 
 // SnapshotTrees writes one tar.gz combining several local trees, each under
@@ -904,6 +914,7 @@ func SnapshotTrees(trees []Tree, w io.Writer) (SnapshotStats, error) {
 	type entry struct {
 		root   *os.Root // nil for a synthesized prefix directory
 		base   string
+		mount  string
 		prefix string
 		name   string // path inside root, OS separators
 		isDir  bool
@@ -970,7 +981,7 @@ func SnapshotTrees(trees []Tree, w io.Writer) (SnapshotStats, error) {
 				archive = prefix + "/" + rel
 			}
 			return add(archive, entry{
-				root: rr, base: root, prefix: prefix,
+				root: rr, base: root, mount: t.MountPath, prefix: prefix,
 				name: filepath.FromSlash(p), isDir: d.IsDir(),
 			})
 		})
@@ -1003,7 +1014,7 @@ func SnapshotTrees(trees []Tree, w io.Writer) (SnapshotStats, error) {
 			if err != nil {
 				return writeErr(err)
 			}
-			link, err = PortableSymlinkTarget(rel, link, e.base, e.prefix)
+			link, err = PortableSymlinkTarget(rel, link, SymlinkSourceRoot(link, e.base, e.mount), e.prefix)
 			if err != nil {
 				return writeErr(err)
 			}
@@ -1515,14 +1526,35 @@ func validateSymlinkTarget(name, target string) error {
 	return nil
 }
 
+// SymlinkSourceRoot picks the root an absolute link target is measured
+// against. A process inside a workspace sees the tree at mountPath (a Docker
+// workspace's /work), not at the node's root, so a link it wrote to its own
+// tree is absolute under mountPath. Claude Code's .claude/debug/latest is one;
+// treating it as external would refuse every snapshot of that workspace.
+func SymlinkSourceRoot(target, root, mountPath string) string {
+	if mountPath == "" {
+		return root
+	}
+	clean := path.Clean(filepath.ToSlash(target))
+	mount := path.Clean(filepath.ToSlash(mountPath))
+	if clean == mount || strings.HasPrefix(clean, mount+"/") {
+		return mount
+	}
+	return root
+}
+
 // PortableSymlinkTarget preserves safe relative links and rewrites absolute
 // links whose targets remain inside sourceRoot into portable archive links.
 func PortableSymlinkTarget(name, target, sourceRoot, archivePrefix string) (string, error) {
-	if !filepath.IsAbs(target) && !path.IsAbs(target) && filepath.VolumeName(target) == "" {
-		target = filepath.ToSlash(target)
-		return target, validateSymlinkTarget(name, target)
+	// Windows reports a link target in its own separators, so a rooted
+	// container path such as /work/x comes back as \work\x: absolute in
+	// meaning, absolute to neither IsAbs. Decide on the slashed form and
+	// compare roots in the native one.
+	slashed := filepath.ToSlash(target)
+	if !filepath.IsAbs(target) && !path.IsAbs(slashed) && filepath.VolumeName(target) == "" {
+		return slashed, validateSymlinkTarget(name, slashed)
 	}
-	targetRel, err := filepath.Rel(sourceRoot, filepath.Clean(target))
+	targetRel, err := filepath.Rel(filepath.FromSlash(sourceRoot), filepath.FromSlash(slashed))
 	if err != nil || targetRel == ".." || strings.HasPrefix(targetRel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("artifact: symlink %q has invalid target %q", name, target)
 	}

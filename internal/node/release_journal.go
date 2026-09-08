@@ -129,7 +129,16 @@ func sameReleaseRequest(a, b proto.WSReleaseReq) bool {
 }
 
 func startsNewReleaseCycle(existing durableRelease, req proto.WSReleaseReq) bool {
+	// An abort-published record is kept so a restarted node can rebuild the
+	// runtime while control is still WSClaiming at that generation. Once
+	// control has placed the workspace at a newer generation, that record is
+	// history, and the newer generation is authority to release, as it is for
+	// a committed record. Found live on 2026-09-07: a sleep aborted at
+	// generation 5 (unsafe symlink), two node restarts re-adopted the
+	// workspace at 6 and 7, and the next sleep was refused as a mismatched
+	// retry and fenced the workspace into failed.
 	return (existing.State == releaseCommitted && req.Gen > existing.Request.Gen) ||
+		(existing.State == releasePublished && req.Gen > existing.Request.Gen) ||
 		(existing.State == releasePublished &&
 			req.Gen == existing.Request.Gen &&
 			req.ReleaseEpoch > existing.Request.ReleaseEpoch &&

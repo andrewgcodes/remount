@@ -98,9 +98,11 @@ func envBindings() []localBinding {
 	return out
 }
 
-// recipeHosts is every host a built-in recipe installs from, so a harness
-// started under the autostarted standalone can fetch itself. These carry no
-// credential; provider hosts are reached through bindings.
+// recipeHosts is every host a built-in recipe installs from, plus the
+// provider endpoints a subscription login and launch reach directly, so a
+// harness started under the autostarted standalone can fetch itself and a
+// provider-native login can complete. These carry no credential; API-key
+// provider traffic is reached through bindings.
 func recipeHosts() []string {
 	seen := map[string]bool{}
 	var hosts []string
@@ -109,7 +111,11 @@ func recipeHosts() []string {
 		if err != nil {
 			continue
 		}
-		for _, h := range r.Hosts {
+		all := append([]string(nil), r.Hosts...)
+		if r.Subscription != nil {
+			all = append(all, r.Subscription.Hosts...)
+		}
+		for _, h := range all {
 			if !seen[h] {
 				seen[h] = true
 				hosts = append(hosts, h)
