@@ -80,16 +80,35 @@ type fault struct {
 	who string
 }
 
+// defaultLeaseSec is the workspace lease every world starts with. The node
+// fences a workspace it cannot renew within two thirds of the lease, so a
+// 2-second lease leaves 1.3 seconds: enough on a developer laptop, not on a
+// hosted Windows runner under the race detector, where process spawns and
+// GC pauses fenced three unrelated tests in two days. Thirty seconds is a
+// production-sized lease; the tests that exercise expiry and failover opt
+// back into the short one through newWorldExpiring.
+const defaultLeaseSec = 30
+
+// expiringLeaseSec is the lease for tests that wait for a lease to run out.
+const expiringLeaseSec = 2
+
 func newWorld(t *testing.T, bindings ...control.Binding) *world {
 	t.Helper()
 	return newWorldWith(t, func(o *server.Options) { o.Bindings = bindings })
+}
+
+// newWorldExpiring is newWorld with the short lease, for tests that cut or
+// stop a node and then wait for the control plane to notice through expiry.
+func newWorldExpiring(t *testing.T, bindings ...control.Binding) *world {
+	t.Helper()
+	return newWorldWith(t, func(o *server.Options) { o.Bindings = bindings; o.LeaseSec = expiringLeaseSec })
 }
 
 // newWorldWith starts a world after letting the test adjust the server options.
 func newWorldWith(t *testing.T, adjust func(*server.Options)) *world {
 	t.Helper()
 	dataDir := filepath.Join(t.TempDir(), "server")
-	opts := server.Options{DataDir: dataDir, Token: "tok", LeaseSec: 2}
+	opts := server.Options{DataDir: dataDir, Token: "tok", LeaseSec: defaultLeaseSec}
 	if adjust != nil {
 		adjust(&opts)
 	}
@@ -1025,7 +1044,7 @@ func TestExistingWorkspaceLaunchPersistsAuthForResume(t *testing.T) {
 }
 
 func TestStaleDetachDoesNotCancelReplacementAttach(t *testing.T) {
-	w := newWorld(t)
+	w := newWorldExpiring(t)
 	w.node("n1", nil)
 	operator := w.client("operator")
 	browser := w.client("browser")
@@ -1081,7 +1100,7 @@ func TestStaleDetachDoesNotCancelReplacementAttach(t *testing.T) {
 // workspace and restores it from the last snapshot. Also exercises an
 // explicit graceful move first (which is what records LastSnapshot).
 func TestNodeDeathMovesWorkspaceFromSnapshot(t *testing.T) {
-	w := newWorld(t)
+	w := newWorldExpiring(t)
 	nodes := map[string]*node.Node{}
 	nodes["n1"] = w.node("n1", map[string]string{"zone": "a"})
 	nodes["n2"] = w.node("n2", map[string]string{"zone": "a"})

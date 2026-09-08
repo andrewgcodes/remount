@@ -173,7 +173,7 @@ func TestE11TieredSessionReplayCrossesNodeAndNamesUnavailableBlob(t *testing.T) 
 }
 
 func TestE11TieredSessionRecordSurvivesNodeRestart(t *testing.T) {
-	w := newWorld(t)
+	w := newWorldExpiring(t)
 	dataDir := t.TempDir()
 	configure := func(options *node.Options) {
 		options.DataDir = dataDir

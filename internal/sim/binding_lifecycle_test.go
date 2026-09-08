@@ -167,7 +167,7 @@ func bindingEventsOf(t *testing.T, ctx context.Context, c *client.Client, bindin
 // hour, so only renew-driven invalidation can produce that result.
 func TestBindingRevokeStopsSubstitutionWithinRenew(t *testing.T) {
 	up := newBrokeredUpstream(t)
-	w := newWorld(t)
+	w := newWorldExpiring(t)
 	w.nodeWithBrokerRoots("n1", nil, up.pool)
 	c := w.client("c1")
 	ctx := ctxT(t, 90*time.Second)

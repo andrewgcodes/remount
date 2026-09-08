@@ -133,6 +133,7 @@ func liveBrokerSession(t *testing.T, ctx context.Context, c *client.Client, work
 // broker capability plus the workspace remain live.
 func TestE8PrincipalRevocationComposes(t *testing.T) {
 	w := newWorldWith(t, func(options *server.Options) {
+		options.LeaseSec = expiringLeaseSec // revocation reaches the node on renewal
 		options.Token = ""
 		options.Mode = server.ModeProductionMultiTenant
 		options.TenantArtifacts = identityEncryptedResolver(t)

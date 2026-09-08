@@ -13,13 +13,7 @@ import (
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/computer/fakecdp"
 	"remount.dev/remount/internal/proto"
-	"remount.dev/remount/internal/server"
 )
-
-func newComputerWorld(t *testing.T) *world {
-	t.Helper()
-	return newWorldWith(t, func(o *server.Options) { o.LeaseSec = 30 })
-}
 
 // waitEvent polls the workspace's event history until typ appears. Events
 // travel node -> control asynchronously, so a poll is the honest wait.
@@ -67,7 +61,7 @@ func TestComputerAttachFakeCDP(t *testing.T) {
 	fake := fakecdp.New()
 	defer fake.Close()
 
-	w := newComputerWorld(t)
+	w := newWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ws := mustWS(t, c, proto.WorkspaceSpec{})
@@ -158,7 +152,7 @@ func TestComputerInputDeduplicatesByISeq(t *testing.T) {
 	fake := fakecdp.New()
 	defer fake.Close()
 
-	w := newComputerWorld(t)
+	w := newWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ws := mustWS(t, c, proto.WorkspaceSpec{})
@@ -231,7 +225,7 @@ func TestComputerGetReportsTheAppliedInputSequence(t *testing.T) {
 	fake := fakecdp.New()
 	defer fake.Close()
 
-	w := newComputerWorld(t)
+	w := newWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ws := mustWS(t, c, proto.WorkspaceSpec{})
@@ -262,7 +256,7 @@ func TestComputerCrashReportsClosed(t *testing.T) {
 	fake := fakecdp.New()
 	defer fake.Close()
 
-	w := newComputerWorld(t)
+	w := newWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ws := mustWS(t, c, proto.WorkspaceSpec{})
@@ -315,7 +309,7 @@ func TestComputerDownloadBecomesArtifact(t *testing.T) {
 	fake := fakecdp.New()
 	defer fake.Close()
 
-	w := newComputerWorld(t)
+	w := newWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ws := mustWS(t, c, proto.WorkspaceSpec{})
@@ -376,7 +370,7 @@ func TestComputerClosesWithWorkspace(t *testing.T) {
 	fake := fakecdp.New()
 	defer fake.Close()
 
-	w := newComputerWorld(t)
+	w := newWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ws := mustWS(t, c, proto.WorkspaceSpec{})

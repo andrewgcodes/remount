@@ -80,7 +80,7 @@ func describeEvents(c interface {
 // invisible: sessions ran, credentials were brokered, and control's log showed
 // none of it while doctor reported healthy.
 func TestNodeEventsSurviveANodeRestart(t *testing.T) {
-	w := newWorld(t)
+	w := newWorldExpiring(t)
 	dataDir := t.TempDir()
 	configure := func(options *node.Options) {
 		options.DataDir = dataDir

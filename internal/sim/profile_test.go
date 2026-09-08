@@ -277,7 +277,7 @@ func TestProfileDriftMakesNodeUnschedulable(t *testing.T) {
 // TestNodeProfileGetReportsEveryNode covers the fleet-wide form of the
 // operation and the rule that an offline node is never reported as passing.
 func TestNodeProfileGetReportsEveryNode(t *testing.T) {
-	w := newWorld(t)
+	w := newWorldExpiring(t)
 	ctx := ctxT(t, 90*time.Second)
 	isolated, _ := isolatedNode(t, w, "pn-a")
 	plain := w.node("pn-b", nil)

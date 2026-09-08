@@ -598,7 +598,7 @@ func TestQueueRunsTasksAcrossSleepAndMove(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unavailable: recipe launchers require a POSIX shell in process workspaces")
 	}
-	w := newWorld(t)
+	w := newWorldExpiring(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ctx := ctxT(t, 180*time.Second)
