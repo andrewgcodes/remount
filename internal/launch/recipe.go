@@ -141,6 +141,19 @@ type SubscriptionSpec struct {
 	Logout   []string `json:"logout"`
 	Verify   string   `json:"verify"`
 	UnsetEnv []string `json:"unset_env,omitempty"`
+	// Hosts are the provider endpoints the login and a subscription launch
+	// reach directly. There is no broker in this mode, so a node serving
+	// subscription launches must allow them without a credential; the
+	// autostarted standalone does, an explicit node takes them via --allow.
+	Hosts []string `json:"hosts,omitempty"`
+	// BypassProxy drops HTTP(S)_PROXY from a subscription launch. Claude Code
+	// runs on Bun, whose fetch hangs on chunked keep-alive responses through
+	// an HTTPS CONNECT proxy (oven-sh/bun#30381), and a subscription launch
+	// has to reach the provider directly rather than through the broker's
+	// plain-HTTP /d/ path an API-key launch uses. Subscription auth is local
+	// profile only, where the proxy is cooperative; the cost is that this
+	// harness's provider traffic is absent from the broker's audit.
+	BypassProxy bool `json:"bypass_proxy,omitempty"`
 }
 
 // ACPSpec is how a recipe starts its harness as an ACP agent.
@@ -331,6 +344,13 @@ func (r *Recipe) Validate() error {
 	for _, h := range r.Hosts {
 		if h == "" || strings.ContainsAny(h, " /\t\n") {
 			return fmt.Errorf("recipe %s: host %q is not a host pattern", r.Name, h)
+		}
+	}
+	if r.Subscription != nil {
+		for _, h := range r.Subscription.Hosts {
+			if h == "" || strings.ContainsAny(h, " /\t\n") {
+				return fmt.Errorf("recipe %s: subscription host %q is not a host pattern", r.Name, h)
+			}
 		}
 	}
 	for i, f := range r.Configure {
@@ -827,6 +847,10 @@ func (r *Recipe) launcher(d Data, out *rendered, argv []string, extraEnv map[str
 		}
 		for _, name := range r.Subscription.UnsetEnv {
 			fmt.Fprintf(&b, "unset %s\n", name)
+		}
+		if r.Subscription.BypassProxy {
+			b.WriteString("# Bun's fetch hangs through a CONNECT proxy (oven-sh/bun#30381); a\n# subscription launch reaches the provider directly.\n")
+			b.WriteString("unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy\n")
 		}
 		fmt.Fprintf(&b, "if ! (\n%s\n) >/dev/null 2>&1; then\n", strings.TrimRight(r.Subscription.Verify, "\n"))
 		fmt.Fprintf(&b, "  echo %s >&2\n", ShellQuote(fmt.Sprintf("%s subscription login is unavailable; run `remount auth login %s --ws %s`", r.Name, r.Name, d.Workspace)))

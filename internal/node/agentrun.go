@@ -75,7 +75,12 @@ type agentRun struct {
 	mount      string
 	stdin      io.Closer // the harness's stdin; closed first when stopping
 
-	mu           sync.Mutex
+	mu sync.Mutex
+	// lastStderr is the harness's final redacted stderr line, kept so a
+	// non-zero exit can say why: a launcher that refuses to start prints one
+	// line and exits, and "harness exited 78" alone sends the operator to
+	// the node's debug log for it.
+	lastStderr   string
 	inbox        []proto.AgentMessage
 	seen         map[string]bool
 	wake         chan struct{}
@@ -793,6 +798,12 @@ func (r *agentRun) finish(exitCode int, runErr error, stopReason string, client 
 		text = runErr.Error()
 		if exitCode != 0 && !strings.Contains(text, "exited") {
 			text = fmt.Sprintf("%s (harness exited %d)", text, exitCode)
+			r.mu.Lock()
+			last := r.lastStderr
+			r.mu.Unlock()
+			if last != "" {
+				text += ": " + last
+			}
 		}
 	}
 	exit := proto.ExitInfo{Code: exitCode, Error: text}
@@ -1123,6 +1134,11 @@ func (r *agentRun) drainStderr(rd io.Reader) {
 		if n > 0 {
 			line, _ := r.redact.apply(bytes.TrimRight(buf[:n], "\n"))
 			r.n.logger.Debug("harness stderr", "agent", r.req.Agent, "run", r.req.Run, "text", string(line))
+			if last := lastStderrLine(line); last != "" {
+				r.mu.Lock()
+				r.lastStderr = last
+				r.mu.Unlock()
+			}
 		}
 		if err != nil {
 			return
@@ -1887,4 +1903,19 @@ func (h *agentHandler) CompleteElicitation(ctx context.Context, n acp.CompleteEl
 
 func (h *agentHandler) Ext(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
 	return nil, proto.Err(proto.CodeUnsupported, "extension method %q is not supported", method)
+}
+
+// lastStderrLine returns the final non-blank line of a redacted stderr chunk,
+// bounded so a stack trace cannot balloon an error string.
+func lastStderrLine(chunk []byte) string {
+	lines := bytes.Split(bytes.TrimSpace(chunk), []byte("\n"))
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(string(lines[i])); line != "" {
+			if len(line) > 200 {
+				line = line[:200] + "…"
+			}
+			return line
+		}
+	}
+	return ""
 }

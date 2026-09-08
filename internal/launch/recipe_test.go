@@ -940,3 +940,58 @@ session_id_from:
 		}
 	}
 }
+
+// A subscription launch has no broker in its path, so the recipe has to say
+// which provider hosts the node must allow; a silent omission surfaces live as
+// egress.denied on every request the harness makes.
+func TestSubscriptionRecipesDeclareTheProviderHostsTheyReachDirectly(t *testing.T) {
+	want := map[string][]string{"claude": {"api.anthropic.com"}, "codex": {"chatgpt.com", "auth.openai.com"}}
+	for name, hosts := range want {
+		r, err := Load(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Subscription == nil || !slices.Equal(r.Subscription.Hosts, hosts) {
+			t.Fatalf("%s subscription hosts = %+v, want %v", name, r.Subscription, hosts)
+		}
+	}
+}
+
+// Claude Code's runtime cannot speak to the Anthropic API through an HTTPS
+// CONNECT proxy (oven-sh/bun#30381), and a subscription launch has no /d/
+// path to fall back on, so its launcher must drop the proxy variables after
+// the API-key ones. Codex is unaffected and keeps the cooperative proxy.
+func TestClaudeSubscriptionLaunchBypassesTheConnectProxy(t *testing.T) {
+	claude, err := Load("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := claude.Launcher(Data{Recipe: "claude", Workspace: "ws_auth", Auth: AuthSubscription}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(script, "unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy") {
+		t.Fatalf("claude subscription launcher keeps the proxy:\n%s", script)
+	}
+	codex, err := Load("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(codex.Subscription.Verify, "codex login status 2>&1") {
+		t.Fatalf("codex verify must capture stderr, where codex prints its status line: %q", codex.Subscription.Verify)
+	}
+	script, err = codex.Launcher(Data{Recipe: "codex", Workspace: "ws_auth", Auth: AuthSubscription}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(script, "unset HTTPS_PROXY") {
+		t.Fatalf("codex subscription launcher drops the proxy without a reason to:\n%s", script)
+	}
+	apiKey, err := claude.Launcher(Data{Recipe: "claude", Workspace: "ws_key", Auth: AuthAPIKey, Providers: []string{"anthropic"}, Primary: "anthropic"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(apiKey, "unset HTTPS_PROXY") {
+		t.Fatalf("api-key launcher must keep the broker proxy:\n%s", apiKey)
+	}
+}

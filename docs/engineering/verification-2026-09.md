@@ -3709,3 +3709,89 @@ from the create body and present only in the delivered file.
 Both pools removed; `e2b sandbox list` and `ix ls` empty; the Modal probe
 app `remount-probe` stopped; local server, tunnels and binary server killed
 at the end of the session.
+
+## 2026-09-07 — Claude Code and Codex subscription auth, live in a Docker workspace
+
+Goal: exercise the provider-subscription flow shipped in PR #45 (ADR 0098)
+end to end with real logins, then the parts of Claude Code a real user hits:
+multi-turn memory, file edits, permission prompts, resume, sleep and wake.
+
+Host: this laptop, darwin/arm64, 18 CPUs, 24 GiB, Docker Desktop 29.4.1.
+Control plane: `remount standalone --backend docker` with the Anthropic
+binding as `env://ANTHROPIC_API_KEY` and `.env` sourced into the server
+process only; the workspace image was built locally from
+`images/workspace/Dockerfile` (the GHCR `:latest` tag is not pullable without
+auth). Base `main` ded2db9 plus the changes in this entry's PR. Claude Code
+2.1.263 and Codex 0.153.4 were installed inside the workspace through the
+proxy. The OAuth and device-code steps were completed by the operator in a
+browser; every other step was driven from the CLI.
+
+### What had to change before either harness ran
+
+| Finding | Fix |
+|---|---|
+| `remount run claude --auth subscription` exited 78 on a valid login: the recipe verifier matched `"authMethod":"oauth_token"`, but Claude Code 2.1.263 reports `"claude.ai"` (in the container and on the laptop) | verifier accepts `claude.ai`, keeps `oauth_token` as an alternate |
+| With the verifier fixed the harness reported "Can't reach the API server (ENOTFOUND)": every CONNECT to `api.anthropic.com` was `egress.denied`, because a subscription launch has no broker path and nothing allowed the host | recipes declare `subscription.hosts`; the autostarted standalone allows them; docs tell an explicit node to `--allow` them |
+| With the host allowed, Claude Code hung for the full timeout through the proxy and answered in seconds without it; curl, Python and a raw CONNECT through the same broker all worked. Bun's fetch hangs on chunked keep-alive responses through an HTTPS CONNECT proxy (oven-sh/bun#30381); API-key launches never see it because they use the broker's plain-HTTP `/d/` path | `subscription.bypass_proxy: true` for Claude drops `HTTP(S)_PROXY` from the launch; the proxy is cooperative under `local`, and the audit gap is documented |
+| `remount run codex --auth subscription` exited 78 on a valid ChatGPT login: `codex login status` prints its line on stderr and the verifier read stdout | verifier captures both streams |
+| `ws sleep` failed with `chunked artifact: unsafe symlink`: Claude Code writes `.claude/debug/latest` as an absolute link under `/work`, the container's mount, and the packer measured it against the host root | `SymlinkSourceRoot` treats an absolute link under the workspace's mount path as internal and rewrites it to a relative one; the chunked packer takes `MountPath` from the node, the tar packer gains `SnapshotMounted` and the Docker handle's `Snapshot`/`Checkpoint` use it (the quarantine checkpoint hit the tar path with the same link after the chunked fix) |
+| "harness exited 78" said nothing about why; the launcher's one-line explanation went to the node's debug log | the harness's last redacted stderr line is appended to a non-zero exit error |
+| The second `ws sleep` of the login workspace, after node restarts had re-adopted it at generations 6 and 7, was refused with `release retry does not match durable operation` and control fenced it into `failed`: the node's release journal kept the generation-5 `abort-published` record from the symlink-aborted sleep, and `startsNewReleaseCycle` let only a committed record be superseded by a newer generation | an `abort-published` record is superseded by a newer generation too, as a committed one is; unit test `TestNewerGenerationSupersedesAnAbortPublishedRelease`; the exact sequence could not be re-provoked on demand (two deliberate node restarts, one 50 s past the lease, re-adopted the workspace at the same generation), so the rule is covered by the unit test and the abort-then-resleep path at the same generation, which passed live |
+| The plan-b gate's `make race` allowed 900s while every other race lane allows 1800s or more; the sim package alone takes ~8 minutes on a 4-vCPU runner | 1800s |
+
+Found, not fixed. Containment and destroy of a `failed` workspace: `ws
+destroy` refuses with "contain it first with `remount fleet quarantine
+--action freeze WS`", but `fleet quarantine` has no per-workspace selector
+(only `--all`, `--node`, `--run`, `--tenant`) and a freeze does not unblock
+`ws destroy` afterwards; a `--action destroy` that ends `partial` stays the
+workspace's active operation, a later quarantine is refused with "another
+active quarantine operation", and replaying its idempotency key returns the
+recorded partial result rather than retrying the failed target. The
+login-bearing workspace of this lane ended in that state and was removed by
+deleting the scratch data directory. The Docker backend caches its
+filesystem-probe result for the node's lifetime, so a probe that fails once (here: the default image was
+not pullable) keeps refusing every materialize after the image appears, until
+the node restarts. Also observed: `remount agent diff` refuses a workspace
+that is not a git checkout, and `remount resume` needs `--recipe` and
+`--auth` on a workspace made by `ws create` rather than `run` or `handoff`;
+both are documented behaviour, recorded here because a first-time user meets
+them.
+
+### Claude Code: pass
+
+| Step | Result |
+|---|---|
+| `auth login claude` | confidential pty session; the operator pasted the code; `Login successful`; `auth.operation.started/finished` carry only recipe, action, exit; no URL, code or argv in any event |
+| `auth status claude` | `loggedIn: true`, `authMethod: claude.ai`, `apiProvider: firstParty` |
+| refusals | `--auth` omitted, `--auth api-key` without a binding, and `handoff --auth subscription` each refused with the documented message |
+| `run claude --auth subscription` | `hello.txt` = `PELICAN`, one turn, about 10 s |
+| second turn via `agent message` | recalled `PELICAN` from the conversation without re-reading, appended `OTTER` with the Edit tool under `acceptEdits`, replied `PELICAN` |
+| `--approve on-request` | a read-only `ls \| wc -l` ran without a prompt (Claude Code auto-allows it); `touch /tmp/approval-marker` raised `approval.pending` (kind `tool_call`, 3 options), the agent parked, `agent approve --option allow-once` released it, the marker exists |
+| `resume --recipe claude --auth subscription` | ran the recipe's `--continue` path and printed the first line of `hello.txt` |
+| `ws sleep --after 8s` then timer wake | first attempt refused (`unsafe symlink`, the finding above); after the fix, a fresh Docker workspace carrying the same `.claude/debug/latest -> /work/...` link slept (`ws.snapshot`, `ws.released`, `ws.paused`), woke on its timer (`ws.resumed`, `ws.restored`, `ws.claimed` at generation 2), kept `hello.txt`, and restored the link as the relative `s.txt`. The login-bearing workspace itself could not be re-slept: see the release-journal finding |
+
+### Codex: pass
+
+`auth login codex` printed the device URL and code, the operator authorised,
+`Successfully logged in`; `auth status codex` reports `Logged in using
+ChatGPT`. `run codex --auth subscription` wrote `codex.txt` = `HERON` in about
+25 s; the transcript shows its first sandboxed `printf` failing and Codex's own
+review step retrying and succeeding, the nested-sandbox limitation
+`docs/harness-integration.md` already describes. Both `--auth` refusals match
+Claude's.
+
+### Unavailable
+
+The API-key `handoff` lane started this session but never claimed: the Docker
+probe failed against the unpullable default image and the cached failure
+refused every later materialize until the node restarted. It was not re-run
+after the pivot to subscription auth and is recorded as unavailable, not as a
+pass.
+
+### Cleanup
+
+The three scratch workspaces were destroyed through the control plane where
+it allowed it; the login-bearing one could not be (above) and went with the
+scratch data directory, which deletes both provider logins. Containers were
+removed, the standalone stopped, the locally built image retained. Nothing
+was published or tagged.

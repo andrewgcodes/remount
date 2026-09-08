@@ -7,9 +7,14 @@ subscription:
   login: ["codex", "login", "--device-auth"]
   status: ["codex", "login", "status"]
   logout: ["codex", "logout"]
+  # Device-code login goes through auth.openai.com; a ChatGPT-backed launch
+  # talks to chatgpt.com directly, with no broker in between.
+  hosts: [chatgpt.com, auth.openai.com]
   unset_env: ["CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "AZURE_OPENAI_API_KEY"]
+  # codex 0.153 prints its status line on stderr (verified live 2026-09-07),
+  # so both streams are captured; the exit status still gates the check.
   verify: |
-    status="$(codex login status 2>/dev/null)" || exit 1
+    status="$(codex login status 2>&1)" || exit 1
     case "$status" in "Logged in using ChatGPT"*) ;; *) exit 1;; esac
 hosts:
   - registry.npmjs.org

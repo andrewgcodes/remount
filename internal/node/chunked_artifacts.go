@@ -142,8 +142,12 @@ func (n *Node) snapshotChunked(ctx context.Context, w *ws, upload bool, excludes
 	if !ok {
 		return chunked.SnapshotResult{}, proto.Err(proto.CodeUnsupported, "backend %s has no host filesystem for chunked snapshot", w.handle.Backend())
 	}
+	mount := ""
+	if m, ok := w.handle.(workspace.Mounter); ok {
+		mount = m.MountPath()
+	}
 	return chunked.Snapshot(ctx, store, host.Root(), chunked.SnapshotOptions{
-		Excludes: excludes, MaxUnsharedBytes: n.chunkedUnsharedLimit(),
+		MountPath: mount, Excludes: excludes, MaxUnsharedBytes: n.chunkedUnsharedLimit(),
 	})
 }
 
