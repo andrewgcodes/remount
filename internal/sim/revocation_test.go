@@ -19,6 +19,7 @@ import (
 // next call is refused, and the other principal's session and grant carry on.
 func TestRevocationClosesSessionsWithinOneRenew(t *testing.T) {
 	w := newWorldWith(t, func(o *server.Options) {
+		o.LeaseSec = expiringLeaseSec // the test waits one renewal
 		o.Authenticator = control.StaticAuthenticator{
 			"owner-tok": {ID: "owner", Tenant: "team"},
 			"guest-tok": {ID: "guest", Tenant: "team"},

@@ -56,7 +56,7 @@ func (l *planBLostPrepare) hook(f *proto.Frame) bool {
 }
 
 func TestPlanBContinuityNodeLostBeforeCheckpointCommitRetainsAndFencesSource(t *testing.T) {
-	w := newWorld(t)
+	w := newWorldExpiring(t)
 	lost := newPlanBLostPrepare()
 	// Hooks are read when a peer dials, so they are installed before the
 	// nodes exist. Both carry the same one: the holder is whichever node the
@@ -187,7 +187,7 @@ func TestPlanBContinuityNodeLostBeforeCheckpointCommitRetainsAndFencesSource(t *
 }
 
 func TestPlanBContinuityNodeLostAfterCommitYieldsOnlyTheNewGeneration(t *testing.T) {
-	w := newWorld(t)
+	w := newWorldExpiring(t)
 	dirs := map[string]string{"b16-n1": t.TempDir(), "b16-n2": t.TempDir()}
 	configure := func(name string) func(*node.Options) {
 		return func(o *node.Options) {

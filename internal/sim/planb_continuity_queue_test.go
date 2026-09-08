@@ -23,7 +23,7 @@ import (
 )
 
 func TestPlanBContinuityQueueResumesWithoutRepeatingACompletedItem(t *testing.T) {
-	w := newWorld(t)
+	w := newWorldExpiring(t)
 	names := map[string]string{}
 	for _, name := range []string{"b18-n1", "b18-n2"} {
 		names[w.node(name, map[string]string{"zone": "b18"}).ID()] = name

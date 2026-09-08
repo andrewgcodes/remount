@@ -215,7 +215,6 @@ func wokenReasons(t *testing.T, evs []proto.Event) []string {
 
 func TestAgentHTTPAuthAndLifecycle(t *testing.T) {
 	w := newWorldWith(t, func(o *server.Options) {
-		o.LeaseSec = 30
 		o.PublicURL = "https://remount.example"
 		o.CORSOrigins = []string{"https://ui.example"}
 	})
@@ -581,7 +580,7 @@ func TestAgentHTTPAuthAndLifecycle(t *testing.T) {
 }
 
 func TestAgentHTTPApprovalsAndFork(t *testing.T) {
-	w := newAgentWorld(t)
+	w := newWorld(t)
 	w.node("n1", nil)
 	ctx := ctxT(t, 120*time.Second)
 	api := w.api("tok")

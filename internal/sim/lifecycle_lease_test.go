@@ -76,7 +76,7 @@ func waitLeaseEvent(t *testing.T, c *client.Client, id, typ string, n int, withi
 // that took the hold is severed before the deadline and never comes back, and
 // the workspace still sleeps.
 func TestWorkspaceLeaseAutoSleepsAfterDeadline(t *testing.T) {
-	w := newWorld(t)
+	w := newWorldExpiring(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ws := mustWS(t, c, proto.WorkspaceSpec{})
@@ -419,7 +419,7 @@ func TestWorkspaceMoveSupersedesLeaseTimer(t *testing.T) {
 // TestDuplicateLeaseRequestIsOneTimer replays the same mutating request and
 // asserts it neither grants a second hold nor arms a second timer.
 func TestDuplicateLeaseRequestIsOneTimer(t *testing.T) {
-	w := newWorld(t)
+	w := newWorldExpiring(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ws := mustWS(t, c, proto.WorkspaceSpec{})
@@ -460,7 +460,7 @@ func TestDuplicateLeaseRequestIsOneTimer(t *testing.T) {
 // degraded. What it must never do is expire twice, or expire and also carry on
 // as though nothing happened.
 func TestLeaseExpiryDuringNodeCutNoSplitBrain(t *testing.T) {
-	w := newWorld(t)
+	w := newWorldExpiring(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ws := mustWS(t, c, proto.WorkspaceSpec{})
