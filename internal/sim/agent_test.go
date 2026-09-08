@@ -15,6 +15,7 @@ import (
 	"remount.dev/remount/internal/acp/acptest"
 	"remount.dev/remount/internal/client"
 	"remount.dev/remount/internal/proto"
+	"remount.dev/remount/internal/server"
 )
 
 // The sim re-execs its own test binary as the ACP harness so an agent's
@@ -25,6 +26,17 @@ const (
 	fakeACPModeEnv = "REMOUNT_SIM_FAKE_ACP_MODE"
 	fakeACPArg     = "-remount-sim-fake-acp"
 )
+
+// newAgentWorld starts a world with a production-sized lease. Agent tests
+// spawn and kill real harness processes, and on a slow hosted runner under
+// the race detector that work can stall the node's renewals past the
+// 1.33-second fence window a 2-second lease leaves, so the node fences a
+// workspace the test still holds. Tests that need a lease to expire, such
+// as TestAgentSurvivesNodeLoss, keep newWorld and its short lease.
+func newAgentWorld(t *testing.T) *world {
+	t.Helper()
+	return newWorldWith(t, func(o *server.Options) { o.LeaseSec = 30 })
+}
 
 func TestMain(m *testing.M) {
 	if len(os.Args) == 3 && os.Args[1] == fakeACPArg {
@@ -198,7 +210,7 @@ func eventTypes(t *testing.T, ctx context.Context, c *client.Client, ws string) 
 }
 
 func TestAgentEndToEndTurnsAndTranscript(t *testing.T) {
-	w := newWorld(t)
+	w := newAgentWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ctx := ctxT(t, 90*time.Second)
@@ -280,7 +292,7 @@ func TestAgentOmittedSandboxAppliesWorkspaceWriteACPMode(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unavailable: recipe ACP launcher scripts require a POSIX shell")
 	}
-	w := newWorld(t)
+	w := newAgentWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ctx := ctxT(t, 90*time.Second)
@@ -318,7 +330,7 @@ acp:
 }
 
 func TestAgentEndToEndApprovalRoundTrip(t *testing.T) {
-	w := newWorld(t)
+	w := newAgentWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ctx := ctxT(t, 90*time.Second)
@@ -385,7 +397,7 @@ func waitApproval(t *testing.T, ctx context.Context, c *client.Client, id string
 }
 
 func TestAgentEndToEndHarnessCrashRetriesThenFails(t *testing.T) {
-	w := newWorld(t)
+	w := newAgentWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ctx := ctxT(t, 120*time.Second)
@@ -416,7 +428,7 @@ func TestAgentEndToEndHarnessCrashRetriesThenFails(t *testing.T) {
 }
 
 func TestAgentEndToEndTranscriptNeverHoldsCredentials(t *testing.T) {
-	w := newWorld(t)
+	w := newAgentWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ctx := ctxT(t, 90*time.Second)
@@ -465,7 +477,7 @@ func TestAgentEndToEndTranscriptNeverHoldsCredentials(t *testing.T) {
 // conversation ended. Before this the harness idled on the node until the
 // workspace was destroyed.
 func TestAgentMaxTurnsStopsHarnessAndMirrorsExit(t *testing.T) {
-	w := newWorld(t)
+	w := newAgentWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ctx := ctxT(t, 90*time.Second)
@@ -713,7 +725,7 @@ func agentTerminalStatus(s string) bool {
 // finishes, the parent hears about it as a prompt turn and an event (1A.8,
 // E22 with the fake harness).
 func TestAgentChildReportsToParent(t *testing.T) {
-	w := newWorld(t)
+	w := newAgentWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ctx := ctxT(t, 120*time.Second)
@@ -796,7 +808,7 @@ func TestAgentChildReportsToParent(t *testing.T) {
 // Policy.StartAt, then runs; messages before the start are kept, not
 // delivered (1A.8).
 func TestAgentScheduledStartHoldsUntilDue(t *testing.T) {
-	w := newWorld(t)
+	w := newAgentWorld(t)
 	w.node("n1", nil)
 	c := w.client("c1")
 	ctx := ctxT(t, 90*time.Second)
