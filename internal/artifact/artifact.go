@@ -1546,11 +1546,15 @@ func SymlinkSourceRoot(target, root, mountPath string) string {
 // PortableSymlinkTarget preserves safe relative links and rewrites absolute
 // links whose targets remain inside sourceRoot into portable archive links.
 func PortableSymlinkTarget(name, target, sourceRoot, archivePrefix string) (string, error) {
-	if !filepath.IsAbs(target) && !path.IsAbs(target) && filepath.VolumeName(target) == "" {
-		target = filepath.ToSlash(target)
-		return target, validateSymlinkTarget(name, target)
+	// Windows reports a link target in its own separators, so a rooted
+	// container path such as /work/x comes back as \work\x: absolute in
+	// meaning, absolute to neither IsAbs. Decide on the slashed form and
+	// compare roots in the native one.
+	slashed := filepath.ToSlash(target)
+	if !filepath.IsAbs(target) && !path.IsAbs(slashed) && filepath.VolumeName(target) == "" {
+		return slashed, validateSymlinkTarget(name, slashed)
 	}
-	targetRel, err := filepath.Rel(sourceRoot, filepath.Clean(target))
+	targetRel, err := filepath.Rel(filepath.FromSlash(sourceRoot), filepath.FromSlash(slashed))
 	if err != nil || targetRel == ".." || strings.HasPrefix(targetRel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("artifact: symlink %q has invalid target %q", name, target)
 	}

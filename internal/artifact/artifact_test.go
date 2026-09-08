@@ -868,3 +868,15 @@ func TestSnapshotMountedRewritesAbsoluteSymlinkUnderTheMountPath(t *testing.T) {
 		}
 	}
 }
+
+// Windows hands back a rooted container path in its own separators; the
+// link is still internal to the mount and must come out relative.
+func TestPortableSymlinkTargetAcceptsAnOSNormalizedRootedLink(t *testing.T) {
+	got, err := PortableSymlinkTarget(".claude/debug/latest", filepath.FromSlash("/work/.claude/debug/s.txt"), "/work", "")
+	if err != nil || got != "s.txt" {
+		t.Fatalf("portable target = %q, %v; want s.txt", got, err)
+	}
+	if _, err := PortableSymlinkTarget(".claude/escape", filepath.FromSlash("/etc/passwd"), "/work", ""); err == nil {
+		t.Fatal("a rooted link outside the mount must still be refused")
+	}
+}
