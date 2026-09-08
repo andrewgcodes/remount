@@ -67,7 +67,7 @@ client may act on; `msg` is never to be matched. A peer that predates the
 field ignores it, and a code without a reason is still complete. Reasons:
 `permission_denied`, `egress_denied`, `approval_required`, `binding_missing`,
 `grant_expired`, `revoked`, `quota_exceeded`, `workspace_not_ready`,
-`workspace_moved`, `generation_mismatch`, `backend_unsupported`,
+`needs_containment`, `workspace_moved`, `generation_mismatch`, `backend_unsupported`,
 `output_evicted`, `lifecycle_deadline_expired`, `browser_crashed`,
 `display_unavailable`, `input_rejected`, `navigation_denied`,
 `profile_corrupt`, `download_blocked`, and `profile_unschedulable`. The
@@ -543,7 +543,7 @@ Sent to `control`. Client operations are marked C, node operations N.
 | `ws.create` | C | `WSCreateReq{spec, idem}` → `Workspace` |
 | `ws.get` | C | `WSGetReq{id}` → `Workspace` |
 | `ws.list` | C | → `WSListRes{workspaces}` |
-| `ws.destroy` | C | `WSGetReq{id, idem}` → `{}` |
+| `ws.destroy` | C | `WSGetReq{id, idem}` → `{}`. Refused `conflict`/`needs_containment` while the workspace is `failed`: its physical state is unknown, and `fleet.quarantine` with the single-workspace selector and action `destroy` is the path that checkpoints what it can, commits the generation fence and deletes |
 | `ws.move` | C | `WSMoveReq{id, requires?, placement?, idem}` → `Workspace` |
 | `ws.sleep` | C | `WSSleepReq{id, after_sec\|at\|on, match?, idem}` → `Timer`; `match` is a bounded exact payload-field predicate used only with `on` |
 | `ws.wake` | C | `WSGetReq{id, idem}` → `Workspace` |

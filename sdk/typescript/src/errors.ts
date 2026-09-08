@@ -77,6 +77,11 @@ export class WorkspaceNotReadyError extends ProtocolError {
   static override readonly reason = "workspace_not_ready";
 }
 
+/** A failed workspace is destroyed through fleet quarantine, not `ws.destroy`. */
+export class NeedsContainmentError extends ProtocolError {
+  static override readonly reason = "needs_containment";
+}
+
 /** The workspace now lives on another node. */
 export class WorkspaceMovedError extends ProtocolError {
   static override readonly reason = "workspace_moved";
@@ -150,6 +155,7 @@ const CLASSES = [
   InputRejectedError,
   LifecycleDeadlineExpiredError,
   NavigationDeniedError,
+  NeedsContainmentError,
   OutputEvictedError,
   PermissionDeniedError,
   ProfileCorruptError,

@@ -2321,6 +2321,7 @@ export type Reason =
   | "input_rejected"
   | "lifecycle_deadline_expired"
   | "navigation_denied"
+  | "needs_containment"
   | "output_evicted"
   | "permission_denied"
   | "profile_corrupt"
@@ -2343,6 +2344,7 @@ export const REASONS: readonly Reason[] = [
   "input_rejected",
   "lifecycle_deadline_expired",
   "navigation_denied",
+  "needs_containment",
   "output_evicted",
   "permission_denied",
   "profile_corrupt",
