@@ -16,11 +16,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -507,7 +509,16 @@ type Docker struct {
 	mu      sync.Mutex
 	checked bool
 	err     error
+	// failedAt is when the last probe failed. A failure is not latched: the
+	// cause (a daemon still starting, an image not yet present, a share not
+	// yet granted) is usually fixed without restarting the node, so the probe
+	// is retried after probeRetryInterval instead of refusing every
+	// workspace for the node's lifetime. Success is latched.
+	failedAt time.Time
 }
+
+// probeRetryInterval bounds how often a failing Docker probe is repeated.
+const probeRetryInterval = 30 * time.Second
 
 // DefaultImageRepository is the registry path of the image CI builds from
 // images/workspace/Dockerfile. docs/images.md is the contract.
@@ -565,22 +576,28 @@ func (d *Docker) Available(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.checked {
+		return nil
+	}
+	if d.err != nil && time.Since(d.failedAt) < probeRetryInterval {
+		return d.err
+	}
+	d.err = d.probe(ctx)
+	if d.err != nil {
+		d.failedAt = time.Now()
 		return d.err
 	}
 	d.checked = true
+	return nil
+}
+
+func (d *Docker) probe(ctx context.Context) error {
 	if _, err := exec.LookPath(d.Binary); err != nil {
-		d.err = err
 		return err
 	}
 	if out, err := exec.CommandContext(ctx, d.Binary, "info", "--format", "{{.ServerVersion}}").CombinedOutput(); err != nil {
-		d.err = fmt.Errorf("docker daemon unavailable: %s", strings.TrimSpace(string(out)))
-		return d.err
+		return fmt.Errorf("docker daemon unavailable: %s", strings.TrimSpace(string(out)))
 	}
-	if err := d.probeSharedFilesystem(ctx); err != nil {
-		d.err = err
-		return d.err
-	}
-	return nil
+	return d.probeSharedFilesystem(ctx)
 }
 
 // probeSharedFilesystem proves the daemon can see this node's data directory.
@@ -829,12 +846,45 @@ func (h *dockerHandle) reown(ctx context.Context) error {
 	if os.Getuid() == 0 {
 		return nil
 	}
-	owner := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	// Only the owner matters for the node's access; the group is left alone
+	// so a share that refuses chgrp cannot fail the whole tree.
+	owner := strconv.Itoa(os.Getuid())
 	out, err := exec.CommandContext(ctx, h.bin, "exec", h.name, "chown", "-R", owner, h.mount).CombinedOutput()
-	if err != nil {
-		return proto.Err(proto.CodeInternal, "docker exec chown: %s", strings.TrimSpace(string(out)))
+	if err == nil {
+		return nil
 	}
-	return nil
+	// Docker Desktop's file sharing presents host files as root's inside the
+	// container and refuses to chown the read-only ones (git objects, for
+	// example) even for root, while the host user already owns every one of
+	// them. What reown is for is host access, so verify that directly before
+	// failing: found live on 2026-09-08, when a handoff of a git checkout
+	// died on exactly those objects.
+	if ownedBy(h.root, os.Getuid()) {
+		return nil
+	}
+	return proto.Err(proto.CodeInternal, "docker exec chown: %s", strings.TrimSpace(string(out)))
+}
+
+// ownedBy reports whether every entry under root is owned by uid on the host.
+func ownedBy(root string, uid int) bool {
+	owned := true
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			owned = false
+			return filepath.SkipAll
+		}
+		info, err := d.Info()
+		if err != nil {
+			owned = false
+			return filepath.SkipAll
+		}
+		if !fileOwnedBy(info, uid) {
+			owned = false
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return owned
 }
 
 func (h *dockerHandle) PrepareFilesystemAccess(ctx context.Context) error {

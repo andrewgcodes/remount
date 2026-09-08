@@ -544,3 +544,34 @@ func TestReleaseCommitAndAbortWaitsAreContextBounded(t *testing.T) {
 		t.Fatal("serialized abort commit did not publish retained source")
 	}
 }
+
+// A fenced destroy whose checkpoint failed cannot be committed, so it must
+// not stand in the way of the retry the operator makes once the cause is
+// fixed; one that holds a checkpoint still does.
+func TestFailedCheckpointDestroyQuarantineCanBeSuperseded(t *testing.T) {
+	n := newTestNode(t, nil)
+	w, _ := releaseTestWorkspace(t, n, "ws_quarantine_retry", nil)
+	stuck := proto.WSQuarantineReq{
+		OperationID: "fleet-destroy-stuck", WS: w.ID, Gen: w.Generation,
+		Action: proto.FleetActionDestroy, Tenant: w.Tenant, Backend: "process",
+	}
+	n.quarantineMu.Lock()
+	n.quarantines[quarantineKey(stuck.OperationID, stuck.WS)] = durableQuarantine{
+		Request: stuck, State: quarantinePrepared,
+		Response: proto.WSQuarantineRes{Fenced: true, Generation: stuck.Gen, Action: stuck.Action, Backend: stuck.Backend, Warning: "checkpoint: unsafe symlink"},
+	}
+	if err := n.persistQuarantinesLocked(); err != nil {
+		n.quarantineMu.Unlock()
+		t.Fatal(err)
+	}
+	n.quarantineMu.Unlock()
+	retry := stuck
+	retry.OperationID = "fleet-destroy-retry"
+	if _, existed, err := n.beginQuarantine(retry); err != nil || existed {
+		t.Fatalf("retry after a failed checkpoint was refused: existed=%v err=%v", existed, err)
+	}
+	old, ok := n.quarantineRecord(stuck.OperationID, stuck.WS)
+	if !ok || old.State != quarantineSuperseded {
+		t.Fatalf("stuck destroy proof was not superseded: %+v present=%v", old, ok)
+	}
+}

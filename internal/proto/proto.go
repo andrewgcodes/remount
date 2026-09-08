@@ -140,6 +140,7 @@ const (
 	ReasonRevoked                  = "revoked"                    // unauthorized: the principal, binding or grant was revoked
 	ReasonQuotaExceeded            = "quota_exceeded"             // resource_exhausted: a tenant quota or hard budget is spent
 	ReasonWorkspaceNotReady        = "workspace_not_ready"        // conflict: the workspace has not reached ws.ready
+	ReasonNeedsContainment         = "needs_containment"          // conflict: a failed workspace is destroyed through fleet quarantine, not ws.destroy
 	ReasonWorkspaceMoved           = "workspace_moved"            // conflict: the workspace now lives on another node
 	ReasonGenerationMismatch       = "generation_mismatch"        // conflict or unauthorized: the request names a stale generation
 	ReasonBackendUnsupported       = "backend_unsupported"        // unsupported: the workspace backend cannot perform this

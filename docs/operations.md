@@ -555,8 +555,8 @@ uncheckpointed copy matters.
 
 ## Fleet containment
 
-Use `fleet quarantine` when a principal, run, model, node, backend, tenant, or
-label set may be compromised. The command freezes its target list at creation,
+Use `fleet quarantine` when a workspace (`--ws`), principal, run, model,
+node, backend, tenant, or label set may be compromised. The command freezes its target list at creation,
 persists the operation, and reports each target independently.
 
 ```sh

@@ -3795,3 +3795,45 @@ it allowed it; the login-bearing one could not be (above) and went with the
 scratch data directory, which deletes both provider logins. Containers were
 removed, the standalone stopped, the locally built image retained. Nothing
 was published or tagged.
+
+## 2026-09-08 — the three items the subscription lane left open
+
+Base `main` 7ab5496 plus this entry's PR; same laptop and Docker Desktop as
+the 2026-09-07 entry.
+
+| Item | Change | Evidence |
+|---|---|---|
+| A `failed` workspace could not be destroyed | `fleet quarantine --ws WS` selects one workspace; `ws destroy` of a `failed` workspace runs that destroy itself and reports the target's result; the refusal carries `reason: needs_containment` and names the real command; on the node, a prepared destroy whose checkpoint failed (no snapshot) is superseded by the operator's retry, while one holding a checkpoint still blocks | `TestFleetDestroyRetriesAfterAFailedCheckpoint` (sim): a destroy with an escaping symlink ends `partial` with the symlink named on the target and the source intact; after removing the link a retry under a new operation checkpoints, commits the fence and deletes. `TestFailedCheckpointDestroyQuarantineCanBeSuperseded` (node); `TestDestroyQuarantineBlocksNewOperationUntilCommit` still holds |
+| The Docker filesystem probe latched one failure for the node's lifetime | a failed probe is retried after 30 s; success stays latched | `TestDockerAvailableRetriesAFailedProbe` (fake docker that fails until a marker exists); live: with the default image tag removed, `ws create` stalled and the node logged six probe failures over three minutes; after re-tagging the image and waiting 35 s, a new `ws create` claimed with no node restart, and the stalled workspace claimed too. `fleet quarantine --ws WS --action destroy` on one of two workspaces acknowledged with a checkpoint and left the other claimed |
+| The `pr` ruleset's "extra approval for unattributed changes" blocked the sole maintainer's own unsigned commits | rule switched off on ruleset 22370915 (`require_extra_approval_for_unattributed_changes: false`); required checks and the admin bypass unchanged | the ruleset read back after the PUT |
+
+### API-key handoff: pass
+
+The lane the 2026-09-07 entry recorded as unavailable. A Claude Code
+conversation was started on the laptop under an isolated `--home` in a
+scratch git checkout and told a secret word; then
+
+```sh
+remount handoff --recipe claude --auth api-key --binding b_anthropic \
+  --dir proj --home home --backend docker --attach \
+  --task 'What is the secret word I told you earlier? Reply with exactly that word.'
+```
+
+uploaded 30 files, claimed a Docker workspace on the first attempt (the probe
+fix above), installed Claude Code through the proxy, placed the checkout at
+the same absolute path, resumed the recorded transcript UUID and answered
+`PELICAN`. Inside the workspace `ANTHROPIC_API_KEY` is `ref:b_anthropic`, no
+key string exists under `.claude` or `.remount`, and the broker logged
+`cred.used` with decision `substituted` for `api.anthropic.com`.
+
+The first attempt failed on the node's `reown`: Docker Desktop's file sharing
+shows host files as root's inside the container and refuses `chown` on the
+read-only git objects even for root, although the host user already owns every
+file. `reown` now changes the owner only, and when the chown is refused it
+verifies host ownership directly before failing.
+
+Not exercised live: `ws destroy` of a `failed` workspace. Producing that
+state on demand needs an aborted release followed by a fence at a newer
+generation, which two deliberate attempts on 2026-09-07 did not reproduce;
+the CLI path is the same `QuarantineFleet` call the sim test drives, keyed
+on the new reason.

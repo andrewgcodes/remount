@@ -3933,8 +3933,10 @@ func (c *Control) wsDestroy(ctx context.Context, principal, id, idem string) err
 		// an operator meets a refusal with no next step and no way to learn
 		// one, which is how a recoverable workspace becomes a permanent
 		// resource leak in practice.
-		return proto.Err(proto.CodeConflict,
-			"workspace %s is failed and requires reconciliation before destroy: contain it first with `remount fleet quarantine --action freeze %s`, then destroy", id, id)
+		refusal := proto.Err(proto.CodeConflict,
+			"workspace %s is failed and requires reconciliation before destroy: run `remount fleet quarantine --ws %s --action destroy`, which checkpoints what it can, commits the generation fence and then deletes", id, id)
+		refusal.Reason = proto.ReasonNeedsContainment
+		return refusal
 	}
 	if ws.State == proto.WSClaiming && ws.ReleaseOperation != "" {
 		node, generation, operation := ws.Node, ws.Generation, ws.ReleaseOperation

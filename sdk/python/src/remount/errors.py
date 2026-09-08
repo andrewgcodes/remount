@@ -119,6 +119,12 @@ class WorkspaceNotReady(ProtocolError):
     REASON = "workspace_not_ready"
 
 
+class NeedsContainment(ProtocolError):
+    """A failed workspace is destroyed through fleet quarantine, not ``ws.destroy``."""
+
+    REASON = "needs_containment"
+
+
 class WorkspaceMoved(ProtocolError):
     """The workspace now lives on another node."""
 
@@ -206,6 +212,7 @@ _BY_REASON: dict[str, type[ProtocolError]] = {
         InputRejected,
         LifecycleDeadlineExpired,
         NavigationDenied,
+        NeedsContainment,
         OutputEvicted,
         PermissionDenied,
         ProfileCorrupt,
