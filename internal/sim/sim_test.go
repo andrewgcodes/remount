@@ -1691,7 +1691,7 @@ func TestHostileWorkspacesUseIsolatedReadOnlyPackageConnector(t *testing.T) {
 	upstreamHost := strings.TrimPrefix(upstream.URL, "https://")
 	roots := x509.NewCertPool()
 	roots.AddCert(upstream.Certificate())
-	w := newWorld(t)
+	w := newWorldWith(t, func(o *server.Options) { o.LeaseSec = 30 }) // no lease expiry here; the 2s default fences on slow runners (see newAgentWorld)
 	w.nodeWithBrokerRoots("n1", nil, roots)
 	c := w.client("package-owner")
 	spec := func(name string) proto.WorkspaceSpec {
