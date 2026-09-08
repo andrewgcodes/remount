@@ -256,8 +256,16 @@ Waking restores from the snapshot taken at sleep and waits for `claimed`.
 ## Incident containment
 
 Use `fleet quarantine` when a tenant, principal, run, model, node, backend or
-label set may be compromised. Always provide at least one selector or explicit
-`--all`, and reuse a stable incident idempotency key.
+label set may be compromised. Always provide at least one selector (`--ws`
+for a single workspace) or explicit `--all`, and reuse a stable incident
+idempotency key.
+
+A workspace in state `failed` has an unknown physical state and `ws destroy`
+refuses it; `remount ws destroy WS` then runs `fleet quarantine --ws WS
+--action destroy` for you, which checkpoints what it can, commits the
+generation fence and deletes. A destroy that could not checkpoint ends
+`partial` with the cause on the target; fix the cause and retry under a new
+operation (omit `--idem` or use a new key), which supersedes the stuck one.
 
 ```sh
 remount fleet quarantine --run run_20260902 --action stop --idem incident-4821

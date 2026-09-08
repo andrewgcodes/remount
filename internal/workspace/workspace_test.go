@@ -394,3 +394,49 @@ func TestProcessBackendRefusesForeignMountPathAndDockerParsesMounts(t *testing.T
 		}
 	}
 }
+
+// A probe that fails once must not refuse the node's workspaces for its whole
+// life: the image appears, the daemon finishes starting, the share is granted.
+// Found live on 2026-09-07, when an unpullable default image left a node
+// refusing every materialize until it was restarted.
+func TestDockerAvailableRetriesAFailedProbe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake docker is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "docker")
+	script := `#!/bin/sh
+# Fail every command until the "ready" marker exists; then answer like docker.
+[ -f "$(dirname "$0")/ready" ] || { echo "no such image" >&2; exit 1; }
+case "$1" in
+  info) echo 29.0.0 ;;
+  run) shift; while [ $# -gt 0 ]; do case "$1" in -v) src="${2%%:*}"; shift 2 ;; cat) cat "$src/probe"; exit 0 ;; *) shift ;; esac; done ;;
+esac
+`
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	d := &Docker{Dir: dir, Image: "img", Binary: fake}
+	ctx := context.Background()
+	if err := d.Available(ctx); err == nil {
+		t.Fatal("first probe must fail while the fake docker is not ready")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ready"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Available(ctx); err == nil {
+		t.Fatal("a failure is retried only after the retry interval, not on every call")
+	}
+	d.mu.Lock()
+	d.failedAt = time.Now().Add(-2 * probeRetryInterval)
+	d.mu.Unlock()
+	if err := d.Available(ctx); err != nil {
+		t.Fatalf("probe not retried after the interval: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, "ready")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Available(ctx); err != nil {
+		t.Fatalf("a successful probe is latched: %v", err)
+	}
+}

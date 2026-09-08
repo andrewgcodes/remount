@@ -3795,3 +3795,20 @@ it allowed it; the login-bearing one could not be (above) and went with the
 scratch data directory, which deletes both provider logins. Containers were
 removed, the standalone stopped, the locally built image retained. Nothing
 was published or tagged.
+
+## 2026-09-08 — the three items the subscription lane left open
+
+Base `main` 7ab5496 plus this entry's PR; same laptop and Docker Desktop as
+the 2026-09-07 entry.
+
+| Item | Change | Evidence |
+|---|---|---|
+| A `failed` workspace could not be destroyed | `fleet quarantine --ws WS` selects one workspace; `ws destroy` of a `failed` workspace runs that destroy itself and reports the target's result; the refusal carries `reason: needs_containment` and names the real command; on the node, a prepared destroy whose checkpoint failed (no snapshot) is superseded by the operator's retry, while one holding a checkpoint still blocks | `TestFleetDestroyRetriesAfterAFailedCheckpoint` (sim): a destroy with an escaping symlink ends `partial` with the symlink named on the target and the source intact; after removing the link a retry under a new operation checkpoints, commits the fence and deletes. `TestFailedCheckpointDestroyQuarantineCanBeSuperseded` (node); `TestDestroyQuarantineBlocksNewOperationUntilCommit` still holds |
+| The Docker filesystem probe latched one failure for the node's lifetime | a failed probe is retried after 30 s; success stays latched | `TestDockerAvailableRetriesAFailedProbe` (fake docker that fails until a marker exists); live: with the default image tag removed, `ws create` stalled and the node logged six probe failures over three minutes; after re-tagging the image and waiting 35 s, a new `ws create` claimed with no node restart, and the stalled workspace claimed too. `fleet quarantine --ws WS --action destroy` on one of two workspaces acknowledged with a checkpoint and left the other claimed |
+| The `pr` ruleset's "extra approval for unattributed changes" blocked the sole maintainer's own unsigned commits | rule switched off on ruleset 22370915 (`require_extra_approval_for_unattributed_changes: false`); required checks and the admin bypass unchanged | the ruleset read back after the PUT |
+
+Not exercised live: `ws destroy` of a `failed` workspace. Producing that
+state on demand needs an aborted release followed by a fence at a newer
+generation, which two deliberate attempts on 2026-09-07 did not reproduce;
+the CLI path is the same `QuarantineFleet` call the sim test drives, keyed
+on the new reason.

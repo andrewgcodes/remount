@@ -128,7 +128,16 @@ func (n *Node) beginQuarantine(req proto.WSQuarantineReq) (durableQuarantine, bo
 		if old.Request.WS != req.WS || old.State == quarantineCommitted || old.State == quarantineSuperseded {
 			continue
 		}
-		if old.State != quarantinePrepared || (old.Response.Action == proto.FleetActionDestroy && old.Response.Fenced) {
+		// A prepared destroy holding a checkpoint is an outstanding proof
+		// that control may commit at any moment, and nothing supersedes it.
+		// A prepared destroy without one can never be committed: control
+		// refuses to delete what it could not checkpoint, marks the target
+		// failed and finishes the operation. Left in place it blocked every
+		// later quarantine of the workspace (found live on 2026-09-07, when
+		// the checkpoint had failed on a symlink), so a newer operation,
+		// which control only sends once the old one is terminal, takes over.
+		outstandingDestroy := old.Response.Action == proto.FleetActionDestroy && old.Response.Fenced && old.Response.Snapshot != ""
+		if old.State != quarantinePrepared || outstandingDestroy {
 			return durableQuarantine{}, false, proto.Err(proto.CodeConflict,
 				"workspace has another active quarantine operation")
 		}

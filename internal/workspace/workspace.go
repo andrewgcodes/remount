@@ -507,7 +507,16 @@ type Docker struct {
 	mu      sync.Mutex
 	checked bool
 	err     error
+	// failedAt is when the last probe failed. A failure is not latched: the
+	// cause (a daemon still starting, an image not yet present, a share not
+	// yet granted) is usually fixed without restarting the node, so the probe
+	// is retried after probeRetryInterval instead of refusing every
+	// workspace for the node's lifetime. Success is latched.
+	failedAt time.Time
 }
+
+// probeRetryInterval bounds how often a failing Docker probe is repeated.
+const probeRetryInterval = 30 * time.Second
 
 // DefaultImageRepository is the registry path of the image CI builds from
 // images/workspace/Dockerfile. docs/images.md is the contract.
@@ -565,22 +574,28 @@ func (d *Docker) Available(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.checked {
+		return nil
+	}
+	if d.err != nil && time.Since(d.failedAt) < probeRetryInterval {
+		return d.err
+	}
+	d.err = d.probe(ctx)
+	if d.err != nil {
+		d.failedAt = time.Now()
 		return d.err
 	}
 	d.checked = true
+	return nil
+}
+
+func (d *Docker) probe(ctx context.Context) error {
 	if _, err := exec.LookPath(d.Binary); err != nil {
-		d.err = err
 		return err
 	}
 	if out, err := exec.CommandContext(ctx, d.Binary, "info", "--format", "{{.ServerVersion}}").CombinedOutput(); err != nil {
-		d.err = fmt.Errorf("docker daemon unavailable: %s", strings.TrimSpace(string(out)))
-		return d.err
+		return fmt.Errorf("docker daemon unavailable: %s", strings.TrimSpace(string(out)))
 	}
-	if err := d.probeSharedFilesystem(ctx); err != nil {
-		d.err = err
-		return d.err
-	}
-	return nil
+	return d.probeSharedFilesystem(ctx)
 }
 
 // probeSharedFilesystem proves the daemon can see this node's data directory.

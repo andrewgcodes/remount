@@ -1092,7 +1092,18 @@ func cmdWS(ctx context.Context, args []string) error {
 		cl := c.client()
 		defer cl.Close()
 		if err := cl.DestroyWorkspace(ctx, fs.Arg(0)); err != nil {
-			return err
+			var refusal *proto.Error
+			if !errors.As(err, &refusal) || refusal.Reason != proto.ReasonNeedsContainment {
+				return err
+			}
+			// A failed workspace has an unknown physical state, so destroy
+			// goes through containment: checkpoint what can be checkpointed,
+			// commit the generation fence, then delete. Do that here rather
+			// than hand the operator a second command to type.
+			fmt.Fprintf(os.Stderr, "%s is failed; destroying it through fleet quarantine\n", fs.Arg(0))
+			if err := containAndDestroy(ctx, cl, fs.Arg(0)); err != nil {
+				return err
+			}
 		}
 		if c.json {
 			printJSON(mutationResult{OK: true, Operation: "ws.destroy", Workspace: fs.Arg(0)})
@@ -1298,6 +1309,7 @@ func cmdFleet(ctx context.Context, args []string) error {
 	case "quarantine":
 		action := fs.String("action", proto.FleetActionFreeze, "freeze|revoke_egress|checkpoint|stop|destroy")
 		all := fs.Bool("all", false, "explicitly select every visible workspace")
+		wsID := fs.String("ws", "", "single workspace selector")
 		tenant := fs.String("tenant", "", "tenant selector")
 		principal := fs.String("principal", "", "principal selector")
 		run := fs.String("run", "", "run selector")
@@ -1326,7 +1338,7 @@ func cmdFleet(ctx context.Context, args []string) error {
 		request := proto.FleetQuarantineReq{
 			Action: *action, IdempotencyKey: *idem, TimeoutMillis: (*deadline).Milliseconds(),
 			Selector: proto.WorkspaceSelector{
-				All: *all, Tenant: *tenant, Principal: *principal, Run: *run, Node: *nodeID,
+				All: *all, Workspace: *wsID, Tenant: *tenant, Principal: *principal, Run: *run, Node: *nodeID,
 				Model: *model, Backend: *backend, Labels: labels,
 				CreatedAfter: afterMillis, CreatedBefore: beforeMillis,
 			},
@@ -1991,4 +2003,30 @@ func levelFromEnv() slog.Level {
 		return slog.LevelError
 	}
 	return slog.LevelInfo
+}
+
+// containAndDestroy runs the single-workspace fleet destroy a failed
+// workspace needs and reports the target's own result, not the aggregate.
+func containAndDestroy(ctx context.Context, cl *client.Client, id string) error {
+	operation, err := cl.QuarantineFleet(ctx, proto.FleetQuarantineReq{
+		Selector: proto.WorkspaceSelector{Workspace: id}, Action: proto.FleetActionDestroy,
+		TimeoutMillis: (5 * time.Minute).Milliseconds(),
+	})
+	if err != nil {
+		return err
+	}
+	operation, err = cl.WaitFleetOperation(ctx, operation.ID)
+	if err != nil {
+		return err
+	}
+	for _, target := range operation.Results {
+		if target.Workspace != id {
+			continue
+		}
+		if target.Acknowledged {
+			return nil
+		}
+		return proto.Err(proto.CodeConflict, "fleet %s could not destroy %s: %s (inspect with `remount fleet get %s`)", operation.ID, id, target.Error, operation.ID)
+	}
+	return proto.Err(proto.CodeConflict, "fleet %s selected no workspace %s", operation.ID, id)
 }

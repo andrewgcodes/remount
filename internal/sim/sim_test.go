@@ -2120,3 +2120,67 @@ func TestDockerWorkspaceIfAvailable(t *testing.T) {
 	}
 	c.DestroyWorkspace(tctx, ws.ID)
 }
+
+// The destroy of a workspace that cannot be checkpointed fails closed, and
+// that has to be retryable once the cause is gone: the operator fixes the
+// tree, retries under a new operation, and the workspace is checkpointed and
+// deleted. Found live on 2026-09-07 with Claude Code's .claude/debug/latest
+// link, when the retry was refused by the node's stuck destroy record.
+func TestFleetDestroyRetriesAfterAFailedCheckpoint(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the escaping symlink needs a POSIX target")
+	}
+	w := newWorld(t)
+	w.node("n1", nil)
+	c := w.client("incident-commander")
+	ctx := ctxT(t, 90*time.Second)
+	ws := mustWS(t, c, proto.WorkspaceSpec{Labels: map[string]string{"incident": "retry"}})
+	if err := c.WriteFile(ctx, ws.ID, "evidence.txt", []byte("preserve me"), 0); err != nil {
+		t.Fatal(err)
+	}
+	info, err := c.WorkspaceInfo(ctx, ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	escape := filepath.Join(info.Root, "escape")
+	if err := os.Symlink("/etc/passwd", escape); err != nil {
+		t.Fatal(err)
+	}
+	first, err := c.QuarantineFleet(ctx, proto.FleetQuarantineReq{
+		Selector: proto.WorkspaceSelector{Workspace: ws.ID}, Action: proto.FleetActionDestroy, IdempotencyKey: "destroy-retry-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first, err = c.WaitFleetOperation(ctx, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if first.State != proto.FleetStatePartial || len(first.Results) != 1 || first.Results[0].Acknowledged || !strings.Contains(first.Results[0].Error, "symlink") {
+		t.Fatalf("destroy with an escaping link must fail closed on the checkpoint: %#v", first)
+	}
+	if _, err := os.Stat(filepath.Join(info.Root, "evidence.txt")); err != nil {
+		t.Fatalf("source was deleted without a checkpoint: %v", err)
+	}
+	if err := os.Remove(escape); err != nil {
+		t.Fatal(err)
+	}
+	second, err := c.QuarantineFleet(ctx, proto.FleetQuarantineReq{
+		Selector: proto.WorkspaceSelector{Workspace: ws.ID}, Action: proto.FleetActionDestroy, IdempotencyKey: "destroy-retry-2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second, err = c.WaitFleetOperation(ctx, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if second.State != proto.FleetStateCompleted || len(second.Results) != 1 || !second.Results[0].Acknowledged || second.Results[0].Snapshot == "" {
+		t.Fatalf("retry after fixing the tree did not destroy: %#v", second)
+	}
+	got, err := c.GetWorkspace(ctx, ws.ID)
+	if err != nil || got.State != proto.WSDestroyed {
+		t.Fatalf("workspace after retried destroy=%#v err=%v", got, err)
+	}
+	if _, err := os.Stat(info.Root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("source still exists after acknowledged destroy: %v", err)
+	}
+}
