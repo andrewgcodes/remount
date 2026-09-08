@@ -274,6 +274,7 @@ const (
 	ReasonRevoked                  = proto.ReasonRevoked
 	ReasonQuotaExceeded            = proto.ReasonQuotaExceeded
 	ReasonWorkspaceNotReady        = proto.ReasonWorkspaceNotReady
+	ReasonNeedsContainment         = proto.ReasonNeedsContainment
 	ReasonWorkspaceMoved           = proto.ReasonWorkspaceMoved
 	ReasonGenerationMismatch       = proto.ReasonGenerationMismatch
 	ReasonOutputEvicted            = proto.ReasonOutputEvicted

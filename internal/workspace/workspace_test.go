@@ -440,3 +440,19 @@ esac
 		t.Fatalf("a successful probe is latched: %v", err)
 	}
 }
+
+func TestOwnedByWalksTheWholeTree(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".git", "objects", "4e"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".git", "objects", "4e", "obj"), []byte("x"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if !ownedBy(root, os.Getuid()) {
+		t.Fatal("a tree the current user created is owned by the current user")
+	}
+	if runtime.GOOS != "windows" && ownedBy(root, os.Getuid()+1) {
+		t.Fatal("a different uid must not be reported as owner")
+	}
+}
