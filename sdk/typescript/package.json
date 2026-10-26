@@ -30,7 +30,7 @@
     "@types/ws": "^8.5.13",
     "esbuild": "^0.28.1",
     "typescript": "^5.7.2",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   },
   "engines": {
     "node": ">=20"
